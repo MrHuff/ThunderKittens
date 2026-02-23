@@ -881,6 +881,47 @@ PYBIND11_MODULE(_C, m) {
     m.def("nvfp4_quantize", &nvfp4_quantize_entrypoint);
     m.def("fp32_to_fp4x2", &fp32_to_fp4x2_entrypoint);
     m.def("fp4x2_to_fp32", &fp4x2_to_fp32_entrypoint);
+
+    // Fused TE→TK GEMM: takes raw TE NVFP4 tensors + dimensions.
+    // ALL tensor manipulation (view, reshape, amax*recip) happens in C++.
+    // Python side passes only raw data pointers + integer dimensions.
+    //
+    // Args:
+    //   a_fp4_data:   raw fp4 packed data (any shape, viewed as fp4x2)
+    //   a_scale_inv:  flat swizzled scales (any shape, reshaped to tiles)
+    //   a_amax:       [1] float32
+    //   a_M, a_K:     dimensions of A matrix
+    //   b_fp4_data, b_scale_inv, b_amax, b_M, b_K: same for B
+    //   out:          [a_M, b_M] bf16 pre-allocated output
+    m.def("nvfp4_gemm_from_te", [](
+        const at::Tensor &a_fp4_data,
+        const at::Tensor &a_scale_inv,
+        const at::Tensor &a_amax,
+        int64_t a_M, int64_t a_K,
+        const at::Tensor &b_fp4_data,
+        const at::Tensor &b_scale_inv,
+        const at::Tensor &b_amax,
+        int64_t b_M, int64_t b_K,
+        at::Tensor &out
+    ) {
+        const float NVFP4_SCALE_RECIP = 1.0f / (6.0f * 448.0f);
+
+        // View fp4_data as fp4x2
+        auto A = a_fp4_data.view(at::kFloat4_e2m1fn_x2);
+        auto B = b_fp4_data.view(at::kFloat4_e2m1fn_x2);
+
+        // Reshape flat scales to tile layout and view as fp8
+        int64_t a_ntm = a_M / 128, a_ntk = a_K / 64;
+        int64_t b_ntm = b_M / 128, b_ntk = b_K / 64;
+        auto A_sc = a_scale_inv.reshape({a_ntm, a_ntk, 512}).view(at::kFloat8_e4m3fn);
+        auto B_sc = b_scale_inv.reshape({b_ntm, b_ntk, 512}).view(at::kFloat8_e4m3fn);
+
+        // Compute sc_global
+        auto A_sg = a_amax.mul(NVFP4_SCALE_RECIP);
+        auto B_sg = b_amax.mul(NVFP4_SCALE_RECIP);
+
+        nvfp4_gemm_entrypoint(A, A_sc, A_sg, B, B_sc, B_sg, out);
+    });
 }
 
 #endif
