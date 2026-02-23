@@ -60,6 +60,11 @@ struct globals {
     B_sc_global_gl B_sc_global; // (1,)
     D_gl           D;           // M x N
 
+    // Per-tile B global scale (raw pointer, not TMA)
+    // nullptr = use B_sc_global[{0}] for all tiles (ungrouped)
+    // non-null = read b_sg_per_tile[col_block_idx] per tile (grouped)
+    const float* b_sg_per_tile;
+
     struct input_tiles_t {
         A_fp4x2_tile A;
         B_fp4x2_tile B;
@@ -240,7 +245,9 @@ __device__ inline void kernel(const globals<C> &g) {
         wait(tmem_provisioned, 0);
         tm_allocator.set_addr(tmem_addr);
         auto out_tm = tm_allocator.template allocate<full_tt_fl<C::Nb>>(0);
-        const float global_scale = g.A_sc_global[{0}] * g.B_sc_global[{0}];
+        const float a_sg = g.A_sc_global[{0}];
+        const float default_b_sg = g.B_sc_global[{0}];
+        const float default_global_scale = a_sg * default_b_sg;
 
         for (int block_idx = cluster_id; block_idx < num_blocks; block_idx += gridDim.x / C::CLUSTER_SIZE) {
             int supergroup_idx = block_idx / num_blocks_per_supergroup;
@@ -265,7 +272,13 @@ __device__ inline void kernel(const globals<C> &g) {
                         warpgroup::sync(1);
                         warpgroup::tma::cluster::arrive(outputs_finished, 0, 1); // signal CTA 0
                     }
-                    warp::mul(D_reg, D_reg, global_scale);
+                    {
+                        float gs = default_global_scale;
+                        if (g.b_sg_per_tile != nullptr) {
+                            gs = a_sg * g.b_sg_per_tile[col_block_idx];
+                        }
+                        warp::mul(D_reg, D_reg, gs);
+                    }
                     warpgroup::tma::store_async_read_wait<C::NUM_D_TILES-1>();
                     warpgroup::sync(1);
                     warpgroup::store(output_tiles.D[i%C::NUM_D_TILES], D_reg);
@@ -278,7 +291,13 @@ __device__ inline void kernel(const globals<C> &g) {
                 for (int i = 0; i < C::EPI_PIPE_DEPTH; i++) {
                     rt_fl<C::Mb / 8, C::Nb/C::EPI_PIPE_DEPTH> D_reg_fl;
                     warpgroup::load_async(D_reg_fl, out_tm.template subtile<full_tt_fl<C::Nb/C::EPI_PIPE_DEPTH>>(0, C::Nb/C::EPI_PIPE_DEPTH*i));
-                    warp::mul(D_reg_fl, D_reg_fl, global_scale);
+                    {
+                        float gs = default_global_scale;
+                        if (g.b_sg_per_tile != nullptr) {
+                            gs = a_sg * g.b_sg_per_tile[col_block_idx];
+                        }
+                        warp::mul(D_reg_fl, D_reg_fl, gs);
+                    }
                     warp::copy(D_reg[i], D_reg_fl);
                 }
                 tensor_load_wait();
@@ -764,7 +783,43 @@ void nvfp4_gemm_entrypoint(
         .B = kittens::py::tensor_to_gl<typename G::B_fp4x2_gl>(B),
         .B_sc = kittens::py::tensor_to_gl<typename G::B_sc_gl, false>(B_sc, 1, B_sc.size(0), B_sc.size(1), 256),
         .B_sc_global = kittens::py::tensor_to_gl<typename G::B_sc_global_gl>(B_sc_global),
-        .D = kittens::py::tensor_to_gl<typename G::D_gl>(D)
+        .D = kittens::py::tensor_to_gl<typename G::D_gl>(D),
+        .b_sg_per_tile = nullptr  // ungrouped: use B_sc_global[{0}] for all tiles
+    };
+    kittens::py::launch_kernel<C, G, nvfp4_gemm::kernel<C>>(g);
+}
+
+// Grouped GEMM: concatenated weights with per-tile B_sc_global
+// B_sg_per_tile: [num_col_tiles] float, pre-computed on GPU by Python.
+//   Each entry has the B_sg value for that column tile's group.
+void nvfp4_grouped_gemm_entrypoint(
+    const at::Tensor &A,              // [M, K/2] fp4
+    const at::Tensor &A_sc,           // [M/16, K/16] fp8
+    const at::Tensor &A_sc_global,    // [1] float
+    const at::Tensor &B,              // [N_total, K/2] fp4 (concatenated weights)
+    const at::Tensor &B_sc,           // [N_total/16, K/16] fp8
+    const at::Tensor &B_sg_per_tile,  // [num_col_tiles] float — pre-computed per-tile B_sg (on GPU)
+    at::Tensor &D                     // [M, N_total] bf16
+) {
+    using C = nvfp4_gemm::config<256, 4, 8, 12, 2, false>;
+    using G = nvfp4_gemm::globals<C>;
+
+    // Dummy B_sc_global [1] — epilogue won't read it when b_sg_per_tile != nullptr
+    // Use a static thread-local to avoid re-allocating every call
+    static thread_local at::Tensor dummy_bsg;
+    if (!dummy_bsg.defined()) {
+        dummy_bsg = at::zeros({1}, at::dtype(at::kFloat).device(at::kCUDA));
+    }
+
+    G g {
+        .A = kittens::py::tensor_to_gl<typename G::A_fp4x2_gl>(A),
+        .A_sc = kittens::py::tensor_to_gl<typename G::A_sc_gl, false>(A_sc, 1, A_sc.size(0), A_sc.size(1), 256),
+        .A_sc_global = kittens::py::tensor_to_gl<typename G::A_sc_global_gl>(A_sc_global),
+        .B = kittens::py::tensor_to_gl<typename G::B_fp4x2_gl>(B),
+        .B_sc = kittens::py::tensor_to_gl<typename G::B_sc_gl, false>(B_sc, 1, B_sc.size(0), B_sc.size(1), 256),
+        .B_sc_global = kittens::py::tensor_to_gl<typename G::B_sc_global_gl>(dummy_bsg),
+        .D = kittens::py::tensor_to_gl<typename G::D_gl>(D),
+        .b_sg_per_tile = B_sg_per_tile.data_ptr<float>()  // per-tile B_sg
     };
     kittens::py::launch_kernel<C, G, nvfp4_gemm::kernel<C>>(g);
 }
@@ -827,6 +882,7 @@ at::Tensor fp4x2_to_fp32_entrypoint(at::Tensor A_fp4x2) {
 
 PYBIND11_MODULE(_C, m) {
     m.def("nvfp4_gemm", &nvfp4_gemm_entrypoint);
+    m.def("nvfp4_grouped_gemm", &nvfp4_grouped_gemm_entrypoint);
     m.def("nvfp4_quantize", &nvfp4_quantize_entrypoint);
     m.def("fp32_to_fp4x2", &fp32_to_fp4x2_entrypoint);
     m.def("fp4x2_to_fp32", &fp4x2_to_fp32_entrypoint);
