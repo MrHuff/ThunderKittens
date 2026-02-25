@@ -29,7 +29,7 @@ struct config {
     static constexpr int SUPERGROUP_SIZE = _SUPERGROUP_SIZE;
     static constexpr int Mb = 256;
     static constexpr int Nb = _Nb;
-    static constexpr int Kb = 256;  // 2x MXFP8's 128, since FP4 elements are half the width
+    static constexpr int Kb = 128;  // Must match scale tile coverage: 128 FP4 values = 4 blocks of 32
     static constexpr int B_SC_SIZE = Nb/128;
 
     static constexpr int NUM_D_TILES = _NUM_D_TILES;
@@ -38,7 +38,7 @@ struct config {
 template <typename C>
 struct globals {
     // FP4 tiles: each element is 4 bits, stored as fp4e2m1_2 (packed pairs)
-    // Tile dimensions: Mb/2 rows × Kb/2 columns (Kb/2 because fp4e2m1_2 packs 2 elements)
+    // Tile dimensions: Mb/2 rows × Kb/2 columns of packed pairs (= Kb FP4 values)
     using A_fp4x2_tile = st_fp4e2m1_2<C::Mb/2, C::Kb/2>;
     using A_sc_tile    = st_fp8e8m0<32, 16, false>;  // E8M0 scale, same as MXFP8
     using B_fp4x2_tile = st_fp4e2m1_2<C::Nb/2, C::Kb/2>;
