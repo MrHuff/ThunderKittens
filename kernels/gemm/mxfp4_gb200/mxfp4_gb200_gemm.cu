@@ -374,7 +374,11 @@ __device__ inline void kernel(const globals &G) {
     }
     __syncthreads();
 
-    // Perform MXFP4 quantization with E8M0 scales (same scale computation as MXFP8)
+    // Perform MXFP4 quantization with E8M0 scales
+    // Scale convention matches TE MXFP4 decode-centric (no global scale):
+    //   E8M0 = round(log2(amax)) + 127  (tracks raw amax, not amax/6)
+    //   Quantize: x * (6.0 / 2^exponent)  (divides by scale, multiplies by FP4 max)
+    //   GEMM needs alpha = 1/36 to compensate (since scale^2 inflates by 36)
     #pragma unroll
     for (int r = 0; r < ROWS_PER_THREAD; r++) {
         int tile_row = tid + (r*64);
@@ -388,12 +392,21 @@ __device__ inline void kernel(const globals &G) {
             for (int j = 1; j < N_PER_K_BLOCK; j++)
                 amax = __hmax2(amax, __habs2(A_bf16_reg[r][i][j]));
 
-            // Compute E8M0 scale: power-of-2 exponent, rounding toward +inf, satfinite
-            // MXFP4 max is 6.0, so divide amax by 6.0 to get the scale
-            // 1/6 * 1/448 (fp8e4m3 max) is not needed here — MXFP4 uses FP4 max = 6.0
-            float scale = max(__bfloat162float(__hmax(amax.x, amax.y)) / 6.0f, 0.000000000001f);
-            A_sc_reg[r][k_block_idx].__x = __nv_cvt_float_to_e8m0(scale, __NV_SATFINITE, cudaRoundPosInf);
-            float scale_inv = 1.0f / static_cast<float>(A_sc_reg[r][k_block_idx]);
+            // Compute E8M0 scale: round(log2(amax)) + 127
+            // This tracks the raw block amax (TE decode-centric convention)
+            // Note: __nv_cvt_float_to_e8m0() doesn't support cudaRoundNearest properly,
+            // so we compute manually to match TE's torch.round(torch.log2(amax)).
+            float block_amax = __bfloat162float(__hmax(amax.x, amax.y));
+            int e8m0_val;
+            if (block_amax <= 1e-9f) {
+                e8m0_val = 0;  // min scale for zero blocks
+            } else {
+                int exp = (int)roundf(log2f(block_amax));
+                e8m0_val = min(max(exp + 127, 0), 255);
+            }
+            A_sc_reg[r][k_block_idx].__x = (__nv_fp8_storage_t)e8m0_val;
+            // Quantize factor = 6.0 / 2^exponent = FP4_MAX / scale
+            float scale_inv = 6.0f / static_cast<float>(A_sc_reg[r][k_block_idx]);
 
             // Quantize to FP4 and store to shared memory
             #pragma unroll

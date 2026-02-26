@@ -836,9 +836,12 @@ void nvfp4_quantize_entrypoint(
         .A_sc_global = kittens::py::tensor_to_gl<G::A_sc_global_gl>(A_sc_global)
     };
 
-    nvfp4_quantize::zero_kernel<<<1, 1>>>(g);
-    nvfp4_quantize::absmax_kernel<<<nvfp4_quantize::absmax_config::NUM_BLOCKS, nvfp4_quantize::absmax_config::NUM_THREADS>>>(g);
-    nvfp4_quantize::divide_kernel<<<1, 1>>>(g);
+    // MUST use PyTorch's current stream — bare <<<>>> uses default stream 0
+    // which races with PyTorch ops on the current stream, causing NaN Heisenbug.
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    nvfp4_quantize::zero_kernel<<<1, 1, 0, stream>>>(g);
+    nvfp4_quantize::absmax_kernel<<<nvfp4_quantize::absmax_config::NUM_BLOCKS, nvfp4_quantize::absmax_config::NUM_THREADS, 0, stream>>>(g);
+    nvfp4_quantize::divide_kernel<<<1, 1, 0, stream>>>(g);
     if (scale_2d) kittens::py::launch_kernel<C, G, nvfp4_quantize::quantize_kernel<true>>(g);
     else          kittens::py::launch_kernel<C, G, nvfp4_quantize::quantize_kernel<false>>(g);
 }
