@@ -1,4 +1,5 @@
 #include "kittens.cuh"
+#include <optional>
 
 using namespace kittens;
 
@@ -60,6 +61,13 @@ struct globals {
     B_sc_global_gl B_sc_global; // (1,)
     D_gl           D;           // M x N
 
+    // Optional independent outputs for QKV grouped GEMM
+    D_gl           D_K;         // M x N_k
+    D_gl           D_V;         // M x N_v
+    int            q_dim;       // Columns for Q
+    int            k_dim;       // Columns for K
+    bool           use_split_D; // Trigger manual splitting logic
+
     // Per-tile B global scale (raw pointer, not TMA)
     // nullptr = use B_sc_global[{0}] for all tiles (ungrouped)
     // non-null = read b_sg_per_tile[col_block_idx] per tile (grouped)
@@ -78,7 +86,8 @@ struct globals {
     };
 
     __host__ inline dim3 grid() const {
-        return dim3(min((D.rows()/(C::Mb/2))*(D.cols()/C::Nb), num_sms()));
+        int d_cols = use_split_D ? (q_dim + k_dim + D_V.cols()) : D.cols();
+        return dim3(min((D.rows()/(C::Mb/2))*(d_cols/C::Nb), num_sms()));
     }
     __host__ inline dim3 block() const { return dim3(C::NUM_THREADS); }
     __host__ inline int dynamic_shared_memory() const {
@@ -100,13 +109,18 @@ __device__ inline void kernel(const globals<C> &g) {
         g.B.template prefetch_tma<typename G::B_fp4x2_tile>();
         g.B_sc.template prefetch_tma<typename G::B_sc_tile>();
         g.D.template prefetch_tma<typename G::D_tile>();
+        if (g.use_split_D) {
+            g.D_K.template prefetch_tma<typename G::D_tile>();
+            g.D_V.template prefetch_tma<typename G::D_tile>();
+        }
     }
 
     const int warpgroup_id = warpgroup::groupid();
     const int cta_id = cluster_ctarank();
     const int cluster_id = clusterIdx().x;
     const int num_row_blocks = g.D.rows() / C::Mb;
-    const int num_col_blocks = g.D.cols() / C::Nb;
+    const int N_total = g.use_split_D ? (g.q_dim + g.k_dim + g.D_V.cols()) : g.D.cols();
+    const int num_col_blocks = N_total / C::Nb;
     const int num_blocks = num_row_blocks * num_col_blocks;
     const int num_red_blocks = 2 * g.A.cols() / C::Kb;
     const int num_blocks_per_supergroup = C::SUPERGROUP_SIZE * num_col_blocks;
@@ -283,7 +297,22 @@ __device__ inline void kernel(const globals<C> &g) {
                     warpgroup::sync(1);
                     warpgroup::store(output_tiles.D[i%C::NUM_D_TILES], D_reg);
                     warpgroup::sync(1);
-                    warpgroup::tma::store_async<dim::ROW, cache_policy::EVICT_FIRST>(g.D, output_tiles.D[i%C::NUM_D_TILES], {row_block_idx*2 + cta_id, C::EPI_PIPE_DEPTH*col_block_idx + i});
+
+                    if (g.use_split_D) {
+                        int col_offset = C::EPI_PIPE_DEPTH*col_block_idx + i;
+                        int col_offset_elems = col_offset * C::Nb/C::EPI_PIPE_DEPTH;
+                        if (col_offset_elems < g.q_dim) {
+                            warpgroup::tma::store_async<dim::ROW, cache_policy::EVICT_FIRST>(g.D, output_tiles.D[i%C::NUM_D_TILES], {row_block_idx*2 + cta_id, col_offset});
+                        } else if (col_offset_elems < g.q_dim + g.k_dim) {
+                            int k_col_offset = col_offset - (g.q_dim / (C::Nb/C::EPI_PIPE_DEPTH));
+                            warpgroup::tma::store_async<dim::ROW, cache_policy::EVICT_FIRST>(g.D_K, output_tiles.D[i%C::NUM_D_TILES], {row_block_idx*2 + cta_id, k_col_offset});
+                        } else {
+                            int v_col_offset = col_offset - ((g.q_dim + g.k_dim) / (C::Nb/C::EPI_PIPE_DEPTH));
+                            warpgroup::tma::store_async<dim::ROW, cache_policy::EVICT_FIRST>(g.D_V, output_tiles.D[i%C::NUM_D_TILES], {row_block_idx*2 + cta_id, v_col_offset});
+                        }
+                    } else {
+                        warpgroup::tma::store_async<dim::ROW, cache_policy::EVICT_FIRST>(g.D, output_tiles.D[i%C::NUM_D_TILES], {row_block_idx*2 + cta_id, C::EPI_PIPE_DEPTH*col_block_idx + i});
+                    }
                 }
             } else {
                 rt_bf<C::Mb / 8, C::Nb/C::EPI_PIPE_DEPTH> D_reg[C::EPI_PIPE_DEPTH];
@@ -310,7 +339,21 @@ __device__ inline void kernel(const globals<C> &g) {
                     warpgroup::sync(1);
                     warpgroup::store(output_tiles.D[i%C::NUM_D_TILES], D_reg[i]);
                     warpgroup::sync(1);
-                    warpgroup::tma::store_async<dim::ROW, cache_policy::EVICT_FIRST>(g.D, output_tiles.D[i%C::NUM_D_TILES], {row_block_idx*2 + cta_id, C::EPI_PIPE_DEPTH*col_block_idx + i});
+                    if (g.use_split_D) {
+                        int col_offset = C::EPI_PIPE_DEPTH*col_block_idx + i;
+                        int col_offset_elems = col_offset * C::Nb/C::EPI_PIPE_DEPTH;
+                        if (col_offset_elems < g.q_dim) {
+                            warpgroup::tma::store_async<dim::ROW, cache_policy::EVICT_FIRST>(g.D, output_tiles.D[i%C::NUM_D_TILES], {row_block_idx*2 + cta_id, col_offset});
+                        } else if (col_offset_elems < g.q_dim + g.k_dim) {
+                            int k_col_offset = col_offset - (g.q_dim / (C::Nb/C::EPI_PIPE_DEPTH));
+                            warpgroup::tma::store_async<dim::ROW, cache_policy::EVICT_FIRST>(g.D_K, output_tiles.D[i%C::NUM_D_TILES], {row_block_idx*2 + cta_id, k_col_offset});
+                        } else {
+                            int v_col_offset = col_offset - ((g.q_dim + g.k_dim) / (C::Nb/C::EPI_PIPE_DEPTH));
+                            warpgroup::tma::store_async<dim::ROW, cache_policy::EVICT_FIRST>(g.D_V, output_tiles.D[i%C::NUM_D_TILES], {row_block_idx*2 + cta_id, v_col_offset});
+                        }
+                    } else {
+                        warpgroup::tma::store_async<dim::ROW, cache_policy::EVICT_FIRST>(g.D, output_tiles.D[i%C::NUM_D_TILES], {row_block_idx*2 + cta_id, C::EPI_PIPE_DEPTH*col_block_idx + i});
+                    }
                 }
             }
             update_phasebit<0>(phasebits, 0);
@@ -778,12 +821,17 @@ void nvfp4_gemm_entrypoint(
 
     G g {
         .A = kittens::py::tensor_to_gl<typename G::A_fp4x2_gl>(A),
-        .A_sc = kittens::py::tensor_to_gl<typename G::A_sc_gl, false>(A_sc, 1, A_sc.size(0), A_sc.size(1), 256),
+        .A_sc = kittens::py::tensor_to_gl<typename G::A_sc_gl, false>(A_sc, 1, A_sc.dim() == 2 ? A_sc.size(0)/128 : A_sc.size(0), A_sc.dim() == 2 ? A_sc.size(1)/4 : A_sc.size(1), 256),
         .A_sc_global = kittens::py::tensor_to_gl<typename G::A_sc_global_gl>(A_sc_global),
         .B = kittens::py::tensor_to_gl<typename G::B_fp4x2_gl>(B),
-        .B_sc = kittens::py::tensor_to_gl<typename G::B_sc_gl, false>(B_sc, 1, B_sc.size(0), B_sc.size(1), 256),
+        .B_sc = kittens::py::tensor_to_gl<typename G::B_sc_gl, false>(B_sc, 1, B_sc.dim() == 2 ? B_sc.size(0)/128 : B_sc.size(0), B_sc.dim() == 2 ? B_sc.size(1)/4 : B_sc.size(1), 256),
         .B_sc_global = kittens::py::tensor_to_gl<typename G::B_sc_global_gl>(B_sc_global),
         .D = kittens::py::tensor_to_gl<typename G::D_gl>(D),
+        .D_K = kittens::py::tensor_to_gl<typename G::D_gl>(D),
+        .D_V = kittens::py::tensor_to_gl<typename G::D_gl>(D),
+        .q_dim = 0,
+        .k_dim = 0,
+        .use_split_D = false,
         .b_sg_per_tile = nullptr  // ungrouped: use B_sc_global[{0}] for all tiles
     };
     kittens::py::launch_kernel<C, G, nvfp4_gemm::kernel<C>>(g);
@@ -799,7 +847,9 @@ void nvfp4_grouped_gemm_entrypoint(
     const at::Tensor &B,              // [N_total, K/2] fp4 (concatenated weights)
     const at::Tensor &B_sc,           // [N_total/16, K/16] fp8
     const at::Tensor &B_sg_per_tile,  // [num_col_tiles] float — pre-computed per-tile B_sg (on GPU)
-    at::Tensor &D                     // [M, N_total] bf16
+    at::Tensor &D,                    // [M, N_total] or [M, Nq] bf16
+    std::optional<at::Tensor> D_K_opt = std::nullopt, // Optional K output
+    std::optional<at::Tensor> D_V_opt = std::nullopt  // Optional V output
 ) {
     using C = nvfp4_gemm::config<256, 4, 8, 12, 2, false>;
     using G = nvfp4_gemm::globals<C>;
@@ -811,14 +861,21 @@ void nvfp4_grouped_gemm_entrypoint(
         dummy_bsg = at::zeros({1}, at::dtype(at::kFloat).device(at::kCUDA));
     }
 
+    bool use_split_D = (D_K_opt.has_value() && D_V_opt.has_value());
+
     G g {
         .A = kittens::py::tensor_to_gl<typename G::A_fp4x2_gl>(A),
-        .A_sc = kittens::py::tensor_to_gl<typename G::A_sc_gl, false>(A_sc, 1, A_sc.size(0), A_sc.size(1), 256),
+        .A_sc = kittens::py::tensor_to_gl<typename G::A_sc_gl, false>(A_sc, 1, A_sc.dim() == 2 ? A_sc.size(0)/128 : A_sc.size(0), A_sc.dim() == 2 ? A_sc.size(1)/4 : A_sc.size(1), 256),
         .A_sc_global = kittens::py::tensor_to_gl<typename G::A_sc_global_gl>(A_sc_global),
         .B = kittens::py::tensor_to_gl<typename G::B_fp4x2_gl>(B),
-        .B_sc = kittens::py::tensor_to_gl<typename G::B_sc_gl, false>(B_sc, 1, B_sc.size(0), B_sc.size(1), 256),
+        .B_sc = kittens::py::tensor_to_gl<typename G::B_sc_gl, false>(B_sc, 1, B_sc.dim() == 2 ? B_sc.size(0)/128 : B_sc.size(0), B_sc.dim() == 2 ? B_sc.size(1)/4 : B_sc.size(1), 256),
         .B_sc_global = kittens::py::tensor_to_gl<typename G::B_sc_global_gl>(dummy_bsg),
         .D = kittens::py::tensor_to_gl<typename G::D_gl>(D),
+        .D_K = use_split_D ? kittens::py::tensor_to_gl<typename G::D_gl>(D_K_opt.value()) : kittens::py::tensor_to_gl<typename G::D_gl>(D),
+        .D_V = use_split_D ? kittens::py::tensor_to_gl<typename G::D_gl>(D_V_opt.value()) : kittens::py::tensor_to_gl<typename G::D_gl>(D),
+        .q_dim = use_split_D ? static_cast<int>(D.size(1)) : 0,
+        .k_dim = use_split_D ? static_cast<int>(D_K_opt.value().size(1)) : 0,
+        .use_split_D = use_split_D,
         .b_sg_per_tile = B_sg_per_tile.data_ptr<float>()  // per-tile B_sg
     };
     kittens::py::launch_kernel<C, G, nvfp4_gemm::kernel<C>>(g);
@@ -885,7 +942,10 @@ at::Tensor fp4x2_to_fp32_entrypoint(at::Tensor A_fp4x2) {
 
 PYBIND11_MODULE(_C, m) {
     m.def("nvfp4_gemm", &nvfp4_gemm_entrypoint);
-    m.def("nvfp4_grouped_gemm", &nvfp4_grouped_gemm_entrypoint);
+    m.def("nvfp4_grouped_gemm", &nvfp4_grouped_gemm_entrypoint,
+          pybind11::arg("A"), pybind11::arg("A_sc"), pybind11::arg("A_sc_global"),
+          pybind11::arg("B"), pybind11::arg("B_sc"), pybind11::arg("B_sg_per_tile"),
+          pybind11::arg("D"), pybind11::arg("D_K_opt") = std::nullopt, pybind11::arg("D_V_opt") = std::nullopt);
     m.def("nvfp4_quantize", &nvfp4_quantize_entrypoint);
     m.def("fp32_to_fp4x2", &fp32_to_fp4x2_entrypoint);
     m.def("fp4x2_to_fp32", &fp4x2_to_fp32_entrypoint);
