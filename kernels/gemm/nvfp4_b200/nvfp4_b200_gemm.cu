@@ -812,8 +812,31 @@ void nvfp4_gemm_entrypoint(
     at::Tensor &D
 ) {
     int K = B.size(1) * 2;
-    if (K <= 2048) {
-        using C = nvfp4_gemm::config<256, 4, 16, 1, 2, false>;
+    int N_out = D.size(1);
+    if (K <= 2048 && N_out <= 4096) {
+        // Dgrad + small-N shapes: sweep-optimized config
+        // Nb=256, LOAD_PIPE=5, EPI_PIPE=8, SG=4, OVL=false
+        // 1.33x faster than Nb=128 on Wo dgrad, 1.49x on small-M dgrad
+        using C = nvfp4_gemm::config<256, 5, 8, 4, 2, false>;
+        using G = nvfp4_gemm::globals<C>;
+        G g {
+            .A = kittens::py::tensor_to_gl<typename G::A_fp4x2_gl>(A),
+            .A_sc = kittens::py::tensor_to_gl<typename G::A_sc_gl, false>(A_sc, 1, A_sc.dim() == 2 ? A_sc.size(0)/128 : A_sc.size(0), A_sc.dim() == 2 ? A_sc.size(1)/4 : A_sc.size(1), 256),
+            .A_sc_global = kittens::py::tensor_to_gl<typename G::A_sc_global_gl>(A_sc_global),
+            .B = kittens::py::tensor_to_gl<typename G::B_fp4x2_gl>(B),
+            .B_sc = kittens::py::tensor_to_gl<typename G::B_sc_gl, false>(B_sc, 1, B_sc.dim() == 2 ? B_sc.size(0)/128 : B_sc.size(0), B_sc.dim() == 2 ? B_sc.size(1)/4 : B_sc.size(1), 256),
+            .B_sc_global = kittens::py::tensor_to_gl<typename G::B_sc_global_gl>(B_sc_global),
+            .D = kittens::py::tensor_to_gl<typename G::D_gl>(D),
+            .D_K = kittens::py::tensor_to_gl<typename G::D_gl>(D),
+            .D_V = kittens::py::tensor_to_gl<typename G::D_gl>(D),
+            .q_dim = 0,
+            .k_dim = 0,
+            .use_split_D = false,
+            .b_sg_per_tile = nullptr
+        };
+        kittens::py::launch_kernel<C, G, nvfp4_gemm::kernel<C>>(g);
+    } else if (K <= 2048) {
+        using C = nvfp4_gemm::config<256, 4, 16, 4, 2, false>;
         using G = nvfp4_gemm::globals<C>;
         G g {
             .A = kittens::py::tensor_to_gl<typename G::A_fp4x2_gl>(A),
@@ -875,7 +898,7 @@ void nvfp4_grouped_gemm_entrypoint(
 
     int K = B.size(1) * 2;
     if (K <= 2048) {
-        using C = nvfp4_gemm::config<256, 4, 16, 1, 2, false>;
+        using C = nvfp4_gemm::config<256, 4, 16, 4, 2, false>;
         using G = nvfp4_gemm::globals<C>;
         G g {
             .A = kittens::py::tensor_to_gl<typename G::A_fp4x2_gl>(A),
@@ -974,8 +997,62 @@ at::Tensor fp4x2_to_fp32_entrypoint(at::Tensor A_fp4x2) {
     return A_fp32;
 }
 
+// ================================================================
+// Config-selectable GEMM for tile tuning sweeps.
+// config_id selects from pre-compiled configs below.
+// ================================================================
+template <typename C>
+static void run_gemm_with_config(
+    const at::Tensor &A, const at::Tensor &A_sc, const at::Tensor &A_sc_global,
+    const at::Tensor &B, const at::Tensor &B_sc, const at::Tensor &B_sc_global,
+    at::Tensor &D
+) {
+    using G = nvfp4_gemm::globals<C>;
+    G g {
+        .A = kittens::py::tensor_to_gl<typename G::A_fp4x2_gl>(A),
+        .A_sc = kittens::py::tensor_to_gl<typename G::A_sc_gl, false>(A_sc, 1, A_sc.dim() == 2 ? A_sc.size(0)/128 : A_sc.size(0), A_sc.dim() == 2 ? A_sc.size(1)/4 : A_sc.size(1), 256),
+        .A_sc_global = kittens::py::tensor_to_gl<typename G::A_sc_global_gl>(A_sc_global),
+        .B = kittens::py::tensor_to_gl<typename G::B_fp4x2_gl>(B),
+        .B_sc = kittens::py::tensor_to_gl<typename G::B_sc_gl, false>(B_sc, 1, B_sc.dim() == 2 ? B_sc.size(0)/128 : B_sc.size(0), B_sc.dim() == 2 ? B_sc.size(1)/4 : B_sc.size(1), 256),
+        .B_sc_global = kittens::py::tensor_to_gl<typename G::B_sc_global_gl>(B_sc_global),
+        .D = kittens::py::tensor_to_gl<typename G::D_gl>(D),
+        .D_K = kittens::py::tensor_to_gl<typename G::D_gl>(D),
+        .D_V = kittens::py::tensor_to_gl<typename G::D_gl>(D),
+        .q_dim = 0, .k_dim = 0, .use_split_D = false, .b_sg_per_tile = nullptr
+    };
+    kittens::py::launch_kernel<C, G, nvfp4_gemm::kernel<C>>(g);
+}
+
+void nvfp4_gemm_config_entrypoint(
+    const at::Tensor &A, const at::Tensor &A_sc, const at::Tensor &A_sc_global,
+    const at::Tensor &B, const at::Tensor &B_sc, const at::Tensor &B_sc_global,
+    at::Tensor &D, int config_id
+) {
+    //                     Nb   LOAD EPI  SG  DT  OVERLAP
+    switch (config_id) {
+    case 0: run_gemm_with_config<nvfp4_gemm::config<256, 4, 16,  1, 2, false>>(A, A_sc, A_sc_global, B, B_sc, B_sc_global, D); break;
+    case 1: run_gemm_with_config<nvfp4_gemm::config<256, 4, 16,  4, 2, false>>(A, A_sc, A_sc_global, B, B_sc, B_sc_global, D); break;
+    case 2: run_gemm_with_config<nvfp4_gemm::config<256, 4, 16, 12, 2, false>>(A, A_sc, A_sc_global, B, B_sc, B_sc_global, D); break;
+    case 3: run_gemm_with_config<nvfp4_gemm::config<256, 5,  8,  4, 2, true >>(A, A_sc, A_sc_global, B, B_sc, B_sc_global, D); break;
+    case 4: run_gemm_with_config<nvfp4_gemm::config<256, 5,  8, 12, 2, true >>(A, A_sc, A_sc_global, B, B_sc, B_sc_global, D); break;
+    case 5: run_gemm_with_config<nvfp4_gemm::config<256, 5,  8,  4, 2, false>>(A, A_sc, A_sc_global, B, B_sc, B_sc_global, D); break;
+    case 6: run_gemm_with_config<nvfp4_gemm::config<256, 4,  8, 12, 2, false>>(A, A_sc, A_sc_global, B, B_sc, B_sc_global, D); break;
+    case 7: run_gemm_with_config<nvfp4_gemm::config<128, 5,  4, 12, 2, true >>(A, A_sc, A_sc_global, B, B_sc, B_sc_global, D); break;
+    case 8: run_gemm_with_config<nvfp4_gemm::config<128, 4,  4, 12, 2, false>>(A, A_sc, A_sc_global, B, B_sc, B_sc_global, D); break;
+    case 9: run_gemm_with_config<nvfp4_gemm::config<128, 5,  4,  4, 2, true >>(A, A_sc, A_sc_global, B, B_sc, B_sc_global, D); break;
+    case 10: run_gemm_with_config<nvfp4_gemm::config<256, 5, 16,  4, 2, true >>(A, A_sc, A_sc_global, B, B_sc, B_sc_global, D); break;
+    case 11: run_gemm_with_config<nvfp4_gemm::config<256, 5, 16, 12, 2, true >>(A, A_sc, A_sc_global, B, B_sc, B_sc_global, D); break;
+    default: TORCH_CHECK(false, "Invalid config_id: ", config_id, " (valid: 0-11)");
+    }
+}
+
 PYBIND11_MODULE(_C, m) {
     m.def("nvfp4_gemm", &nvfp4_gemm_entrypoint);
+    m.def("nvfp4_gemm_config", &nvfp4_gemm_config_entrypoint,
+          "GEMM with selectable tile config (for sweeping)",
+          pybind11::arg("A"), pybind11::arg("A_sc"), pybind11::arg("A_sc_global"),
+          pybind11::arg("B"), pybind11::arg("B_sc"), pybind11::arg("B_sc_global"),
+          pybind11::arg("D"), pybind11::arg("config_id"));
     m.def("nvfp4_grouped_gemm", &nvfp4_grouped_gemm_entrypoint,
           pybind11::arg("A"), pybind11::arg("A_sc"), pybind11::arg("A_sc_global"),
           pybind11::arg("B"), pybind11::arg("B_sc"), pybind11::arg("B_sg_per_tile"),
