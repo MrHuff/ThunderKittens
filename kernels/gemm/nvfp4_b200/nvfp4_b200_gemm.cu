@@ -811,25 +811,46 @@ void nvfp4_gemm_entrypoint(
     const at::Tensor &B_sc_global,
     at::Tensor &D
 ) {
-    using C = nvfp4_gemm::config<256, 4, 8, 12, 2, false>;
-    using G = nvfp4_gemm::globals<C>;
-
-    G g {
-        .A = kittens::py::tensor_to_gl<typename G::A_fp4x2_gl>(A),
-        .A_sc = kittens::py::tensor_to_gl<typename G::A_sc_gl, false>(A_sc, 1, A_sc.dim() == 2 ? A_sc.size(0)/128 : A_sc.size(0), A_sc.dim() == 2 ? A_sc.size(1)/4 : A_sc.size(1), 256),
-        .A_sc_global = kittens::py::tensor_to_gl<typename G::A_sc_global_gl>(A_sc_global),
-        .B = kittens::py::tensor_to_gl<typename G::B_fp4x2_gl>(B),
-        .B_sc = kittens::py::tensor_to_gl<typename G::B_sc_gl, false>(B_sc, 1, B_sc.dim() == 2 ? B_sc.size(0)/128 : B_sc.size(0), B_sc.dim() == 2 ? B_sc.size(1)/4 : B_sc.size(1), 256),
-        .B_sc_global = kittens::py::tensor_to_gl<typename G::B_sc_global_gl>(B_sc_global),
-        .D = kittens::py::tensor_to_gl<typename G::D_gl>(D),
-        .D_K = kittens::py::tensor_to_gl<typename G::D_gl>(D),
-        .D_V = kittens::py::tensor_to_gl<typename G::D_gl>(D),
-        .q_dim = 0,
-        .k_dim = 0,
-        .use_split_D = false,
-        .b_sg_per_tile = nullptr  // ungrouped: use B_sc_global[{0}] for all tiles
-    };
-    kittens::py::launch_kernel<C, G, nvfp4_gemm::kernel<C>>(g);
+    int K = B.size(1) * 2;
+    if (K <= 2048) {
+        using C = nvfp4_gemm::config<256, 4, 16, 1, 2, false>;
+        using G = nvfp4_gemm::globals<C>;
+        G g {
+            .A = kittens::py::tensor_to_gl<typename G::A_fp4x2_gl>(A),
+            .A_sc = kittens::py::tensor_to_gl<typename G::A_sc_gl, false>(A_sc, 1, A_sc.dim() == 2 ? A_sc.size(0)/128 : A_sc.size(0), A_sc.dim() == 2 ? A_sc.size(1)/4 : A_sc.size(1), 256),
+            .A_sc_global = kittens::py::tensor_to_gl<typename G::A_sc_global_gl>(A_sc_global),
+            .B = kittens::py::tensor_to_gl<typename G::B_fp4x2_gl>(B),
+            .B_sc = kittens::py::tensor_to_gl<typename G::B_sc_gl, false>(B_sc, 1, B_sc.dim() == 2 ? B_sc.size(0)/128 : B_sc.size(0), B_sc.dim() == 2 ? B_sc.size(1)/4 : B_sc.size(1), 256),
+            .B_sc_global = kittens::py::tensor_to_gl<typename G::B_sc_global_gl>(B_sc_global),
+            .D = kittens::py::tensor_to_gl<typename G::D_gl>(D),
+            .D_K = kittens::py::tensor_to_gl<typename G::D_gl>(D),
+            .D_V = kittens::py::tensor_to_gl<typename G::D_gl>(D),
+            .q_dim = 0,
+            .k_dim = 0,
+            .use_split_D = false,
+            .b_sg_per_tile = nullptr
+        };
+        kittens::py::launch_kernel<C, G, nvfp4_gemm::kernel<C>>(g);
+    } else {
+        using C = nvfp4_gemm::config<256, 4, 8, 12, 2, false>;
+        using G = nvfp4_gemm::globals<C>;
+        G g {
+            .A = kittens::py::tensor_to_gl<typename G::A_fp4x2_gl>(A),
+            .A_sc = kittens::py::tensor_to_gl<typename G::A_sc_gl, false>(A_sc, 1, A_sc.dim() == 2 ? A_sc.size(0)/128 : A_sc.size(0), A_sc.dim() == 2 ? A_sc.size(1)/4 : A_sc.size(1), 256),
+            .A_sc_global = kittens::py::tensor_to_gl<typename G::A_sc_global_gl>(A_sc_global),
+            .B = kittens::py::tensor_to_gl<typename G::B_fp4x2_gl>(B),
+            .B_sc = kittens::py::tensor_to_gl<typename G::B_sc_gl, false>(B_sc, 1, B_sc.dim() == 2 ? B_sc.size(0)/128 : B_sc.size(0), B_sc.dim() == 2 ? B_sc.size(1)/4 : B_sc.size(1), 256),
+            .B_sc_global = kittens::py::tensor_to_gl<typename G::B_sc_global_gl>(B_sc_global),
+            .D = kittens::py::tensor_to_gl<typename G::D_gl>(D),
+            .D_K = kittens::py::tensor_to_gl<typename G::D_gl>(D),
+            .D_V = kittens::py::tensor_to_gl<typename G::D_gl>(D),
+            .q_dim = 0,
+            .k_dim = 0,
+            .use_split_D = false,
+            .b_sg_per_tile = nullptr
+        };
+        kittens::py::launch_kernel<C, G, nvfp4_gemm::kernel<C>>(g);
+    }
 }
 
 // Grouped GEMM: concatenated weights with per-tile B_sc_global
@@ -846,34 +867,52 @@ void nvfp4_grouped_gemm_entrypoint(
     std::optional<at::Tensor> D_K_opt = std::nullopt, // Optional K output
     std::optional<at::Tensor> D_V_opt = std::nullopt  // Optional V output
 ) {
-    using C = nvfp4_gemm::config<256, 4, 8, 12, 2, false>;
-    using G = nvfp4_gemm::globals<C>;
-
-    // Dummy B_sc_global [1] — epilogue won't read it when b_sg_per_tile != nullptr
-    // Use a static thread-local to avoid re-allocating every call
     static thread_local at::Tensor dummy_bsg;
     if (!dummy_bsg.defined()) {
         dummy_bsg = at::zeros({1}, at::dtype(at::kFloat).device(at::kCUDA));
     }
-
     bool use_split_D = (D_K_opt.has_value() && D_V_opt.has_value());
 
-    G g {
-        .A = kittens::py::tensor_to_gl<typename G::A_fp4x2_gl>(A),
-        .A_sc = kittens::py::tensor_to_gl<typename G::A_sc_gl, false>(A_sc, 1, A_sc.dim() == 2 ? A_sc.size(0)/128 : A_sc.size(0), A_sc.dim() == 2 ? A_sc.size(1)/4 : A_sc.size(1), 256),
-        .A_sc_global = kittens::py::tensor_to_gl<typename G::A_sc_global_gl>(A_sc_global),
-        .B = kittens::py::tensor_to_gl<typename G::B_fp4x2_gl>(B),
-        .B_sc = kittens::py::tensor_to_gl<typename G::B_sc_gl, false>(B_sc, 1, B_sc.dim() == 2 ? B_sc.size(0)/128 : B_sc.size(0), B_sc.dim() == 2 ? B_sc.size(1)/4 : B_sc.size(1), 256),
-        .B_sc_global = kittens::py::tensor_to_gl<typename G::B_sc_global_gl>(dummy_bsg),
-        .D = kittens::py::tensor_to_gl<typename G::D_gl>(D),
-        .D_K = use_split_D ? kittens::py::tensor_to_gl<typename G::D_gl>(D_K_opt.value()) : kittens::py::tensor_to_gl<typename G::D_gl>(D),
-        .D_V = use_split_D ? kittens::py::tensor_to_gl<typename G::D_gl>(D_V_opt.value()) : kittens::py::tensor_to_gl<typename G::D_gl>(D),
-        .q_dim = use_split_D ? static_cast<int>(D.size(1)) : 0,
-        .k_dim = use_split_D ? static_cast<int>(D_K_opt.value().size(1)) : 0,
-        .use_split_D = use_split_D,
-        .b_sg_per_tile = B_sg_per_tile.data_ptr<float>()  // per-tile B_sg
-    };
-    kittens::py::launch_kernel<C, G, nvfp4_gemm::kernel<C>>(g);
+    int K = B.size(1) * 2;
+    if (K <= 2048) {
+        using C = nvfp4_gemm::config<256, 4, 16, 1, 2, false>;
+        using G = nvfp4_gemm::globals<C>;
+        G g {
+            .A = kittens::py::tensor_to_gl<typename G::A_fp4x2_gl>(A),
+            .A_sc = kittens::py::tensor_to_gl<typename G::A_sc_gl, false>(A_sc, 1, A_sc.dim() == 2 ? A_sc.size(0)/128 : A_sc.size(0), A_sc.dim() == 2 ? A_sc.size(1)/4 : A_sc.size(1), 256),
+            .A_sc_global = kittens::py::tensor_to_gl<typename G::A_sc_global_gl>(A_sc_global),
+            .B = kittens::py::tensor_to_gl<typename G::B_fp4x2_gl>(B),
+            .B_sc = kittens::py::tensor_to_gl<typename G::B_sc_gl, false>(B_sc, 1, B_sc.dim() == 2 ? B_sc.size(0)/128 : B_sc.size(0), B_sc.dim() == 2 ? B_sc.size(1)/4 : B_sc.size(1), 256),
+            .B_sc_global = kittens::py::tensor_to_gl<typename G::B_sc_global_gl>(dummy_bsg),
+            .D = kittens::py::tensor_to_gl<typename G::D_gl>(D),
+            .D_K = use_split_D ? kittens::py::tensor_to_gl<typename G::D_gl>(D_K_opt.value()) : kittens::py::tensor_to_gl<typename G::D_gl>(D),
+            .D_V = use_split_D ? kittens::py::tensor_to_gl<typename G::D_gl>(D_V_opt.value()) : kittens::py::tensor_to_gl<typename G::D_gl>(D),
+            .q_dim = use_split_D ? static_cast<int>(D.size(1)) : 0,
+            .k_dim = use_split_D ? static_cast<int>(D_K_opt.value().size(1)) : 0,
+            .use_split_D = use_split_D,
+            .b_sg_per_tile = B_sg_per_tile.data_ptr<float>()
+        };
+        kittens::py::launch_kernel<C, G, nvfp4_gemm::kernel<C>>(g);
+    } else {
+        using C = nvfp4_gemm::config<256, 4, 8, 12, 2, false>;
+        using G = nvfp4_gemm::globals<C>;
+        G g {
+            .A = kittens::py::tensor_to_gl<typename G::A_fp4x2_gl>(A),
+            .A_sc = kittens::py::tensor_to_gl<typename G::A_sc_gl, false>(A_sc, 1, A_sc.dim() == 2 ? A_sc.size(0)/128 : A_sc.size(0), A_sc.dim() == 2 ? A_sc.size(1)/4 : A_sc.size(1), 256),
+            .A_sc_global = kittens::py::tensor_to_gl<typename G::A_sc_global_gl>(A_sc_global),
+            .B = kittens::py::tensor_to_gl<typename G::B_fp4x2_gl>(B),
+            .B_sc = kittens::py::tensor_to_gl<typename G::B_sc_gl, false>(B_sc, 1, B_sc.dim() == 2 ? B_sc.size(0)/128 : B_sc.size(0), B_sc.dim() == 2 ? B_sc.size(1)/4 : B_sc.size(1), 256),
+            .B_sc_global = kittens::py::tensor_to_gl<typename G::B_sc_global_gl>(dummy_bsg),
+            .D = kittens::py::tensor_to_gl<typename G::D_gl>(D),
+            .D_K = use_split_D ? kittens::py::tensor_to_gl<typename G::D_gl>(D_K_opt.value()) : kittens::py::tensor_to_gl<typename G::D_gl>(D),
+            .D_V = use_split_D ? kittens::py::tensor_to_gl<typename G::D_gl>(D_V_opt.value()) : kittens::py::tensor_to_gl<typename G::D_gl>(D),
+            .q_dim = use_split_D ? static_cast<int>(D.size(1)) : 0,
+            .k_dim = use_split_D ? static_cast<int>(D_K_opt.value().size(1)) : 0,
+            .use_split_D = use_split_D,
+            .b_sg_per_tile = B_sg_per_tile.data_ptr<float>()
+        };
+        kittens::py::launch_kernel<C, G, nvfp4_gemm::kernel<C>>(g);
+    }
 }
 
 void nvfp4_quantize_entrypoint(
