@@ -1051,6 +1051,84 @@ void nvfp4_gemm_config_entrypoint(
     }
 }
 
+// ================================================================
+// Fused split dgrad+sum: replaces Python loop that does
+//   3× (slice FP4/SC → .contiguous() → nvfp4_gemm → accumulate)
+// All tensor slicing and GEMM dispatch stays in C++.
+// ================================================================
+void nvfp4_split_dgrad_sum(
+    // Concatenated row-quantized gradient: dy_cat_q
+    const at::Tensor &A_fp4_cat,     // [M, N_total/2] fp4x2 (row-quantized dY)
+    const at::Tensor &A_sc_cat,      // [ntm, ntk_total, 512] fp8 (row scales)
+    const at::Tensor &A_sg,          // [1] float32 (global scale for dY)
+    // Per-split column-quantized weights
+    const std::vector<at::Tensor> &B_fp4_list,  // [n_splits] each [K, N_i/2] fp4x2
+    const std::vector<at::Tensor> &B_sc_list,   // [n_splits] each [ntm_c, ntk_c_i, 512] fp8
+    const at::Tensor &B_sg_cat,                  // [n_splits] float32
+    // Split dimensions
+    const std::vector<int64_t> &split_dims,      // [q_dim, k_dim, v_dim]
+    // Output
+    at::Tensor &D_out                            // [M, K] bf16 — accumulated dgrad
+) {
+    const int n_splits = (int)split_dims.size();
+    TORCH_CHECK(n_splits == (int)B_fp4_list.size());
+    TORCH_CHECK(n_splits == (int)B_sc_list.size());
+
+    const int64_t M = D_out.size(0);
+    const int64_t K = D_out.size(1);
+
+    // First GEMM writes directly to D_out, subsequent GEMMs use tmp and accumulate.
+    // No zero_() needed — GEMM writes all elements.
+    at::Tensor tmp;  // lazily allocated on second iteration
+
+    // A_fp4_cat is Float4_e2m1fn_x2 — copy_ not implemented for this dtype,
+    // so we must view as byte (uint8) before narrow+contiguous, then view back.
+    auto a_fp4_bytes = A_fp4_cat.view(c10::ScalarType::Byte);
+    auto a_sc_bytes = A_sc_cat.view(c10::ScalarType::Byte);
+
+    int64_t fp4_col_offset = 0;
+    int64_t sc_col_offset = 0;
+    for (int i = 0; i < n_splits; ++i) {
+        const int64_t N_i = split_dims[i];
+        const int64_t fp4_cols_i = N_i / 2;
+        const int64_t sc_tiles_i = N_i / 64;
+
+        // Slice FP4 as bytes, contiguous copy, then view back as fp4x2
+        auto a_fp4_i = a_fp4_bytes.narrow(1, fp4_col_offset, fp4_cols_i)
+                           .contiguous()
+                           .view(at::kFloat4_e2m1fn_x2);
+
+        // Slice scales as bytes, contiguous copy, then view back as fp8
+        auto a_sc_i = a_sc_bytes.narrow(1, sc_col_offset, sc_tiles_i)
+                          .contiguous()
+                          .view(at::kFloat8_e4m3fn);
+
+        auto b_sg_i = B_sg_cat.narrow(0, i, 1);
+
+        if (i == 0) {
+            // First split → write directly to D_out
+            nvfp4_gemm_entrypoint(
+                a_fp4_i, a_sc_i, A_sg,
+                B_fp4_list[i], B_sc_list[i], b_sg_i,
+                D_out
+            );
+        } else {
+            // Subsequent splits → write to tmp, accumulate into D_out
+            if (!tmp.defined()) {
+                tmp = at::empty({M, K}, at::dtype(at::kBFloat16).device(D_out.device()));
+            }
+            nvfp4_gemm_entrypoint(
+                a_fp4_i, a_sc_i, A_sg,
+                B_fp4_list[i], B_sc_list[i], b_sg_i,
+                tmp
+            );
+            D_out.add_(tmp);
+        }
+        fp4_col_offset += fp4_cols_i;
+        sc_col_offset += sc_tiles_i;
+    }
+}
+
 PYBIND11_MODULE(_C, m) {
     m.def("nvfp4_gemm", &nvfp4_gemm_entrypoint);
     m.def("nvfp4_gemm_config", &nvfp4_gemm_config_entrypoint,
@@ -1062,6 +1140,11 @@ PYBIND11_MODULE(_C, m) {
           pybind11::arg("A"), pybind11::arg("A_sc"), pybind11::arg("A_sc_global"),
           pybind11::arg("B"), pybind11::arg("B_sc"), pybind11::arg("B_sg_per_tile"),
           pybind11::arg("D"), pybind11::arg("D_K_opt") = std::nullopt, pybind11::arg("D_V_opt") = std::nullopt);
+    m.def("nvfp4_split_dgrad_sum", &nvfp4_split_dgrad_sum,
+          "Fused split dgrad: slice concatenated row-quantized gradient → 3× GEMM → sum",
+          pybind11::arg("A_fp4_cat"), pybind11::arg("A_sc_cat"), pybind11::arg("A_sg"),
+          pybind11::arg("B_fp4_list"), pybind11::arg("B_sc_list"), pybind11::arg("B_sg_cat"),
+          pybind11::arg("split_dims"), pybind11::arg("D_out"));
     m.def("nvfp4_quantize", &nvfp4_quantize_entrypoint);
     m.def("fp32_to_fp4x2", &fp32_to_fp4x2_entrypoint);
     m.def("fp4x2_to_fp32", &fp4x2_to_fp32_entrypoint);
