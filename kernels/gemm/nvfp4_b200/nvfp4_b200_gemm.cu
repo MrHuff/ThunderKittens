@@ -1123,14 +1123,15 @@ __device__ inline void kernel(const globals<C> &g) {
             // Load input tiles — create proxy from device CUtensorMap per batch
             pdl::wait();
             everyone::tma::cluster::wait();
-            int prev_batch = -1;
             tma_dev_proxy<typename G::A_fp4x2_gl> proxy_A(&g.A_tma[0]);
             tma_dev_proxy<typename G::B_fp4x2_gl> proxy_B(&g.B_tma[0]);
             proxy_A.prefetch();
             proxy_B.prefetch();
-            for (int block_idx = cluster_id; block_idx < total_blocks; block_idx += gridDim.x / C::CLUSTER_SIZE) {
-                int batch_idx = block_idx / g.tiles_per_batch;
-                int tile_in_batch = block_idx % g.tiles_per_batch;
+            const int step = gridDim.x / C::CLUSTER_SIZE;
+            int batch_idx = cluster_id / g.tiles_per_batch;
+            int tile_in_batch = cluster_id - batch_idx * g.tiles_per_batch;
+            int prev_batch = -1;
+            for (int block_idx = cluster_id; block_idx < total_blocks; block_idx += step) {
                 int supergroup_idx = tile_in_batch / num_blocks_per_supergroup;
                 int idx_within_supergroup = tile_in_batch % num_blocks_per_supergroup;
                 int rows_in_supergroup = min(C::SUPERGROUP_SIZE, g.num_row_blocks - supergroup_idx * C::SUPERGROUP_SIZE);
@@ -1139,7 +1140,6 @@ __device__ inline void kernel(const globals<C> &g) {
                 int col_block_idx = idx_within_supergroup / rows_in_supergroup;
                 int nrb = g.num_red_blocks[batch_idx];
 
-                // Switch to new batch's CUtensorMaps + prefetch
                 if (batch_idx != prev_batch) {
                     proxy_A.dev_tma = &g.A_tma[batch_idx];
                     proxy_B.dev_tma = &g.B_tma[batch_idx];
@@ -1155,19 +1155,25 @@ __device__ inline void kernel(const globals<C> &g) {
                     update_phasebit<1>(phasebits, stage);
                     stage = (stage + 1) % C::LOAD_PIPE_DEPTH;
                 }
+                tile_in_batch += step;
+                while (tile_in_batch >= g.tiles_per_batch) {
+                    tile_in_batch -= g.tiles_per_batch;
+                    batch_idx++;
+                }
             }
         } else if (warp_id == 2) {
             // Load input scales — create proxy from device CUtensorMap per batch
             pdl::wait();
             everyone::tma::cluster::wait();
-            int prev_batch = -1;
             tma_dev_proxy<typename G::A_sc_gl> proxy_A_sc(&g.A_sc_tma[0]);
             tma_dev_proxy<typename G::B_sc_gl> proxy_B_sc(&g.B_sc_tma[0]);
             proxy_A_sc.prefetch();
             proxy_B_sc.prefetch();
-            for (int block_idx = cluster_id; block_idx < total_blocks; block_idx += gridDim.x / C::CLUSTER_SIZE) {
-                int batch_idx = block_idx / g.tiles_per_batch;
-                int tile_in_batch = block_idx % g.tiles_per_batch;
+            const int step = gridDim.x / C::CLUSTER_SIZE;
+            int batch_idx = cluster_id / g.tiles_per_batch;
+            int tile_in_batch = cluster_id - batch_idx * g.tiles_per_batch;
+            int prev_batch = -1;
+            for (int block_idx = cluster_id; block_idx < total_blocks; block_idx += step) {
                 int supergroup_idx = tile_in_batch / num_blocks_per_supergroup;
                 int idx_within_supergroup = tile_in_batch % num_blocks_per_supergroup;
                 int rows_in_supergroup = min(C::SUPERGROUP_SIZE, g.num_row_blocks - supergroup_idx * C::SUPERGROUP_SIZE);
@@ -1192,6 +1198,11 @@ __device__ inline void kernel(const globals<C> &g) {
                     update_phasebit<1>(phasebits, stage);
                     stage = (stage + 1) % C::LOAD_PIPE_DEPTH;
                 }
+                tile_in_batch += step;
+                while (tile_in_batch >= g.tiles_per_batch) {
+                    tile_in_batch -= g.tiles_per_batch;
+                    batch_idx++;
+                }
             }
         } else if (cta_id == 0 && warp_id == 0) {
             // MMA warp — standard accumulation per batch
@@ -1201,8 +1212,10 @@ __device__ inline void kernel(const globals<C> &g) {
             auto out_tm  = tm_allocator.template allocate<full_tt_fl<C::Nb>>(0);
             auto A_sc_tm = tm_allocator.template allocate<full_tt_fp8e4m3<16*C::MMA_PER_TILE*C::LOAD_PIPE_DEPTH>>(256);
             auto B_sc_tm = tm_allocator.template allocate<full_tt_fp8e4m3<32*C::MMA_PER_TILE*C::LOAD_PIPE_DEPTH>>(256+4*C::MMA_PER_TILE*C::LOAD_PIPE_DEPTH);
-            for (int block_idx = cluster_id; block_idx < total_blocks; block_idx += gridDim.x / C::CLUSTER_SIZE) {
-                int batch_idx = block_idx / g.tiles_per_batch;
+            const int step = gridDim.x / C::CLUSTER_SIZE;
+            int batch_idx = cluster_id / g.tiles_per_batch;
+            int tile_in_batch = cluster_id - batch_idx * g.tiles_per_batch;
+            for (int block_idx = cluster_id; block_idx < total_blocks; block_idx += step) {
                 int nrb = g.num_red_blocks[batch_idx];
                 wait(outputs_finished, get_phasebit<1>(phasebits, 0));
                 tensor_after_thread_sync();
@@ -1238,6 +1251,11 @@ __device__ inline void kernel(const globals<C> &g) {
                 }
                 tensor_commit<2>(outputs_arrived);
                 update_phasebit<1>(phasebits, 0);
+                tile_in_batch += step;
+                while (tile_in_batch >= g.tiles_per_batch) {
+                    tile_in_batch -= g.tiles_per_batch;
+                    batch_idx++;
+                }
             }
         }
     } else if (warpgroup_id < C::CONSUMER_WARPGROUPS) {
@@ -1255,9 +1273,10 @@ __device__ inline void kernel(const globals<C> &g) {
         tma_dev_proxy<typename G::D_gl> proxy_D(&g.D_tma[0]);
         proxy_D.prefetch();
 
-        for (int block_idx = cluster_id; block_idx < total_blocks; block_idx += gridDim.x / C::CLUSTER_SIZE) {
-            int batch_idx = block_idx / g.tiles_per_batch;
-            int tile_in_batch = block_idx % g.tiles_per_batch;
+        const int step = gridDim.x / C::CLUSTER_SIZE;
+        int batch_idx = cluster_id / g.tiles_per_batch;
+        int tile_in_batch = cluster_id - batch_idx * g.tiles_per_batch;
+        for (int block_idx = cluster_id; block_idx < total_blocks; block_idx += step) {
             int supergroup_idx = tile_in_batch / num_blocks_per_supergroup;
             int idx_within_supergroup = tile_in_batch % num_blocks_per_supergroup;
             int rows_in_supergroup = min(C::SUPERGROUP_SIZE, g.num_row_blocks - supergroup_idx * C::SUPERGROUP_SIZE);
@@ -1318,6 +1337,11 @@ __device__ inline void kernel(const globals<C> &g) {
                 }
             }
             update_phasebit<0>(phasebits, 0);
+            tile_in_batch += step;
+            while (tile_in_batch >= g.tiles_per_batch) {
+                tile_in_batch -= g.tiles_per_batch;
+                batch_idx++;
+            }
         }
         warpgroup::sync(1);
         warpgroup::pdl::arrive();
