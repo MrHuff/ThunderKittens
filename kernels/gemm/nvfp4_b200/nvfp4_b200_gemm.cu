@@ -565,7 +565,7 @@ __device__ inline void quantize_kernel(const globals &G) {
         // Compute the local scales
         #pragma unroll
         for (int i = 0; i < NUM_K_BLOCKS_HALF; i++)
-            A_sc_reg[col_half][i] = __nv_fp8_e4m3(amax[i] / 6.0f * s_global_enc); // round-to-even
+            A_sc_reg[col_half][i] = __nv_fp8_e4m3(amax[i] / 6.0f * s_global_enc);
 
         // Quantize input matrix to FP4 and store to shared memory
         #pragma unroll
@@ -607,6 +607,31 @@ __device__ inline void quantize_kernel(const globals &G) {
 }
 
 } // namespace nvfp4_quantize
+
+// Standalone kernel: fixup FP8 E4M3 NaN (0x7F/0xFF) → max (0x7E/0xFE = ±448.0)
+// Processes 4 bytes (uint32) per thread for efficiency.
+__global__ void fp8_nan_fixup_kernel(uint8_t* __restrict__ data, int64_t numel) {
+    int64_t idx = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    // Process 4 bytes at a time
+    int64_t idx4 = idx * 4;
+    if (idx4 + 3 < numel) {
+        uint32_t packed = *reinterpret_cast<uint32_t*>(data + idx4);
+        // Check if any byte is NaN (0x7F or 0xFF) and fixup
+        bool needs_fix = false;
+        uint32_t b0 = (packed >>  0) & 0xFF; if ((b0 & 0x7F) == 0x7F) { b0 = (b0 & 0x80) | 0x7E; needs_fix = true; }
+        uint32_t b1 = (packed >>  8) & 0xFF; if ((b1 & 0x7F) == 0x7F) { b1 = (b1 & 0x80) | 0x7E; needs_fix = true; }
+        uint32_t b2 = (packed >> 16) & 0xFF; if ((b2 & 0x7F) == 0x7F) { b2 = (b2 & 0x80) | 0x7E; needs_fix = true; }
+        uint32_t b3 = (packed >> 24) & 0xFF; if ((b3 & 0x7F) == 0x7F) { b3 = (b3 & 0x80) | 0x7E; needs_fix = true; }
+        if (needs_fix) {
+            *reinterpret_cast<uint32_t*>(data + idx4) = b0 | (b1 << 8) | (b2 << 16) | (b3 << 24);
+        }
+    } else {
+        // Handle tail elements
+        for (int64_t i = idx4; i < numel; i++) {
+            if ((data[i] & 0x7F) == 0x7F) data[i] = (data[i] & 0x80) | 0x7E;
+        }
+    }
+}
 
 namespace nvfp4_utils {
 
@@ -971,13 +996,14 @@ __device__ inline void kernel(const globals<C> &g) {
 } // namespace nvfp4_grouped_k_gemm
 
 // ================================================================
-// Batched GEMM: single kernel, N_batches independent GEMMs
+// Batched GEMM with Fused Accumulation
 //
-// Each CTA handles ONE batch's contribution to ONE output tile.
-// Total tiles = num_batches × (M/Mb × K_out/Nb).
-// No MMA pipeline flush — each CTA is a standard GEMM.
-// Each batch writes to its own output buffer D[batch_idx].
-// Caller sums the buffers externally: D_out = D[0] + D[1] + ... + D[n-1].
+// Single kernel, N_batches independent GEMMs with fused output
+// accumulation. Grid covers spatial tiles only; each CTA iterates
+// over ALL batches for its assigned spatial tile(s), accumulating
+// scaled partials in consumer registers before writing once.
+//
+// Eliminates: per-batch D buffers, setup kernel, post-summation.
 // ================================================================
 namespace nvfp4_batched_gemm {
 
@@ -1025,21 +1051,21 @@ struct globals {
     using D_gl           = gl<bf16,       1,  1, -1, -1, D_tile>;
 
     // Per-batch CUtensorMap descriptors EMBEDDED directly in __grid_constant__.
-    // TMA hardware reads these directly — no device memory indirection.
     CUtensorMap A_tma[MAX_BATCHES];
     CUtensorMap A_sc_tma[MAX_BATCHES];
     CUtensorMap B_tma[MAX_BATCHES];
     CUtensorMap B_sc_tma[MAX_BATCHES];
-    CUtensorMap D_tma[MAX_BATCHES];
 
-    // Per-batch scale factor device pointers — computed on-device by consumer
+    // Single output — consumer writes accumulated result here
+    D_gl D;
+
+    // Per-batch scale factor device pointers
     const float* A_sg[MAX_BATCHES];
     const float* B_sg[MAX_BATCHES];
 
     // Scalar metadata
     int       num_red_blocks[MAX_BATCHES];
     int       num_batches;
-    int       tiles_per_batch;
     int       num_row_blocks;
     int       num_col_blocks;
 
@@ -1055,9 +1081,10 @@ struct globals {
         D_tile D[C::NUM_D_TILES];
     };
 
+    // Grid covers spatial tiles only — batches iterated inside CTA
     __host__ inline dim3 grid() const {
-        int total_blocks = num_batches * tiles_per_batch;
-        return dim3(min(total_blocks, num_sms()));
+        int spatial_tiles = num_row_blocks * num_col_blocks;
+        return dim3(min(spatial_tiles, num_sms()));
     }
     __host__ inline dim3 block() const { return dim3(C::NUM_THREADS); }
     __host__ inline int dynamic_shared_memory() const {
@@ -1073,34 +1100,31 @@ template <typename C>
 __device__ inline void kernel(const globals<C> &g) {
     using G = globals<C>;
 
-    const int warpgroup_id = warpgroup::groupid();
-    const int cta_id = cluster_ctarank();
-    const int cluster_id = clusterIdx().x;
-    const int total_blocks = g.num_batches * g.tiles_per_batch;
-    const int num_blocks_per_supergroup = C::SUPERGROUP_SIZE * g.num_col_blocks;
-    uint32_t stage = 0;
-    uint32_t phasebits = 0xFFFF0000;
-
-    // Prefetch batch 0's CUtensorMaps into TMA cache
+    // Prefetch batch 0's input CUtensorMaps + single output TMA
     if (threadIdx.x == 0) {
         asm volatile("{prefetch.tensormap [%0];}" :: "l"(reinterpret_cast<uint64_t>(&g.A_tma[0])) : "memory");
         asm volatile("{prefetch.tensormap [%0];}" :: "l"(reinterpret_cast<uint64_t>(&g.A_sc_tma[0])) : "memory");
         asm volatile("{prefetch.tensormap [%0];}" :: "l"(reinterpret_cast<uint64_t>(&g.B_tma[0])) : "memory");
         asm volatile("{prefetch.tensormap [%0];}" :: "l"(reinterpret_cast<uint64_t>(&g.B_sc_tma[0])) : "memory");
-        asm volatile("{prefetch.tensormap [%0];}" :: "l"(reinterpret_cast<uint64_t>(&g.D_tma[0])) : "memory");
+        g.D.template prefetch_tma<typename G::D_tile>();
     }
 
-    // Allocate shared memory for tiles/scales/outputs
+    const int warpgroup_id = warpgroup::groupid();
+    const int cta_id = cluster_ctarank();
+    const int cluster_id = clusterIdx().x;
+    const int num_blocks = g.num_row_blocks * g.num_col_blocks;
+    const int num_blocks_per_supergroup = C::SUPERGROUP_SIZE * g.num_col_blocks;
+    uint32_t stage = 0;
+    uint32_t phasebits = 0xFFFF0000;
+
     extern __shared__ int __shm[];
     tma_swizzle_allocator sm_allocator((int*)&__shm[0]);
     typename G::input_tiles_t  (&input_tiles) [C::LOAD_PIPE_DEPTH] = sm_allocator.allocate<G::input_tiles_t, C::LOAD_PIPE_DEPTH>();
     typename G::input_scales_t (&input_scales)[C::LOAD_PIPE_DEPTH] = sm_allocator.allocate<G::input_scales_t, C::LOAD_PIPE_DEPTH>();
     typename G::outputs_t       &output_tiles                      = sm_allocator.allocate<G::outputs_t>();
 
-    // Allocate tensor memory
     tensor_allocator<1, C::CLUSTER_SIZE, false> tm_allocator;
 
-    // Set up mbarriers
     __shared__ uint32_t tmem_addr;
     __shared__ semaphore tmem_provisioned;
     __shared__ semaphore tiles_arrived[C::LOAD_PIPE_DEPTH];
@@ -1121,150 +1145,137 @@ __device__ inline void kernel(const globals<C> &g) {
     }
     everyone::tma::cluster::arrive_aligned();
 
-    // Main divergence
     if (warpgroup_id >= C::CONSUMER_WARPGROUPS && warp::elect_leader()) {
         int warp_id = group<WARPGROUP_WARPS*C::PRODUCER_WARPGROUPS>::warpid();
         if (warp_id == 3) {
-            // Load input tiles — create proxy from device CUtensorMap per batch
+            // ── Producer: load input tiles ──
+            // Outer: spatial tiles, Inner: batches
             pdl::wait();
             everyone::tma::cluster::wait();
             tma_dev_proxy<typename G::A_fp4x2_gl> proxy_A(&g.A_tma[0]);
             tma_dev_proxy<typename G::B_fp4x2_gl> proxy_B(&g.B_tma[0]);
             proxy_A.prefetch();
             proxy_B.prefetch();
-            const int step = gridDim.x / C::CLUSTER_SIZE;
-            int batch_idx = cluster_id / g.tiles_per_batch;
-            int tile_in_batch = cluster_id - batch_idx * g.tiles_per_batch;
-            int prev_batch = -1;
-            for (int block_idx = cluster_id; block_idx < total_blocks; block_idx += step) {
-                int supergroup_idx = tile_in_batch / num_blocks_per_supergroup;
-                int idx_within_supergroup = tile_in_batch % num_blocks_per_supergroup;
+
+            for (int block_idx = cluster_id; block_idx < num_blocks; block_idx += gridDim.x / C::CLUSTER_SIZE) {
+                int supergroup_idx = block_idx / num_blocks_per_supergroup;
+                int idx_within_supergroup = block_idx % num_blocks_per_supergroup;
                 int rows_in_supergroup = min(C::SUPERGROUP_SIZE, g.num_row_blocks - supergroup_idx * C::SUPERGROUP_SIZE);
                 int row_within_supergroup = idx_within_supergroup % rows_in_supergroup;
                 int row_block_idx = supergroup_idx * C::SUPERGROUP_SIZE + row_within_supergroup;
                 int col_block_idx = idx_within_supergroup / rows_in_supergroup;
-                int nrb = g.num_red_blocks[batch_idx];
 
-                if (batch_idx != prev_batch) {
-                    proxy_A.dev_tma = &g.A_tma[batch_idx];
-                    proxy_B.dev_tma = &g.B_tma[batch_idx];
-                    proxy_A.prefetch();
-                    proxy_B.prefetch();
-                    prev_batch = batch_idx;
-                }
-
-                for (int i = 0; i < nrb; ++i) {
-                    wait(inputs_finished[stage], get_phasebit<1>(phasebits, stage));
-                    tma::cluster::load_async(input_tiles[stage].A, proxy_A, {row_block_idx*2 + cta_id, i}, tiles_arrived[stage], (uint16_t)(1<<cta_id), 0);
-                    tma::cluster::load_async(input_tiles[stage].B, proxy_B, {col_block_idx*2 + cta_id, i}, tiles_arrived[stage], (uint16_t)(1<<cta_id), 0);
-                    update_phasebit<1>(phasebits, stage);
-                    stage = (stage + 1) % C::LOAD_PIPE_DEPTH;
-                }
-                tile_in_batch += step;
-                while (tile_in_batch >= g.tiles_per_batch) {
-                    tile_in_batch -= g.tiles_per_batch;
-                    batch_idx++;
+                for (int batch = 0; batch < g.num_batches; batch++) {
+                    // Switch TMA descriptor when batch changes
+                    if (batch == 0 || true) {  // always switch per-batch (different A/B)
+                        proxy_A.dev_tma = &g.A_tma[batch];
+                        proxy_B.dev_tma = &g.B_tma[batch];
+                        proxy_A.prefetch();
+                        proxy_B.prefetch();
+                    }
+                    int nrb = g.num_red_blocks[batch];
+                    for (int i = 0; i < nrb; ++i) {
+                        wait(inputs_finished[stage], get_phasebit<1>(phasebits, stage));
+                        tma::cluster::load_async(input_tiles[stage].A, proxy_A, {row_block_idx*2 + cta_id, i}, tiles_arrived[stage], (uint16_t)(1<<cta_id), 0);
+                        tma::cluster::load_async(input_tiles[stage].B, proxy_B, {col_block_idx*2 + cta_id, i}, tiles_arrived[stage], (uint16_t)(1<<cta_id), 0);
+                        update_phasebit<1>(phasebits, stage);
+                        stage = (stage + 1) % C::LOAD_PIPE_DEPTH;
+                    }
                 }
             }
         } else if (warp_id == 2) {
-            // Load input scales — create proxy from device CUtensorMap per batch
+            // ── Producer: load input scales ──
             pdl::wait();
             everyone::tma::cluster::wait();
             tma_dev_proxy<typename G::A_sc_gl> proxy_A_sc(&g.A_sc_tma[0]);
             tma_dev_proxy<typename G::B_sc_gl> proxy_B_sc(&g.B_sc_tma[0]);
             proxy_A_sc.prefetch();
             proxy_B_sc.prefetch();
-            const int step = gridDim.x / C::CLUSTER_SIZE;
-            int batch_idx = cluster_id / g.tiles_per_batch;
-            int tile_in_batch = cluster_id - batch_idx * g.tiles_per_batch;
-            int prev_batch = -1;
-            for (int block_idx = cluster_id; block_idx < total_blocks; block_idx += step) {
-                int supergroup_idx = tile_in_batch / num_blocks_per_supergroup;
-                int idx_within_supergroup = tile_in_batch % num_blocks_per_supergroup;
+
+            for (int block_idx = cluster_id; block_idx < num_blocks; block_idx += gridDim.x / C::CLUSTER_SIZE) {
+                int supergroup_idx = block_idx / num_blocks_per_supergroup;
+                int idx_within_supergroup = block_idx % num_blocks_per_supergroup;
                 int rows_in_supergroup = min(C::SUPERGROUP_SIZE, g.num_row_blocks - supergroup_idx * C::SUPERGROUP_SIZE);
                 int row_within_supergroup = idx_within_supergroup % rows_in_supergroup;
                 int row_block_idx = supergroup_idx * C::SUPERGROUP_SIZE + row_within_supergroup;
                 int col_block_idx = idx_within_supergroup / rows_in_supergroup;
-                int nrb = g.num_red_blocks[batch_idx];
 
-                if (batch_idx != prev_batch) {
-                    proxy_A_sc.dev_tma = &g.A_sc_tma[batch_idx];
-                    proxy_B_sc.dev_tma = &g.B_sc_tma[batch_idx];
+                for (int batch = 0; batch < g.num_batches; batch++) {
+                    proxy_A_sc.dev_tma = &g.A_sc_tma[batch];
+                    proxy_B_sc.dev_tma = &g.B_sc_tma[batch];
                     proxy_A_sc.prefetch();
                     proxy_B_sc.prefetch();
-                    prev_batch = batch_idx;
-                }
-
-                for (int i = 0; i < nrb; ++i) {
-                    wait(inputs_finished[stage], get_phasebit<1>(phasebits, stage));
-                    tma::cluster::load_async(input_scales[stage].A, proxy_A_sc, {row_block_idx*2 + cta_id, i, 0}, scales_arrived[stage], (uint16_t)(1<<cta_id), 0);
-                    if constexpr (C::B_SC_SIZE == 2) tma::cluster::load_async(input_scales[stage].B[cta_id], proxy_B_sc, {col_block_idx*2 + cta_id, i, 0}, scales_arrived[stage], (uint16_t)(0b11), 0);
-                    else if (cta_id == 0)            tma::cluster::load_async(input_scales[stage].B[0], proxy_B_sc, {col_block_idx, i, 0}, scales_arrived[stage], (uint16_t)(0b11), 0);
-                    update_phasebit<1>(phasebits, stage);
-                    stage = (stage + 1) % C::LOAD_PIPE_DEPTH;
-                }
-                tile_in_batch += step;
-                while (tile_in_batch >= g.tiles_per_batch) {
-                    tile_in_batch -= g.tiles_per_batch;
-                    batch_idx++;
+                    int nrb = g.num_red_blocks[batch];
+                    for (int i = 0; i < nrb; ++i) {
+                        wait(inputs_finished[stage], get_phasebit<1>(phasebits, stage));
+                        tma::cluster::load_async(input_scales[stage].A, proxy_A_sc, {row_block_idx*2 + cta_id, i, 0}, scales_arrived[stage], (uint16_t)(1<<cta_id), 0);
+                        if constexpr (C::B_SC_SIZE == 2) tma::cluster::load_async(input_scales[stage].B[cta_id], proxy_B_sc, {col_block_idx*2 + cta_id, i, 0}, scales_arrived[stage], (uint16_t)(0b11), 0);
+                        else if (cta_id == 0)            tma::cluster::load_async(input_scales[stage].B[0], proxy_B_sc, {col_block_idx, i, 0}, scales_arrived[stage], (uint16_t)(0b11), 0);
+                        update_phasebit<1>(phasebits, stage);
+                        stage = (stage + 1) % C::LOAD_PIPE_DEPTH;
+                    }
                 }
             }
         } else if (cta_id == 0 && warp_id == 0) {
-            // MMA warp — standard accumulation per batch
+            // ── MMA warp ──
+            // For each spatial tile: iterate batches, signal consumer after each batch
             everyone::tma::cluster::wait();
             wait(tmem_provisioned, 0);
             tm_allocator.set_addr(tmem_addr);
             auto out_tm  = tm_allocator.template allocate<full_tt_fl<C::Nb>>(0);
             auto A_sc_tm = tm_allocator.template allocate<full_tt_fp8e4m3<16*C::MMA_PER_TILE*C::LOAD_PIPE_DEPTH>>(256);
             auto B_sc_tm = tm_allocator.template allocate<full_tt_fp8e4m3<32*C::MMA_PER_TILE*C::LOAD_PIPE_DEPTH>>(256+4*C::MMA_PER_TILE*C::LOAD_PIPE_DEPTH);
-            const int step = gridDim.x / C::CLUSTER_SIZE;
-            int batch_idx = cluster_id / g.tiles_per_batch;
-            int tile_in_batch = cluster_id - batch_idx * g.tiles_per_batch;
-            for (int block_idx = cluster_id; block_idx < total_blocks; block_idx += step) {
-                int nrb = g.num_red_blocks[batch_idx];
-                wait(outputs_finished, get_phasebit<1>(phasebits, 0));
-                tensor_after_thread_sync();
-                for (int i = 0; i < nrb; i++) {
-                    tma::expect_bytes(scales_arrived[stage], 2*sizeof(G::input_scales_t));
-                    wait(scales_arrived[stage], get_phasebit<0>(phasebits, stage));
-                    #pragma unroll
-                    for (int ii = 0; ii < C::MMA_PER_TILE; ii++) {
-                        auto A_sc_tm_subtile = A_sc_tm.template subtile<full_tt_fp8e4m3<16>>(stage*C::MMA_PER_TILE*16+ii*16);
-                        auto &A_sc_sm_subtile = *reinterpret_cast<st_fp8e4m3<32, 16, false> *>(reinterpret_cast<uint64_t>(&input_scales[stage].A.data[0])+16*32*ii);
-                        load_mxnv_scale_async2(A_sc_tm_subtile, A_sc_sm_subtile);
-                        auto B_sc_tm_subtile_0 = B_sc_tm.template subtile<full_tt_fp8e4m3<16>>(stage*C::MMA_PER_TILE*32+ii*C::B_SC_SIZE*16);
-                        auto &B_sc_sm_subtile_0 = *reinterpret_cast<st_fp8e4m3<32, 16, false> *>(reinterpret_cast<uint64_t>(&input_scales[stage].B[0].data[0])+16*32*ii);
-                        load_mxnv_scale_async2(B_sc_tm_subtile_0, B_sc_sm_subtile_0);
-                        if constexpr (C::B_SC_SIZE == 2) {
-                            auto B_sc_tm_subtile_1 = B_sc_tm.template subtile<full_tt_fp8e4m3<16>>(stage*C::MMA_PER_TILE*32+ii*C::B_SC_SIZE*16+16);
-                            auto &B_sc_sm_subtile_1 = *reinterpret_cast<st_fp8e4m3<32, 16, false> *>(reinterpret_cast<uint64_t>(&input_scales[stage].B[1].data[0])+16*32*ii);
-                            load_mxnv_scale_async2(B_sc_tm_subtile_1, B_sc_sm_subtile_1);
+
+            for (int block_idx = cluster_id; block_idx < num_blocks; block_idx += gridDim.x / C::CLUSTER_SIZE) {
+                for (int batch = 0; batch < g.num_batches; batch++) {
+                    int nrb = g.num_red_blocks[batch];
+
+                    // Wait for consumer: first batch waits from prev tile, others from prev batch
+                    wait(outputs_finished, get_phasebit<1>(phasebits, 0));
+                    tensor_after_thread_sync();
+
+                    for (int i = 0; i < nrb; i++) {
+                        tma::expect_bytes(scales_arrived[stage], 2*sizeof(G::input_scales_t));
+                        wait(scales_arrived[stage], get_phasebit<0>(phasebits, stage));
+                        #pragma unroll
+                        for (int ii = 0; ii < C::MMA_PER_TILE; ii++) {
+                            auto A_sc_tm_subtile = A_sc_tm.template subtile<full_tt_fp8e4m3<16>>(stage*C::MMA_PER_TILE*16+ii*16);
+                            auto &A_sc_sm_subtile = *reinterpret_cast<st_fp8e4m3<32, 16, false> *>(reinterpret_cast<uint64_t>(&input_scales[stage].A.data[0])+16*32*ii);
+                            load_mxnv_scale_async2(A_sc_tm_subtile, A_sc_sm_subtile);
+                            auto B_sc_tm_subtile_0 = B_sc_tm.template subtile<full_tt_fp8e4m3<16>>(stage*C::MMA_PER_TILE*32+ii*C::B_SC_SIZE*16);
+                            auto &B_sc_sm_subtile_0 = *reinterpret_cast<st_fp8e4m3<32, 16, false> *>(reinterpret_cast<uint64_t>(&input_scales[stage].B[0].data[0])+16*32*ii);
+                            load_mxnv_scale_async2(B_sc_tm_subtile_0, B_sc_sm_subtile_0);
+                            if constexpr (C::B_SC_SIZE == 2) {
+                                auto B_sc_tm_subtile_1 = B_sc_tm.template subtile<full_tt_fp8e4m3<16>>(stage*C::MMA_PER_TILE*32+ii*C::B_SC_SIZE*16+16);
+                                auto &B_sc_sm_subtile_1 = *reinterpret_cast<st_fp8e4m3<32, 16, false> *>(reinterpret_cast<uint64_t>(&input_scales[stage].B[1].data[0])+16*32*ii);
+                                load_mxnv_scale_async2(B_sc_tm_subtile_1, B_sc_sm_subtile_1);
+                            }
                         }
+                        tma::expect_bytes(tiles_arrived[stage], 2*sizeof(G::input_tiles_t));
+                        wait(tiles_arrived[stage], get_phasebit<0>(phasebits, stage));
+
+                        if (i == 0)
+                            mm2_ABt(out_tm, input_tiles[stage].A, input_tiles[stage].B,
+                                    A_sc_tm.template subtile<full_tt_fp8e4m3<C::MMA_PER_TILE*16>>(stage*C::MMA_PER_TILE*16),
+                                    B_sc_tm.template subtile<full_tt_fp8e4m3<C::MMA_PER_TILE*32>>(stage*C::MMA_PER_TILE*32),
+                                    inputs_finished[stage]);
+                        else
+                            mma2_ABt(out_tm, input_tiles[stage].A, input_tiles[stage].B,
+                                    A_sc_tm.template subtile<full_tt_fp8e4m3<C::MMA_PER_TILE*16>>(stage*C::MMA_PER_TILE*16),
+                                    B_sc_tm.template subtile<full_tt_fp8e4m3<C::MMA_PER_TILE*32>>(stage*C::MMA_PER_TILE*32),
+                                    inputs_finished[stage]);
+
+                        update_phasebit<0>(phasebits, stage);
+                        stage = (stage + 1) % C::LOAD_PIPE_DEPTH;
                     }
-                    tma::expect_bytes(tiles_arrived[stage], 2*sizeof(G::input_tiles_t));
-                    wait(tiles_arrived[stage], get_phasebit<0>(phasebits, stage));
-                    if (i == 0) mm2_ABt(out_tm, input_tiles[stage].A, input_tiles[stage].B,
-                                        A_sc_tm.template subtile<full_tt_fp8e4m3<C::MMA_PER_TILE*16>>(stage*C::MMA_PER_TILE*16),
-                                        B_sc_tm.template subtile<full_tt_fp8e4m3<C::MMA_PER_TILE*32>>(stage*C::MMA_PER_TILE*32),
-                                        inputs_finished[stage]);
-                    else       mma2_ABt(out_tm, input_tiles[stage].A, input_tiles[stage].B,
-                                        A_sc_tm.template subtile<full_tt_fp8e4m3<C::MMA_PER_TILE*16>>(stage*C::MMA_PER_TILE*16),
-                                        B_sc_tm.template subtile<full_tt_fp8e4m3<C::MMA_PER_TILE*32>>(stage*C::MMA_PER_TILE*32),
-                                        inputs_finished[stage]);
-                    update_phasebit<0>(phasebits, stage);
-                    stage = (stage + 1) % C::LOAD_PIPE_DEPTH;
-                }
-                tensor_commit<2>(outputs_arrived);
-                update_phasebit<1>(phasebits, 0);
-                tile_in_batch += step;
-                while (tile_in_batch >= g.tiles_per_batch) {
-                    tile_in_batch -= g.tiles_per_batch;
-                    batch_idx++;
+                    // Signal consumer: this batch's partial is ready in tensor memory
+                    tensor_commit<2>(outputs_arrived);
+                    update_phasebit<1>(phasebits, 0);
                 }
             }
         }
     } else if (warpgroup_id < C::CONSUMER_WARPGROUPS) {
-        // Consumer group — epilogue with per-batch scaling + per-batch output via SMEM TMA
+        // ── Consumer: accumulate scaled partials across batches, write once ──
         everyone::tma::cluster::wait_aligned();
         if (warpgroup::warpid() == 0) {
             tm_allocator.provision(tmem_addr);
@@ -1273,136 +1284,65 @@ __device__ inline void kernel(const globals<C> &g) {
         wait(tmem_provisioned, 0);
         tm_allocator.set_addr(tmem_addr);
         auto out_tm = tm_allocator.template allocate<full_tt_fl<C::Nb>>(0);
-        int prev_batch = -1;
-        float gs = 0.0f;
-        tma_dev_proxy<typename G::D_gl> proxy_D(&g.D_tma[0]);
-        proxy_D.prefetch();
 
-        const int step = gridDim.x / C::CLUSTER_SIZE;
-        int batch_idx = cluster_id / g.tiles_per_batch;
-        int tile_in_batch = cluster_id - batch_idx * g.tiles_per_batch;
-        for (int block_idx = cluster_id; block_idx < total_blocks; block_idx += step) {
-            int supergroup_idx = tile_in_batch / num_blocks_per_supergroup;
-            int idx_within_supergroup = tile_in_batch % num_blocks_per_supergroup;
+        for (int block_idx = cluster_id; block_idx < num_blocks; block_idx += gridDim.x / C::CLUSTER_SIZE) {
+            int supergroup_idx = block_idx / num_blocks_per_supergroup;
+            int idx_within_supergroup = block_idx % num_blocks_per_supergroup;
             int rows_in_supergroup = min(C::SUPERGROUP_SIZE, g.num_row_blocks - supergroup_idx * C::SUPERGROUP_SIZE);
             int row_within_supergroup = idx_within_supergroup % rows_in_supergroup;
             int row_block_idx = supergroup_idx * C::SUPERGROUP_SIZE + row_within_supergroup;
             int col_block_idx = idx_within_supergroup / rows_in_supergroup;
 
-            // Compute gs on-device and switch D proxy when batch changes
-            if (batch_idx != prev_batch) {
-                gs = *g.A_sg[batch_idx] * *g.B_sg[batch_idx];
-                proxy_D.dev_tma = &g.D_tma[batch_idx];
-                proxy_D.prefetch();
-                prev_batch = batch_idx;
-            }
-            warpgroup::sync(1);
+            // Accumulate scaled partials across batches in registers
+            rt_fl<C::Mb / 8, C::Nb/C::EPI_PIPE_DEPTH> D_acc[C::EPI_PIPE_DEPTH];
 
-            // Wait for MMA to finish
-            wait(outputs_arrived, get_phasebit<0>(phasebits, 0));
+            for (int batch = 0; batch < g.num_batches; batch++) {
+                // Wait for MMA to signal this batch's partial is ready
+                wait(outputs_arrived, get_phasebit<0>(phasebits, 0));
 
-            if constexpr (C::OVERLAP_EPI) {
+                // Load partial from tensor memory to registers
+                rt_fl<C::Mb / 8, C::Nb/C::EPI_PIPE_DEPTH> D_partial[C::EPI_PIPE_DEPTH];
                 #pragma unroll
                 for (int i = 0; i < C::EPI_PIPE_DEPTH; i++) {
-                    rt_fl<C::Mb / 8, C::Nb/C::EPI_PIPE_DEPTH> D_reg;
-                    warpgroup::load_async(D_reg, out_tm.template subtile<full_tt_fl<C::Nb/C::EPI_PIPE_DEPTH>>(0, C::Nb/C::EPI_PIPE_DEPTH*i));
-                    if (i == C::EPI_PIPE_DEPTH - 1) {
-                        tensor_load_wait();
-                        tensor_before_thread_sync();
-                        warpgroup::sync(1);
-                        warpgroup::tma::cluster::arrive(outputs_finished, 0, 1);
-                    }
-                    warp::mul(D_reg, D_reg, gs);
-                    warpgroup::tma::store_async_read_wait<C::NUM_D_TILES-1>();
-                    warpgroup::sync(1);
-                    warpgroup::store(output_tiles.D[i%C::NUM_D_TILES], D_reg);
-                    warpgroup::sync(1);
-                    warpgroup::tma::store_async<dim::ROW, cache_policy::EVICT_FIRST>(proxy_D, output_tiles.D[i%C::NUM_D_TILES], {row_block_idx*2 + cta_id, C::EPI_PIPE_DEPTH*col_block_idx + i});
-                }
-            } else {
-                rt_bf<C::Mb / 8, C::Nb/C::EPI_PIPE_DEPTH> D_reg[C::EPI_PIPE_DEPTH];
-                #pragma unroll
-                for (int i = 0; i < C::EPI_PIPE_DEPTH; i++) {
-                    rt_fl<C::Mb / 8, C::Nb/C::EPI_PIPE_DEPTH> D_reg_fl;
-                    warpgroup::load_async(D_reg_fl, out_tm.template subtile<full_tt_fl<C::Nb/C::EPI_PIPE_DEPTH>>(0, C::Nb/C::EPI_PIPE_DEPTH*i));
-                    warp::mul(D_reg_fl, D_reg_fl, gs);
-                    warp::copy(D_reg[i], D_reg_fl);
+                    warpgroup::load_async(D_partial[i], out_tm.template subtile<full_tt_fl<C::Nb/C::EPI_PIPE_DEPTH>>(0, C::Nb/C::EPI_PIPE_DEPTH*i));
                 }
                 tensor_load_wait();
                 tensor_before_thread_sync();
                 warpgroup::sync(1);
+
+                // Signal MMA: done reading tensor memory, safe to overwrite
                 warpgroup::tma::cluster::arrive(outputs_finished, 0, 1);
+                update_phasebit<0>(phasebits, 0);
+
+                // Scale by per-batch gs and accumulate
+                float gs = *g.A_sg[batch] * *g.B_sg[batch];
                 #pragma unroll
                 for (int i = 0; i < C::EPI_PIPE_DEPTH; i++) {
-                    warpgroup::tma::store_async_read_wait<C::NUM_D_TILES-1>();
-                    warpgroup::sync(1);
-                    warpgroup::store(output_tiles.D[i%C::NUM_D_TILES], D_reg[i]);
-                    warpgroup::sync(1);
-                    warpgroup::tma::store_async<dim::ROW, cache_policy::EVICT_FIRST>(proxy_D, output_tiles.D[i%C::NUM_D_TILES], {row_block_idx*2 + cta_id, C::EPI_PIPE_DEPTH*col_block_idx + i});
+                    warp::mul(D_partial[i], D_partial[i], gs);
+                    if (batch == 0) {
+                        warp::copy(D_acc[i], D_partial[i]);
+                    } else {
+                        warp::add(D_acc[i], D_acc[i], D_partial[i]);
+                    }
                 }
             }
-            update_phasebit<0>(phasebits, 0);
-            tile_in_batch += step;
-            while (tile_in_batch >= g.tiles_per_batch) {
-                tile_in_batch -= g.tiles_per_batch;
-                batch_idx++;
+
+            // Store accumulated result to global memory ONCE
+            #pragma unroll
+            for (int i = 0; i < C::EPI_PIPE_DEPTH; i++) {
+                rt_bf<C::Mb / 8, C::Nb/C::EPI_PIPE_DEPTH> D_out;
+                warp::copy(D_out, D_acc[i]);
+                warpgroup::tma::store_async_read_wait<C::NUM_D_TILES-1>();
+                warpgroup::sync(1);
+                warpgroup::store(output_tiles.D[i%C::NUM_D_TILES], D_out);
+                warpgroup::sync(1);
+                warpgroup::tma::store_async<dim::ROW, cache_policy::EVICT_FIRST>(g.D, output_tiles.D[i%C::NUM_D_TILES], {row_block_idx*2 + cta_id, C::EPI_PIPE_DEPTH*col_block_idx + i});
             }
         }
         warpgroup::sync(1);
         warpgroup::pdl::arrive();
         if (warpgroup::warpid() == 0) tm_allocator.deprovision();
     }
-}
-
-} // namespace nvfp4_batched_gemm
-
-// ── Device-side descriptor setup for batched GEMM ──
-// This kernel runs BEFORE the main GEMM kernel. It copies template CUtensorMaps,
-// patches base addresses via PTX tensormap.replace, and computes combined scale values.
-// This eliminates ALL host-side cudaMemcpyAsync/cudaStreamSynchronize/cuTensorMapReplaceAddress.
-struct SetupArgs {
-    const CUtensorMap* tpl[5];                                // template on device
-    CUtensorMap* out[5];                                      // output slots on device [type × MB]
-    float* out_sg;                                            // combined_sg output
-    void* data_ptrs[5][nvfp4_batched_gemm::MAX_BATCHES];     // per-batch data pointers
-    const float* sg_ptrs[2][nvfp4_batched_gemm::MAX_BATCHES]; // per-batch sg pointers [A,B]
-    int n;
-};
-
-namespace nvfp4_batched_gemm {
-
-__global__ void __launch_bounds__(32)
-setup_descriptors_kernel(SetupArgs args) {
-    const int i = threadIdx.x;
-    if (i >= args.n) return;
-
-    // For each of the 5 descriptor types: copy template → patch address
-    #pragma unroll
-    for (int t = 0; t < 5; ++t) {
-        CUtensorMap* dst = &args.out[t][i];
-        const CUtensorMap* src = args.tpl[t];
-
-        // Copy 128 bytes (CUtensorMap) using 16 × uint64_t stores
-        uint64_t* d = reinterpret_cast<uint64_t*>(dst);
-        const uint64_t* s = reinterpret_cast<const uint64_t*>(src);
-        #pragma unroll
-        for (int j = 0; j < 16; ++j) {
-            d[j] = s[j];
-        }
-
-        // Fence to ensure copy is globally visible before tensormap.replace
-        __threadfence();
-
-        // Replace global_address field using device-side PTX instruction
-        uint64_t new_addr = reinterpret_cast<uint64_t>(args.data_ptrs[t][i]);
-        asm volatile(
-            "tensormap.replace.tile.global_address.global.b1024.b64 [%0], %1;"
-            :: "l"(reinterpret_cast<uint64_t>(dst)), "l"(new_addr) : "memory"
-        );
-    }
-
-    // Compute combined_sg on device (no host sync needed!)
-    args.out_sg[i] = *args.sg_ptrs[0][i] * *args.sg_ptrs[1][i];
 }
 
 } // namespace nvfp4_batched_gemm
@@ -1729,6 +1669,16 @@ void nvfp4_quantize_entrypoint(
     nvfp4_quantize::divide_kernel<<<1, 1, 0, stream>>>(g);
     if (scale_2d) kittens::py::launch_kernel<C, G, nvfp4_quantize::quantize_kernel<true>>(g);
     else          kittens::py::launch_kernel<C, G, nvfp4_quantize::quantize_kernel<false>>(g);
+
+    // Fixup FP8 E4M3 NaN in scale tensor: overflow during quantization can produce
+    // NaN bit patterns (0x7F) which poison downstream MMA operations.
+    {
+        int64_t sc_numel = A_sc.numel();
+        int threads = 256;
+        int blocks = ((sc_numel / 4) + threads - 1) / threads;
+        fp8_nan_fixup_kernel<<<blocks, threads, 0, stream>>>(
+            reinterpret_cast<uint8_t*>(A_sc.data_ptr()), sc_numel);
+    }
 }
 
 at::Tensor fp32_to_fp4x2_entrypoint(at::Tensor A_fp32) {
@@ -2000,158 +1950,56 @@ void nvfp4_batched_gemm_entrypoint(
     const int64_t M = D_out.size(0);
     const int64_t N_out = D_out.size(1);
 
-    // Allocate per-batch output buffers.
-    // batch 0 writes directly to D_out; others get temp buffers.
-    std::vector<at::Tensor> D_buffers(n);
-    D_buffers[0] = D_out;
-    for (int i = 1; i < n; ++i) {
-        D_buffers[i] = at::empty({M, N_out}, at::dtype(at::kBFloat16).device(D_out.device()));
-    }
-
-    // Build globals struct: per-batch CUtensorMaps in device global memory.
-    // Uses a STATIC CACHE for templates + device-side setup kernel for zero host overhead.
+    // Build globals and launch — no D_buffers, no setup kernel, no post-sum
     auto build_and_launch = [&]<typename C>() {
         using G = nvfp4_batched_gemm::globals<C>;
-        using A_gl = typename G::A_fp4x2_gl;
-        using Asc_gl = typename G::A_sc_gl;
-        using B_gl = typename G::B_fp4x2_gl;
-        using Bsc_gl = typename G::B_sc_gl;
-        using D_gl_t = typename G::D_gl;
 
-        // ── Static TMA descriptor cache ──
-        struct TmaCache {
-            int64_t M, K_half, N;
-            at::Tensor dev_buf;        // persistent device buffer: 5*MB CUtensorMaps + MB floats + 5 template CUtensorMaps
+        // Construct D_gl first (gl has no default constructor)
+        auto d_gl = kittens::py::tensor_to_gl<typename G::D_gl>(D_out);
+
+        // Construct globals with D gl; other fields populated below
+        G g_host {
+            .D = d_gl,
+            .num_batches = n,
+            .num_row_blocks = (int)(M / C::Mb),
+            .num_col_blocks = (int)(N_out / C::Nb)
         };
-        static thread_local TmaCache cache = {.M = -1, .K_half = -1, .N = -1};
 
-        constexpr int MB = nvfp4_batched_gemm::MAX_BATCHES;
-        const int64_t K_half = A_list[0].size(1);
-        const bool cache_hit = (cache.M == M && cache.K_half == K_half && cache.N == N_out);
-
-        // Device buffer layout:
-        // [0..5*MB):          per-batch CUtensorMaps (output slots, written by setup kernel)
-        // [5*MB..5*MB+1):     combined_sg floats (cast to float*)
-        // [5*MB+1..5*MB+6):   template CUtensorMaps (5 templates, written once on cache miss)
-        CUtensorMap* d_base;
-        CUtensorMap* d_tpl_base;
-        float* d_combined_sg;
-
-        if (!cache_hit) {
-            // COLD PATH: create 5 template CUtensorMaps on host, copy to device (one-time)
-            A_gl   a0_gl = kittens::py::tensor_to_gl<A_gl>(A_list[0]);
-            Asc_gl asc0_gl = kittens::py::tensor_to_gl<Asc_gl, false>(
-                A_sc_list[0], 1,
-                A_sc_list[0].dim() == 2 ? A_sc_list[0].size(0)/128 : A_sc_list[0].size(0),
-                A_sc_list[0].dim() == 2 ? A_sc_list[0].size(1)/4   : A_sc_list[0].size(1), 256);
-            B_gl   b0_gl = kittens::py::tensor_to_gl<B_gl>(B_list[0]);
-            Bsc_gl bsc0_gl = kittens::py::tensor_to_gl<Bsc_gl, false>(
-                B_sc_list[0], 1,
-                B_sc_list[0].dim() == 2 ? B_sc_list[0].size(0)/128 : B_sc_list[0].size(0),
-                B_sc_list[0].dim() == 2 ? B_sc_list[0].size(1)/4   : B_sc_list[0].size(1), 256);
-            D_gl_t d0_gl = kittens::py::tensor_to_gl<D_gl_t>(D_buffers[0]);
-
-            CUtensorMap h_tpls[5] = {
-                a0_gl.tma_descs.tma_desc, asc0_gl.tma_descs.tma_desc,
-                b0_gl.tma_descs.tma_desc, bsc0_gl.tma_descs.tma_desc,
-                d0_gl.tma_descs.tma_desc
-            };
-
-            // Allocate persistent buffer: output slots + sg floats + templates
-            // Ensure float alignment: MB floats need MB*4 bytes, round up to CUtensorMap boundary
-            int64_t sg_ctm_slots = (MB * sizeof(float) + sizeof(CUtensorMap) - 1) / sizeof(CUtensorMap);
-            int64_t total_ctm = 5 * MB + sg_ctm_slots + 5;
-            cache.dev_buf = at::empty({total_ctm * (int64_t)sizeof(CUtensorMap)},
-                                       at::dtype(at::kByte).device(A_list[0].device()));
-            cache.M = M;  cache.K_half = K_half;  cache.N = N_out;
-
-            d_base = reinterpret_cast<CUtensorMap*>(cache.dev_buf.data_ptr());
-            d_combined_sg = reinterpret_cast<float*>(d_base + 5 * MB);
-            d_tpl_base = d_base + 5 * MB + sg_ctm_slots;
-
-            // Copy templates to device (one-time)
-            cudaStream_t stream = at::cuda::getCurrentCUDAStream();
-            CUDACHECK(cudaMemcpyAsync(d_tpl_base, h_tpls, 5 * sizeof(CUtensorMap),
-                                       cudaMemcpyHostToDevice, stream));
-        } else {
-            d_base = reinterpret_cast<CUtensorMap*>(cache.dev_buf.data_ptr());
-            int64_t sg_ctm_slots = (MB * sizeof(float) + sizeof(CUtensorMap) - 1) / sizeof(CUtensorMap);
-            d_combined_sg = reinterpret_cast<float*>(d_base + 5 * MB);
-            d_tpl_base = d_base + 5 * MB + sg_ctm_slots;
-        }
-
-        // ── HOT PATH: populate SetupArgs (just pointer reads — ~0 cost) ──
-        SetupArgs sargs;
-        for (int t = 0; t < 5; ++t) {
-            sargs.tpl[t] = &d_tpl_base[t];
-            sargs.out[t] = d_base + t * MB;
-        }
-        sargs.out_sg = d_combined_sg;
-        sargs.n = n;
+        // Per-batch input CUtensorMaps + metadata
         for (int i = 0; i < n; ++i) {
-            sargs.data_ptrs[0][i] = A_list[i].data_ptr();
-            sargs.data_ptrs[1][i] = A_sc_list[i].data_ptr();
-            sargs.data_ptrs[2][i] = B_list[i].data_ptr();
-            sargs.data_ptrs[3][i] = B_sc_list[i].data_ptr();
-            sargs.data_ptrs[4][i] = D_buffers[i].data_ptr();
-            sargs.sg_ptrs[0][i] = A_sg_list[i].data_ptr<float>();
-            sargs.sg_ptrs[1][i] = B_sg_list[i].data_ptr<float>();
-        }
-
-        // Launch setup kernel: 1 block, 32 threads — copies templates + patches addresses + computes sg
-        cudaStream_t stream = at::cuda::getCurrentCUDAStream();
-        nvfp4_batched_gemm::setup_descriptors_kernel<<<1, 32, 0, stream>>>(sargs);
-
-        // Populate GEMM globals — create TMA descriptors on host, embed directly
-        G g_host;
-        memset(&g_host, 0, sizeof(G));
-        for (int i = 0; i < n; ++i) {
-            // Create temporary gl objects to get CUtensorMaps
             auto a_gl = kittens::py::tensor_to_gl<typename G::A_fp4x2_gl>(A_list[i]);
-            auto a_sc_gl_tmp = kittens::py::tensor_to_gl<typename G::A_sc_gl, false>(
+            auto a_sc_gl = kittens::py::tensor_to_gl<typename G::A_sc_gl, false>(
                 A_sc_list[i], 1,
                 A_sc_list[i].dim() == 2 ? A_sc_list[i].size(0)/128 : A_sc_list[i].size(0),
                 A_sc_list[i].dim() == 2 ? A_sc_list[i].size(1)/4 : A_sc_list[i].size(1), 256);
             auto b_gl = kittens::py::tensor_to_gl<typename G::B_fp4x2_gl>(B_list[i]);
-            auto b_sc_gl_tmp = kittens::py::tensor_to_gl<typename G::B_sc_gl, false>(
+            auto b_sc_gl = kittens::py::tensor_to_gl<typename G::B_sc_gl, false>(
                 B_sc_list[i], 1,
                 B_sc_list[i].dim() == 2 ? B_sc_list[i].size(0)/128 : B_sc_list[i].size(0),
                 B_sc_list[i].dim() == 2 ? B_sc_list[i].size(1)/4 : B_sc_list[i].size(1), 256);
-            auto d_gl_tmp = kittens::py::tensor_to_gl<typename G::D_gl>(D_buffers[i]);
 
-            // Copy CUtensorMaps from gl objects into globals struct
             memcpy(&g_host.A_tma[i], &a_gl.tma_descs.tma_desc, sizeof(CUtensorMap));
-            memcpy(&g_host.A_sc_tma[i], &a_sc_gl_tmp.tma_descs.tma_desc, sizeof(CUtensorMap));
+            memcpy(&g_host.A_sc_tma[i], &a_sc_gl.tma_descs.tma_desc, sizeof(CUtensorMap));
             memcpy(&g_host.B_tma[i], &b_gl.tma_descs.tma_desc, sizeof(CUtensorMap));
-            memcpy(&g_host.B_sc_tma[i], &b_sc_gl_tmp.tma_descs.tma_desc, sizeof(CUtensorMap));
-            memcpy(&g_host.D_tma[i], &d_gl_tmp.tma_descs.tma_desc, sizeof(CUtensorMap));
+            memcpy(&g_host.B_sc_tma[i], &b_sc_gl.tma_descs.tma_desc, sizeof(CUtensorMap));
 
-            // Store per-batch sg device pointers and metadata
             g_host.A_sg[i] = A_sg_list[i].data_ptr<float>();
             g_host.B_sg[i] = B_sg_list[i].data_ptr<float>();
             g_host.num_red_blocks[i] = (int)(2 * A_list[i].size(1) / C::Kb);
         }
-        g_host.num_batches    = n;
-        g_host.tiles_per_batch = (int)(M / C::Mb) * (int)(N_out / C::Nb);
-        g_host.num_row_blocks  = (int)(M / C::Mb);
-        g_host.num_col_blocks  = (int)(N_out / C::Nb);
 
         kittens::py::launch_kernel<C, G, nvfp4_batched_gemm::kernel<C>>(g_host);
     };
 
-    // Select config based on dimensions (match standard GEMM dispatch)
+    // Select config based on dimensions.
+    // For batched GEMM, always use MMA_PER_TILE=4 configs.
+    // The standard GEMM's MMA_PER_TILE=12 config overflows resources
+    // with the per-batch TMA descriptor arrays in the globals struct.
     const int K_first = (int)(A_list[0].size(1) * 2);
-    if (K_first <= 2048 && N_out <= 4096) {
+    if (N_out <= 4096) {
         build_and_launch.template operator()<nvfp4_gemm::config<256, 5, 8, 4, 2, false>>();
-    } else if (K_first <= 2048) {
-        build_and_launch.template operator()<nvfp4_gemm::config<256, 4, 16, 4, 2, false>>();
     } else {
-        build_and_launch.template operator()<nvfp4_gemm::config<256, 4, 8, 12, 2, false>>();
-    }
-
-    // Sum per-batch outputs into D_out: D_out += D_buffers[1] + D_buffers[2] + ...
-    for (int i = 1; i < n; ++i) {
-        D_out.add_(D_buffers[i]);
+        build_and_launch.template operator()<nvfp4_gemm::config<256, 4, 16, 4, 2, false>>();
     }
 }
 
@@ -2178,7 +2026,7 @@ PYBIND11_MODULE(_C, m) {
           pybind11::arg("combined_sg"), pybind11::arg("group_k_start"),
           pybind11::arg("num_k_groups"), pybind11::arg("D"));
     m.def("nvfp4_batched_gemm", &nvfp4_batched_gemm_entrypoint,
-          "Batched GEMM: single kernel, N independent GEMMs writing to separate buffers + sum",
+          "Batched GEMM: fused accumulation, N independent GEMMs → single output",
           pybind11::arg("A_list"), pybind11::arg("A_sc_list"), pybind11::arg("A_sg_list"),
           pybind11::arg("B_list"), pybind11::arg("B_sc_list"), pybind11::arg("B_sg_list"),
           pybind11::arg("D_out"));
