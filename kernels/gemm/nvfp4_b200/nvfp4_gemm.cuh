@@ -78,6 +78,10 @@ struct globals {
     // non-null = read b_sg_per_tile[col_block_idx] per tile (grouped)
     const float* b_sg_per_tile;
 
+    // SiLU epilogue: apply silu(x) = x * sigmoid(x) to output columns [0, silu_dim).
+    // 0 = disabled. Used for SwiGLU FFN where W1 output needs SiLU.
+    int silu_dim;
+
     struct input_tiles_t {
         A_fp4x2_tile A;
         B_fp4x2_tile B;
@@ -103,6 +107,24 @@ struct globals {
         return _dynamic_shared_memory;
     }
 };
+
+// Apply SiLU activation element-wise on an rt_fl register tile.
+// silu(x) = x * sigmoid(x) = x / (1 + exp(-x))
+template <typename RT>
+__device__ inline void apply_silu_inplace(RT &D_reg) {
+    #pragma unroll
+    for (int i = 0; i < RT::height; i++) {
+        #pragma unroll
+        for (int j = 0; j < RT::width; j++) {
+            #pragma unroll
+            for (int k = 0; k < RT::packed_per_tile; k++) {
+                auto &v = D_reg.tiles[i][j].data[k];
+                v.x = v.x / (1.0f + __expf(-v.x));
+                v.y = v.y / (1.0f + __expf(-v.y));
+            }
+        }
+    }
+}
 
 template <typename C>
 __device__ inline void kernel(const globals<C> &g) {
@@ -297,6 +319,13 @@ __device__ inline void kernel(const globals<C> &g) {
                         }
                         warp::mul(D_reg, D_reg, gs);
                     }
+                    // SiLU epilogue: apply to tiles in [0, silu_dim) columns
+                    if (g.silu_dim > 0) {
+                        int col_offset_elems = (C::EPI_PIPE_DEPTH*col_block_idx + i) * C::Nb/C::EPI_PIPE_DEPTH;
+                        if (col_offset_elems < g.silu_dim) {
+                            apply_silu_inplace(D_reg);
+                        }
+                    }
                     warpgroup::tma::store_async_read_wait<C::NUM_D_TILES-1>();
                     warpgroup::sync(1);
                     warpgroup::store(output_tiles.D[i%C::NUM_D_TILES], D_reg);
@@ -330,6 +359,13 @@ __device__ inline void kernel(const globals<C> &g) {
                             gs = a_sg * g.b_sg_per_tile[col_block_idx];
                         }
                         warp::mul(D_reg_fl, D_reg_fl, gs);
+                    }
+                    // SiLU epilogue: apply to tiles in [0, silu_dim) columns
+                    if (g.silu_dim > 0) {
+                        int col_offset_elems = (C::EPI_PIPE_DEPTH*col_block_idx + i) * C::Nb/C::EPI_PIPE_DEPTH;
+                        if (col_offset_elems < g.silu_dim) {
+                            apply_silu_inplace(D_reg_fl);
+                        }
                     }
                     warp::copy(D_reg[i], D_reg_fl);
                 }
