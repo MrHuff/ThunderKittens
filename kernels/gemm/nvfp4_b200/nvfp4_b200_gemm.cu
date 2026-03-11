@@ -4,7 +4,7 @@
 // ================================================================
 #include "nvfp4_gemm.cuh"
 #include "nvfp4_quantize.cuh"
-#include "nvfp4_batched_gemm.cuh"
+#include "nvfp4_batched_accum_gemm.cuh"
 #include <optional>
 
 #ifndef TORCH_COMPILE
@@ -433,14 +433,14 @@ void nvfp4_gemm_config_entrypoint(
 // ================================================================
 
 // Forward declaration — defined below
-void nvfp4_batched_gemm_entrypoint(
+void nvfp4_batched_accum_gemm_entrypoint(
     const std::vector<at::Tensor> &A_list,
     const std::vector<at::Tensor> &A_sc_list,
     const std::vector<at::Tensor> &A_sg_list,
     const std::vector<at::Tensor> &B_list,
     const std::vector<at::Tensor> &B_sc_list,
     const std::vector<at::Tensor> &B_sg_list,
-    std::vector<at::Tensor> &D_out_list
+    at::Tensor &D_out
 );
 void nvfp4_split_dgrad_sum(
     // Concatenated row-quantized gradient: dy_cat_q
@@ -469,7 +469,6 @@ void nvfp4_split_dgrad_sum(
     auto a_sc_bytes = A_sc_cat.view(c10::ScalarType::Byte);
 
     std::vector<at::Tensor> A_list, A_sc_list_v, B_sg_list;
-    std::vector<at::Tensor> D_out_list;
 
     int64_t fp4_col_offset = 0;
     int64_t sc_col_offset = 0;
@@ -488,62 +487,49 @@ void nvfp4_split_dgrad_sum(
         );
         B_sg_list.push_back(B_sg_cat.narrow(0, i, 1));
 
-        // First batch writes directly to D_out, rest to temp buffers
-        if (i == 0) {
-            D_out_list.push_back(D_out);
-        } else {
-            D_out_list.push_back(
-                at::empty({M, K}, at::dtype(at::kBFloat16).device(D_out.device()))
-            );
-        }
-
         fp4_col_offset += fp4_cols_i;
         sc_col_offset += sc_tiles_i;
     }
 
-    // Single batched GEMM kernel launch for all splits
-    nvfp4_batched_gemm_entrypoint(
+    // Single batched GEMM with fused accumulation kernel launch for all splits
+    nvfp4_batched_accum_gemm_entrypoint(
         A_list, A_sc_list_v, A_sg_list,
         B_fp4_list, B_sc_list, B_sg_list,
-        D_out_list
+        D_out
     );
-
-    // Accumulate batches 1..n into D_out (batch 0 already wrote to D_out)
-    for (int i = 1; i < n_splits; ++i) {
-        D_out.add_(D_out_list[i]);
-    }
 }
 
 // ================================================================
-// True Batched GEMM entrypoint
-// D_out_list[i] = A_list[i] × B_list[i]^T, independently per batch.
+// True Batched GEMM entrypoint with Fused Accumulation
+// D_out = sum_i(A_i × B_i^T), independently per batch but output is accumulated.
 // ================================================================
-void nvfp4_batched_gemm_entrypoint(
+void nvfp4_batched_accum_gemm_entrypoint(
     const std::vector<at::Tensor> &A_list,       // per-batch [M, K/2] fp4x2
     const std::vector<at::Tensor> &A_sc_list,    // per-batch [ntm, ntk, 512] fp8
     const std::vector<at::Tensor> &A_sg_list,    // per-batch [1] float32
     const std::vector<at::Tensor> &B_list,       // per-batch [N, K/2] fp4x2
     const std::vector<at::Tensor> &B_sc_list,    // per-batch [ntm_b, ntk, 512] fp8
     const std::vector<at::Tensor> &B_sg_list,    // per-batch [1] float32
-    std::vector<at::Tensor> &D_out_list          // per-batch [M, N] bf16
+    at::Tensor &D_out                            // accumulated [M, N] bf16
 ) {
     const int n = (int)A_list.size();
-    TORCH_CHECK(n > 0 && n <= nvfp4_batched_gemm::MAX_BATCHES,
-                "num_batches must be 1..", nvfp4_batched_gemm::MAX_BATCHES);
+    TORCH_CHECK(n > 0 && n <= nvfp4_batched_accum_gemm::MAX_BATCHES,
+                "num_batches must be 1..", nvfp4_batched_accum_gemm::MAX_BATCHES);
     TORCH_CHECK(n == (int)A_sc_list.size());
     TORCH_CHECK(n == (int)A_sg_list.size());
     TORCH_CHECK(n == (int)B_list.size());
     TORCH_CHECK(n == (int)B_sc_list.size());
     TORCH_CHECK(n == (int)B_sg_list.size());
-    TORCH_CHECK(n == (int)D_out_list.size());
+    TORCH_CHECK(D_out.dim() == 2);
 
-    const int64_t M = D_out_list[0].size(0);
-    const int64_t N_out = D_out_list[0].size(1);
+    const int64_t M = D_out.size(0);
+    const int64_t N_out = D_out.size(1);
     const int K_first = (int)(A_list[0].size(1) * 2);
 
     auto build_and_launch = [&]<typename C>() {
-        using G = nvfp4_batched_gemm::globals<C>;
-        G g_host {};
+        using G = nvfp4_batched_accum_gemm::globals<C>;
+        G g_host;
+        memset(&g_host, 0, sizeof(G));
         g_host.num_batches = n;
         g_host.num_row_blocks = (int)(M / C::Mb);
         g_host.num_col_blocks = (int)(N_out / C::Nb);
@@ -566,23 +552,25 @@ void nvfp4_batched_gemm_entrypoint(
             memcpy(&g_host.B_tma[i], &b_gl.tma_descs.tma_desc, sizeof(CUtensorMap));
             memcpy(&g_host.B_sc_tma[i], &b_sc_gl.tma_descs.tma_desc, sizeof(CUtensorMap));
 
-            // Output TMA descriptor
-            auto d_gl = kittens::py::tensor_to_gl<typename G::D_gl>(D_out_list[i]);
-            memcpy(&g_host.D_tma[i], &d_gl.tma_descs.tma_desc, sizeof(CUtensorMap));
+            // Output TMA descriptor is fixed for all batches
+            if (i == 0) {
+                auto d_gl = kittens::py::tensor_to_gl<typename G::D_gl>(D_out);
+                memcpy(&g_host.D_tma, &d_gl.tma_descs.tma_desc, sizeof(CUtensorMap));
+            }
 
             // Scale pointers
             g_host.A_sg[i] = A_sg_list[i].data_ptr<float>();
             g_host.B_sg[i] = B_sg_list[i].data_ptr<float>();
         }
-        kittens::py::launch_kernel<C, G, nvfp4_batched_gemm::kernel<C>>(g_host);
+        kittens::py::launch_kernel<C, G, nvfp4_batched_accum_gemm::kernel<C>>(g_host);
     };
 
     if (K_first <= 2048 && N_out <= 4096) {
-        build_and_launch.template operator()<nvfp4_gemm::config<256, 5, 8, 4, 2, false>>();
+        build_and_launch.operator()<nvfp4_gemm::config<256, 5, 8, 4, 2, false>>();
     } else if (K_first <= 2048) {
-        build_and_launch.template operator()<nvfp4_gemm::config<256, 4, 16, 4, 2, false>>();
+        build_and_launch.operator()<nvfp4_gemm::config<256, 4, 16, 4, 2, false>>();
     } else {
-        build_and_launch.template operator()<nvfp4_gemm::config<256, 4, 8, 12, 2, false>>();
+        build_and_launch.operator()<nvfp4_gemm::config<256, 4, 8, 12, 2, false>>();
     }
 }
 
@@ -599,15 +587,15 @@ PYBIND11_MODULE(_C, m) {
           pybind11::arg("D"), pybind11::arg("D_K_opt") = std::nullopt, pybind11::arg("D_V_opt") = std::nullopt,
           pybind11::arg("silu_dim") = 0);
     m.def("nvfp4_split_dgrad_sum", &nvfp4_split_dgrad_sum,
-          "Fused split dgrad: slice concatenated row-quantized gradient → batched GEMM → sum",
+          "Fused split dgrad: slice concatenated row-quantized gradient → batched GEMM + accumulation",
           pybind11::arg("A_fp4_cat"), pybind11::arg("A_sc_cat"), pybind11::arg("A_sg_list"),
           pybind11::arg("B_fp4_list"), pybind11::arg("B_sc_list"), pybind11::arg("B_sg_cat"),
           pybind11::arg("split_dims"), pybind11::arg("D_out"));
-    m.def("nvfp4_batched_gemm", &nvfp4_batched_gemm_entrypoint,
-          "True Batched GEMM: D_i = A_i × B_i^T, independently per batch",
+    m.def("nvfp4_batched_accum_gemm", &nvfp4_batched_accum_gemm_entrypoint,
+          "True Batched GEMM with Fused Accumulation: D_out = sum_i(A_i × B_i^T)",
           pybind11::arg("A_list"), pybind11::arg("A_sc_list"), pybind11::arg("A_sg_list"),
           pybind11::arg("B_list"), pybind11::arg("B_sc_list"), pybind11::arg("B_sg_list"),
-          pybind11::arg("D_out_list"));
+          pybind11::arg("D_out"));
     m.def("nvfp4_quantize", &nvfp4_quantize_entrypoint);
     m.def("fp32_to_fp4x2", &fp32_to_fp4x2_entrypoint);
     m.def("fp4x2_to_fp32", &fp4x2_to_fp32_entrypoint);
