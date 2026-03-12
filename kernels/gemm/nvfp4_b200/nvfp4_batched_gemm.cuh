@@ -292,6 +292,7 @@ __device__ inline void kernel(const globals<C> &g) {
             update_phasebit<0>(phasebits, 0);
         }
         warpgroup::sync(1);
+        warpgroup::tma::store_async_read_wait<0>();
         warpgroup::pdl::arrive();
         if (warpgroup::warpid() == 0) tm_allocator.deprovision();
     }

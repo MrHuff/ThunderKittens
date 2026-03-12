@@ -203,7 +203,8 @@ void nvfp4_gemm_entrypoint(
         };
         kittens::py::launch_kernel<C, G, nvfp4_gemm::kernel<C>>(g);
     } else if (K <= 2048) {
-        using C = nvfp4_gemm::config<256, 4, 16, 4, 2, false>;
+        // Sweep-optimized: Nb=512 beats Nb=1024 by 22% for large-N (e.g. N=6144)
+        using C = nvfp4_gemm::config<256, 5, 8, 4, 2, false>;
         using G = nvfp4_gemm::globals<C>;
         G g {
             .A = kittens::py::tensor_to_gl<typename G::A_fp4x2_gl>(A),
@@ -266,7 +267,8 @@ void nvfp4_grouped_gemm_entrypoint(
 
     int K = B.size(1) * 2;
     if (K <= 2048) {
-        using C = nvfp4_gemm::config<256, 4, 16, 4, 2, false>;
+        // Sweep-optimized: Nb=512 beats Nb=1024 by 22% for QKV fwd (K=2048, N=6144)
+        using C = nvfp4_gemm::config<256, 5, 8, 4, 2, false>;
         using G = nvfp4_gemm::globals<C>;
         G g {
             .A = kittens::py::tensor_to_gl<typename G::A_fp4x2_gl>(A),
@@ -286,7 +288,8 @@ void nvfp4_grouped_gemm_entrypoint(
         };
         kittens::py::launch_kernel<C, G, nvfp4_gemm::kernel<C>>(g);
     } else {
-        using C = nvfp4_gemm::config<256, 4, 8, 12, 2, false>;
+        // Sweep-optimized: LP=5 + overlap beats LP=4 by 9% for wgrad at large M
+        using C = nvfp4_gemm::config<256, 5, 8, 12, 2, true>;
         using G = nvfp4_gemm::globals<C>;
         G g {
             .A = kittens::py::tensor_to_gl<typename G::A_fp4x2_gl>(A),
@@ -486,9 +489,243 @@ void nvfp4_batched_gemm_entrypoint(
     if (K_first <= 2048 && N_out <= 4096) {
         build_and_launch.operator()<nvfp4_gemm::config<256, 5, 8, 4, 2, false>>();
     } else if (K_first <= 2048) {
-        build_and_launch.operator()<nvfp4_gemm::config<256, 4, 16, 4, 2, false>>();
+        build_and_launch.operator()<nvfp4_gemm::config<256, 5, 8, 4, 2, false>>();
     } else {
-        build_and_launch.operator()<nvfp4_gemm::config<256, 4, 8, 12, 2, false>>();
+        build_and_launch.operator()<nvfp4_gemm::config<256, 5, 8, 12, 2, true>>();
+    }
+}
+
+// ================================================================
+// Strided batched GEMM: reads A from a full (M, K_total/2) buffer
+// with per-batch column offsets, avoiding .contiguous() copies.
+// ================================================================
+
+// Create a TMA descriptor for FP4 data with custom row stride.
+// This allows reading from a sub-region of a larger contiguous buffer
+// without requiring the sub-region itself to be contiguous.
+static void create_strided_fp4_tma(
+    CUtensorMap *tma_map,
+    const void  *global_addr,    // pointer to start of sub-region
+    int64_t      rows,           // M (number of rows)
+    int64_t      sub_cols,       // N_g/2 (columns in this batch's sub-region)
+    int64_t      full_row_stride // N_total/2 * sizeof(fp4x2) = total bytes between rows
+) {
+    // FP4 TMA: 5D with 128B swizzle (matching st_fp4e2m1_2 tile layout)
+    constexpr uint32_t  tma_dim = 5;
+    constexpr int64_t   swizzle_elements = 128;  // 128B / sizeof(fp4x2=1) = 128 elements
+
+    uint64_t gmem_shape [5];
+    uint64_t gmem_stride[4];
+    uint32_t smem_shape [5];
+    uint32_t smem_stride[5] = {1, 1, 1, 1, 1};
+
+    gmem_shape[0] = (uint64_t)swizzle_elements;
+    gmem_shape[1] = (uint64_t)rows;
+    gmem_shape[2] = (uint64_t)(sub_cols + swizzle_elements - 1) / swizzle_elements;
+    gmem_shape[3] = 1;
+    gmem_shape[4] = 1;
+
+    // KEY: gmem_stride[0] uses full_row_stride, NOT sub_cols
+    gmem_stride[0] = (uint64_t)full_row_stride;
+    gmem_stride[1] = 128;  // swizzle_bytes
+    gmem_stride[2] = (uint64_t)rows * full_row_stride;
+    gmem_stride[3] = (uint64_t)rows * full_row_stride;
+
+    // Shared memory tile shape — must match the FP4 tile used by the kernel
+    // st_fp4e2m1_2<Mb/2, Kb/2>: e.g. <64, 128> → smem rows=64, cols=128
+    // The TMA loads swizzle_elements per inner dim and tile_height per outer dim
+    smem_shape[0] = swizzle_elements;
+    smem_shape[1] = 64;  // will be overridden below based on actual tile
+    smem_shape[2] = 1;   // sub_cols / swizzle_elements;
+    smem_shape[3] = 1;
+    smem_shape[4] = 1;
+
+    CUresult result = cuTensorMapEncodeTiled(
+        tma_map,
+        CU_TENSOR_MAP_DATA_TYPE_UINT8,  // fp4x2 → uint8
+        tma_dim,
+        const_cast<void*>(global_addr),
+        gmem_shape, gmem_stride,
+        smem_shape, smem_stride,
+        CU_TENSOR_MAP_INTERLEAVE_NONE,
+        CU_TENSOR_MAP_SWIZZLE_128B,
+        CU_TENSOR_MAP_L2_PROMOTION_NONE,
+        CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE
+    );
+    TORCH_CHECK(result == CUDA_SUCCESS, "Failed to create strided FP4 TMA descriptor");
+}
+
+// Create a TMA descriptor for FP8 scale data with custom layout.
+// Scales: [ntm, ntk, 512] where ntm = M/128, ntk = N_g/64.
+// Scale tiles are stored separately per-group already in our case,
+// but for strided A scales, we use the same approach.
+static void create_strided_sc_tma(
+    CUtensorMap *tma_map,
+    const void  *global_addr,
+    int64_t      depth,        // ntm = M/128
+    int64_t      sub_rows,     // ntk = N_g/64
+    int64_t      full_depth_stride  // bytes between depth slices in full buffer
+) {
+    // Scale TMA: 5D with 128B swizzle (matching st_hf<4, 256> tile layout)
+    // The scale layout is (1, depth=ntm, rows=ntk, cols=256) with half type
+    constexpr uint32_t  tma_dim = 5;
+    constexpr int64_t   swizzle_elements = 64;  // 128B / sizeof(half=2) = 64 elements
+
+    uint64_t gmem_shape [5];
+    uint64_t gmem_stride[4];
+    uint32_t smem_shape [5];
+    uint32_t smem_stride[5] = {1, 1, 1, 1, 1};
+
+    gmem_shape[0] = (uint64_t)swizzle_elements;
+    gmem_shape[1] = (uint64_t)depth;  // ntm
+    gmem_shape[2] = (uint64_t)(256 + swizzle_elements - 1) / swizzle_elements;  // 256/64 = 4
+    gmem_shape[3] = (uint64_t)sub_rows;  // ntk
+    gmem_shape[4] = 1;
+
+    gmem_stride[0] = (uint64_t)256 * sizeof(uint16_t);  // stride between ntm slices = 256 * 2 = 512B
+    gmem_stride[1] = 128;  // swizzle_bytes
+    gmem_stride[2] = (uint64_t)depth * 256 * sizeof(uint16_t);  // stride between ntk slices
+    gmem_stride[3] = full_depth_stride;  // stride between batches (if applicable)
+
+    smem_shape[0] = swizzle_elements;
+    smem_shape[1] = 4;   // tile height
+    smem_shape[2] = 256 / swizzle_elements;  // 4
+    smem_shape[3] = 1;
+    smem_shape[4] = 1;
+
+    CUresult result = cuTensorMapEncodeTiled(
+        tma_map,
+        CU_TENSOR_MAP_DATA_TYPE_FLOAT16,
+        tma_dim,
+        const_cast<void*>(global_addr),
+        gmem_shape, gmem_stride,
+        smem_shape, smem_stride,
+        CU_TENSOR_MAP_INTERLEAVE_NONE,
+        CU_TENSOR_MAP_SWIZZLE_128B,
+        CU_TENSOR_MAP_L2_PROMOTION_NONE,
+        CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE
+    );
+    TORCH_CHECK(result == CUDA_SUCCESS, "Failed to create strided scale TMA descriptor");
+}
+
+// Strided batched GEMM: A FP4 data is read from a single full buffer with per-batch offsets.
+// Scales are still passed per-batch (contiguous) since their copies are negligible.
+// This avoids the expensive .contiguous() copies for FP4 narrow(1,...) views (0.4ms at M=64K).
+void nvfp4_batched_gemm_strided_entrypoint(
+    // A FP4: single full row-quantized buffer
+    const at::Tensor &A_full,           // [M, K_total/2] fp4x2 (full concatenated row FP4)
+    // A scales: per-batch contiguous (unchanged from regular batched GEMM)
+    const std::vector<at::Tensor> &A_sc_list,  // per-batch scale tensors
+    const std::vector<at::Tensor> &A_sg_list,  // per-batch [1] float32
+    const std::vector<int64_t> &A_col_offsets,  // per-batch FP4 column offsets (in fp4x2 elements)
+    const std::vector<int64_t> &A_col_widths,   // per-batch FP4 column widths (= N_g/2)
+    // B: per-batch (unchanged)
+    const std::vector<at::Tensor> &B_list,
+    const std::vector<at::Tensor> &B_sc_list,
+    const std::vector<at::Tensor> &B_sg_list,
+    std::vector<at::Tensor> &D_list
+) {
+    const int n = (int)A_sg_list.size();
+    TORCH_CHECK(n > 0 && n <= nvfp4_batched_gemm::MAX_BATCHES);
+    TORCH_CHECK(n == (int)D_list.size());
+    TORCH_CHECK(n == (int)A_col_offsets.size());
+    TORCH_CHECK(n == (int)A_col_widths.size());
+    TORCH_CHECK(n == (int)A_sc_list.size());
+
+    const int64_t M = D_list[0].size(0);
+    const int64_t N_out = D_list[0].size(1);
+    const int64_t K_total_fp4 = A_full.size(1);  // total fp4x2 columns
+    const int K_first = (int)(A_col_widths[0] * 2);  // first batch's K in elements
+
+    auto build_and_launch = [&]<typename C>() {
+        using G = nvfp4_batched_gemm::globals<C>;
+        G g_host;
+        memset(&g_host, 0, sizeof(G));
+        g_host.num_batches = n;
+        g_host.num_row_blocks = (int)(M / C::Mb);
+        g_host.num_col_blocks = (int)(N_out / C::Nb);
+        g_host.num_red_blocks = (int)(2 * A_col_widths[0] / C::Kb);
+
+        const uint8_t *a_base = (const uint8_t*)A_full.data_ptr();
+        const int64_t a_full_row_stride = K_total_fp4;  // bytes per row (sizeof(fp4x2) = 1)
+
+        for (int i = 0; i < n; ++i) {
+            const int64_t fp4_cols = A_col_widths[i];     // N_g/2 in fp4x2 elements
+            const int64_t fp4_offset = A_col_offsets[i];  // column offset in fp4x2
+
+            // --- A FP4 TMA: strided ---
+            // Create TMA for (M, fp4_cols) sub-region from (M, K_total_fp4) buffer
+            // by overriding gmem_stride[0] to use full row stride.
+            {
+                // First create reference TMA via tensor_to_gl on a dummy contiguous tensor
+                // to get correct smem_shape and other params, then override.
+                // Actually, build from scratch matching create_tensor_map<st_fp4e2m1_2<128,128>, 2>:
+                constexpr int64_t swizzle_elements = 128;  // 128B / sizeof(fp4x2=1) = 128
+                const void *data_ptr = a_base + fp4_offset;
+                
+                uint64_t gmem_shape [5] = {
+                    (uint64_t)swizzle_elements,                             // dim0: swizzle block
+                    (uint64_t)M,                                            // dim1: rows
+                    (uint64_t)(fp4_cols + swizzle_elements - 1) / swizzle_elements, // dim2: col-blocks
+                    1, 1                                                    // dim3,4: depth, batch
+                };
+                uint64_t gmem_stride[4] = {
+                    (uint64_t)a_full_row_stride,       // stride between rows (KEY: full buffer stride)
+                    128,                               // swizzle_bytes
+                    (uint64_t)M * a_full_row_stride,   // stride between depth slices
+                    (uint64_t)M * a_full_row_stride    // stride between batches
+                };
+                // smem tile: st_fp4e2m1_2<Mb/2=128, Kb/2=128> → rows=128, cols=128
+                uint32_t smem_shape [5] = {(uint32_t)swizzle_elements, (uint32_t)(C::Mb/2), 1, 1, 1};
+                uint32_t smem_stride[5] = {1, 1, 1, 1, 1};
+
+                CUresult result = cuTensorMapEncodeTiled(
+                    &g_host.A_tma[i],
+                    CU_TENSOR_MAP_DATA_TYPE_UINT8,
+                    5,
+                    const_cast<void*>(data_ptr),
+                    gmem_shape, gmem_stride,
+                    smem_shape, smem_stride,
+                    CU_TENSOR_MAP_INTERLEAVE_NONE,
+                    CU_TENSOR_MAP_SWIZZLE_128B,
+                    CU_TENSOR_MAP_L2_PROMOTION_NONE,
+                    CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE
+                );
+                TORCH_CHECK(result == CUDA_SUCCESS,
+                    "Strided FP4 TMA creation failed for batch ", i);
+            }
+
+            // --- A Scale TMA: standard (using tensor_to_gl) ---
+            auto a_sc_gl = kittens::py::tensor_to_gl<typename G::A_sc_gl, false>(
+                A_sc_list[i], 1,
+                A_sc_list[i].dim() == 2 ? A_sc_list[i].size(0)/128 : A_sc_list[i].size(0),
+                A_sc_list[i].dim() == 2 ? A_sc_list[i].size(1)/4 : A_sc_list[i].size(1), 256);
+            memcpy(&g_host.A_sc_tma[i], &a_sc_gl.tma_descs.tma_desc, sizeof(CUtensorMap));
+
+            // --- B and D: standard (unchanged) ---
+            auto b_gl = kittens::py::tensor_to_gl<typename G::B_fp4x2_gl>(B_list[i]);
+            auto b_sc_gl = kittens::py::tensor_to_gl<typename G::B_sc_gl, false>(
+                B_sc_list[i], 1,
+                B_sc_list[i].dim() == 2 ? B_sc_list[i].size(0)/128 : B_sc_list[i].size(0),
+                B_sc_list[i].dim() == 2 ? B_sc_list[i].size(1)/4 : B_sc_list[i].size(1), 256);
+            memcpy(&g_host.B_tma[i], &b_gl.tma_descs.tma_desc, sizeof(CUtensorMap));
+            memcpy(&g_host.B_sc_tma[i], &b_sc_gl.tma_descs.tma_desc, sizeof(CUtensorMap));
+
+            auto d_gl = kittens::py::tensor_to_gl<typename G::D_gl>(D_list[i]);
+            memcpy(&g_host.D_tma[i], &d_gl.tma_descs.tma_desc, sizeof(CUtensorMap));
+
+            g_host.A_sg[i] = A_sg_list[i].data_ptr<float>();
+            g_host.B_sg[i] = B_sg_list[i].data_ptr<float>();
+        }
+        kittens::py::launch_kernel<C, G, nvfp4_batched_gemm::kernel<C>>(g_host);
+    };
+
+    if (K_first <= 2048 && N_out <= 4096) {
+        build_and_launch.operator()<nvfp4_gemm::config<256, 5, 8, 4, 2, false>>();
+    } else if (K_first <= 2048) {
+        build_and_launch.operator()<nvfp4_gemm::config<256, 5, 8, 4, 2, false>>();
+    } else {
+        build_and_launch.operator()<nvfp4_gemm::config<256, 5, 8, 12, 2, true>>();
     }
 }
 
@@ -641,9 +878,9 @@ void nvfp4_batched_accum_gemm_entrypoint(
     if (K_first <= 2048 && N_out <= 4096) {
         build_and_launch.operator()<nvfp4_gemm::config<256, 5, 8, 4, 2, false>>();
     } else if (K_first <= 2048) {
-        build_and_launch.operator()<nvfp4_gemm::config<256, 4, 16, 4, 2, false>>();
+        build_and_launch.operator()<nvfp4_gemm::config<256, 5, 8, 4, 2, false>>();
     } else {
-        build_and_launch.operator()<nvfp4_gemm::config<256, 4, 8, 12, 2, false>>();
+        build_and_launch.operator()<nvfp4_gemm::config<256, 5, 8, 12, 2, true>>();
     }
 }
 
@@ -672,6 +909,12 @@ PYBIND11_MODULE(_C, m) {
     m.def("nvfp4_batched_gemm", &nvfp4_batched_gemm_entrypoint,
           "True Batched GEMM (z-dim parallel): D_i = A_i × B_i^T",
           pybind11::arg("A_list"), pybind11::arg("A_sc_list"), pybind11::arg("A_sg_list"),
+          pybind11::arg("B_list"), pybind11::arg("B_sc_list"), pybind11::arg("B_sg_list"),
+          pybind11::arg("D_list"));
+    m.def("nvfp4_batched_gemm_strided", &nvfp4_batched_gemm_strided_entrypoint,
+          "Strided Batched GEMM: reads A FP4 from full buffer with column offsets, avoiding .contiguous()",
+          pybind11::arg("A_full"), pybind11::arg("A_sc_list"), pybind11::arg("A_sg_list"),
+          pybind11::arg("A_col_offsets"), pybind11::arg("A_col_widths"),
           pybind11::arg("B_list"), pybind11::arg("B_sc_list"), pybind11::arg("B_sg_list"),
           pybind11::arg("D_list"));
     m.def("nvfp4_quantize", &nvfp4_quantize_entrypoint);
