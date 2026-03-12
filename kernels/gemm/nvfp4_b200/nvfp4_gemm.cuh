@@ -10,9 +10,10 @@ using namespace kittens;
 
 namespace nvfp4_gemm {
 
-template <int _Nb, int _LOAD_PIPE_DEPTH, int _EPI_PIPE_DEPTH, int _SUPERGROUP_SIZE, int _NUM_D_TILES, bool _OVERLAP_EPI>
+template <int _Nb, int _LOAD_PIPE_DEPTH, int _EPI_PIPE_DEPTH, int _SUPERGROUP_SIZE, int _NUM_D_TILES, bool _OVERLAP_EPI, int _Mb = 256>
 struct config {
     static_assert(_Nb == 128 || _Nb == 256, "Nb must be 128 or 256");
+    static_assert(_Mb == 256 || _Mb == 512, "Mb must be 256 or 512");
     static_assert(_LOAD_PIPE_DEPTH > 0 && _LOAD_PIPE_DEPTH <= 5, "LOAD_PIPE_DEPTH must be greater than 0 and at most 5");
     static_assert(_EPI_PIPE_DEPTH > 0, "EPI_PIPE_DEPTH must be greater than 0");
     static_assert(_SUPERGROUP_SIZE > 0, "SUPERGROUP_SIZE must be greater than 0");
@@ -33,13 +34,16 @@ struct config {
     static constexpr bool OVERLAP_EPI = _OVERLAP_EPI;
 
     static constexpr int SUPERGROUP_SIZE = _SUPERGROUP_SIZE;
-    static constexpr int Mb = 256;
+    static constexpr int Mb = _Mb;
     static constexpr int Nb = _Nb;
     static constexpr int Kb = 256;
     static constexpr int B_SC_SIZE = Nb/128;
     static constexpr int MMA_PER_TILE = Kb/64;
 
     static constexpr int NUM_D_TILES = _NUM_D_TILES;
+
+    // Output cache policy for TMA stores
+    static constexpr auto D_CACHE_POLICY = cache_policy::EVICT_FIRST;
 };
 
 template <typename C>
@@ -335,16 +339,16 @@ __device__ inline void kernel(const globals<C> &g) {
                         int col_offset = C::EPI_PIPE_DEPTH*col_block_idx + i;
                         int col_offset_elems = col_offset * C::Nb/C::EPI_PIPE_DEPTH;
                         if (col_offset_elems < g.q_dim) {
-                            warpgroup::tma::store_async<dim::ROW, cache_policy::EVICT_FIRST>(g.D, output_tiles.D[i%C::NUM_D_TILES], {row_block_idx*2 + cta_id, col_offset});
+                            warpgroup::tma::store_async<dim::ROW, C::D_CACHE_POLICY>(g.D, output_tiles.D[i%C::NUM_D_TILES], {row_block_idx*2 + cta_id, col_offset});
                         } else if (col_offset_elems < g.q_dim + g.k_dim) {
                             int k_col_offset = col_offset - (g.q_dim / (C::Nb/C::EPI_PIPE_DEPTH));
-                            warpgroup::tma::store_async<dim::ROW, cache_policy::EVICT_FIRST>(g.D_K, output_tiles.D[i%C::NUM_D_TILES], {row_block_idx*2 + cta_id, k_col_offset});
+                            warpgroup::tma::store_async<dim::ROW, C::D_CACHE_POLICY>(g.D_K, output_tiles.D[i%C::NUM_D_TILES], {row_block_idx*2 + cta_id, k_col_offset});
                         } else {
                             int v_col_offset = col_offset - ((g.q_dim + g.k_dim) / (C::Nb/C::EPI_PIPE_DEPTH));
-                            warpgroup::tma::store_async<dim::ROW, cache_policy::EVICT_FIRST>(g.D_V, output_tiles.D[i%C::NUM_D_TILES], {row_block_idx*2 + cta_id, v_col_offset});
+                            warpgroup::tma::store_async<dim::ROW, C::D_CACHE_POLICY>(g.D_V, output_tiles.D[i%C::NUM_D_TILES], {row_block_idx*2 + cta_id, v_col_offset});
                         }
                     } else {
-                        warpgroup::tma::store_async<dim::ROW, cache_policy::EVICT_FIRST>(g.D, output_tiles.D[i%C::NUM_D_TILES], {row_block_idx*2 + cta_id, C::EPI_PIPE_DEPTH*col_block_idx + i});
+                        warpgroup::tma::store_async<dim::ROW, C::D_CACHE_POLICY>(g.D, output_tiles.D[i%C::NUM_D_TILES], {row_block_idx*2 + cta_id, C::EPI_PIPE_DEPTH*col_block_idx + i});
                     }
                 }
             } else {
@@ -383,22 +387,28 @@ __device__ inline void kernel(const globals<C> &g) {
                         int col_offset = C::EPI_PIPE_DEPTH*col_block_idx + i;
                         int col_offset_elems = col_offset * C::Nb/C::EPI_PIPE_DEPTH;
                         if (col_offset_elems < g.q_dim) {
-                            warpgroup::tma::store_async<dim::ROW, cache_policy::EVICT_FIRST>(g.D, output_tiles.D[i%C::NUM_D_TILES], {row_block_idx*2 + cta_id, col_offset});
+                            warpgroup::tma::store_async<dim::ROW, C::D_CACHE_POLICY>(g.D, output_tiles.D[i%C::NUM_D_TILES], {row_block_idx*2 + cta_id, col_offset});
                         } else if (col_offset_elems < g.q_dim + g.k_dim) {
                             int k_col_offset = col_offset - (g.q_dim / (C::Nb/C::EPI_PIPE_DEPTH));
-                            warpgroup::tma::store_async<dim::ROW, cache_policy::EVICT_FIRST>(g.D_K, output_tiles.D[i%C::NUM_D_TILES], {row_block_idx*2 + cta_id, k_col_offset});
+                            warpgroup::tma::store_async<dim::ROW, C::D_CACHE_POLICY>(g.D_K, output_tiles.D[i%C::NUM_D_TILES], {row_block_idx*2 + cta_id, k_col_offset});
                         } else {
                             int v_col_offset = col_offset - ((g.q_dim + g.k_dim) / (C::Nb/C::EPI_PIPE_DEPTH));
-                            warpgroup::tma::store_async<dim::ROW, cache_policy::EVICT_FIRST>(g.D_V, output_tiles.D[i%C::NUM_D_TILES], {row_block_idx*2 + cta_id, v_col_offset});
+                            warpgroup::tma::store_async<dim::ROW, C::D_CACHE_POLICY>(g.D_V, output_tiles.D[i%C::NUM_D_TILES], {row_block_idx*2 + cta_id, v_col_offset});
                         }
                     } else {
-                        warpgroup::tma::store_async<dim::ROW, cache_policy::EVICT_FIRST>(g.D, output_tiles.D[i%C::NUM_D_TILES], {row_block_idx*2 + cta_id, C::EPI_PIPE_DEPTH*col_block_idx + i});
+                        warpgroup::tma::store_async<dim::ROW, C::D_CACHE_POLICY>(g.D, output_tiles.D[i%C::NUM_D_TILES], {row_block_idx*2 + cta_id, C::EPI_PIPE_DEPTH*col_block_idx + i});
                     }
                 }
             }
             update_phasebit<0>(phasebits, 0);
         }
         warpgroup::sync(1);
+        // Ensure all TMA stores have committed before signaling the next
+        // kernel can start. Without this wait, pdl::arrive() can fire while
+        // async TMA stores are still in-flight, causing the next kernel to
+        // read stale output data (manifests as cudaErrorLaunchFailure at
+        // large M when kernels are launched back-to-back).
+        warpgroup::tma::store_async_read_wait<0>();
         warpgroup::pdl::arrive();
         if (warpgroup::warpid() == 0) tm_allocator.deprovision();
     }
