@@ -10,7 +10,7 @@ using namespace kittens;
 
 namespace nvfp4_gemm {
 
-template <int _Nb, int _LOAD_PIPE_DEPTH, int _EPI_PIPE_DEPTH, int _SUPERGROUP_SIZE, int _NUM_D_TILES, bool _OVERLAP_EPI, int _Mb = 256>
+template <int _Nb, int _LOAD_PIPE_DEPTH, int _EPI_PIPE_DEPTH, int _SUPERGROUP_SIZE, int _NUM_D_TILES, bool _OVERLAP_EPI, int _Mb = 256, bool _USE_PDL = true, int _CLUSTER_SIZE = 2>
 struct config {
     static_assert(_Nb == 128 || _Nb == 256, "Nb must be 128 or 256");
     static_assert(_Mb == 256 || _Mb == 512, "Mb must be 256 or 512");
@@ -20,8 +20,8 @@ struct config {
     static_assert(_NUM_D_TILES > 0, "NUM_D_TILES must be greater than 0");
     static_assert(_EPI_PIPE_DEPTH <= 1 || _NUM_D_TILES >= 2, "NUM_D_TILES must be at least 2 if EPI_PIPE_DEPTH > 1");
 
-    static constexpr int CLUSTER_SIZE = 2;
-    static constexpr bool USE_PDL = true;
+    static constexpr int CLUSTER_SIZE = _CLUSTER_SIZE;
+    static constexpr bool USE_PDL = _USE_PDL;
 
     static constexpr int CONSUMER_WARPGROUPS = 1;
     static constexpr int PRODUCER_WARPGROUPS = 1;
@@ -195,7 +195,7 @@ __device__ inline void kernel(const globals<C> &g) {
         int warp_id = group<WARPGROUP_WARPS*C::PRODUCER_WARPGROUPS>::warpid();
         if (warp_id == 3) {
             // Load input tiles to shared memory
-            pdl::wait();
+            if constexpr (C::USE_PDL) pdl::wait();
             everyone::tma::cluster::wait();
             for (int block_idx = cluster_id; block_idx < num_blocks; block_idx += gridDim.x / C::CLUSTER_SIZE) {
                 int supergroup_idx = block_idx / num_blocks_per_supergroup;
@@ -215,7 +215,7 @@ __device__ inline void kernel(const globals<C> &g) {
             }
         } else if (warp_id == 2) {
             // Load input scales to shared memory
-            pdl::wait();
+            if constexpr (C::USE_PDL) pdl::wait();
             everyone::tma::cluster::wait();
             for (int block_idx = cluster_id; block_idx < num_blocks; block_idx += gridDim.x / C::CLUSTER_SIZE) {
                 int supergroup_idx = block_idx / num_blocks_per_supergroup;
@@ -409,7 +409,7 @@ __device__ inline void kernel(const globals<C> &g) {
         // read stale output data (manifests as cudaErrorLaunchFailure at
         // large M when kernels are launched back-to-back).
         warpgroup::tma::store_async_read_wait<0>();
-        warpgroup::pdl::arrive();
+        if constexpr (C::USE_PDL) warpgroup::pdl::arrive();
         if (warpgroup::warpid() == 0) tm_allocator.deprovision();
     }
 }
