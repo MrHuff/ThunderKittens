@@ -288,8 +288,8 @@ void nvfp4_grouped_gemm_entrypoint(
         };
         kittens::py::launch_kernel<C, G, nvfp4_gemm::kernel<C>>(g);
     } else {
-        // Sweep-optimized: LP=5 + overlap beats LP=4 by 9% for wgrad at large M
-        using C = nvfp4_gemm::config<256, 5, 8, 12, 2, true>;
+        // Sweep-optimized: SG=4 OVL=false beats SG=12 OVL=true by 5-6% for wgrad at M=32K-65K
+        using C = nvfp4_gemm::config<256, 5, 8, 4, 2, false>;
         using G = nvfp4_gemm::globals<C>;
         G g {
             .A = kittens::py::tensor_to_gl<typename G::A_fp4x2_gl>(A),
@@ -309,6 +309,55 @@ void nvfp4_grouped_gemm_entrypoint(
         };
         kittens::py::launch_kernel<C, G, nvfp4_gemm::kernel<C>>(g);
     }
+}
+
+
+// ================================================================
+// Non-PDL Grouped GEMM: same as above but with USE_PDL=false.
+// Safe for multi-stream (side stream) and CUDA graph capture.
+// PDL (Programmatic Dependent Launch) requires per-stream arrive/wait
+// which deadlocks on side streams without prior PDL kernel launches.
+// ================================================================
+void nvfp4_grouped_gemm_nopdl_entrypoint(
+    const at::Tensor &A,
+    const at::Tensor &A_sc,
+    const at::Tensor &A_sc_global,
+    const at::Tensor &B,
+    const at::Tensor &B_sc,
+    const at::Tensor &B_sg_per_tile,
+    at::Tensor &D,
+    std::optional<at::Tensor> D_K_opt = std::nullopt,
+    std::optional<at::Tensor> D_V_opt = std::nullopt,
+    int silu_dim = 0
+) {
+    static thread_local at::Tensor dummy_bsg;
+    if (!dummy_bsg.defined()) {
+        dummy_bsg = at::zeros({1}, at::dtype(at::kFloat).device(at::kCUDA));
+    }
+    bool use_split_D = (D_K_opt.has_value() && D_V_opt.has_value());
+
+    // USE_PDL=false, CLUSTER_SIZE=2 (default) — safe for multi-stream
+    // Note: CLUSTER_SIZE=2 is required for correct spatial tiling.
+    // CUDA graph capture requires CLUSTER_SIZE=1 which is NOT supported yet.
+    using C = nvfp4_gemm::config<256, 5, 8, 4, 2, false, 256, false>;
+    using G = nvfp4_gemm::globals<C>;
+    G g {
+        .A = kittens::py::tensor_to_gl<typename G::A_fp4x2_gl>(A),
+        .A_sc = kittens::py::tensor_to_gl<typename G::A_sc_gl, false>(A_sc, 1, A_sc.dim() == 2 ? A_sc.size(0)/128 : A_sc.size(0), A_sc.dim() == 2 ? A_sc.size(1)/4 : A_sc.size(1), 256),
+        .A_sc_global = kittens::py::tensor_to_gl<typename G::A_sc_global_gl>(A_sc_global),
+        .B = kittens::py::tensor_to_gl<typename G::B_fp4x2_gl>(B),
+        .B_sc = kittens::py::tensor_to_gl<typename G::B_sc_gl, false>(B_sc, 1, B_sc.dim() == 2 ? B_sc.size(0)/128 : B_sc.size(0), B_sc.dim() == 2 ? B_sc.size(1)/4 : B_sc.size(1), 256),
+        .B_sc_global = kittens::py::tensor_to_gl<typename G::B_sc_global_gl>(dummy_bsg),
+        .D = kittens::py::tensor_to_gl<typename G::D_gl>(D),
+        .D_K = use_split_D ? kittens::py::tensor_to_gl<typename G::D_gl>(D_K_opt.value()) : kittens::py::tensor_to_gl<typename G::D_gl>(D),
+        .D_V = use_split_D ? kittens::py::tensor_to_gl<typename G::D_gl>(D_V_opt.value()) : kittens::py::tensor_to_gl<typename G::D_gl>(D),
+        .q_dim = use_split_D ? static_cast<int>(D.size(1)) : 0,
+        .k_dim = use_split_D ? static_cast<int>(D_K_opt.value().size(1)) : 0,
+        .use_split_D = use_split_D,
+        .b_sg_per_tile = B_sg_per_tile.data_ptr<float>(),
+        .silu_dim = silu_dim
+    };
+    kittens::py::launch_kernel<C, G, nvfp4_gemm::kernel<C>>(g);
 }
 
 
@@ -491,7 +540,7 @@ void nvfp4_batched_gemm_entrypoint(
     } else if (K_first <= 2048) {
         build_and_launch.operator()<nvfp4_gemm::config<256, 5, 8, 4, 2, false>>();
     } else {
-        build_and_launch.operator()<nvfp4_gemm::config<256, 5, 8, 12, 2, true>>();
+        build_and_launch.operator()<nvfp4_gemm::config<256, 5, 8, 4, 2, false>>();
     }
 }
 
@@ -725,7 +774,7 @@ void nvfp4_batched_gemm_strided_entrypoint(
     } else if (K_first <= 2048) {
         build_and_launch.operator()<nvfp4_gemm::config<256, 5, 8, 4, 2, false>>();
     } else {
-        build_and_launch.operator()<nvfp4_gemm::config<256, 5, 8, 12, 2, true>>();
+        build_and_launch.operator()<nvfp4_gemm::config<256, 5, 8, 4, 2, false>>();
     }
 }
 
@@ -880,7 +929,7 @@ void nvfp4_batched_accum_gemm_entrypoint(
     } else if (K_first <= 2048) {
         build_and_launch.operator()<nvfp4_gemm::config<256, 5, 8, 4, 2, false>>();
     } else {
-        build_and_launch.operator()<nvfp4_gemm::config<256, 5, 8, 12, 2, true>>();
+        build_and_launch.operator()<nvfp4_gemm::config<256, 5, 8, 4, 2, false>>();
     }
 }
 
@@ -892,6 +941,12 @@ PYBIND11_MODULE(_C, m) {
           pybind11::arg("B"), pybind11::arg("B_sc"), pybind11::arg("B_sc_global"),
           pybind11::arg("D"), pybind11::arg("config_id"));
     m.def("nvfp4_grouped_gemm", &nvfp4_grouped_gemm_entrypoint,
+          pybind11::arg("A"), pybind11::arg("A_sc"), pybind11::arg("A_sc_global"),
+          pybind11::arg("B"), pybind11::arg("B_sc"), pybind11::arg("B_sg_per_tile"),
+          pybind11::arg("D"), pybind11::arg("D_K_opt") = std::nullopt, pybind11::arg("D_V_opt") = std::nullopt,
+          pybind11::arg("silu_dim") = 0);
+    m.def("nvfp4_grouped_gemm_nopdl", &nvfp4_grouped_gemm_nopdl_entrypoint,
+          "Non-PDL grouped GEMM for multi-stream and CUDA graph usage",
           pybind11::arg("A"), pybind11::arg("A_sc"), pybind11::arg("A_sc_global"),
           pybind11::arg("B"), pybind11::arg("B_sc"), pybind11::arg("B_sg_per_tile"),
           pybind11::arg("D"), pybind11::arg("D_K_opt") = std::nullopt, pybind11::arg("D_V_opt") = std::nullopt,

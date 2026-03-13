@@ -159,7 +159,7 @@ __device__ inline void kernel(const globals<C> &g) {
         int warp_id = group<WARPGROUP_WARPS*C::PRODUCER_WARPGROUPS>::warpid();
         if (warp_id == 3) {
             // ── Producer: load input tiles ──
-            pdl::wait();
+            if constexpr (C::USE_PDL) pdl::wait();
             everyone::tma::cluster::wait();
 
             for (int block_idx = cluster_id; block_idx < num_blocks; block_idx += gridDim.x / C::CLUSTER_SIZE) {
@@ -180,7 +180,7 @@ __device__ inline void kernel(const globals<C> &g) {
             }
         } else if (warp_id == 2) {
             // ── Producer: load input scales ──
-            pdl::wait();
+            if constexpr (C::USE_PDL) pdl::wait();
             everyone::tma::cluster::wait();
 
             for (int block_idx = cluster_id; block_idx < num_blocks; block_idx += gridDim.x / C::CLUSTER_SIZE) {
@@ -293,7 +293,7 @@ __device__ inline void kernel(const globals<C> &g) {
         }
         warpgroup::sync(1);
         warpgroup::tma::store_async_read_wait<0>();
-        warpgroup::pdl::arrive();
+        if constexpr (C::USE_PDL) warpgroup::pdl::arrive();
         if (warpgroup::warpid() == 0) tm_allocator.deprovision();
     }
 }
