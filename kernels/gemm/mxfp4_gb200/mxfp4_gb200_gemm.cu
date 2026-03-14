@@ -376,7 +376,7 @@ void mxfp4_batched_gemm_entrypoint(
     }
 }
 
-PYBIND11_MODULE(_C, m) {
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("mxfp4_gemm", &mxfp4_gemm_entrypoint);
     m.def("mxfp4_gemm_config", &mxfp4_gemm_config_entrypoint,
           "GEMM with selectable tile config (for sweeping)",
