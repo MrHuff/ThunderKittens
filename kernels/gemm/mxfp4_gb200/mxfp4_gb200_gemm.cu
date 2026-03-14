@@ -246,17 +246,79 @@ void mxfp4_gemm_config_entrypoint(
 ) {
     //                     Nb   LOAD EPI  SG  DT  OVERLAP
     switch (config_id) {
-    case 0: run_gemm_with_config<mxfp4_gemm::config<256, 4, 16,  1, 2, false>>(A, A_sc, B, B_sc, D); break;
-    case 1: run_gemm_with_config<mxfp4_gemm::config<256, 4, 16,  4, 2, false>>(A, A_sc, B, B_sc, D); break;
-    case 2: run_gemm_with_config<mxfp4_gemm::config<256, 4, 16, 12, 2, false>>(A, A_sc, B, B_sc, D); break;
-    case 3: run_gemm_with_config<mxfp4_gemm::config<256, 5,  8,  4, 2, true >>(A, A_sc, B, B_sc, D); break;
-    case 4: run_gemm_with_config<mxfp4_gemm::config<256, 5,  8, 12, 2, true >>(A, A_sc, B, B_sc, D); break;
-    case 5: run_gemm_with_config<mxfp4_gemm::config<256, 5,  8,  4, 2, false>>(A, A_sc, B, B_sc, D); break;
-    case 6: run_gemm_with_config<mxfp4_gemm::config<256, 4,  8, 12, 2, false>>(A, A_sc, B, B_sc, D); break;
-    case 7: run_gemm_with_config<mxfp4_gemm::config<128, 5,  4, 12, 2, true >>(A, A_sc, B, B_sc, D); break;
-    case 8: run_gemm_with_config<mxfp4_gemm::config<128, 4,  4, 12, 2, false>>(A, A_sc, B, B_sc, D); break;
-    case 9: run_gemm_with_config<mxfp4_gemm::config<256, 4, 16, 12, 4, false>>(A, A_sc, B, B_sc, D); break;
-    default: TORCH_CHECK(false, "Invalid config_id: ", config_id, " (valid: 0-9)");
+    // ── Original 10 ──
+    case 0:  run_gemm_with_config<mxfp4_gemm::config<256, 4, 16,  1, 2, false>>(A, A_sc, B, B_sc, D); break;
+    case 1:  run_gemm_with_config<mxfp4_gemm::config<256, 4, 16,  4, 2, false>>(A, A_sc, B, B_sc, D); break;
+    case 2:  run_gemm_with_config<mxfp4_gemm::config<256, 4, 16, 12, 2, false>>(A, A_sc, B, B_sc, D); break;
+    case 3:  run_gemm_with_config<mxfp4_gemm::config<256, 5,  8,  4, 2, true >>(A, A_sc, B, B_sc, D); break;
+    case 4:  run_gemm_with_config<mxfp4_gemm::config<256, 5,  8, 12, 2, true >>(A, A_sc, B, B_sc, D); break;
+    case 5:  run_gemm_with_config<mxfp4_gemm::config<256, 5,  8,  4, 2, false>>(A, A_sc, B, B_sc, D); break;
+    case 6:  run_gemm_with_config<mxfp4_gemm::config<256, 4,  8, 12, 2, false>>(A, A_sc, B, B_sc, D); break;
+    case 7:  run_gemm_with_config<mxfp4_gemm::config<128, 5,  4, 12, 2, true >>(A, A_sc, B, B_sc, D); break;
+    case 8:  run_gemm_with_config<mxfp4_gemm::config<128, 4,  4, 12, 2, false>>(A, A_sc, B, B_sc, D); break;
+    case 9:  run_gemm_with_config<mxfp4_gemm::config<256, 4, 16, 12, 4, false>>(A, A_sc, B, B_sc, D); break;
+
+    // ── Nb=256 LP=5 EP=8 SG sweep (best family) ──
+    case 10: run_gemm_with_config<mxfp4_gemm::config<256, 5,  8,  1, 2, false>>(A, A_sc, B, B_sc, D); break;
+    case 11: run_gemm_with_config<mxfp4_gemm::config<256, 5,  8,  2, 2, false>>(A, A_sc, B, B_sc, D); break;
+    case 12: run_gemm_with_config<mxfp4_gemm::config<256, 5,  8,  8, 2, false>>(A, A_sc, B, B_sc, D); break;
+    case 13: run_gemm_with_config<mxfp4_gemm::config<256, 5,  8, 12, 2, false>>(A, A_sc, B, B_sc, D); break;
+    case 14: run_gemm_with_config<mxfp4_gemm::config<256, 5,  8,  1, 2, true >>(A, A_sc, B, B_sc, D); break;
+    case 15: run_gemm_with_config<mxfp4_gemm::config<256, 5,  8,  2, 2, true >>(A, A_sc, B, B_sc, D); break;
+    case 16: run_gemm_with_config<mxfp4_gemm::config<256, 5,  8,  8, 2, true >>(A, A_sc, B, B_sc, D); break;
+
+    // ── Nb=256 LP=5 EP=16 SG sweep ──
+    case 17: run_gemm_with_config<mxfp4_gemm::config<256, 5, 16,  4, 2, false>>(A, A_sc, B, B_sc, D); break;
+    case 18: run_gemm_with_config<mxfp4_gemm::config<256, 5, 16, 12, 2, false>>(A, A_sc, B, B_sc, D); break;
+    case 19: run_gemm_with_config<mxfp4_gemm::config<256, 5, 16,  4, 2, true >>(A, A_sc, B, B_sc, D); break;
+    case 20: run_gemm_with_config<mxfp4_gemm::config<256, 5, 16, 12, 2, true >>(A, A_sc, B, B_sc, D); break;
+    case 21: run_gemm_with_config<mxfp4_gemm::config<256, 5, 16,  1, 2, true >>(A, A_sc, B, B_sc, D); break;
+    case 22: run_gemm_with_config<mxfp4_gemm::config<256, 5, 16,  8, 2, true >>(A, A_sc, B, B_sc, D); break;
+
+    // ── Nb=256 LP=4 EP=8 SG sweep ──
+    case 23: run_gemm_with_config<mxfp4_gemm::config<256, 4,  8,  1, 2, false>>(A, A_sc, B, B_sc, D); break;
+    case 24: run_gemm_with_config<mxfp4_gemm::config<256, 4,  8,  4, 2, false>>(A, A_sc, B, B_sc, D); break;
+    case 25: run_gemm_with_config<mxfp4_gemm::config<256, 4,  8,  2, 2, false>>(A, A_sc, B, B_sc, D); break;
+    case 26: run_gemm_with_config<mxfp4_gemm::config<256, 4,  8,  8, 2, false>>(A, A_sc, B, B_sc, D); break;
+    case 27: run_gemm_with_config<mxfp4_gemm::config<256, 4,  8,  4, 2, true >>(A, A_sc, B, B_sc, D); break;
+    case 28: run_gemm_with_config<mxfp4_gemm::config<256, 4,  8, 12, 2, true >>(A, A_sc, B, B_sc, D); break;
+
+    // ── Nb=256 LP=3 (shallower pipeline) ──
+    case 29: run_gemm_with_config<mxfp4_gemm::config<256, 3,  8,  4, 2, false>>(A, A_sc, B, B_sc, D); break;
+    case 30: run_gemm_with_config<mxfp4_gemm::config<256, 3, 16,  4, 2, false>>(A, A_sc, B, B_sc, D); break;
+    case 31: run_gemm_with_config<mxfp4_gemm::config<256, 3,  8, 12, 2, true >>(A, A_sc, B, B_sc, D); break;
+
+    // ── DT=4 variants (more output tiles) ──
+    case 32: run_gemm_with_config<mxfp4_gemm::config<256, 5,  8,  4, 4, false>>(A, A_sc, B, B_sc, D); break;
+    case 33: run_gemm_with_config<mxfp4_gemm::config<256, 5,  8, 12, 4, true >>(A, A_sc, B, B_sc, D); break;
+    case 34: run_gemm_with_config<mxfp4_gemm::config<256, 4,  8, 12, 4, false>>(A, A_sc, B, B_sc, D); break;
+    case 35: run_gemm_with_config<mxfp4_gemm::config<256, 5, 16,  4, 4, true >>(A, A_sc, B, B_sc, D); break;
+    case 36: run_gemm_with_config<mxfp4_gemm::config<256, 5, 16, 12, 4, true >>(A, A_sc, B, B_sc, D); break;
+
+    // ── Nb=128 EP=8 ──
+    case 37: run_gemm_with_config<mxfp4_gemm::config<128, 5,  8,  4, 2, false>>(A, A_sc, B, B_sc, D); break;
+    case 38: run_gemm_with_config<mxfp4_gemm::config<128, 5,  8, 12, 2, false>>(A, A_sc, B, B_sc, D); break;
+    case 39: run_gemm_with_config<mxfp4_gemm::config<128, 5,  8,  4, 2, true >>(A, A_sc, B, B_sc, D); break;
+    case 40: run_gemm_with_config<mxfp4_gemm::config<128, 5,  8, 12, 2, true >>(A, A_sc, B, B_sc, D); break;
+    case 41: run_gemm_with_config<mxfp4_gemm::config<128, 4,  8,  4, 2, false>>(A, A_sc, B, B_sc, D); break;
+    case 42: run_gemm_with_config<mxfp4_gemm::config<128, 4,  8, 12, 2, false>>(A, A_sc, B, B_sc, D); break;
+
+    // ── Nb=128 EP=4 more SG ──
+    case 43: run_gemm_with_config<mxfp4_gemm::config<128, 5,  4,  1, 2, false>>(A, A_sc, B, B_sc, D); break;
+    case 44: run_gemm_with_config<mxfp4_gemm::config<128, 5,  4,  2, 2, false>>(A, A_sc, B, B_sc, D); break;
+    case 45: run_gemm_with_config<mxfp4_gemm::config<128, 5,  4,  4, 2, true >>(A, A_sc, B, B_sc, D); break;
+    case 46: run_gemm_with_config<mxfp4_gemm::config<128, 5,  4,  4, 2, false>>(A, A_sc, B, B_sc, D); break;
+    case 47: run_gemm_with_config<mxfp4_gemm::config<128, 4,  4,  4, 2, false>>(A, A_sc, B, B_sc, D); break;
+    case 48: run_gemm_with_config<mxfp4_gemm::config<128, 4,  4,  1, 2, false>>(A, A_sc, B, B_sc, D); break;
+
+    // ── Nb=256 LP=4 EP=16 OVL=T ──
+    case 49: run_gemm_with_config<mxfp4_gemm::config<256, 4, 16,  1, 2, true >>(A, A_sc, B, B_sc, D); break;
+    case 50: run_gemm_with_config<mxfp4_gemm::config<256, 4, 16,  4, 2, true >>(A, A_sc, B, B_sc, D); break;
+    case 51: run_gemm_with_config<mxfp4_gemm::config<256, 4, 16, 12, 2, true >>(A, A_sc, B, B_sc, D); break;
+    case 52: run_gemm_with_config<mxfp4_gemm::config<256, 4, 16,  2, 2, false>>(A, A_sc, B, B_sc, D); break;
+    case 53: run_gemm_with_config<mxfp4_gemm::config<256, 4, 16,  8, 2, false>>(A, A_sc, B, B_sc, D); break;
+
+    default: TORCH_CHECK(false, "Invalid config_id: ", config_id, " (valid: 0-53)");
     }
 }
 
