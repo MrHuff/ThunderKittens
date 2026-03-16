@@ -1,7 +1,8 @@
 #pragma once
 // ================================================================
-// MXFP4 Standard GEMM Kernel
+// MXFP4 Standard GEMM Kernel — Kb=256 with MMA_PER_TILE
 // Single GEMM: D = A × B^T  (no global scale, E8M0 per-block scales)
+// Mirrors nvfp4_gemm architecture for higher compute density.
 // ================================================================
 
 #include "kittens.cuh"
@@ -35,8 +36,9 @@ struct config {
     static constexpr int SUPERGROUP_SIZE = _SUPERGROUP_SIZE;
     static constexpr int Mb = 256;
     static constexpr int Nb = _Nb;
-    static constexpr int Kb = 128;  // Must match scale tile coverage: 128 FP4 values = 4 blocks of 32
+    static constexpr int Kb = 256;  // Doubled from 128 to match NVFP4 architecture
     static constexpr int B_SC_SIZE = Nb/128;
+    static constexpr int MMA_PER_TILE = Kb/128;  // 2: number of 128-wide sub-MMAs per Kb tile
 
     static constexpr int NUM_D_TILES = _NUM_D_TILES;
 };
@@ -44,13 +46,15 @@ struct config {
 template <typename C>
 struct globals {
     // FP4 tiles: each element is 4 bits, stored as fp4e2m1_2 (packed pairs)
+    // With Kb=256: A tile is 128×128 packed (256×256 FP4 elements)
     using A_fp4x2_tile = st_fp4e2m1_2<C::Mb/2, C::Kb/2>;
-    using A_sc_tile    = st_fp8e8m0<32, 16, false>;  // E8M0 scale, block-32
+    using A_sc_tile    = st_fp8e8m0<32, 16, false>;  // E8M0 scale, block-32, covers 128 K
     using B_fp4x2_tile = st_fp4e2m1_2<C::Nb/2, C::Kb/2>;
-    using B_sc_tile    = st_fp8e8m0<32, 16, false>;  // E8M0 scale, block-32
+    using B_sc_tile    = st_fp8e8m0<32, 16, false>;  // E8M0 scale, block-32, covers 128 K
     using D_tile       = st_bf<C::Mb/2, C::Nb/C::EPI_PIPE_DEPTH>;
 
     using A_fp4x2_gl = gl<fp4e2m1_2, 1,  1, -1, -1, A_fp4x2_tile>;
+    // Scale global: (M/128) x (K/128) x 32 x 16 — each tile covers 128 K elements
     using A_sc_gl    = gl<fp8e8m0,  -1, -1, 32, 16, A_sc_tile>;
     using B_fp4x2_gl = gl<fp4e2m1_2, 1,  1, -1, -1, B_fp4x2_tile>;
     using B_sc_gl    = gl<fp8e8m0,  -1, -1, 32, 16, B_sc_tile>;
@@ -66,9 +70,11 @@ struct globals {
         A_fp4x2_tile A;
         B_fp4x2_tile B;
     };
+    // Scale struct: MMA_PER_TILE (=2) scale tiles per pipeline stage
+    // to cover the full Kb=256 range (2 × 128-wide E8M0 tiles)
     struct input_scales_t {
-        A_sc_tile A;
-        B_sc_tile B[C::B_SC_SIZE];
+        A_sc_tile A[C::MMA_PER_TILE];
+        B_sc_tile B[C::B_SC_SIZE * C::MMA_PER_TILE];
     };
     struct outputs_t {
         D_tile D[C::NUM_D_TILES];
@@ -105,7 +111,7 @@ __device__ inline void kernel(const globals<C> &g) {
     const int num_row_blocks = g.D.rows() / C::Mb;
     const int num_col_blocks = g.D.cols() / C::Nb;
     const int num_blocks = num_row_blocks * num_col_blocks;
-    const int num_iters_per_block = 2 * g.A.cols() / C::Kb;
+    const int num_iters_per_block = 2 * g.A.cols() / C::Kb;  // Half the iters vs Kb=128
     const int num_blocks_per_supergroup = C::SUPERGROUP_SIZE * num_col_blocks;
     uint32_t stage = 0;
     uint32_t phasebits = 0xFFFF0000;
@@ -146,7 +152,7 @@ __device__ inline void kernel(const globals<C> &g) {
         // Producer group
         int warp_id = group<WARPGROUP_WARPS*C::PRODUCER_WARPGROUPS>::warpid();
         if (warp_id == 3) {
-            // Load input tiles to shared memory
+            // Load input FP4 tiles to shared memory
             pdl::wait();
             everyone::tma::cluster::wait();
             for (int block_idx = cluster_id; block_idx < num_blocks; block_idx += gridDim.x / C::CLUSTER_SIZE) {
@@ -167,6 +173,7 @@ __device__ inline void kernel(const globals<C> &g) {
             }
         } else if (warp_id == 2) {
             // Load input scales to shared memory
+            // Each iteration loads MMA_PER_TILE (=2) scale tiles per A and B
             pdl::wait();
             everyone::tma::cluster::wait();
             for (int block_idx = cluster_id; block_idx < num_blocks; block_idx += gridDim.x / C::CLUSTER_SIZE) {
@@ -179,9 +186,31 @@ __device__ inline void kernel(const globals<C> &g) {
 
                 for (int i = 0; i < num_iters_per_block; ++i) {
                     wait(inputs_finished[stage], get_phasebit<1>(phasebits, stage));
-                    tma::cluster::load_async(input_scales[stage].A, g.A_sc, {row_block_idx*2 + cta_id, i, 0, 0}, scales_arrived[stage], (uint16_t)(1<<cta_id), 0);
-                    if constexpr (C::B_SC_SIZE == 2) tma::cluster::load_async(input_scales[stage].B[cta_id], g.B_sc, {col_block_idx*2 + cta_id, i, 0, 0}, scales_arrived[stage], (uint16_t)(0b11), 0);
-                    else if (cta_id == 0)            tma::cluster::load_async(input_scales[stage].B[0], g.B_sc, {col_block_idx, i, 0, 0}, scales_arrived[stage], (uint16_t)(0b11), 0);
+                    // Load MMA_PER_TILE A scale tiles (each covers 128 K elements)
+                    #pragma unroll
+                    for (int k = 0; k < C::MMA_PER_TILE; k++) {
+                        tma::cluster::load_async(input_scales[stage].A[k], g.A_sc,
+                            {row_block_idx*2 + cta_id, i*C::MMA_PER_TILE + k, 0, 0},
+                            scales_arrived[stage], (uint16_t)(1<<cta_id), 0);
+                    }
+                    // Load B scale tiles
+                    if constexpr (C::B_SC_SIZE == 2) {
+                        #pragma unroll
+                        for (int k = 0; k < C::MMA_PER_TILE; k++) {
+                            tma::cluster::load_async(
+                                input_scales[stage].B[cta_id * C::MMA_PER_TILE + k], g.B_sc,
+                                {col_block_idx*2 + cta_id, i*C::MMA_PER_TILE + k, 0, 0},
+                                scales_arrived[stage], (uint16_t)(0b11), 0);
+                        }
+                    } else if (cta_id == 0) {
+                        #pragma unroll
+                        for (int k = 0; k < C::MMA_PER_TILE; k++) {
+                            tma::cluster::load_async(
+                                input_scales[stage].B[k], g.B_sc,
+                                {col_block_idx, i*C::MMA_PER_TILE + k, 0, 0},
+                                scales_arrived[stage], (uint16_t)(0b11), 0);
+                        }
+                    }
                     update_phasebit<1>(phasebits, stage);
                     stage = (stage + 1) % C::LOAD_PIPE_DEPTH;
                 }
@@ -192,39 +221,42 @@ __device__ inline void kernel(const globals<C> &g) {
             wait(tmem_provisioned, 0);
             tm_allocator.set_addr(tmem_addr);
             auto out_tm  = tm_allocator.template allocate<full_tt_fl<C::Nb>>(0);
-            // Scale tensor memory: E8M0 scales, block-32
-            auto A_sc_tm = tm_allocator.template allocate<full_tt_fp8e8m0<16*C::LOAD_PIPE_DEPTH>>(256);
-            auto B_sc_tm = tm_allocator.template allocate<full_tt_fp8e8m0<32*C::LOAD_PIPE_DEPTH>>(384);
+            // Scale tensor memory: MMA_PER_TILE × per-stage entries
+            auto A_sc_tm = tm_allocator.template allocate<full_tt_fp8e8m0<16*C::MMA_PER_TILE*C::LOAD_PIPE_DEPTH>>(256);
+            auto B_sc_tm = tm_allocator.template allocate<full_tt_fp8e8m0<32*C::MMA_PER_TILE*C::LOAD_PIPE_DEPTH>>(256+4*C::MMA_PER_TILE*C::LOAD_PIPE_DEPTH);
             for (int block_idx = cluster_id; block_idx < num_blocks; block_idx += gridDim.x / C::CLUSTER_SIZE) {
                 wait(outputs_finished, get_phasebit<1>(phasebits, 0));
                 tensor_after_thread_sync();
-                #pragma unroll 2
                 for (int i = 0; i < num_iters_per_block; i++) {
                     tma::expect_bytes(scales_arrived[stage], 2*sizeof(G::input_scales_t));
                     wait(scales_arrived[stage], get_phasebit<0>(phasebits, stage));
-                    auto A_sc_tm_subtile = A_sc_tm.template subtile<full_tt_fp8e8m0<16>>(stage*16);
-                    load_mxnv_scale_async2(A_sc_tm_subtile, input_scales[stage].A);
-                    auto B_sc_tm_subtile_0 = B_sc_tm.template subtile<full_tt_fp8e8m0<16>>(stage*32);
-                    load_mxnv_scale_async2(B_sc_tm_subtile_0, input_scales[stage].B[0]);
-                    if constexpr (C::B_SC_SIZE == 2) {
-                        auto B_sc_tm_subtile_1 = B_sc_tm.template subtile<full_tt_fp8e8m0<16>>(stage*32+16);
-                        load_mxnv_scale_async2(B_sc_tm_subtile_1, input_scales[stage].B[1]);
+                    // Load MMA_PER_TILE scale subtiles into tensor memory
+                    #pragma unroll
+                    for (int k = 0; k < C::MMA_PER_TILE; k++) {
+                        auto A_sc_tm_subtile = A_sc_tm.template subtile<full_tt_fp8e8m0<16>>(stage*C::MMA_PER_TILE*16 + k*16);
+                        load_mxnv_scale_async2(A_sc_tm_subtile, input_scales[stage].A[k]);
+                        auto B_sc_tm_subtile_0 = B_sc_tm.template subtile<full_tt_fp8e8m0<16>>(stage*C::MMA_PER_TILE*32 + k*C::B_SC_SIZE*16);
+                        load_mxnv_scale_async2(B_sc_tm_subtile_0, input_scales[stage].B[k]);
+                        if constexpr (C::B_SC_SIZE == 2) {
+                            auto B_sc_tm_subtile_1 = B_sc_tm.template subtile<full_tt_fp8e8m0<16>>(stage*C::MMA_PER_TILE*32 + k*C::B_SC_SIZE*16 + 16);
+                            load_mxnv_scale_async2(B_sc_tm_subtile_1, input_scales[stage].B[C::MMA_PER_TILE + k]);
+                        }
                     }
                     tma::expect_bytes(tiles_arrived[stage], 2*sizeof(G::input_tiles_t));
                     wait(tiles_arrived[stage], get_phasebit<0>(phasebits, stage));
                     if (i == 0) mm2_ABt(out_tm, input_tiles[stage].A, input_tiles[stage].B,
-                                        A_sc_tm.template subtile<full_tt_fp8e8m0<16>>(stage * 16),
-                                        B_sc_tm.template subtile<full_tt_fp8e8m0<32>>(stage * 32),
+                                        A_sc_tm.template subtile<full_tt_fp8e8m0<C::MMA_PER_TILE*16>>(stage * C::MMA_PER_TILE * 16),
+                                        B_sc_tm.template subtile<full_tt_fp8e8m0<C::MMA_PER_TILE*32>>(stage * C::MMA_PER_TILE * 32),
                                         inputs_finished[stage]);
                     else       mma2_ABt(out_tm, input_tiles[stage].A, input_tiles[stage].B,
-                                        A_sc_tm.template subtile<full_tt_fp8e8m0<16>>(stage * 16),
-                                        B_sc_tm.template subtile<full_tt_fp8e8m0<32>>(stage * 32),
+                                        A_sc_tm.template subtile<full_tt_fp8e8m0<C::MMA_PER_TILE*16>>(stage * C::MMA_PER_TILE * 16),
+                                        B_sc_tm.template subtile<full_tt_fp8e8m0<C::MMA_PER_TILE*32>>(stage * C::MMA_PER_TILE * 32),
                                         inputs_finished[stage]);
                     update_phasebit<0>(phasebits, stage);
                     stage = (stage + 1) % C::LOAD_PIPE_DEPTH;
                 }
-                update_phasebit<1>(phasebits, 0);
                 tensor_commit<2>(outputs_arrived);
+                update_phasebit<1>(phasebits, 0);
             }
         }
     } else if (warpgroup_id < C::CONSUMER_WARPGROUPS) {
@@ -250,7 +282,6 @@ __device__ inline void kernel(const globals<C> &g) {
 
             // Load the output from tensor memory into registers and store to HBM
             // Apply MXFP4 alpha scaling (1/36) in-register before store.
-            // FP4 E2M1 max = 6, so raw FP4×FP4 accumulation needs /36.
             constexpr float MXFP4_ALPHA = 1.0f / 36.0f;
             if constexpr (C::OVERLAP_EPI) {
                 #pragma unroll
@@ -297,6 +328,9 @@ __device__ inline void kernel(const globals<C> &g) {
             update_phasebit<0>(phasebits, 0);
         }
         warpgroup::sync(1);
+        // Ensure all TMA stores have committed before signaling the next
+        // kernel can start (matches NVFP4 pattern).
+        warpgroup::tma::store_async_read_wait<0>();
         warpgroup::pdl::arrive();
         if (warpgroup::warpid() == 0) tm_allocator.deprovision();
     }
