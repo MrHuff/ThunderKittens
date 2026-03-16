@@ -167,40 +167,18 @@ void mxfp4_gemm_entrypoint(
 ) {
     int K = A.size(1) * 2;
     int N_out = D.size(1);
-    if (K <= 2048 && N_out <= 4096) {
-        using C = mxfp4_gemm::config<256, 5, 8, 4, 2, false>;
-        using G = mxfp4_gemm::globals<C>;
-        G g {
-            .A = kittens::py::tensor_to_gl<typename G::A_fp4x2_gl>(A),
-            .A_sc = kittens::py::tensor_to_gl<typename G::A_sc_gl>(A_sc),
-            .B = kittens::py::tensor_to_gl<typename G::B_fp4x2_gl>(B),
-            .B_sc = kittens::py::tensor_to_gl<typename G::B_sc_gl>(B_sc),
-            .D = kittens::py::tensor_to_gl<typename G::D_gl>(D)
-        };
-        kittens::py::launch_kernel<C, G, mxfp4_gemm::kernel<C>>(g);
-    } else if (K <= 2048) {
-        using C = mxfp4_gemm::config<256, 4, 16, 4, 2, false>;
-        using G = mxfp4_gemm::globals<C>;
-        G g {
-            .A = kittens::py::tensor_to_gl<typename G::A_fp4x2_gl>(A),
-            .A_sc = kittens::py::tensor_to_gl<typename G::A_sc_gl>(A_sc),
-            .B = kittens::py::tensor_to_gl<typename G::B_fp4x2_gl>(B),
-            .B_sc = kittens::py::tensor_to_gl<typename G::B_sc_gl>(B_sc),
-            .D = kittens::py::tensor_to_gl<typename G::D_gl>(D)
-        };
-        kittens::py::launch_kernel<C, G, mxfp4_gemm::kernel<C>>(g);
-    } else {
-        using C = mxfp4_gemm::config<256, 4, 16, 12, 4, false>;
-        using G = mxfp4_gemm::globals<C>;
-        G g {
-            .A = kittens::py::tensor_to_gl<typename G::A_fp4x2_gl>(A),
-            .A_sc = kittens::py::tensor_to_gl<typename G::A_sc_gl>(A_sc),
-            .B = kittens::py::tensor_to_gl<typename G::B_fp4x2_gl>(B),
-            .B_sc = kittens::py::tensor_to_gl<typename G::B_sc_gl>(B_sc),
-            .D = kittens::py::tensor_to_gl<typename G::D_gl>(D)
-        };
-        kittens::py::launch_kernel<C, G, mxfp4_gemm::kernel<C>>(g);
-    }
+    // Single config that works for all shapes with Kb=256.
+    // config<256,5,8,4,2,false> = Nb=256, LOAD_PIPE=5, EPI=8, SG=4, DT=2, no overlap
+    using C = mxfp4_gemm::config<256, 5, 8, 4, 2, false>;
+    using G = mxfp4_gemm::globals<C>;
+    G g {
+        .A = kittens::py::tensor_to_gl<typename G::A_fp4x2_gl>(A),
+        .A_sc = kittens::py::tensor_to_gl<typename G::A_sc_gl>(A_sc),
+        .B = kittens::py::tensor_to_gl<typename G::B_fp4x2_gl>(B),
+        .B_sc = kittens::py::tensor_to_gl<typename G::B_sc_gl>(B_sc),
+        .D = kittens::py::tensor_to_gl<typename G::D_gl>(D)
+    };
+    kittens::py::launch_kernel<C, G, mxfp4_gemm::kernel<C>>(g);
 }
 
 
