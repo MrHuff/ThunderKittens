@@ -22,6 +22,7 @@ void nvfp4_cce_entrypoint(
     at::Tensor &lse,               // [M] float32 — initialized to -inf
     at::Tensor &neg_logit,         // [M] float32 — initialized to 0
     const at::Tensor &targets,     // [M] int64
+    at::Tensor &D_scratch,         // [Mb/2, Nb/EPI_PIPE_DEPTH] bf16 — scratch for TMA pipeline
     int M,                         // actual M (unpadded)
     int N                          // actual N (unpadded)
 ) {
@@ -35,6 +36,7 @@ void nvfp4_cce_entrypoint(
         .B = kittens::py::tensor_to_gl<typename G::B_fp4x2_gl>(B),
         .B_sc = kittens::py::tensor_to_gl<typename G::B_sc_gl, false>(B_sc, 1, B_sc.dim() == 2 ? B_sc.size(0)/128 : B_sc.size(0), B_sc.dim() == 2 ? B_sc.size(1)/4 : B_sc.size(1), 256),
         .B_sc_global = kittens::py::tensor_to_gl<typename G::B_sc_global_gl>(B_sc_global),
+        .D_scratch = kittens::py::tensor_to_gl<typename G::D_gl>(D_scratch),
         .lse = lse.data_ptr<float>(),
         .neg_correct_logit = neg_logit.data_ptr<float>(),
         .targets = targets.data_ptr<int64_t>(),
@@ -51,7 +53,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           pybind11::arg("A"), pybind11::arg("A_sc"), pybind11::arg("A_sc_global"),
           pybind11::arg("B"), pybind11::arg("B_sc"), pybind11::arg("B_sc_global"),
           pybind11::arg("lse"), pybind11::arg("neg_logit"),
-          pybind11::arg("targets"),
+          pybind11::arg("targets"), pybind11::arg("D_scratch"),
           pybind11::arg("M"), pybind11::arg("N"));
 }
 
