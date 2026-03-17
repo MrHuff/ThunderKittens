@@ -20,6 +20,7 @@ void mxfp4_cce_entrypoint(
     at::Tensor &lse,           // [M] float32 — initialized to -inf
     at::Tensor &neg_logit,     // [M] float32 — initialized to 0
     const at::Tensor &targets, // [M] int64
+    at::Tensor &D_scratch,     // [Mb/2, Nb/EPI_PIPE_DEPTH] bf16 — scratch for TMA pipeline
     int M,                     // actual M (unpadded)
     int N                      // actual N (unpadded)
 ) {
@@ -31,6 +32,7 @@ void mxfp4_cce_entrypoint(
         .A_sc = kittens::py::tensor_to_gl<typename G::A_sc_gl>(A_sc),
         .B = kittens::py::tensor_to_gl<typename G::B_fp4x2_gl>(B),
         .B_sc = kittens::py::tensor_to_gl<typename G::B_sc_gl>(B_sc),
+        .D_scratch = kittens::py::tensor_to_gl<typename G::D_gl>(D_scratch),
         .lse = lse.data_ptr<float>(),
         .neg_correct_logit = neg_logit.data_ptr<float>(),
         .targets = targets.data_ptr<int64_t>(),
@@ -38,7 +40,6 @@ void mxfp4_cce_entrypoint(
         .N = N
     };
 
-    // Use kittens::py::launch_kernel which handles cluster launch, PDL, and shared memory
     kittens::py::launch_kernel<C, G, mxfp4_cce::kernel<C>>(g);
 }
 
@@ -48,7 +49,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           pybind11::arg("A"), pybind11::arg("A_sc"),
           pybind11::arg("B"), pybind11::arg("B_sc"),
           pybind11::arg("lse"), pybind11::arg("neg_logit"),
-          pybind11::arg("targets"),
+          pybind11::arg("targets"), pybind11::arg("D_scratch"),
           pybind11::arg("M"), pybind11::arg("N"));
 }
 
