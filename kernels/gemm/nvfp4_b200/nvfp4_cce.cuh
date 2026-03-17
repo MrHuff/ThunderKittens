@@ -85,7 +85,6 @@ struct globals {
     using B_fp4x2_gl     = gl<fp4e2m1_2,  1,  1, -1, -1, B_fp4x2_tile>;
     using B_sc_gl        = gl<half,       1, -1, -1, 256, B_sc_tile>;
     using B_sc_global_gl = gl<float,      1,  1,  1,  1>;
-    using D_gl           = gl<bf16,       1,  1, -1, -1, D_tile>;
 
     A_fp4x2_gl     A;
     A_sc_gl        A_sc;
@@ -93,7 +92,6 @@ struct globals {
     B_fp4x2_gl     B;
     B_sc_gl        B_sc;
     B_sc_global_gl B_sc_global;
-    D_gl           D_scratch;  // Tiny scratch buffer for TMA pipeline pacing
 
     // CCE outputs (raw pointers, not TMA)
     float* lse;                // [M] — initialized to -inf
@@ -144,7 +142,6 @@ __device__ inline void kernel(const globals<C> &g) {
         g.A_sc.template prefetch_tma<typename G::A_sc_tile>();
         g.B.template prefetch_tma<typename G::B_fp4x2_tile>();
         g.B_sc.template prefetch_tma<typename G::B_sc_tile>();
-        g.D_scratch.template prefetch_tma<typename G::D_tile>();
     }
 
     const int warpgroup_id = warpgroup::groupid();
@@ -278,12 +275,7 @@ __device__ inline void kernel(const globals<C> &g) {
                 update_phasebit<1>(phasebits, 0);
             }
         }
-    // ======================== CONSUMER — DEFERRED CCE EPILOGUE ========================
-    //
-    // Key optimization: Adapts OVERLAP_EPI=false pattern to decouple CCE from pipeline.
-    //   Phase 1: Batch ALL TMEM → bf16 registers (fast). Signal outputs_finished.
-    //   Phase 2: CCE + TMA store interleaved (overlaps with producer MMA).
-    //
+    // ======================== CONSUMER — CCE EPILOGUE ========================
     } else if (warpgroup_id < C::CONSUMER_WARPGROUPS) {
         everyone::tma::cluster::wait_aligned();
         if (warpgroup::warpid() == 0) {
@@ -303,7 +295,6 @@ __device__ inline void kernel(const globals<C> &g) {
 
         // Register tile and col vector types for this warp
         using subtile_rt = rt_fl<C::Mb / 8, SUBTILE_COLS>;
-        using bf16_subtile_rt = rt_bf<C::Mb / 8, SUBTILE_COLS>;
         using col_vec_t = typename subtile_rt::col_vec;
 
         for (int block_idx = cluster_id; block_idx < num_blocks; block_idx += gridDim.x / C::CLUSTER_SIZE) {
@@ -316,27 +307,7 @@ __device__ inline void kernel(const globals<C> &g) {
 
             wait(outputs_arrived, get_phasebit<0>(phasebits, 0));
 
-            // ============ PHASE 1: Batch TMEM loads → bf16 registers ============
-            // Adapted from GEMM OVERLAP_EPI=false: load ALL subtiles at once,
-            // apply global scaling, convert to bf16, then signal outputs_finished.
-            // This fires the signal BEFORE any CCE computation.
-            bf16_subtile_rt D_reg_bf[C::EPI_PIPE_DEPTH];
-            #pragma unroll
-            for (int epi = 0; epi < C::EPI_PIPE_DEPTH; epi++) {
-                subtile_rt D_reg_fl;
-                warpgroup::load_async(D_reg_fl, out_tm.template subtile<full_tt_fl<SUBTILE_COLS>>(0, SUBTILE_COLS * epi));
-                warp::mul(D_reg_fl, D_reg_fl, global_scale);
-                warp::copy(D_reg_bf[epi], D_reg_fl);
-            }
-            tensor_load_wait();
-            tensor_before_thread_sync();
-            warpgroup::sync(1);
-            warpgroup::tma::cluster::arrive(outputs_finished, 0, 1);
-            // Producer can now start MMA for next block immediately!
-
-            // ============ PHASE 2: CCE + TMA store (interleaved, overlaps producer MMA) ============
-            // Each iteration: bf16→FP32, CCE computation, then TMA store for pacing.
-            // Interleaving lets the compiler free D_reg_bf[epi] registers after each iteration.
+            // Online logsumexp running state per row in this warp
             col_vec_t running_max;
             col_vec_t running_sumexp;
             #pragma unroll
@@ -350,17 +321,28 @@ __device__ inline void kernel(const globals<C> &g) {
                 }
             }
 
+            // Process subtiles one at a time, matching GEMM OVERLAP_EPI pattern.
             #pragma unroll
             for (int epi = 0; epi < C::EPI_PIPE_DEPTH; epi++) {
-                // bf16 → FP32
                 subtile_rt D_reg_fl;
-                warp::copy(D_reg_fl, D_reg_bf[epi]);
+                warpgroup::load_async(D_reg_fl, out_tm.template subtile<full_tt_fl<SUBTILE_COLS>>(0, SUBTILE_COLS * epi));
 
-                // --- Target logit extraction ---
+                if (epi == C::EPI_PIPE_DEPTH - 1) {
+                    tensor_load_wait();
+                    tensor_before_thread_sync();
+                    warpgroup::sync(1);
+                    warpgroup::tma::cluster::arrive(outputs_finished, 0, 1);
+                }
+
+                // Scale by NVFP4 global scale (a_sg * b_sg)
+                warp::mul(D_reg_fl, D_reg_fl, global_scale);
+
+                // Extract correct-class logits from registers
                 {
                     int col_start = col_block_idx * C::Nb + epi * SUBTILE_COLS;
                     int tile_row_base = row_block_idx * C::Mb + cta_id * (C::Mb / 2);
                     int warp_row_base = tile_row_base + warpgroup::warpid() * (C::Mb / 8);
+
                     warp::apply(D_reg_fl, D_reg_fl, [&](int local_row, int local_col, float val) -> float {
                         int global_row = warp_row_base + local_row;
                         int global_col = col_start + local_col;
@@ -374,13 +356,18 @@ __device__ inline void kernel(const globals<C> &g) {
                     });
                 }
 
-                // --- Online logsumexp: IN-PLACE on D_reg_fl ---
+                // Online logsumexp
                 col_vec_t tile_max;
                 warp::row_max(tile_max, D_reg_fl);
-                warp::sub_row(D_reg_fl, D_reg_fl, tile_max);
-                warp::exp(D_reg_fl, D_reg_fl);
+
+                subtile_rt shifted;
+                warp::sub_row(shifted, D_reg_fl, tile_max);
+
+                subtile_rt exp_tile;
+                warp::exp(exp_tile, shifted);
+
                 col_vec_t tile_sumexp;
-                warp::row_sum(tile_sumexp, D_reg_fl);
+                warp::row_sum(tile_sumexp, exp_tile);
 
                 // Merge into running state
                 #pragma unroll
@@ -391,6 +378,7 @@ __device__ inline void kernel(const globals<C> &g) {
                         float new_max_x = fmaxf(old_max_x, tile_max[i][j].x);
                         float old_max_y = running_max[i][j].y;
                         float new_max_y = fmaxf(old_max_y, tile_max[i][j].y);
+
                         if (new_max_x > -INFINITY) {
                             running_sumexp[i][j].x = running_sumexp[i][j].x * __expf(old_max_x - new_max_x) +
                                                      tile_sumexp[i][j].x * __expf(tile_max[i][j].x - new_max_x);
@@ -403,19 +391,12 @@ __device__ inline void kernel(const globals<C> &g) {
                         running_max[i][j].y = new_max_y;
                     }
                 }
-
-                // --- TMA store for pipeline pacing ---
-                // D_reg_bf[epi] used for last time here → compiler can free its registers.
-                warpgroup::tma::store_async_read_wait<C::NUM_D_TILES-1>();
-                warpgroup::sync(1);
-                warpgroup::store(output_tiles.D[epi%C::NUM_D_TILES], D_reg_bf[epi]);
-                warpgroup::sync(1);
-                warpgroup::tma::store_async<dim::ROW, cache_policy::EVICT_FIRST>(g.D_scratch, output_tiles.D[epi%C::NUM_D_TILES], {0, 0});
             }
 
-            // ============ PHASE 3: Finalize LSE ============
+            // After all epi subtiles: compute per-row LSE and atomically merge
             const int lane_id = threadIdx.x % 32;
             const int warpid_in_wg = warpgroup::warpid();
+
             int tile_row_base = row_block_idx * C::Mb + cta_id * (C::Mb / 2);
             int warp_row_offset = warpid_in_wg * (C::Mb / 8);
 
