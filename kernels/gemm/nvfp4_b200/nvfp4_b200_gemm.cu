@@ -244,6 +244,43 @@ void nvfp4_gemm_entrypoint(
     }
 }
 
+// ================================================================
+// Non-PDL standard GEMM: USE_PDL=false, CLUSTER_SIZE=1.
+// Safe for CUDA graph capture and replay.
+// Regular nvfp4_gemm uses PDL + CLUSTER_SIZE=2 which do not replay
+// correctly inside CUDA graphs.
+// ================================================================
+void nvfp4_gemm_nopdl_entrypoint(
+    const at::Tensor &A,
+    const at::Tensor &A_sc,
+    const at::Tensor &A_sc_global,
+    const at::Tensor &B,
+    const at::Tensor &B_sc,
+    const at::Tensor &B_sc_global,
+    at::Tensor &D
+) {
+    // USE_PDL=false (8th arg), CLUSTER_SIZE=2 (9th arg, default — kernel requires cluster pairs)
+    using C = nvfp4_gemm::config<256, 5, 8, 4, 2, false, 256, false, 2>;
+    using G = nvfp4_gemm::globals<C>;
+    G g {
+        .A = kittens::py::tensor_to_gl<typename G::A_fp4x2_gl>(A),
+        .A_sc = kittens::py::tensor_to_gl<typename G::A_sc_gl, false>(A_sc, 1, A_sc.dim() == 2 ? A_sc.size(0)/128 : A_sc.size(0), A_sc.dim() == 2 ? A_sc.size(1)/4 : A_sc.size(1), 256),
+        .A_sc_global = kittens::py::tensor_to_gl<typename G::A_sc_global_gl>(A_sc_global),
+        .B = kittens::py::tensor_to_gl<typename G::B_fp4x2_gl>(B),
+        .B_sc = kittens::py::tensor_to_gl<typename G::B_sc_gl, false>(B_sc, 1, B_sc.dim() == 2 ? B_sc.size(0)/128 : B_sc.size(0), B_sc.dim() == 2 ? B_sc.size(1)/4 : B_sc.size(1), 256),
+        .B_sc_global = kittens::py::tensor_to_gl<typename G::B_sc_global_gl>(B_sc_global),
+        .D = kittens::py::tensor_to_gl<typename G::D_gl>(D),
+        .D_K = kittens::py::tensor_to_gl<typename G::D_gl>(D),
+        .D_V = kittens::py::tensor_to_gl<typename G::D_gl>(D),
+        .q_dim = 0,
+        .k_dim = 0,
+        .use_split_D = false,
+        .b_sg_per_tile = nullptr,
+        .silu_dim = 0
+    };
+    kittens::py::launch_kernel<C, G, nvfp4_gemm::kernel<C>>(g);
+}
+
 // Grouped GEMM: concatenated weights with per-tile B_sc_global
 // B_sg_per_tile: [num_col_tiles] float, pre-computed on GPU by Python.
 //   Each entry has the B_sg value for that column tile's group.
@@ -337,9 +374,8 @@ void nvfp4_grouped_gemm_nopdl_entrypoint(
     bool use_split_D = (D_K_opt.has_value() && D_V_opt.has_value());
 
     // USE_PDL=false, CLUSTER_SIZE=2 (default) — safe for multi-stream
-    // Note: CLUSTER_SIZE=2 is required for correct spatial tiling.
-    // CUDA graph capture requires CLUSTER_SIZE=1 which is NOT supported yet.
-    using C = nvfp4_gemm::config<256, 5, 8, 4, 2, false, 256, false>;
+    // USE_PDL=false (8th arg), CLUSTER_SIZE=2 (9th arg — kernel requires cluster pairs)
+    using C = nvfp4_gemm::config<256, 5, 8, 4, 2, false, 256, false, 2>;
     using G = nvfp4_gemm::globals<C>;
     G g {
         .A = kittens::py::tensor_to_gl<typename G::A_fp4x2_gl>(A),
@@ -1024,6 +1060,8 @@ void nvfp4_batched_accum_gemm_entrypoint(
 }
 PYBIND11_MODULE(_C, m) {
     m.def("nvfp4_gemm", &nvfp4_gemm_entrypoint);
+    m.def("nvfp4_gemm_nopdl", &nvfp4_gemm_nopdl_entrypoint,
+          "Non-PDL GEMM for CUDA graph capture (CLUSTER_SIZE=1, USE_PDL=false)");
     m.def("nvfp4_gemm_config", &nvfp4_gemm_config_entrypoint,
           "GEMM with selectable tile config (for sweeping)",
           pybind11::arg("A"), pybind11::arg("A_sc"), pybind11::arg("A_sc_global"),
