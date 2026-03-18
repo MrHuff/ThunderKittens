@@ -1,8 +1,5 @@
-// ================================================================
-// NVFP4 Fused Cross-Entropy v2 — Fixed Nb=128
-// Pybind11 bindings
-// ================================================================
-#include "nvfp4_cce.cuh"
+// NVFP4 CCE v2 — Streamlined consumer, 3 key configs
+#include "nvfp4_cce_v2.cuh"
 
 #ifndef TORCH_COMPILE
 int main() { return 0; }
@@ -11,14 +8,14 @@ int main() { return 0; }
 #include "pyutils/torchutils.cuh"
 
 template <typename C>
-static void launch_nvfp4_cce_v2(
+static void launch_v2(
     const at::Tensor &A, const at::Tensor &A_sc, const at::Tensor &A_sc_global,
     const at::Tensor &B, const at::Tensor &B_sc, const at::Tensor &B_sc_global,
     at::Tensor &lse, at::Tensor &neg_logit,
     const at::Tensor &targets, at::Tensor &D_scratch,
     int M, int N
 ) {
-    using G = nvfp4_cce::globals<C>;
+    using G = nvfp4_cce_v2::globals<C>;
     G g {
         .A = kittens::py::tensor_to_gl<typename G::A_fp4x2_gl>(A),
         .A_sc = kittens::py::tensor_to_gl<typename G::A_sc_gl, false>(A_sc, 1, A_sc.dim() == 2 ? A_sc.size(0)/128 : A_sc.size(0), A_sc.dim() == 2 ? A_sc.size(1)/4 : A_sc.size(1), 256),
@@ -33,18 +30,13 @@ static void launch_nvfp4_cce_v2(
         .M = M,
         .N = N
     };
-    kittens::py::launch_kernel<C, G, nvfp4_cce::kernel<C>>(g);
+    kittens::py::launch_kernel<C, G, nvfp4_cce_v2::kernel<C>>(g);
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-    // All Nb=128 configs
-    // config<Nb, LOAD_PIPE_DEPTH, EPI_PIPE_DEPTH, SUPERGROUP_SIZE, NUM_D_TILES, OVERLAP_EPI>
-    m.def("L4_SG4", &launch_nvfp4_cce_v2<nvfp4_cce::config<128, 4, 4, 4, 2, false>>, "Nb128 L4 SG4");
-    m.def("L4_SG8", &launch_nvfp4_cce_v2<nvfp4_cce::config<128, 4, 4, 8, 2, false>>, "Nb128 L4 SG8");
-    m.def("L5_SG4", &launch_nvfp4_cce_v2<nvfp4_cce::config<128, 5, 4, 4, 2, false>>, "Nb128 L5 SG4");
-    m.def("L5_SG8", &launch_nvfp4_cce_v2<nvfp4_cce::config<128, 5, 4, 8, 2, false>>, "Nb128 L5 SG8");
-    m.def("L4_SG12", &launch_nvfp4_cce_v2<nvfp4_cce::config<128, 4, 4, 12, 2, false>>, "Nb128 L4 SG12");
-    m.def("L5_SG12", &launch_nvfp4_cce_v2<nvfp4_cce::config<128, 5, 4, 12, 2, false>>, "Nb128 L5 SG12");
+    m.def("v2_n256_L5_E8_SG8",  &launch_v2<nvfp4_cce::config<256, 5, 8,  8, 2, false>>, "");
+    m.def("v2_n256_L4_E8_SG8",  &launch_v2<nvfp4_cce::config<256, 4, 8,  8, 2, false>>, "");
+    m.def("v2_n128_L4_E4_SG8",  &launch_v2<nvfp4_cce::config<128, 4, 4,  8, 2, false>>, "");
 }
 
 #endif
