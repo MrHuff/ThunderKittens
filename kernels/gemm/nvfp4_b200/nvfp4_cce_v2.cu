@@ -36,10 +36,12 @@ static void launch_pp(
     kittens::py::launch_kernel<C, G, nvfp4_cce_v2::pp_kernel<C>>(g);
 }
 
-// Ping-pong configs: L4, SG8
+// Ping-pong configs
 using pp_L4_SG8 = nvfp4_cce_v2::pp_config<4, 8, true>;
+using pp_L3_SG8 = nvfp4_cce_v2::pp_config<3, 8, true>;
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("pp_L4_SG8", &launch_pp<pp_L4_SG8>, "NVFP4 CCE v2 ping-pong L4 SG8");
+    m.def("pp_L3_SG8", &launch_pp<pp_L3_SG8>, "NVFP4 CCE v2 ping-pong L3 SG8");
 }
 #endif

@@ -868,6 +868,98 @@ void nvfp4_batched_gemm_strided_entrypoint(
 }
 
 // ================================================================
+// Non-PDL batched GEMM strided: USE_PDL=false for CUDA graph safety.
+// ================================================================
+void nvfp4_batched_gemm_strided_nopdl_entrypoint(
+    const at::Tensor &A_full,
+    const std::vector<at::Tensor> &A_sc_list,
+    const std::vector<at::Tensor> &A_sg_list,
+    const std::vector<int64_t> &A_col_offsets,
+    const std::vector<int64_t> &A_col_widths,
+    const std::vector<at::Tensor> &B_list,
+    const std::vector<at::Tensor> &B_sc_list,
+    const std::vector<at::Tensor> &B_sg_list,
+    std::vector<at::Tensor> &D_list
+) {
+    const int n = (int)A_sg_list.size();
+    TORCH_CHECK(n > 0 && n <= nvfp4_batched_gemm::MAX_BATCHES);
+    TORCH_CHECK(n == (int)D_list.size());
+    TORCH_CHECK(n == (int)A_col_offsets.size());
+    TORCH_CHECK(n == (int)A_col_widths.size());
+    TORCH_CHECK(n == (int)A_sc_list.size());
+
+    const int64_t M = D_list[0].size(0);
+    const int64_t N_out = D_list[0].size(1);
+    const int64_t K_total_fp4 = A_full.size(1);
+    const int K_first = (int)(A_col_widths[0] * 2);
+
+    auto build_and_launch = [&]<typename C>() {
+        using G = nvfp4_batched_gemm::globals<C>;
+        G g_host;
+        memset(&g_host, 0, sizeof(G));
+        g_host.num_batches = n;
+        g_host.num_row_blocks = (int)(M / C::Mb);
+        g_host.num_col_blocks = (int)(N_out / C::Nb);
+        g_host.num_red_blocks = (int)(2 * A_col_widths[0] / C::Kb);
+
+        const uint8_t *a_base = (const uint8_t*)A_full.data_ptr();
+        const int64_t a_full_row_stride = K_total_fp4;
+
+        for (int i = 0; i < n; ++i) {
+            const int64_t fp4_cols = A_col_widths[i];
+            const int64_t fp4_offset = A_col_offsets[i];
+
+            {
+                constexpr int64_t swizzle_elements = 128;
+                const void *data_ptr = a_base + fp4_offset;
+                uint64_t gmem_shape [5] = {
+                    (uint64_t)swizzle_elements, (uint64_t)M,
+                    (uint64_t)(fp4_cols + swizzle_elements - 1) / swizzle_elements, 1, 1
+                };
+                uint64_t gmem_stride[4] = {
+                    (uint64_t)a_full_row_stride, 128,
+                    (uint64_t)M * a_full_row_stride, (uint64_t)M * a_full_row_stride
+                };
+                uint32_t smem_shape [5] = {(uint32_t)swizzle_elements, (uint32_t)(C::Mb/2), 1, 1, 1};
+                uint32_t smem_stride[5] = {1, 1, 1, 1, 1};
+                CUresult result = cuTensorMapEncodeTiled(
+                    &g_host.A_tma[i], CU_TENSOR_MAP_DATA_TYPE_UINT8, 5,
+                    const_cast<void*>(data_ptr), gmem_shape, gmem_stride,
+                    smem_shape, smem_stride,
+                    CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B,
+                    CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE
+                );
+                TORCH_CHECK(result == CUDA_SUCCESS, "Strided FP4 TMA (nopdl) failed for batch ", i);
+            }
+
+            auto a_sc_gl = kittens::py::tensor_to_gl<typename G::A_sc_gl, false>(
+                A_sc_list[i], 1,
+                A_sc_list[i].dim() == 2 ? A_sc_list[i].size(0)/128 : A_sc_list[i].size(0),
+                A_sc_list[i].dim() == 2 ? A_sc_list[i].size(1)/4 : A_sc_list[i].size(1), 256);
+            memcpy(&g_host.A_sc_tma[i], &a_sc_gl.tma_descs.tma_desc, sizeof(CUtensorMap));
+
+            auto b_gl = kittens::py::tensor_to_gl<typename G::B_fp4x2_gl>(B_list[i]);
+            auto b_sc_gl = kittens::py::tensor_to_gl<typename G::B_sc_gl, false>(
+                B_sc_list[i], 1,
+                B_sc_list[i].dim() == 2 ? B_sc_list[i].size(0)/128 : B_sc_list[i].size(0),
+                B_sc_list[i].dim() == 2 ? B_sc_list[i].size(1)/4 : B_sc_list[i].size(1), 256);
+            memcpy(&g_host.B_tma[i], &b_gl.tma_descs.tma_desc, sizeof(CUtensorMap));
+            memcpy(&g_host.B_sc_tma[i], &b_sc_gl.tma_descs.tma_desc, sizeof(CUtensorMap));
+
+            auto d_gl = kittens::py::tensor_to_gl<typename G::D_gl>(D_list[i]);
+            memcpy(&g_host.D_tma[i], &d_gl.tma_descs.tma_desc, sizeof(CUtensorMap));
+
+            g_host.A_sg[i] = A_sg_list[i].data_ptr<float>();
+            g_host.B_sg[i] = B_sg_list[i].data_ptr<float>();
+        }
+        kittens::py::launch_kernel<C, G, nvfp4_batched_gemm::kernel<C>>(g_host);
+    };
+
+    // USE_PDL=false (8th arg), CLUSTER_SIZE=2 (9th arg)
+    build_and_launch.operator()<nvfp4_gemm::config<256, 5, 8, 4, 2, false, 256, false, 2>>();
+}
+
+// ================================================================
 // Fused split dgrad+sum: slices concatenated dY, runs batched GEMM
 // (z-dim parallel), then sums the per-split outputs.
 // ================================================================
@@ -1095,6 +1187,12 @@ PYBIND11_MODULE(_C, m) {
           pybind11::arg("D_list"));
     m.def("nvfp4_batched_gemm_strided", &nvfp4_batched_gemm_strided_entrypoint,
           "Strided Batched GEMM: reads A FP4 from full buffer with column offsets, avoiding .contiguous()",
+          pybind11::arg("A_full"), pybind11::arg("A_sc_list"), pybind11::arg("A_sg_list"),
+          pybind11::arg("A_col_offsets"), pybind11::arg("A_col_widths"),
+          pybind11::arg("B_list"), pybind11::arg("B_sc_list"), pybind11::arg("B_sg_list"),
+          pybind11::arg("D_list"));
+    m.def("nvfp4_batched_gemm_strided_nopdl", &nvfp4_batched_gemm_strided_nopdl_entrypoint,
+          "Non-PDL batched GEMM strided (USE_PDL=false) for CUDA graph safety",
           pybind11::arg("A_full"), pybind11::arg("A_sc_list"), pybind11::arg("A_sg_list"),
           pybind11::arg("A_col_offsets"), pybind11::arg("A_col_widths"),
           pybind11::arg("B_list"), pybind11::arg("B_sc_list"), pybind11::arg("B_sg_list"),
