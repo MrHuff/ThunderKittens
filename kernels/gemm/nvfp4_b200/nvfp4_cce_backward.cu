@@ -11,7 +11,7 @@ static void launch_backward(
     const at::Tensor &A, const at::Tensor &A_sc, const at::Tensor &A_sc_global,
     const at::Tensor &B, const at::Tensor &B_sc, const at::Tensor &B_sc_global,
     at::Tensor &grad_out, const at::Tensor &lse, const at::Tensor &targets,
-    float grad_scale, int M, int N)
+    float grad_scale, int M, int N, float filter_eps = 0.0f)
 {
     using G = nvfp4_cce_backward::globals<C>;
     G g {
@@ -31,6 +31,7 @@ static void launch_backward(
         .lse = lse.data_ptr<float>(),
         .targets = targets.data_ptr<int64_t>(),
         .grad_scale = grad_scale,
+        .filter_eps = filter_eps,
         .M = M, .N = N
     };
     kittens::py::launch_kernel<C, G, nvfp4_cce_backward::backward_kernel<C>>(g);

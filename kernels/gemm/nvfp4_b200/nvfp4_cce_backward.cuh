@@ -82,6 +82,7 @@ struct globals {
     const float* lse;              // (M,) log-sum-exp from forward
     const int64_t* targets;        // (M,) target indices
     float grad_scale;              // grad_output / n_valid (scalar)
+    float filter_eps;              // CUT threshold: skip tile if max(|G|) < eps
     int M;
     int N;
 
@@ -425,16 +426,56 @@ __device__ inline void backward_kernel(const globals<C>& g) {
             // Free TMEM — MMA can start next block on the other accumulator
             warpgroup::tma::cluster::arrive(outputs_finished, 0, 1);
 
+            // CUT filtering: compute max(|G|) across all subtiles
+            // Must agree across all warps to avoid warpgroup::sync deadlock
+            bool tile_is_filtered = false;
+            if (g.filter_eps > 0.0f) {
+                float local_max = 0.0f;
+                #pragma unroll
+                for (int epi = 0; epi < C::EPI_PIPE_DEPTH; epi++) {
+                    #pragma unroll
+                    for (int i = 0; i < subtile_rt::height; i++) {
+                        #pragma unroll
+                        for (int j = 0; j < subtile_rt::width; j++) {
+                            #pragma unroll
+                            for (int k = 0; k < 4; k++) {
+                                local_max = fmaxf(local_max, fabsf(D_regs_fl[epi].tiles[i][j].data[k].x));
+                                local_max = fmaxf(local_max, fabsf(D_regs_fl[epi].tiles[i][j].data[k].y));
+                            }
+                        }
+                    }
+                }
+                // Warp-level reduction
+                #pragma unroll
+                for (int offset = 16; offset > 0; offset >>= 1) {
+                    local_max = fmaxf(local_max, __shfl_xor_sync(0xFFFFFFFF, local_max, offset));
+                }
+                // Cross-warp reduction via shared memory so all warps agree
+                __shared__ float filter_max_smem[WARPGROUP_WARPS];
+                if (lane_id == 0) {
+                    filter_max_smem[warpgroup::warpid()] = local_max;
+                }
+                warpgroup::sync(1);
+                float global_max = 0.0f;
+                #pragma unroll
+                for (int w = 0; w < WARPGROUP_WARPS; w++) {
+                    global_max = fmaxf(global_max, filter_max_smem[w]);
+                }
+                tile_is_filtered = (global_max < g.filter_eps);
+            }
+
             // Step 3: Store BF16 tiles to shared memory → TMA to global
-            #pragma unroll
-            for (int epi = 0; epi < C::EPI_PIPE_DEPTH; epi++) {
-                warpgroup::tma::store_async_read_wait<C::NUM_D_TILES-1>();
-                warpgroup::sync(1);
-                warpgroup::store(output_tiles.D[epi % C::NUM_D_TILES], D_regs_bf[epi]);
-                warpgroup::sync(1);
-                warpgroup::tma::store_async<dim::ROW, cache_policy::EVICT_FIRST>(
-                    g.D_out, output_tiles.D[epi % C::NUM_D_TILES],
-                    {row_block_idx*2 + cta_id, C::EPI_PIPE_DEPTH*col_block_idx + epi});
+            if (!tile_is_filtered) {
+                #pragma unroll
+                for (int epi = 0; epi < C::EPI_PIPE_DEPTH; epi++) {
+                    warpgroup::tma::store_async_read_wait<C::NUM_D_TILES-1>();
+                    warpgroup::sync(1);
+                    warpgroup::store(output_tiles.D[epi % C::NUM_D_TILES], D_regs_bf[epi]);
+                    warpgroup::sync(1);
+                    warpgroup::tma::store_async<dim::ROW, cache_policy::EVICT_FIRST>(
+                        g.D_out, output_tiles.D[epi % C::NUM_D_TILES],
+                        {row_block_idx*2 + cta_id, C::EPI_PIPE_DEPTH*col_block_idx + epi});
+                }
             }
 
             update_phasebit<0>(phasebits, 0);
