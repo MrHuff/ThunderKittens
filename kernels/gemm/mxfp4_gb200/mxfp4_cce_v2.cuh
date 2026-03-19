@@ -177,10 +177,10 @@ __device__ inline void consumer_epilogue(
             int tgt_x = my_targets[i];
             if (tgt_x >= col_start && tgt_x < col_start + SUBTILE_COLS) {
                 int local_col = tgt_x - col_start;
-                int j_idx = local_col / 8;
-                int within_tile = local_col % 8;
-                int k_half = within_tile / 4;
-                int pair_pos = (within_tile % 4) / 2;
+                int j_idx = local_col / 16;           // TILE_COL_DIM<float>=16
+                int within_tile = local_col % 16;
+                int k_half = within_tile / 8;          // col half: 0=left(0-7), 1=right(8-15)
+                int pair_pos = (within_tile % 8) / 2;  // which lane pair (0-3)
                 if ((lane_id % 4) == pair_pos) {
                     int k_idx = k_half * 2;
                     float val;
@@ -195,10 +195,10 @@ __device__ inline void consumer_epilogue(
             int tgt_y = my_targets_y[i];
             if (tgt_y >= col_start && tgt_y < col_start + SUBTILE_COLS) {
                 int local_col = tgt_y - col_start;
-                int j_idx = local_col / 8;
-                int within_tile = local_col % 8;
-                int k_half = within_tile / 4;
-                int pair_pos = (within_tile % 4) / 2;
+                int j_idx = local_col / 16;
+                int within_tile = local_col % 16;
+                int k_half = within_tile / 8;
+                int pair_pos = (within_tile % 8) / 2;
                 if ((lane_id % 4) == pair_pos) {
                     int k_idx = k_half * 2 + 1;
                     float val;
