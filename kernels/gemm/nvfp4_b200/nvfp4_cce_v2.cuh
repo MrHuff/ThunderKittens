@@ -128,6 +128,20 @@ __device__ inline void consumer_epilogue(
     using subtile_rt = rt_fl<C::Mb / 8, SUBTILE_COLS>;
     using col_vec_t = typename subtile_rt::col_vec;
 
+    // Precompute per-lane target info (read from global memory once, reuse across EPI_PIPE_DEPTH)
+    int my_targets[subtile_rt::height];
+    #pragma unroll
+    for (int i = 0; i < subtile_rt::height; i++) {
+        int global_row_x = warp_row_base + i * 16 + lane_id / 4;
+        my_targets[i] = (global_row_x < g.M) ? (int)g.targets[global_row_x] : -1;
+    }
+    int my_targets_y[subtile_rt::height];
+    #pragma unroll
+    for (int i = 0; i < subtile_rt::height; i++) {
+        int global_row_y = warp_row_base + i * 16 + 8 + lane_id / 4;
+        my_targets_y[i] = (global_row_y < g.M) ? (int)g.targets[global_row_y] : -1;
+    }
+
     col_vec_t running_max;
     col_vec_t running_sumexp;
     #pragma unroll
@@ -146,58 +160,46 @@ __device__ inline void consumer_epilogue(
         subtile_rt& D_reg_fl = D_regs[epi];
         warp::mul(D_reg_fl, D_reg_fl, global_scale);
 
-        // Target extraction — inline target reads with correct RT indexing
-        // For float RT: TILE_COL_DIM=16, so each outer tile covers 16 columns.
+        // Target extraction with correct RT indexing (TILE_COL_DIM<float>=16)
         // data[k]: k%2 selects row half (0=top, 1=bottom), k/2 selects col half (0=left 8 cols, 1=right 8 cols)
         // Lane column: (laneid()%4)*2 within each 8-col half. .x=even, .y=odd.
-        {
-            int col_start = col_block_idx * C::Nb + epi * SUBTILE_COLS;
-            int col_end = col_start + SUBTILE_COLS;
-            if (col_start < g.N && col_end > 0) {
-                #pragma unroll
-                for (int i = 0; i < subtile_rt::height; i++) {
-                    // x-half (rows 0-7 within this 16-row tile)
-                    {
-                        int global_row = warp_row_base + i * 16 + lane_id / 4;
-                        if (global_row < g.M) {
-                            int tgt = (int)g.targets[global_row];
-                            if (tgt >= col_start && tgt < col_end) {
-                                int local_col = tgt - col_start;
-                                int j_idx = local_col / 16;           // outer tile: 16 cols each
-                                int within_tile = local_col % 16;     // position within 16-col tile
-                                int k_half = within_tile / 8;         // col half: 0=left(0-7), 1=right(8-15)
-                                int pair_pos = (within_tile % 8) / 2; // which lane pair (0-3)
-                                if ((lane_id % 4) == pair_pos) {
-                                    int k_idx = k_half * 2;           // k=0 (left,x-row) or k=2 (right,x-row)
-                                    float val = (local_col & 1) == 0
-                                        ? D_reg_fl.tiles[i][j_idx].data[k_idx].x
-                                        : D_reg_fl.tiles[i][j_idx].data[k_idx].y;
-                                    atomicAdd(&g.neg_correct_logit[global_row], -val);
-                                }
-                            }
-                        }
-                    }
-                    // y-half (rows 8-15 within this 16-row tile)
-                    {
-                        int global_row = warp_row_base + i * 16 + 8 + lane_id / 4;
-                        if (global_row < g.M) {
-                            int tgt = (int)g.targets[global_row];
-                            if (tgt >= col_start && tgt < col_end) {
-                                int local_col = tgt - col_start;
-                                int j_idx = local_col / 16;
-                                int within_tile = local_col % 16;
-                                int k_half = within_tile / 8;
-                                int pair_pos = (within_tile % 8) / 2;
-                                if ((lane_id % 4) == pair_pos) {
-                                    int k_idx = k_half * 2 + 1;       // k=1 (left,y-row) or k=3 (right,y-row)
-                                    float val = (local_col & 1) == 0
-                                        ? D_reg_fl.tiles[i][j_idx].data[k_idx].x
-                                        : D_reg_fl.tiles[i][j_idx].data[k_idx].y;
-                                    atomicAdd(&g.neg_correct_logit[global_row], -val);
-                                }
-                            }
-                        }
-                    }
+        int col_start = col_block_idx * C::Nb + epi * SUBTILE_COLS;
+        #pragma unroll
+        for (int i = 0; i < subtile_rt::height; i++) {
+            int tgt_x = my_targets[i];
+            if (tgt_x >= col_start && tgt_x < col_start + SUBTILE_COLS) {
+                int local_col = tgt_x - col_start;
+                int j_idx = local_col / 16;           // TILE_COL_DIM<float>=16
+                int within_tile = local_col % 16;
+                int k_half = within_tile / 8;         // col half: 0=left(0-7), 1=right(8-15)
+                int pair_pos = (within_tile % 8) / 2; // which lane pair (0-3)
+                if ((lane_id % 4) == pair_pos) {
+                    int k_idx = k_half * 2;
+                    float val;
+                    if ((local_col & 1) == 0)
+                        val = D_reg_fl.tiles[i][j_idx].data[k_idx].x;
+                    else
+                        val = D_reg_fl.tiles[i][j_idx].data[k_idx].y;
+                    int global_row = warp_row_base + i * 16 + lane_id / 4;
+                    atomicAdd(&g.neg_correct_logit[global_row], -val);
+                }
+            }
+            int tgt_y = my_targets_y[i];
+            if (tgt_y >= col_start && tgt_y < col_start + SUBTILE_COLS) {
+                int local_col = tgt_y - col_start;
+                int j_idx = local_col / 16;
+                int within_tile = local_col % 16;
+                int k_half = within_tile / 8;
+                int pair_pos = (within_tile % 8) / 2;
+                if ((lane_id % 4) == pair_pos) {
+                    int k_idx = k_half * 2 + 1;
+                    float val;
+                    if ((local_col & 1) == 0)
+                        val = D_reg_fl.tiles[i][j_idx].data[k_idx].x;
+                    else
+                        val = D_reg_fl.tiles[i][j_idx].data[k_idx].y;
+                    int global_row = warp_row_base + i * 16 + 8 + lane_id / 4;
+                    atomicAdd(&g.neg_correct_logit[global_row], -val);
                 }
             }
         }
