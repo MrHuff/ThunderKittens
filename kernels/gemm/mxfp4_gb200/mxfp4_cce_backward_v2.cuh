@@ -22,7 +22,8 @@ namespace mxfp4_cce_backward_v2 {
 // =========================================================================
 // Config
 // =========================================================================
-template <int _LOAD_PIPE_DEPTH, int _SUPERGROUP_SIZE, bool _USE_BF16_ACCUM = true, bool _PINGPONG = true>
+// QUANT_MODE: 0=RTE (default), 1=ENCODE-centric (ceil), 2=DECODE-centric (floor)
+template <int _LOAD_PIPE_DEPTH, int _SUPERGROUP_SIZE, bool _USE_BF16_ACCUM = true, bool _PINGPONG = true, int _QUANT_MODE = 0>
 struct config {
     static_assert(_LOAD_PIPE_DEPTH > 0 && _LOAD_PIPE_DEPTH <= 5);
     static_assert(_SUPERGROUP_SIZE > 0);
@@ -50,6 +51,7 @@ struct config {
 
     static constexpr int NUM_D_TILES = 2;
     static constexpr bool USE_BF16_ACCUM = _USE_BF16_ACCUM;
+    static constexpr int QUANT_MODE = _QUANT_MODE;  // 0=RTE, 1=ENCODE, 2=DECODE
 };
 
 // =========================================================================
@@ -88,6 +90,32 @@ __device__ __forceinline__ uint8_t float_to_e8m0_rn(float val) {
         ++exponent;
     }
     return exponent;
+}
+
+// Encode-centric: ceil exponent → 2^exp >= val always (scale >= amax → no clipping)
+__device__ __forceinline__ uint8_t float_to_e8m0_ceil(float val) {
+    if (val == 0.0f) return 0x00;
+    uint32_t u = __float_as_uint(val);
+    uint8_t exp = (u >> 23) & 0xFF;
+    uint32_t mant = u & 0x7FFFFF;
+    if (mant > 0 && exp < 0xFE) ++exp;
+    return exp;
+}
+
+// Decode-centric: floor exponent → 2^exp <= val always (scale < amax → fills range)
+__device__ __forceinline__ uint8_t float_to_e8m0_floor(float val) {
+    if (val == 0.0f) return 0x00;
+    uint32_t u = __float_as_uint(val);
+    uint8_t exp = (u >> 23) & 0xFF;
+    return exp;
+}
+
+// Dispatch based on mode: 0=RTE, 1=ENCODE, 2=DECODE
+template<int MODE>  // 0=RTE, 1=ENCODE(ceil), 2=DECODE(floor)
+__device__ __forceinline__ uint8_t float_to_e8m0_dispatch(float val) {
+    if constexpr (MODE == 1) return float_to_e8m0_ceil(val);
+    else if constexpr (MODE == 2) return float_to_e8m0_floor(val);
+    else return float_to_e8m0_rn(val);
 }
 
 // Reciprocal of 2^(e8m0 - 127)
@@ -576,9 +604,9 @@ __device__ inline void backward_kernel_v2(const globals<C>& g) {
                                 amax_y = fmaxf(amax_y, __shfl_xor_sync(0xFFFFFFFF, amax_y, offset));
                             }
 
-                            // Convert amax to E8M0 scale
-                            uint8_t e8m0_x = (amax_x <= 1e-9f) ? 0 : float_to_e8m0_rn(amax_x);
-                            uint8_t e8m0_y = (amax_y <= 1e-9f) ? 0 : float_to_e8m0_rn(amax_y);
+                            // Convert amax to E8M0 scale (mode-dependent rounding)
+                            uint8_t e8m0_x = (amax_x <= 1e-9f) ? 0 : float_to_e8m0_dispatch<C::QUANT_MODE>(amax_x);
+                            uint8_t e8m0_y = (amax_y <= 1e-9f) ? 0 : float_to_e8m0_dispatch<C::QUANT_MODE>(amax_y);
                             float rcp_x = exp2f_rcp_e8m0(e8m0_x);
                             float rcp_y = exp2f_rcp_e8m0(e8m0_y);
                             float coeff_x = 6.0f * rcp_x;
