@@ -66,6 +66,10 @@ using bwd_v2_bf16_L5_SG8 = mxfp4_cce_backward_v2::config<5, 8, true, true>;
 using bwd_v2_bf16_L4_SG8 = mxfp4_cce_backward_v2::config<4, 8, true, true>;
 using bwd_v2_fp4_L5_SG8  = mxfp4_cce_backward_v2::config<5, 8, false, true>;
 using bwd_v2_fp4_L4_SG8  = mxfp4_cce_backward_v2::config<4, 8, false, true>;
+// Encode-centric: ceil E8M0 exponent (QUANT_MODE=1)
+using bwd_v2_fp4_enc_L4_SG8 = mxfp4_cce_backward_v2::config<4, 8, false, true, 1>;
+// Decode-centric: floor E8M0 exponent (QUANT_MODE=2)
+using bwd_v2_fp4_dec_L4_SG8 = mxfp4_cce_backward_v2::config<4, 8, false, true, 2>;
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("backward_v2_bf16_L5_SG8", &launch_backward_v2_bf16<bwd_v2_bf16_L5_SG8>,
@@ -73,8 +77,12 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("backward_v2_bf16_L4_SG8", &launch_backward_v2_bf16<bwd_v2_bf16_L4_SG8>,
           "MXFP4 CCE backward v2 (BF16 output) L4 SG8");
     m.def("backward_v2_fp4_L5_SG8", &launch_backward_v2_fp4<bwd_v2_fp4_L5_SG8>,
-          "MXFP4 CCE backward v2 (FP4 quantized output) L5 SG8");
+          "MXFP4 CCE backward v2 (FP4 RTE output) L5 SG8");
     m.def("backward_v2_fp4_L4_SG8", &launch_backward_v2_fp4<bwd_v2_fp4_L4_SG8>,
-          "MXFP4 CCE backward v2 (FP4 quantized output) L4 SG8");
+          "MXFP4 CCE backward v2 (FP4 RTE output) L4 SG8");
+    m.def("backward_v2_fp4_enc_L4_SG8", &launch_backward_v2_fp4<bwd_v2_fp4_enc_L4_SG8>,
+          "MXFP4 CCE backward v2 (FP4 encode-centric output) L4 SG8");
+    m.def("backward_v2_fp4_dec_L4_SG8", &launch_backward_v2_fp4<bwd_v2_fp4_dec_L4_SG8>,
+          "MXFP4 CCE backward v2 (FP4 decode-centric output) L4 SG8");
 }
 #endif
