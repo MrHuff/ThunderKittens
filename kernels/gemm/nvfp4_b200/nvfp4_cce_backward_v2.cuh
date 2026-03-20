@@ -22,8 +22,7 @@ namespace nvfp4_cce_backward_v2 {
 // =========================================================================
 // Config
 // =========================================================================
-// ENCODE_CENTRIC: false=decode (default), true=encode (E4M3 multiplier → coeff = float(M))
-template <int _LOAD_PIPE_DEPTH, int _SUPERGROUP_SIZE, bool _USE_BF16_ACCUM = true, bool _PINGPONG = true, bool _ENCODE_CENTRIC = false>
+template <int _LOAD_PIPE_DEPTH, int _SUPERGROUP_SIZE, bool _USE_BF16_ACCUM = true, bool _PINGPONG = true>
 struct config {
     static_assert(_LOAD_PIPE_DEPTH > 0 && _LOAD_PIPE_DEPTH <= 5);
     static_assert(_SUPERGROUP_SIZE > 0);
@@ -51,7 +50,6 @@ struct config {
 
     static constexpr int NUM_D_TILES = 2;
     static constexpr bool USE_BF16_ACCUM = _USE_BF16_ACCUM;
-    static constexpr bool ENCODE_CENTRIC = _ENCODE_CENTRIC;
 };
 
 // =========================================================================
@@ -578,26 +576,11 @@ __device__ inline void backward_kernel_v2(const globals<C>& g) {
                                 const float FP4_MAX = 6.0f;
                                 float rcp_scale_x, rcp_scale_y;
                                 float scale_x, scale_y;
-                                if constexpr (C::ENCODE_CENTRIC) {
-                                    // Encode-centric: M = FP4_MAX/amax → E4M3,
-                                    // coeff = float(M), stored scale = 1/M
-                                    float mult_x = (amax_x > 0.0f) ? FP4_MAX / amax_x : 1.0f;
-                                    float mult_y = (amax_y > 0.0f) ? FP4_MAX / amax_y : 1.0f;
-                                    __nv_fp8_e4m3 mult_fp8_x = __nv_fp8_e4m3(mult_x);
-                                    __nv_fp8_e4m3 mult_fp8_y = __nv_fp8_e4m3(mult_y);
-                                    rcp_scale_x = static_cast<float>(mult_fp8_x);
-                                    rcp_scale_y = static_cast<float>(mult_fp8_y);
-                                    // Stored scale is 1/M (for dequantization)
-                                    scale_x = 1.0f / fmaxf(rcp_scale_x, 1e-12f);
-                                    scale_y = 1.0f / fmaxf(rcp_scale_y, 1e-12f);
-                                } else {
-                                    // Decode-centric: scale = amax/FP4_MAX → E4M3,
-                                    // coeff = 1/scale
-                                    scale_x = fmaxf(amax_x / FP4_MAX, 1.0f / 65536.0f);
-                                    scale_y = fmaxf(amax_y / FP4_MAX, 1.0f / 65536.0f);
-                                    rcp_scale_x = 1.0f / scale_x;
-                                    rcp_scale_y = 1.0f / scale_y;
-                                }
+                                // Decode-centric: scale = amax/FP4_MAX, coeff = 1/scale
+                                scale_x = fmaxf(amax_x / FP4_MAX, 1.0f / 65536.0f);
+                                scale_y = fmaxf(amax_y / FP4_MAX, 1.0f / 65536.0f);
+                                rcp_scale_x = 1.0f / scale_x;
+                                rcp_scale_y = 1.0f / scale_y;
 
                                 // Quantize each pair of values to fp4x2
                                 // Thread holds 2 col values per k position

@@ -60,8 +60,9 @@ static void launch_backward_v2_fp4(
     static_assert(!C::USE_BF16_ACCUM, "Must use FP4 config for this function");
     using G = nvfp4_cce_backward_v2::globals<C>;
 
-    // Create dummy BF16 output tensor for unused field
-    auto dummy_bf16 = A.new_empty({1, 1}, A.options().dtype(c10::kBFloat16));
+    // Dummy BF16 output — must be properly sized for valid TMA descriptors
+    // (even though D_out is never written in FP4 mode, the TMA desc is still created)
+    auto dummy_bf16 = A.new_empty({M, N}, A.options().dtype(c10::kBFloat16));
 
     G g {
         .A = kittens::py::tensor_to_gl<typename G::A_fp4x2_gl>(A),
@@ -95,15 +96,11 @@ static void launch_backward_v2_fp4(
 // Config instantiations
 using bwd_v2_bf16_L4_SG8 = nvfp4_cce_backward_v2::config<4, 8, true, true>;
 using bwd_v2_fp4_L4_SG8  = nvfp4_cce_backward_v2::config<4, 8, false, true>;
-// Encode-centric FP4 quantization (M=FP4_MAX/amax→E4M3)
-using bwd_v2_fp4_enc_L4_SG8 = nvfp4_cce_backward_v2::config<4, 8, false, true, true>;
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("backward_v2_bf16_L4_SG8", &launch_backward_v2_bf16<bwd_v2_bf16_L4_SG8>,
           "NVFP4 CCE backward v2 (BF16 output) L4 SG8");
     m.def("backward_v2_fp4_L4_SG8", &launch_backward_v2_fp4<bwd_v2_fp4_L4_SG8>,
-          "NVFP4 CCE backward v2 (FP4 decode-centric output) L4 SG8");
-    m.def("backward_v2_fp4_enc_L4_SG8", &launch_backward_v2_fp4<bwd_v2_fp4_enc_L4_SG8>,
-          "NVFP4 CCE backward v2 (FP4 encode-centric output) L4 SG8");
+          "NVFP4 CCE backward v2 (FP4 output) L4 SG8");
 }
 #endif
