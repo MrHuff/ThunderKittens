@@ -1150,7 +1150,7 @@ void nvfp4_batched_accum_gemm_entrypoint(
             numel);
     }
 }
-PYBIND11_MODULE(_C, m) {
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("nvfp4_gemm", &nvfp4_gemm_entrypoint);
     m.def("nvfp4_gemm_nopdl", &nvfp4_gemm_nopdl_entrypoint,
           "Non-PDL GEMM for CUDA graph capture (CLUSTER_SIZE=1, USE_PDL=false)");
