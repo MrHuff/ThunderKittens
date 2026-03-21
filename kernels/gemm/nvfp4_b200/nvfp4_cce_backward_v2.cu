@@ -37,13 +37,18 @@ static void launch_backward_v2_bf16(
         .B_sc_global = kittens::py::tensor_to_gl<typename G::B_sc_global_gl>(B_sc_global),
         .D_out = kittens::py::tensor_to_gl<typename G::D_gl>(grad_out),
         .G_fp4_row = kittens::py::tensor_to_gl<typename G::G_fp4_row_gl>(dummy_fp4),
-        .G_sc_row = kittens::py::tensor_to_gl<typename G::G_sc_row_gl, false>(dummy_sc, 1, 1, 1, 256),
+        .G_sc_row_ptr = nullptr,
+        .G_sc_row_kgroups = 1,
         .G_sg_row = kittens::py::tensor_to_gl<typename G::G_sg_row_gl>(dummy_sg),
+        .G_fp4_col_ptr = nullptr,
+        .G_sc_col_ptr = nullptr,
+        .G_sc_col_kgroups = 1,
         .lse = lse.data_ptr<float>(),
         .targets = targets.data_ptr<int64_t>(),
         .grad_scale = grad_scale,
         .filter_eps = filter_eps,
-        .M = M, .N = N
+        .M = M, .N = N,
+        .encode_centric = false
     };
     kittens::py::launch_kernel<C, G, nvfp4_cce_backward_v2::backward_kernel_v2<C>>(g);
 }
@@ -54,14 +59,15 @@ static void launch_backward_v2_fp4(
     const at::Tensor &A, const at::Tensor &A_sc, const at::Tensor &A_sc_global,
     const at::Tensor &B, const at::Tensor &B_sc, const at::Tensor &B_sc_global,
     at::Tensor &G_fp4_row, at::Tensor &G_sc_row, at::Tensor &G_sg_row,
+    at::Tensor &G_fp4_col, at::Tensor &G_sc_col,
     const at::Tensor &lse, const at::Tensor &targets,
-    float grad_scale, int M, int N, float filter_eps = 0.0f)
+    float grad_scale, int M, int N, float filter_eps = 0.0f,
+    bool encode_centric = false)
 {
     static_assert(!C::USE_BF16_ACCUM, "Must use FP4 config for this function");
     using G = nvfp4_cce_backward_v2::globals<C>;
 
-    // Dummy BF16 output — must be properly sized for valid TMA descriptors
-    // (even though D_out is never written in FP4 mode, the TMA desc is still created)
+    // Dummy BF16 output — D_out is unused in FP4 mode but TMA needs valid tensor
     auto dummy_bf16 = A.new_empty({M, N}, A.options().dtype(c10::kBFloat16));
 
     G g {
@@ -79,16 +85,18 @@ static void launch_backward_v2_fp4(
         .B_sc_global = kittens::py::tensor_to_gl<typename G::B_sc_global_gl>(B_sc_global),
         .D_out = kittens::py::tensor_to_gl<typename G::D_gl>(dummy_bf16),
         .G_fp4_row = kittens::py::tensor_to_gl<typename G::G_fp4_row_gl>(G_fp4_row),
-        .G_sc_row = kittens::py::tensor_to_gl<typename G::G_sc_row_gl, false>(
-            G_sc_row, 1,
-            G_sc_row.dim()==2 ? G_sc_row.size(0)/128 : G_sc_row.size(0),
-            G_sc_row.dim()==2 ? G_sc_row.size(1)/4 : G_sc_row.size(1), 256),
+        .G_sc_row_ptr = reinterpret_cast<uint8_t*>(G_sc_row.data_ptr()),
+        .G_sc_row_kgroups = N / 64,  // V/64 k-groups for row-quant scale
         .G_sg_row = kittens::py::tensor_to_gl<typename G::G_sg_row_gl>(G_sg_row),
+        .G_fp4_col_ptr = reinterpret_cast<uint8_t*>(G_fp4_col.data_ptr()),
+        .G_sc_col_ptr = reinterpret_cast<uint8_t*>(G_sc_col.data_ptr()),
+        .G_sc_col_kgroups = M / 64,  // M/64 k-groups for col-quant scale
         .lse = lse.data_ptr<float>(),
         .targets = targets.data_ptr<int64_t>(),
         .grad_scale = grad_scale,
         .filter_eps = filter_eps,
-        .M = M, .N = N
+        .M = M, .N = N,
+        .encode_centric = encode_centric
     };
     kittens::py::launch_kernel<C, G, nvfp4_cce_backward_v2::backward_kernel_v2<C>>(g);
 }
