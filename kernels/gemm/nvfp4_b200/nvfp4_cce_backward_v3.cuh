@@ -17,7 +17,7 @@
 
 #include "nvfp4_cce.cuh"
 
-namespace nvfp4_cce_backward_v2 {
+namespace nvfp4_cce_backward_v3 {
 
 // =========================================================================
 // Config
@@ -129,8 +129,19 @@ struct globals {
 
     // FP4 mode outputs (row-quantized G for dE = G @ C)
     G_fp4_row_gl   G_fp4_row;
-    G_sc_row_gl    G_sc_row;
+    // Scale in TK 3D format: [M/128, V/64, 512] fp8
+    // byte = (row%32)*16 + (row/32%4)*4 + (col/16%4)
+    // depth=row/128, k_group=col/64
+    uint8_t*       G_sc_row_ptr;    // TK 3D scale tensor, cast to uint8_t
+    int            G_sc_row_kgroups; // = V/64
     G_sg_row_gl    G_sg_row;
+
+    // FP4 mode outputs (col-quantized G^T for dC = E^T @ G = (G^T)^T @ E)
+    // Stored transposed as (V, M) so it's row-quantized G^T — usable as B operand
+    uint8_t*       G_fp4_col_ptr;   // fp4x2 at [col, row/2], size (V, M/2)
+    // Col-quant scale in TK 3D format: [V/128, M/64, 512] fp8
+    uint8_t*       G_sc_col_ptr;
+    int            G_sc_col_kgroups; // = M/64
 
     // Backward inputs
     const float* lse;
@@ -139,6 +150,7 @@ struct globals {
     float filter_eps;
     int M;
     int N;    // V (vocab)
+    bool encode_centric;  // false=decode: store E4M3(scale), true=encode: store E4M3(1/scale)
 
     struct input_tiles_t {
         A_fp4x2_tile A;
@@ -177,7 +189,7 @@ struct globals {
 // Main kernel
 // =========================================================================
 template <typename C>
-__device__ inline void backward_kernel_v2(const globals<C>& g) {
+__device__ inline void backward_kernel_v3(const globals<C>& g) {
     using G = globals<C>;
 
     if (threadIdx.x == 0) {
@@ -595,6 +607,7 @@ __device__ inline void backward_kernel_v2(const globals<C>& g) {
                                 uint8_t fp4_y_lo = quantize_fp4_pair(vals_y[0], vals_y[1], rcp_scale_y);
                                 uint8_t fp4_y_hi = quantize_fp4_pair(vals_y[2], vals_y[3], rcp_scale_y);
 
+
                                 // Write FP4 data to global memory
                                 // Global offset: g_fp4_row[row, col/2]
                                 if (global_row_x < g.M) {
@@ -617,32 +630,156 @@ __device__ inline void backward_kernel_v2(const globals<C>& g) {
                                     fp4_ptr[local_row * (C::Nb/2) + local_col_hi/2] = fp4_y_hi;
                                 }
 
-                                // Write FP8 E4M3 scale for this block
-                                // Scale layout: [row/128, col/64, 512] fp8
-                                // One scale per 16-col block per row
+
+                                // Write FP8 E4M3 scale in TK 3D format: [M/128, V/64, 512] fp8
+                                // byte = (row%32)*16 + (row/32%4)*4 + (col/16%4)
+                                // chunk = (row/128)*kgroups + (col/64)
                                 if ((lane_id % 4) == 0) {
                                     __nv_fp8_e4m3 sc_x = __nv_fp8_e4m3(scale_x);
                                     __nv_fp8_e4m3 sc_y = __nv_fp8_e4m3(scale_y);
-                                    // Scale index within the tile
-                                    int sc_col_block = (col_start + j * 16) / 16;  // Which 16-col block
-                                    // Write to global scale array
-                                    // TODO: proper scale layout matching NVFP4 format
-                                    // For now, use raw FP8 pointer
+                                    if (g.encode_centric) {
+                                        constexpr float E4M3_MAX = 448.0f;
+                                        sc_x = __nv_fp8_e4m3(fminf(rcp_scale_x, E4M3_MAX));
+                                        sc_y = __nv_fp8_e4m3(fminf(rcp_scale_y, E4M3_MAX));
+                                    }
+                                    int global_col_16 = col_start + j * 16;
+                                    int kgroup = global_col_16 / 64;
+                                    int col_16_in_64 = (global_col_16 / 16) % 4;
+
                                     if (global_row_x < g.M) {
-                                        reinterpret_cast<__nv_fp8_e4m3*>(
-                                            &g.G_sc_row[{global_row_x / 128, sc_col_block, 0, 0}]
-                                        )[global_row_x % 128] = sc_x;
+                                        int depth_x = global_row_x / 128;
+                                        int sr_x = global_row_x % 32;
+                                        int rr_x = (global_row_x / 32) % 4;
+                                        int chunk_x = depth_x * g.G_sc_row_kgroups + kgroup;
+                                        int byte_x = sr_x * 16 + rr_x * 4 + col_16_in_64;
+                                        g.G_sc_row_ptr[chunk_x * 512 + byte_x] =
+                                            *reinterpret_cast<uint8_t*>(&sc_x);
                                     }
                                     if (global_row_y < g.M) {
-                                        reinterpret_cast<__nv_fp8_e4m3*>(
-                                            &g.G_sc_row[{global_row_y / 128, sc_col_block, 0, 0}]
-                                        )[global_row_y % 128] = sc_y;
+                                        int depth_y = global_row_y / 128;
+                                        int sr_y = global_row_y % 32;
+                                        int rr_y = (global_row_y / 32) % 4;
+                                        int chunk_y = depth_y * g.G_sc_row_kgroups + kgroup;
+                                        int byte_y = sr_y * 16 + rr_y * 4 + col_16_in_64;
+                                        g.G_sc_row_ptr[chunk_y * 512 + byte_y] =
+                                            *reinterpret_cast<uint8_t*>(&sc_y);
                                     }
                                 }
-                            }
-                        }
-                    }
-                }
+
+                                // ═══ Column quantization ═══
+                                // For dC = G^T @ E: store G transposed as (V, M) row-quantized
+                                // Col-quant groups 16 consecutive ROWS per column
+                                // Each (i,j) tile = 16 rows × 16 cols = exactly one col-quant group
+                                // vals_x = row (i*16 + lane_id/4), vals_y = row (i*16 + 8 + lane_id/4)
+                                // Each thread has 4 values at cols: (lane_id%4)*2, +1, +8, +9
+                                //
+                                // For col amax: reduce across threads with same lane_id%4
+                                // (same columns, different rows) → offsets 4, 8, 16 in lane space
+                                {
+                                    // Per-column amax: each thread contributes its row's abs values
+                                    // For each of the 4 column values this thread holds:
+                                    float col_amax[4];
+                                    col_amax[0] = fmaxf(fabsf(vals_x[0]), fabsf(vals_y[0]));
+                                    col_amax[1] = fmaxf(fabsf(vals_x[1]), fabsf(vals_y[1]));
+                                    col_amax[2] = fmaxf(fabsf(vals_x[2]), fabsf(vals_y[2]));
+                                    col_amax[3] = fmaxf(fabsf(vals_x[3]), fabsf(vals_y[3]));
+
+                                    // Reduce across 8 threads with same lane_id%4 (same cols, different rows)
+                                    // These threads are spaced 4 apart: lane 0,4,8,12,16,20,24,28
+                                    #pragma unroll
+                                    for (int offset = 4; offset < 32; offset <<= 1) {
+                                        #pragma unroll
+                                        for (int v = 0; v < 4; v++) {
+                                            col_amax[v] = fmaxf(col_amax[v], __shfl_xor_sync(0xFFFFFFFF, col_amax[v], offset));
+                                        }
+                                    }
+                                    // Now every thread has the full 16-row amax for its columns
+
+                                    const float FP4_MAX_COL = 6.0f;
+                                    float col_scale[4], col_rcp[4];
+                                    #pragma unroll
+                                    for (int v = 0; v < 4; v++) {
+                                        col_scale[v] = fmaxf(col_amax[v] / FP4_MAX_COL, 1.0f / 65536.0f);
+                                        col_rcp[v] = 1.0f / col_scale[v];
+                                    }
+
+                                    // Quantize: each thread quantizes its own row values with the col scale
+                                    // vals_x[0],vals_x[1] are at cols (lane_id%4)*2, (lane_id%4)*2+1
+                                    // vals_x[2],vals_x[3] are at cols (lane_id%4)*2+8, (lane_id%4)*2+8+1
+                                    // For col-quant fp4, pair along rows: (row_x, row_y) at same col
+                                    // → stored as fp4x2 in transposed layout: G_col[col, row/2]
+
+                                    // For each column pair, pack (row_x_val, row_y_val) as fp4x2
+                                    uint8_t cfp4_0 = quantize_fp4_pair(vals_x[0], vals_y[0], col_rcp[0]);  // col c+0
+                                    uint8_t cfp4_1 = quantize_fp4_pair(vals_x[1], vals_y[1], col_rcp[1]);  // col c+1
+                                    uint8_t cfp4_2 = quantize_fp4_pair(vals_x[2], vals_y[2], col_rcp[2]);  // col c+8
+                                    uint8_t cfp4_3 = quantize_fp4_pair(vals_x[3], vals_y[3], col_rcp[3]);  // col c+8+1
+
+                                    // Write col-quantized FP4 data: G_col[global_col, global_row/2]
+                                    // global_col = col_start + j*16 + (lane_id%4)*2 + {0, 1, 8, 9}
+                                    int gc0 = col_start + j * 16 + (lane_id % 4) * 2;      // col pair 0,1
+                                    int gc8 = gc0 + 8;                                      // col pair 8,9
+                                    // global_row for the pair: row_x and row_y are paired
+                                    // row_x = i*16 + lane_id/4, row_y = row_x + 8
+                                    // The pair (row_x, row_y) maps to row_x/2 in the transposed fp4x2
+                                    int row_pair_idx = (lane_id / 4);  // 0..7, maps to row within the 16-row block
+                                    int global_row_pair = warp_row_base + i * 16 + row_pair_idx;
+
+                                    // Transposed layout: G_col_fp4[col, row/2], stride = M/2
+                                    int col_fp4_stride = g.M / 2;  // number of fp4x2 per col-row
+                                    if (gc0 < g.N && global_row_pair < g.M) {
+                                        g.G_fp4_col_ptr[gc0 * col_fp4_stride + global_row_pair / 2] = cfp4_0;
+                                        g.G_fp4_col_ptr[(gc0 + 1) * col_fp4_stride + global_row_pair / 2] = cfp4_1;
+                                    }
+                                    if (gc8 < g.N && global_row_pair < g.M) {
+                                        g.G_fp4_col_ptr[gc8 * col_fp4_stride + global_row_pair / 2] = cfp4_2;
+                                        g.G_fp4_col_ptr[(gc8 + 1) * col_fp4_stride + global_row_pair / 2] = cfp4_3;
+                                    }
+
+                                    // Write col-quantized E4M3 scale in TK 3D format
+                                    // For G^T (V, M): [V/128, M/64, 512] fp8
+                                    // "row" = global_col (V-dim), "col" = global_row (M-dim)
+                                    // byte = (gcol%32)*16 + (gcol/32%4)*4 + (grow/16%4)
+                                    // chunk = (gcol/128)*kgroups + (grow/64)
+                                    if ((lane_id / 4) == 0) {
+                                        // The 16-row block index in M-dim for col-quant
+                                        int global_row_m = warp_row_base + i * 16;  // first of the 16 rows
+                                        int m_kgroup = global_row_m / 64;
+                                        int m_16_in_64 = (global_row_m / 16) % 4;
+
+                                        __nv_fp8_e4m3 csc[4];
+                                        #pragma unroll
+                                        for (int v = 0; v < 4; v++) {
+                                            csc[v] = __nv_fp8_e4m3(col_scale[v]);
+                                            if (g.encode_centric) {
+                                                constexpr float E4M3_MAX = 448.0f;
+                                                csc[v] = __nv_fp8_e4m3(fminf(col_rcp[v], E4M3_MAX));
+                                            }
+                                        }
+
+                                        // gc0, gc0+1 are two consecutive V-dim columns
+                                        // gc8, gc8+1 are two more
+                                        // csc[0] → gc0, csc[1] → gc0+1, csc[2] → gc8, csc[3] → gc8+1
+                                        int gc_vals[4] = {gc0, gc0 + 1, gc8, gc8 + 1};
+                                        #pragma unroll
+                                        for (int v = 0; v < 4; v++) {
+                                            int gc = gc_vals[v];
+                                            if (gc < g.N) {
+                                                int depth = gc / 128;
+                                                int sr = gc % 32;
+                                                int rr = (gc / 32) % 4;
+                                                int chunk = depth * g.G_sc_col_kgroups + m_kgroup;
+                                                int byte_idx = sr * 16 + rr * 4 + m_16_in_64;
+                                                g.G_sc_col_ptr[chunk * 512 + byte_idx] =
+                                                    *reinterpret_cast<uint8_t*>(&csc[v]);
+                                            }
+                                        }
+                                    }
+                                }
+                            }  // for j
+                        }  // for i
+                    }  // for epi
+                }  // if !C::USE_BF16_ACCUM
             }
 
             update_phasebit<0>(phasebits, 0);
@@ -657,4 +794,4 @@ __device__ inline void backward_kernel_v2(const globals<C>& g) {
     }
 }
 
-} // namespace nvfp4_cce_backward_v2
+} // namespace nvfp4_cce_backward_v3
