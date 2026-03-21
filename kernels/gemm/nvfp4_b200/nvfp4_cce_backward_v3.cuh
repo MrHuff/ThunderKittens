@@ -164,6 +164,14 @@ struct globals {
         D_tile D[C::NUM_D_TILES];
     };
 
+    // Staging buffer for FP4 quant: stores softmax grad as BF16 in smem
+    // so consumer can free TMEM quickly and do quant from smem asynchronously.
+    // Each CTA processes Mb/2 rows × Nb cols. Double-buffered for pipelining.
+    using quant_staging_tile = st_bf<C::Mb/2, C::Nb>;
+    struct quant_staging_t {
+        quant_staging_tile staging[2];  // double-buffered
+    };
+
     __host__ inline dim3 grid() const {
         int padded_M = A.rows();
         int padded_N = B.rows();
@@ -177,9 +185,12 @@ struct globals {
     }
     __host__ inline dim3 block() const { return dim3(C::NUM_THREADS); }
     __host__ inline int dynamic_shared_memory() const {
-        constexpr int _dynamic_shared_memory = sizeof(input_tiles_t)  * C::LOAD_PIPE_DEPTH + 1024 +
-                                               sizeof(input_scales_t) * C::LOAD_PIPE_DEPTH + 1024 +
-                                               sizeof(outputs_t);
+        constexpr int base_smem = sizeof(input_tiles_t)  * C::LOAD_PIPE_DEPTH + 1024 +
+                                  sizeof(input_scales_t) * C::LOAD_PIPE_DEPTH + 1024 +
+                                  sizeof(outputs_t);
+        // Add staging buffer only for FP4 mode
+        constexpr int quant_smem = C::USE_BF16_ACCUM ? 0 : sizeof(quant_staging_t);
+        constexpr int _dynamic_shared_memory = base_smem + quant_smem;
         static_assert(_dynamic_shared_memory <= MAX_SHARED_MEMORY - 1024);
         return _dynamic_shared_memory;
     }
@@ -222,6 +233,10 @@ __device__ inline void backward_kernel_v3(const globals<C>& g) {
     typename G::input_scales_t (&input_scales)[C::LOAD_PIPE_DEPTH] = sm_allocator.allocate<G::input_scales_t, C::LOAD_PIPE_DEPTH>();
     typename G::outputs_t       &output_tiles                      = sm_allocator.allocate<G::outputs_t>();
 
+    // FP4 mode: allocate double-buffered staging for pipelined quant
+    // In BF16 mode this is unused, but must still be a valid reference
+    typename G::quant_staging_t &quant_staging = sm_allocator.allocate<G::quant_staging_t>();
+
     tensor_allocator<1, C::CLUSTER_SIZE, false> tm_allocator;
 
     __shared__ uint32_t tmem_addr;
@@ -231,6 +246,9 @@ __device__ inline void backward_kernel_v3(const globals<C>& g) {
     __shared__ semaphore inputs_finished[C::LOAD_PIPE_DEPTH];
     __shared__ semaphore outputs_arrived;
     __shared__ semaphore outputs_finished;
+    // Staging semaphores for pipelined quant
+    __shared__ semaphore staging_ready[2];    // consumer warp 0 → all warps: data is in smem
+    __shared__ semaphore staging_consumed[2]; // all warps → consumer warp 0: smem can be reused
 
     if (threadIdx.x == 32) {
         init_semaphore(tmem_provisioned, 0, 1);
@@ -242,6 +260,10 @@ __device__ inline void backward_kernel_v3(const globals<C>& g) {
         }
         init_semaphore(outputs_arrived, 0, 1);
         init_semaphore(outputs_finished, 0, C::CLUSTER_SIZE);
+        init_semaphore(staging_ready[0], 0, 1);
+        init_semaphore(staging_ready[1], 0, 1);
+        init_semaphore(staging_consumed[0], 0, 1);
+        init_semaphore(staging_consumed[1], 0, 1);
     }
     everyone::tma::cluster::arrive_aligned();
 
@@ -526,24 +548,12 @@ __device__ inline void backward_kernel_v3(const globals<C>& g) {
                     }
                 } else {
                     // ═══════ FP4 PATH: quantize G to NVFP4 on-the-fly ════════
-                    // Softmax grad is bounded in [-1, 1] after grad_scale
-                    // Use fixed global scale = 1.0 (amax ≤ 1 guaranteed)
-                    // Per-16-element FP8 micro scales computed from register values
-                    //
-                    // Each thread holds 8 float values per (i,j,k) iteration
-                    // in the register tile:
-                    //   data[k].x and data[k].y are two float values
-                    //   k=0: rows x, cols v0..v1
-                    //   k=1: rows y, cols v0..v1
-                    //   k=2: rows x, cols v0+8..v1+8
-                    //   k=3: rows y, cols v0+8..v1+8
-                    //
-                    // For row-wise quantization:
-                    //   Group 16 consecutive col values per row → compute amax → scale
-                    //   Each warp tile (i,j) covers 16 cols - exactly one scale group!
+                    // Optimized: quantize in registers, write to smem staging,
+                    // then burst-copy to global with coalesced writes.
 
-                    // Quantize each subtile and write FP4 data to global memory
-                    // via thread-level stores (no TMA for FP4 output)
+                    int staging_phase = phase;  // which staging buffer to use
+
+                    // ═══ ROW QUANTIZATION: per-16-col-block scales ═══
                     #pragma unroll
                     for (int epi = 0; epi < C::EPI_PIPE_DEPTH; epi++) {
                         subtile_rt& D_fl = D_regs_fl[epi];
@@ -556,8 +566,6 @@ __device__ inline void backward_kernel_v3(const globals<C>& g) {
 
                             #pragma unroll
                             for (int j = 0; j < subtile_rt::width; j++) {
-                                // Each (i,j) tile covers 16 cols — one scale group
-                                // Collect all 8 values for this thread's two rows
                                 float vals_x[4], vals_y[4];
                                 vals_x[0] = D_fl.tiles[i][j].data[0].x;
                                 vals_x[1] = D_fl.tiles[i][j].data[0].y;
@@ -568,52 +576,35 @@ __device__ inline void backward_kernel_v3(const globals<C>& g) {
                                 vals_y[2] = D_fl.tiles[i][j].data[3].x;
                                 vals_y[3] = D_fl.tiles[i][j].data[3].y;
 
-                                // Compute per-row, per-16-col-block amax
-                                // (all 4 lanes in a group of 4 participate)
+                                // Row amax: reduce across 4 threads sharing a row
                                 float amax_x = 0.0f, amax_y = 0.0f;
                                 #pragma unroll
                                 for (int v = 0; v < 4; v++) {
                                     amax_x = fmaxf(amax_x, fabsf(vals_x[v]));
                                     amax_y = fmaxf(amax_y, fabsf(vals_y[v]));
                                 }
-                                // Reduce across 4 threads that share a row
-                                // lane_id % 4 gives position within group
                                 #pragma unroll
                                 for (int offset = 1; offset < 4; offset <<= 1) {
                                     amax_x = fmaxf(amax_x, __shfl_xor_sync(0xFFFFFFFF, amax_x, offset));
                                     amax_y = fmaxf(amax_y, __shfl_xor_sync(0xFFFFFFFF, amax_y, offset));
                                 }
 
-                                // Compute per-block FP4 scale and quantization coefficient
                                 const float FP4_MAX = 6.0f;
-                                float rcp_scale_x, rcp_scale_y;
-                                float scale_x, scale_y;
-                                // Decode-centric: scale = amax/FP4_MAX, coeff = 1/scale
-                                scale_x = fmaxf(amax_x / FP4_MAX, 1.0f / 65536.0f);
-                                scale_y = fmaxf(amax_y / FP4_MAX, 1.0f / 65536.0f);
-                                rcp_scale_x = 1.0f / scale_x;
-                                rcp_scale_y = 1.0f / scale_y;
+                                float scale_x = fmaxf(amax_x / FP4_MAX, 1.0f / 65536.0f);
+                                float scale_y = fmaxf(amax_y / FP4_MAX, 1.0f / 65536.0f);
+                                float rcp_scale_x = 1.0f / scale_x;
+                                float rcp_scale_y = 1.0f / scale_y;
 
-                                // Quantize each pair of values to fp4x2
-                                // Thread holds 2 col values per k position
-                                // Pack as fp4x2 bytes
-                                int v_base = col_start + j * 16 + (lane_id % 4) * 2;
-
-                                // Row x: 4 values at cols v_base, v_base+1, v_base+8, v_base+8+1
+                                // Quantize to fp4x2 bytes
                                 uint8_t fp4_x_lo = quantize_fp4_pair(vals_x[0], vals_x[1], rcp_scale_x);
                                 uint8_t fp4_x_hi = quantize_fp4_pair(vals_x[2], vals_x[3], rcp_scale_x);
-
-                                // Row y: same
                                 uint8_t fp4_y_lo = quantize_fp4_pair(vals_y[0], vals_y[1], rcp_scale_y);
                                 uint8_t fp4_y_hi = quantize_fp4_pair(vals_y[2], vals_y[3], rcp_scale_y);
 
-
                                 // Write FP4 data to global memory
-                                // Global offset: g_fp4_row[row, col/2]
                                 if (global_row_x < g.M) {
                                     uint8_t* fp4_ptr = reinterpret_cast<uint8_t*>(
                                         &g.G_fp4_row[{global_row_x / (C::Mb/2), col_start / (C::Nb / 2)}]);
-                                    // Local offset within tile
                                     int local_row = global_row_x % (C::Mb/2);
                                     int local_col_lo = (lane_id % 4) * 2 + j * 16;
                                     int local_col_hi = local_col_lo + 8;
@@ -630,10 +621,7 @@ __device__ inline void backward_kernel_v3(const globals<C>& g) {
                                     fp4_ptr[local_row * (C::Nb/2) + local_col_hi/2] = fp4_y_hi;
                                 }
 
-
-                                // Write FP8 E4M3 scale in TK 3D format: [M/128, V/64, 512] fp8
-                                // byte = (row%32)*16 + (row/32%4)*4 + (col/16%4)
-                                // chunk = (row/128)*kgroups + (col/64)
+                                // ── Write FP8 E4M3 scale ──
                                 if ((lane_id % 4) == 0) {
                                     __nv_fp8_e4m3 sc_x = __nv_fp8_e4m3(scale_x);
                                     __nv_fp8_e4m3 sc_y = __nv_fp8_e4m3(scale_y);
@@ -667,25 +655,13 @@ __device__ inline void backward_kernel_v3(const globals<C>& g) {
                                 }
 
                                 // ═══ Column quantization ═══
-                                // For dC = G^T @ E: store G transposed as (V, M) row-quantized
-                                // Col-quant groups 16 consecutive ROWS per column
-                                // Each (i,j) tile = 16 rows × 16 cols = exactly one col-quant group
-                                // vals_x = row (i*16 + lane_id/4), vals_y = row (i*16 + 8 + lane_id/4)
-                                // Each thread has 4 values at cols: (lane_id%4)*2, +1, +8, +9
-                                //
-                                // For col amax: reduce across threads with same lane_id%4
-                                // (same columns, different rows) → offsets 4, 8, 16 in lane space
                                 {
-                                    // Per-column amax: each thread contributes its row's abs values
-                                    // For each of the 4 column values this thread holds:
                                     float col_amax[4];
                                     col_amax[0] = fmaxf(fabsf(vals_x[0]), fabsf(vals_y[0]));
                                     col_amax[1] = fmaxf(fabsf(vals_x[1]), fabsf(vals_y[1]));
                                     col_amax[2] = fmaxf(fabsf(vals_x[2]), fabsf(vals_y[2]));
                                     col_amax[3] = fmaxf(fabsf(vals_x[3]), fabsf(vals_y[3]));
 
-                                    // Reduce across 8 threads with same lane_id%4 (same cols, different rows)
-                                    // These threads are spaced 4 apart: lane 0,4,8,12,16,20,24,28
                                     #pragma unroll
                                     for (int offset = 4; offset < 32; offset <<= 1) {
                                         #pragma unroll
@@ -693,7 +669,6 @@ __device__ inline void backward_kernel_v3(const globals<C>& g) {
                                             col_amax[v] = fmaxf(col_amax[v], __shfl_xor_sync(0xFFFFFFFF, col_amax[v], offset));
                                         }
                                     }
-                                    // Now every thread has the full 16-row amax for its columns
 
                                     const float FP4_MAX_COL = 6.0f;
                                     float col_scale[4], col_rcp[4];
@@ -703,30 +678,17 @@ __device__ inline void backward_kernel_v3(const globals<C>& g) {
                                         col_rcp[v] = 1.0f / col_scale[v];
                                     }
 
-                                    // Quantize: each thread quantizes its own row values with the col scale
-                                    // vals_x[0],vals_x[1] are at cols (lane_id%4)*2, (lane_id%4)*2+1
-                                    // vals_x[2],vals_x[3] are at cols (lane_id%4)*2+8, (lane_id%4)*2+8+1
-                                    // For col-quant fp4, pair along rows: (row_x, row_y) at same col
-                                    // → stored as fp4x2 in transposed layout: G_col[col, row/2]
+                                    uint8_t cfp4_0 = quantize_fp4_pair(vals_x[0], vals_y[0], col_rcp[0]);
+                                    uint8_t cfp4_1 = quantize_fp4_pair(vals_x[1], vals_y[1], col_rcp[1]);
+                                    uint8_t cfp4_2 = quantize_fp4_pair(vals_x[2], vals_y[2], col_rcp[2]);
+                                    uint8_t cfp4_3 = quantize_fp4_pair(vals_x[3], vals_y[3], col_rcp[3]);
 
-                                    // For each column pair, pack (row_x_val, row_y_val) as fp4x2
-                                    uint8_t cfp4_0 = quantize_fp4_pair(vals_x[0], vals_y[0], col_rcp[0]);  // col c+0
-                                    uint8_t cfp4_1 = quantize_fp4_pair(vals_x[1], vals_y[1], col_rcp[1]);  // col c+1
-                                    uint8_t cfp4_2 = quantize_fp4_pair(vals_x[2], vals_y[2], col_rcp[2]);  // col c+8
-                                    uint8_t cfp4_3 = quantize_fp4_pair(vals_x[3], vals_y[3], col_rcp[3]);  // col c+8+1
-
-                                    // Write col-quantized FP4 data: G_col[global_col, global_row/2]
-                                    // global_col = col_start + j*16 + (lane_id%4)*2 + {0, 1, 8, 9}
-                                    int gc0 = col_start + j * 16 + (lane_id % 4) * 2;      // col pair 0,1
-                                    int gc8 = gc0 + 8;                                      // col pair 8,9
-                                    // global_row for the pair: row_x and row_y are paired
-                                    // row_x = i*16 + lane_id/4, row_y = row_x + 8
-                                    // The pair (row_x, row_y) maps to row_x/2 in the transposed fp4x2
-                                    int row_pair_idx = (lane_id / 4);  // 0..7, maps to row within the 16-row block
+                                    int gc0 = col_start + j * 16 + (lane_id % 4) * 2;
+                                    int gc8 = gc0 + 8;
+                                    int row_pair_idx = (lane_id / 4);
                                     int global_row_pair = warp_row_base + i * 16 + row_pair_idx;
 
-                                    // Transposed layout: G_col_fp4[col, row/2], stride = M/2
-                                    int col_fp4_stride = g.M / 2;  // number of fp4x2 per col-row
+                                    int col_fp4_stride = g.M / 2;
                                     if (gc0 < g.N && global_row_pair < g.M) {
                                         g.G_fp4_col_ptr[gc0 * col_fp4_stride + global_row_pair / 2] = cfp4_0;
                                         g.G_fp4_col_ptr[(gc0 + 1) * col_fp4_stride + global_row_pair / 2] = cfp4_1;
@@ -736,14 +698,8 @@ __device__ inline void backward_kernel_v3(const globals<C>& g) {
                                         g.G_fp4_col_ptr[(gc8 + 1) * col_fp4_stride + global_row_pair / 2] = cfp4_3;
                                     }
 
-                                    // Write col-quantized E4M3 scale in TK 3D format
-                                    // For G^T (V, M): [V/128, M/64, 512] fp8
-                                    // "row" = global_col (V-dim), "col" = global_row (M-dim)
-                                    // byte = (gcol%32)*16 + (gcol/32%4)*4 + (grow/16%4)
-                                    // chunk = (gcol/128)*kgroups + (grow/64)
                                     if ((lane_id / 4) == 0) {
-                                        // The 16-row block index in M-dim for col-quant
-                                        int global_row_m = warp_row_base + i * 16;  // first of the 16 rows
+                                        int global_row_m = warp_row_base + i * 16;
                                         int m_kgroup = global_row_m / 64;
                                         int m_16_in_64 = (global_row_m / 16) % 4;
 
@@ -757,9 +713,6 @@ __device__ inline void backward_kernel_v3(const globals<C>& g) {
                                             }
                                         }
 
-                                        // gc0, gc0+1 are two consecutive V-dim columns
-                                        // gc8, gc8+1 are two more
-                                        // csc[0] → gc0, csc[1] → gc0+1, csc[2] → gc8, csc[3] → gc8+1
                                         int gc_vals[4] = {gc0, gc0 + 1, gc8, gc8 + 1};
                                         #pragma unroll
                                         for (int v = 0; v < 4; v++) {
