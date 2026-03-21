@@ -24,6 +24,9 @@ static void launch_backward_v2_bf16(
         .G_fp4_row = kittens::py::tensor_to_gl<typename G::G_fp4x2_gl>(
             A.new_empty({1, 1}, A.options().dtype(c10::kByte))),
         .G_sc_row = nullptr,
+        .G_fp4_col_ptr = nullptr,
+        .G_sc_col_ptr = nullptr,
+        .G_sc_col_kgroups = 1,
         .lse = lse.data_ptr<float>(),
         .targets = targets.data_ptr<int64_t>(),
         .grad_scale = grad_scale,
@@ -39,6 +42,7 @@ static void launch_backward_v2_fp4(
     const at::Tensor &A, const at::Tensor &A_sc,
     const at::Tensor &B, const at::Tensor &B_sc,
     at::Tensor &G_fp4_row, at::Tensor &G_sc_row,
+    at::Tensor &G_fp4_col, at::Tensor &G_sc_col,
     const at::Tensor &lse, const at::Tensor &targets,
     float grad_scale, int M, int N, float filter_eps = 0.0f)
 {
@@ -49,9 +53,12 @@ static void launch_backward_v2_fp4(
         .B = kittens::py::tensor_to_gl<typename G::B_fp4x2_gl>(B),
         .B_sc = kittens::py::tensor_to_gl<typename G::B_sc_gl>(B_sc),
         .D_out = kittens::py::tensor_to_gl<typename G::D_gl>(
-            A.new_empty({1, 1}, A.options().dtype(c10::kBFloat16))),
+            A.new_empty({M, N}, A.options().dtype(c10::kBFloat16))),
         .G_fp4_row = kittens::py::tensor_to_gl<typename G::G_fp4x2_gl>(G_fp4_row),
         .G_sc_row = G_sc_row.data_ptr<uint8_t>(),
+        .G_fp4_col_ptr = reinterpret_cast<uint8_t*>(G_fp4_col.data_ptr()),
+        .G_sc_col_ptr = reinterpret_cast<uint8_t*>(G_sc_col.data_ptr()),
+        .G_sc_col_kgroups = M / 128,
         .lse = lse.data_ptr<float>(),
         .targets = targets.data_ptr<int64_t>(),
         .grad_scale = grad_scale,
