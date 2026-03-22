@@ -1,17 +1,18 @@
 #pragma once
 // ================================================================
-// NVFP4 CCE Backward v4 — Fully Fused One-Pass (Algorithm 3)
+// NVFP4 CCE Backward v4 — Full One-Pass Fusion (Algorithm 3)
 //
 // Single kernel that fuses:
 //   Phase 1: FP4 GEMM recomputes logits A = E_fp4 @ C_fp4^T
-//   Phase 2: Softmax gradient G = grad_scale * (exp(A - LSE) - 1[target])
-//            Quantize G to FP4 row-format → SMEM (no HBM writes!)
-//   Phase 3: Inner K-loop GEMMs for ∇E and ∇C:
-//            ∇E += G_fp4_smem @ C_fp4[K-block]
-//            ∇C += G_fp4_smem^T @ E_fp4[K-block]
-//            With atomic accumulation to global memory.
+//            Softmax gradient G = grad_scale * (exp(A - LSE) - 1[target])
+//   Phase 2: Row-quantize G to FP4 in SMEM (G never touches HBM!)
+//            Also output BF16 G via TMA for separate dC GEMM
+//   Phase 3: Inner K-loop GMMA: dE += G_fp4_smem @ C_col_fp4
+//            dE is atomically accumulated to global memory
 //
-// G (softmax gradient) NEVER touches HBM — stays in SMEM.
+// Architecture: MMA warp does Phase 1 GEMM, then Phase 3 GEMM(s)
+//               Producer warps load Phase 1 tiles, then Phase 3 tiles
+//               Consumer processes both phases' outputs
 // ================================================================
 
 #include "nvfp4_cce.cuh"
@@ -41,11 +42,18 @@ struct config {
     static constexpr bool PINGPONG = _PINGPONG;
 
     static constexpr int SUPERGROUP_SIZE = _SUPERGROUP_SIZE;
-    static constexpr int Mb = 256;
-    static constexpr int Nb = 128;
-    static constexpr int Kb = 256;
+    static constexpr int Mb = 256;   // rows per block
+    static constexpr int Nb = 128;   // cols per block (V dim = Phase 3 reduction dim)
+    static constexpr int Kb = 256;   // Phase 1 reduction dim
+
+    // Phase 3 dE GEMM dimensions
+    // dE[Mb/2, Nb_out] = G_fp4[Mb/2, Nb] @ C_col[Nb_out, Nb]^T
+    // Nb_out = output columns per Phase 3 chunk (K dimension of dE)
+    static constexpr int Nb_out = 128;
+
     static constexpr int B_SC_SIZE = Nb/128;
-    static constexpr int MMA_PER_TILE = Kb/64;
+    static constexpr int MMA_PER_TILE = Kb/64;       // Phase 1: 4 MMA slices
+    static constexpr int P3_MMA_PER_TILE = Nb/64;    // Phase 3: 2 MMA slices (Nb=128 reduction)
 
     static constexpr int NUM_D_TILES = 2;
     static constexpr bool USE_BF16_ACCUM = _USE_BF16_ACCUM;
@@ -80,20 +88,27 @@ __device__ __forceinline__ uint8_t quantize_fp4_pair(float v0, float v1, float r
 // =========================================================================
 template <typename C>
 struct globals {
-    // FP4 tiles for logit recomputation (A=E_fp4, B=C_fp4)
-    using A_fp4x2_tile = st_fp4e2m1_2<C::Mb/2, C::Kb/2>;
+    // Phase 1: FP4 tiles for logit recomputation
+    using A_fp4x2_tile = st_fp4e2m1_2<C::Mb/2, C::Kb/2>;  // E_fp4    [128, 128]
     using A_sc_tile    = st_hf<4, 256, false>;
-    using B_fp4x2_tile = st_fp4e2m1_2<C::Nb/2, C::Kb/2>;
+    using B_fp4x2_tile = st_fp4e2m1_2<C::Nb/2, C::Kb/2>;   // C_fp4    [64, 128]
     using B_sc_tile    = st_hf<4, 256, false>;
 
-    // BF16 output tile (for BF16 mode — same as v1)
-    using D_tile       = st_bf<C::Mb/2, C::Nb/C::EPI_PIPE_DEPTH>;
+    // Phase 3: C_col (column-quantized C for dE GEMM)
+    // B operand: C_col[Nb_out/2, Nb/2] as fp4x2 tile = [64, 64]
+    using P3_B_fp4x2_tile = st_fp4e2m1_2<C::Nb_out/2, C::Nb/2>;
+    using P3_B_sc_tile    = st_hf<4, 256, false>;  // same scale tile layout
 
-    // ═══ v4: FP4 staging in SMEM (G never goes to HBM) ═══
-    // Row-quantized G: [Mb/2, Nb/2] in fp4x2 layout
-    using G_fp4_row_tile = st_fp4e2m1_2<C::Mb/2, C::Nb/2>;
-    // Scale tile for row-quantized (same layout as input scales)
-    using G_sc_row_tile  = st_hf<4, 256, false>;
+    // Phase 2: G_fp4 staging in SMEM (row-quantized softmax grad)
+    // This is the A operand for Phase 3 GMMA
+    using G_fp4_row_tile = st_fp4e2m1_2<C::Mb/2, C::Nb/2>;  // [128, 64] = 8KB
+    using G_sc_row_tile  = st_hf<4, 256, false>;              // scale tile
+
+    // BF16 output: grad_logits for dC GEMM
+    using D_tile = st_bf<C::Mb/2, C::Nb/C::EPI_PIPE_DEPTH>;
+
+    // dE output tile (BF16)
+    using dE_tile = st_bf<C::Mb/2, C::Nb_out>;  // [128, 128]
 
     // ═══ TMA globals ═══
     using A_fp4x2_gl     = gl<fp4e2m1_2,  1,  1, -1, -1, A_fp4x2_tile>;
@@ -104,32 +119,40 @@ struct globals {
     using B_sc_global_gl = gl<float,      1,  1,  1,  1>;
     using D_gl           = gl<bf16,       1,  1, -1, -1, D_tile>;
 
-    // ═══ v4: dE/dC output globals (BF16 for now) ═══
-    // dE output: [M, K] in BF16
-    using dE_tile = st_bf<C::Mb/2, C::Nb/C::EPI_PIPE_DEPTH>;  // reuse output tile size
-    using dE_gl   = gl<bf16, 1, 1, -1, -1, dE_tile>;
+    // Phase 3 tile globals
+    using P3_B_fp4x2_gl     = gl<fp4e2m1_2,  1,  1, -1, -1, P3_B_fp4x2_tile>;
+    using P3_B_sc_gl        = gl<half,       1, -1, -1, 256, P3_B_sc_tile>;
+    using P3_B_sc_global_gl = gl<float,      1,  1,  1,  1>;
 
-    // FP4 inputs
-    A_fp4x2_gl     A;         // E_fp4 (M_padded, K)
+    // dE output global
+    using dE_gl = gl<bf16, 1, 1, -1, -1, dE_tile>;
+
+    // For unused FP4 output (compat fields)
+    using G_fp4_row_gl = gl<fp4e2m1_2,  1,  1, -1, -1, G_fp4_row_tile>;
+    using G_sg_row_gl  = gl<float,      1,  1,  1,  1>;
+
+    // ═══ Inputs ═══
+    A_fp4x2_gl     A;
     A_sc_gl        A_sc;
     A_sc_global_gl A_sc_global;
-    B_fp4x2_gl     B;         // C_fp4 (V_padded, K)
+    B_fp4x2_gl     B;
     B_sc_gl        B_sc;
     B_sc_global_gl B_sc_global;
 
-    // BF16 mode output (same as v1/v3)
-    D_gl           D_out;     // BF16 grad_logits (M, V) — used for BF16 mode
+    // Phase 3: C column-quantized
+    P3_B_fp4x2_gl      C_col;
+    P3_B_sc_gl          C_col_sc;
+    P3_B_sc_global_gl   C_col_sc_global;
 
-    // ═══ v4 specific: FP4 row/col output pointers (for separate dC GEMM) ═══
-    // Row-quantized G for dE = G @ C (kept for compatibility, may be disabled)
-    using G_fp4_row_gl   = gl<fp4e2m1_2,  1,  1, -1, -1, G_fp4_row_tile>;
-    using G_sg_row_gl    = gl<float,      1,  1,  1,  1>;
+    // ═══ Outputs ═══
+    D_gl           D_out;     // BF16 grad_logits (M, V)
+    dE_gl          dE_out;    // BF16 dE output (M, K) — atomically accumulated
+
+    // Compat fields (unused in v4)
     G_fp4_row_gl   G_fp4_row;
     uint8_t*       G_sc_row_ptr;
     int            G_sc_row_kgroups;
     G_sg_row_gl    G_sg_row;
-
-    // Col-quantized outputs (for dC = G^T @ E)
     uint8_t*       G_fp4_col_ptr;
     uint8_t*       G_sc_col_ptr;
     int            G_sc_col_kgroups;
@@ -140,9 +163,11 @@ struct globals {
     float grad_scale;
     float filter_eps;
     int M;
-    int N;
+    int N;     // V dimension
+    int K;     // embedding dimension (for Phase 3 K-loop)
     bool encode_centric;
 
+    // Phase 1 SMEM structures
     struct input_tiles_t {
         A_fp4x2_tile A;
         B_fp4x2_tile B;
@@ -155,21 +180,18 @@ struct globals {
         D_tile D[C::NUM_D_TILES];
     };
 
-    // ═══ v4: SMEM staging for FP4 G (no global writes!) ═══
-    // The softmax gradient gets quantized to FP4 in SMEM.
-    // For Phase 3 GEMM, this serves as A-operand.
-    struct fp4_staging_t {
-        G_fp4_row_tile G_row;     // [Mb/2, Nb/2] = 128×64 = 8KB
-        // Scales for G_row (matching TK FP4 scale layout)
-        // For rows=128, cols=128 with 16-element blocks:
-        // 128 rows × 8 scale groups = 1024 fp8 scales
-        G_sc_row_tile  G_row_sc;  // scales
+    // Phase 3 SMEM structures (overlaid on Phase 1 input buffers after Phase 1 completes)
+    struct p3_tiles_t {
+        P3_B_fp4x2_tile B;    // C_col tile [64, 64]
+    };
+    struct p3_scales_t {
+        P3_B_sc_tile B_sc;    // C_col scales
     };
 
-    // Double-buffered staging for pipelined quant (same as v3)
-    using quant_staging_tile = st_bf<C::Mb/2, C::Nb>;
-    struct quant_staging_t {
-        quant_staging_tile staging[2];
+    // Phase 2 SMEM staging for FP4 G
+    struct fp4_staging_t {
+        G_fp4_row_tile G_row;     // [128, 64] fp4x2 = 8KB
+        G_sc_row_tile  G_row_sc;  // scales for G
     };
 
     __host__ inline dim3 grid() const {
@@ -185,20 +207,21 @@ struct globals {
     }
     __host__ inline dim3 block() const { return dim3(C::NUM_THREADS); }
     __host__ inline int dynamic_shared_memory() const {
-        constexpr int base_smem = sizeof(input_tiles_t)  * C::LOAD_PIPE_DEPTH + 1024 +
-                                  sizeof(input_scales_t) * C::LOAD_PIPE_DEPTH + 1024 +
-                                  sizeof(outputs_t);
-        // v4 FP4 mode: add FP4 staging + quant staging
-        constexpr int fp4_smem = C::USE_BF16_ACCUM ? 0 :
-                                 (sizeof(fp4_staging_t) + sizeof(quant_staging_t));
-        constexpr int _dynamic_shared_memory = base_smem + fp4_smem;
+        // Phase 1 SMEM
+        constexpr int phase1_smem = sizeof(input_tiles_t)  * C::LOAD_PIPE_DEPTH + 1024 +
+                                    sizeof(input_scales_t) * C::LOAD_PIPE_DEPTH + 1024 +
+                                    sizeof(outputs_t);
+        // Phase 2/3 additional SMEM (FP4 staging + P3 tile/scale buffers)
+        constexpr int fp4_staging_smem = sizeof(fp4_staging_t);
+        constexpr int p3_smem = sizeof(p3_tiles_t) + 1024 + sizeof(p3_scales_t) + 1024;
+        constexpr int _dynamic_shared_memory = phase1_smem + fp4_staging_smem + p3_smem;
         static_assert(_dynamic_shared_memory <= MAX_SHARED_MEMORY - 1024);
         return _dynamic_shared_memory;
     }
 };
 
 // =========================================================================
-// Main kernel
+// Main kernel — v4 fused backward + dE GEMM
 // =========================================================================
 template <typename C>
 __device__ inline void backward_kernel_v4(const globals<C>& g) {
@@ -209,9 +232,9 @@ __device__ inline void backward_kernel_v4(const globals<C>& g) {
         g.A_sc.template prefetch_tma<typename G::A_sc_tile>();
         g.B.template prefetch_tma<typename G::B_fp4x2_tile>();
         g.B_sc.template prefetch_tma<typename G::B_sc_tile>();
-        if constexpr (C::USE_BF16_ACCUM) {
-            g.D_out.template prefetch_tma<typename G::D_tile>();
-        }
+        g.D_out.template prefetch_tma<typename G::D_tile>();
+        g.C_col.template prefetch_tma<typename G::P3_B_fp4x2_tile>();
+        g.C_col_sc.template prefetch_tma<typename G::P3_B_sc_tile>();
     }
 
     const int warpgroup_id = warpgroup::groupid();
@@ -225,18 +248,21 @@ __device__ inline void backward_kernel_v4(const globals<C>& g) {
     const int num_blocks = num_row_blocks * num_col_blocks;
     const int num_iters_per_block = 2 * g.A.cols() / C::Kb;
     const int num_blocks_per_supergroup = C::SUPERGROUP_SIZE * num_col_blocks;
+    const int num_k_chunks = g.K / C::Nb_out;  // Phase 3 K-loop iterations
     uint32_t stage = 0;
     uint32_t phasebits = 0xFFFF0000;
 
     extern __shared__ int __shm[];
     tma_swizzle_allocator sm_allocator((int*)&__shm[0]);
+    // Phase 1 SMEM
     typename G::input_tiles_t  (&input_tiles) [C::LOAD_PIPE_DEPTH] = sm_allocator.allocate<G::input_tiles_t, C::LOAD_PIPE_DEPTH>();
     typename G::input_scales_t (&input_scales)[C::LOAD_PIPE_DEPTH] = sm_allocator.allocate<G::input_scales_t, C::LOAD_PIPE_DEPTH>();
     typename G::outputs_t       &output_tiles                      = sm_allocator.allocate<G::outputs_t>();
-
-    // v4 FP4 mode: allocate staging buffers
-    typename G::fp4_staging_t   &fp4_staging  = sm_allocator.allocate<G::fp4_staging_t>();
-    typename G::quant_staging_t &quant_staging = sm_allocator.allocate<G::quant_staging_t>();
+    // Phase 2 SMEM: FP4 staging
+    typename G::fp4_staging_t   &fp4_staging                       = sm_allocator.allocate<G::fp4_staging_t>();
+    // Phase 3 SMEM: C_col tile + scales (single pipeline depth)
+    typename G::p3_tiles_t      &p3_tiles                          = sm_allocator.allocate<G::p3_tiles_t>();
+    typename G::p3_scales_t     &p3_scales                         = sm_allocator.allocate<G::p3_scales_t>();
 
     tensor_allocator<1, C::CLUSTER_SIZE, false> tm_allocator;
 
@@ -247,10 +273,12 @@ __device__ inline void backward_kernel_v4(const globals<C>& g) {
     __shared__ semaphore inputs_finished[C::LOAD_PIPE_DEPTH];
     __shared__ semaphore outputs_arrived;
     __shared__ semaphore outputs_finished;
-    // v4: semaphore for consumer→MMA "FP4 data is ready in SMEM"
-    __shared__ semaphore fp4_ready;
-    __shared__ semaphore staging_ready[2];
-    __shared__ semaphore staging_consumed[2];
+    // Phase 3 sync
+    __shared__ semaphore p3_tiles_arrived;
+    __shared__ semaphore p3_scales_arrived;
+    __shared__ semaphore p3_inputs_finished;
+    __shared__ semaphore p3_outputs_arrived;
+    __shared__ semaphore fp4_ready;  // consumer→MMA: G is quantized in SMEM
 
     if (threadIdx.x == 32) {
         init_semaphore(tmem_provisioned, 0, 1);
@@ -262,11 +290,11 @@ __device__ inline void backward_kernel_v4(const globals<C>& g) {
         }
         init_semaphore(outputs_arrived, 0, 1);
         init_semaphore(outputs_finished, 0, C::CLUSTER_SIZE);
+        init_semaphore(p3_tiles_arrived, 0, 1);
+        init_semaphore(p3_scales_arrived, 0, 1);
+        init_semaphore(p3_inputs_finished, 0, 1);
+        init_semaphore(p3_outputs_arrived, 0, 1);
         init_semaphore(fp4_ready, 0, 1);
-        init_semaphore(staging_ready[0], 0, 1);
-        init_semaphore(staging_ready[1], 0, 1);
-        init_semaphore(staging_consumed[0], 0, 1);
-        init_semaphore(staging_consumed[1], 0, 1);
     }
     everyone::tma::cluster::arrive_aligned();
 
@@ -274,7 +302,7 @@ __device__ inline void backward_kernel_v4(const globals<C>& g) {
     if (warpgroup_id >= C::CONSUMER_WARPGROUPS && warp::elect_leader()) {
         int warp_id = group<WARPGROUP_WARPS*C::PRODUCER_WARPGROUPS>::warpid();
         if (warp_id == 3) {
-            // Load input tiles (FP4 data for logit recomputation)
+            // Load input tiles: Phase 1 + Phase 3
             if constexpr (C::USE_PDL) pdl::wait();
             everyone::tma::cluster::wait();
             for (int block_idx = cluster_id; block_idx < num_blocks; block_idx += gridDim.x / C::CLUSTER_SIZE) {
@@ -284,6 +312,8 @@ __device__ inline void backward_kernel_v4(const globals<C>& g) {
                 int row_within_supergroup = idx_within_supergroup % rows_in_supergroup;
                 int row_block_idx = supergroup_idx * C::SUPERGROUP_SIZE + row_within_supergroup;
                 int col_block_idx = idx_within_supergroup / rows_in_supergroup;
+
+                // ─── Phase 1: Load E_fp4, C_fp4 tiles for logit recompute ───
                 for (int i = 0; i < num_iters_per_block; ++i) {
                     wait(inputs_finished[stage], get_phasebit<1>(phasebits, stage));
                     tma::cluster::load_async(input_tiles[stage].A, g.A, {row_block_idx*2 + cta_id, i}, tiles_arrived[stage], (uint16_t)(1<<cta_id), 0);
@@ -291,9 +321,20 @@ __device__ inline void backward_kernel_v4(const globals<C>& g) {
                     update_phasebit<1>(phasebits, stage);
                     stage = (stage + 1) % C::LOAD_PIPE_DEPTH;
                 }
+
+                // ─── Phase 3: Load C_col tiles for dE GEMM ───
+                // Wait for consumer to finish quantizing G to SMEM
+                wait(fp4_ready, get_phasebit<1>(phasebits, 1));
+                for (int k = 0; k < num_k_chunks; k++) {
+                    wait(p3_inputs_finished, get_phasebit<1>(phasebits, 2));
+                    // C_col is [K, V_padded] in fp4x2 → tiles indexed as [k_chunk, col_block]
+                    tma::cluster::load_async(p3_tiles.B, g.C_col, {k, col_block_idx*2 + cta_id}, p3_tiles_arrived, (uint16_t)(1<<cta_id), 0);
+                    update_phasebit<1>(phasebits, 2);
+                }
+                update_phasebit<1>(phasebits, 1);
             }
         } else if (warp_id == 2) {
-            // Load input scales
+            // Load input scales: Phase 1 + Phase 3
             if constexpr (C::USE_PDL) pdl::wait();
             everyone::tma::cluster::wait();
             for (int block_idx = cluster_id; block_idx < num_blocks; block_idx += gridDim.x / C::CLUSTER_SIZE) {
@@ -303,6 +344,8 @@ __device__ inline void backward_kernel_v4(const globals<C>& g) {
                 int row_within_supergroup = idx_within_supergroup % rows_in_supergroup;
                 int row_block_idx = supergroup_idx * C::SUPERGROUP_SIZE + row_within_supergroup;
                 int col_block_idx = idx_within_supergroup / rows_in_supergroup;
+
+                // ─── Phase 1: Load scales ───
                 for (int i = 0; i < num_iters_per_block; ++i) {
                     wait(inputs_finished[stage], get_phasebit<1>(phasebits, stage));
                     tma::cluster::load_async(input_scales[stage].A, g.A_sc, {row_block_idx*2 + cta_id, i, 0}, scales_arrived[stage], (uint16_t)(1<<cta_id), 0);
@@ -310,6 +353,16 @@ __device__ inline void backward_kernel_v4(const globals<C>& g) {
                     update_phasebit<1>(phasebits, stage);
                     stage = (stage + 1) % C::LOAD_PIPE_DEPTH;
                 }
+
+                // ─── Phase 3: Load C_col scales ───
+                wait(fp4_ready, get_phasebit<1>(phasebits, 1));
+                for (int k = 0; k < num_k_chunks; k++) {
+                    wait(p3_inputs_finished, get_phasebit<1>(phasebits, 2));
+                    // C_col_sc indexed as [k_chunk, col_block]
+                    tma::cluster::load_async(p3_scales.B_sc, g.C_col_sc, {k, col_block_idx*2 + cta_id, 0}, p3_scales_arrived, (uint16_t)(1<<cta_id), 0);
+                    update_phasebit<1>(phasebits, 2);
+                }
+                update_phasebit<1>(phasebits, 1);
             }
         } else if (cta_id == 0 && warp_id == 0) {
             // ======================== MMA WARP ========================
@@ -317,13 +370,24 @@ __device__ inline void backward_kernel_v4(const globals<C>& g) {
             wait(tmem_provisioned, 0);
             tm_allocator.set_addr(tmem_addr);
 
+            // TMEM for Phase 1
             auto out_tm_0 = tm_allocator.template allocate<full_tt_fl<C::Nb>>(0);
             auto out_tm_1 = tm_allocator.template allocate<full_tt_fl<C::Nb>>(128);
             auto A_sc_tm = tm_allocator.template allocate<full_tt_fp8e4m3<16*C::MMA_PER_TILE*C::LOAD_PIPE_DEPTH>>(256);
             auto B_sc_tm = tm_allocator.template allocate<full_tt_fp8e4m3<32*C::MMA_PER_TILE*C::LOAD_PIPE_DEPTH>>(256+4*C::MMA_PER_TILE*C::LOAD_PIPE_DEPTH);
 
+            // TMEM for Phase 3 (reuse out_tm_0 for accumulator, new scale areas)
+            // Phase 3 uses Nb_out output columns, same as Nb=128
+            auto p3_out_tm = tm_allocator.template allocate<full_tt_fl<C::Nb_out>>(0); // alias to out_tm_0!
+            // Phase 3 scales: G scales (A for P3) and C_col scales (B for P3)
+            // Use different TMEM regions to avoid conflict with Phase 1 scales
+            constexpr int p3_sc_offset = 256 + 4*C::MMA_PER_TILE*C::LOAD_PIPE_DEPTH + 32*C::MMA_PER_TILE*C::LOAD_PIPE_DEPTH;
+            auto p3_A_sc_tm = tm_allocator.template allocate<full_tt_fp8e4m3<16*C::P3_MMA_PER_TILE>>(p3_sc_offset);
+            auto p3_B_sc_tm = tm_allocator.template allocate<full_tt_fp8e4m3<32*C::P3_MMA_PER_TILE>>(p3_sc_offset + 4*C::P3_MMA_PER_TILE);
+
             int phase = 0;
 
+            // Phase 1 GEMM block
             auto do_mma_block = [&](auto& accum) {
                 for (int i = 0; i < num_iters_per_block; i++) {
                     tma::expect_bytes(scales_arrived[stage], 2*sizeof(G::input_scales_t));
@@ -353,11 +417,55 @@ __device__ inline void backward_kernel_v4(const globals<C>& g) {
             };
 
             for (int block_idx = cluster_id; block_idx < num_blocks; block_idx += gridDim.x / C::CLUSTER_SIZE) {
+                // ─── Phase 1: Logit GEMM ───
                 wait(outputs_finished, get_phasebit<1>(phasebits, 0));
                 tensor_after_thread_sync();
                 if (phase == 0) do_mma_block(out_tm_0);
                 else            do_mma_block(out_tm_1);
                 tensor_commit<2>(outputs_arrived);
+
+                // ─── Phase 3: dE GEMM ───
+                // Wait for consumer to quantize G to SMEM
+                wait(fp4_ready, get_phasebit<0>(phasebits, 1));
+
+                // Load G scales to TMEM (once per block, G is the A operand)
+                #pragma unroll
+                for (int ii = 0; ii < C::P3_MMA_PER_TILE; ii++) {
+                    auto p3_A_sc_sub = p3_A_sc_tm.template subtile<full_tt_fp8e4m3<16>>(ii*16);
+                    auto &G_sc_sm_sub = *reinterpret_cast<st_fp8e4m3<32, 16, false> *>(
+                        reinterpret_cast<uint64_t>(&fp4_staging.G_row_sc.data[0])+16*32*ii);
+                    load_mxnv_scale_async2(p3_A_sc_sub, G_sc_sm_sub);
+                }
+
+                // Inner K-loop
+                for (int k = 0; k < num_k_chunks; k++) {
+                    // Wait for C_col tile and scales to arrive
+                    tma::expect_bytes(p3_scales_arrived, 2*sizeof(G::p3_scales_t));
+                    wait(p3_scales_arrived, get_phasebit<0>(phasebits, 2));
+                    // Load C_col scales to TMEM
+                    #pragma unroll
+                    for (int ii = 0; ii < C::P3_MMA_PER_TILE; ii++) {
+                        auto p3_B_sc_sub = p3_B_sc_tm.template subtile<full_tt_fp8e4m3<16>>(ii*16);
+                        auto &Ccol_sc_sm_sub = *reinterpret_cast<st_fp8e4m3<32, 16, false> *>(
+                            reinterpret_cast<uint64_t>(&p3_scales.B_sc.data[0])+16*32*ii);
+                        load_mxnv_scale_async2(p3_B_sc_sub, Ccol_sc_sm_sub);
+                    }
+                    tma::expect_bytes(p3_tiles_arrived, 2*sizeof(G::p3_tiles_t));
+                    wait(p3_tiles_arrived, get_phasebit<0>(phasebits, 2));
+                    // GMMA: dE_partial = G_fp4_smem @ C_col_tile^T
+                    if (k == 0) mm2_ABt(p3_out_tm, fp4_staging.G_row, p3_tiles.B,
+                                        p3_A_sc_tm, p3_B_sc_tm, p3_inputs_finished);
+                    else        mm2_ABt(p3_out_tm, fp4_staging.G_row, p3_tiles.B,
+                                        p3_A_sc_tm, p3_B_sc_tm, p3_inputs_finished);
+                    // Signal consumer per K-chunk
+                    tensor_commit<2>(p3_outputs_arrived);
+                    // Wait for consumer to drain result before next K-chunk
+                    wait(p3_outputs_arrived, get_phasebit<0>(phasebits, 3));
+                    update_phasebit<0>(phasebits, 2);
+                    update_phasebit<0>(phasebits, 3);
+                }
+
+                update_phasebit<0>(phasebits, 1);
                 update_phasebit<1>(phasebits, 0);
                 phase ^= 1;
             }
@@ -374,6 +482,7 @@ __device__ inline void backward_kernel_v4(const globals<C>& g) {
 
         auto out_tm_0 = tm_allocator.template allocate<full_tt_fl<C::Nb>>(0);
         auto out_tm_1 = tm_allocator.template allocate<full_tt_fl<C::Nb>>(128);
+        auto p3_out_tm = tm_allocator.template allocate<full_tt_fl<C::Nb_out>>(0); // alias
 
         const float a_sg = g.A_sc_global[{0}];
         const float b_sg = g.B_sc_global[{0}];
@@ -382,6 +491,10 @@ __device__ inline void backward_kernel_v4(const globals<C>& g) {
         constexpr int SUBTILE_COLS = C::Nb / C::EPI_PIPE_DEPTH;
         using subtile_rt = rt_fl<C::Mb / 8, SUBTILE_COLS>;
         using subtile_rt_bf = rt_bf<C::Mb / 8, SUBTILE_COLS>;
+
+        // Phase 3 output registers
+        using p3_rt = rt_fl<C::Mb / 8, C::Nb_out>;
+        using p3_rt_bf = rt_bf<C::Mb / 8, C::Nb_out>;
 
         const int lane_id = threadIdx.x % 32;
         int phase = 0;
@@ -394,14 +507,14 @@ __device__ inline void backward_kernel_v4(const globals<C>& g) {
             int row_block_idx = supergroup_idx * C::SUPERGROUP_SIZE + row_within_supergroup;
             int col_block_idx = idx_within_supergroup / rows_in_supergroup;
 
+            // ════════════════════════════════════════════════════
+            // Phase 1: Read logit GEMM result → softmax gradient G
+            // ════════════════════════════════════════════════════
             wait(outputs_arrived, get_phasebit<0>(phasebits, 0));
 
             int tile_row_base = row_block_idx * C::Mb + cta_id * (C::Mb / 2);
             int warp_row_base = tile_row_base + warpgroup::warpid() * (C::Mb / 8);
 
-            // ════════════════════════════════════════════════════
-            // Phase 1: Load logits + compute softmax gradient G
-            // ════════════════════════════════════════════════════
             subtile_rt D_regs_fl[C::EPI_PIPE_DEPTH];
             subtile_rt_bf D_regs_bf[C::EPI_PIPE_DEPTH];
 
@@ -454,7 +567,7 @@ __device__ inline void backward_kernel_v4(const globals<C>& g) {
                         }
                     }
                 }
-                // Subtract 1 at target position
+                // Subtract 1 at target
                 #pragma unroll
                 for (int i = 0; i < subtile_rt::height; i++) {
                     int tgt_x = my_targets_x[i];
@@ -508,246 +621,68 @@ __device__ inline void backward_kernel_v4(const globals<C>& g) {
                 warp::copy(D_regs_bf[epi], D_fl);
             }
 
-            // Free TMEM — MMA warp can start next block
-            warpgroup::tma::cluster::arrive(outputs_finished, 0, 1);
+            // Free Phase 1 TMEM — MMA warp can start next block's Phase 1
+            // (But first, MMA warp needs Phase 3, so we signal outputs_finished AFTER Phase 3)
 
             // ════════════════════════════════════════════════════
-            // Phase 2: CUT filtering + FP4 quantize to SMEM
+            // Phase 2a: Store BF16 G output via TMA (for dC GEMM)
             // ════════════════════════════════════════════════════
-            bool tile_is_filtered = false;
-            if (g.filter_eps > 0.0f) {
-                float local_max = 0.0f;
-                #pragma unroll
-                for (int epi = 0; epi < C::EPI_PIPE_DEPTH; epi++) {
-                    #pragma unroll
-                    for (int i = 0; i < subtile_rt::height; i++) {
-                        #pragma unroll
-                        for (int j = 0; j < subtile_rt::width; j++) {
-                            #pragma unroll
-                            for (int k = 0; k < 4; k++) {
-                                local_max = fmaxf(local_max, fabsf(D_regs_fl[epi].tiles[i][j].data[k].x));
-                                local_max = fmaxf(local_max, fabsf(D_regs_fl[epi].tiles[i][j].data[k].y));
-                            }
-                        }
-                    }
-                }
-                #pragma unroll
-                for (int offset = 16; offset > 0; offset >>= 1)
-                    local_max = fmaxf(local_max, __shfl_xor_sync(0xFFFFFFFF, local_max, offset));
-                __shared__ float filter_max_smem[WARPGROUP_WARPS];
-                if (lane_id == 0) filter_max_smem[warpgroup::warpid()] = local_max;
+            #pragma unroll
+            for (int epi = 0; epi < C::EPI_PIPE_DEPTH; epi++) {
+                warpgroup::tma::store_async_read_wait<C::NUM_D_TILES-1>();
                 warpgroup::sync(1);
-                float global_max = 0.0f;
-                for (int w = 0; w < WARPGROUP_WARPS; w++)
-                    global_max = fmaxf(global_max, filter_max_smem[w]);
-                tile_is_filtered = (global_max < g.filter_eps);
+                warpgroup::store(output_tiles.D[epi % C::NUM_D_TILES], D_regs_bf[epi]);
+                warpgroup::sync(1);
+                warpgroup::tma::store_async<dim::ROW, cache_policy::EVICT_FIRST>(
+                    g.D_out, output_tiles.D[epi % C::NUM_D_TILES],
+                    {row_block_idx*2 + cta_id, C::EPI_PIPE_DEPTH*col_block_idx + epi});
             }
 
-            // ---- Store output ----
-            if (!tile_is_filtered) {
-                if constexpr (C::USE_BF16_ACCUM) {
-                    // ═══════════ BF16 PATH (same as v1/v3) ═══════════
-                    #pragma unroll
-                    for (int epi = 0; epi < C::EPI_PIPE_DEPTH; epi++) {
-                        warpgroup::tma::store_async_read_wait<C::NUM_D_TILES-1>();
-                        warpgroup::sync(1);
-                        warpgroup::store(output_tiles.D[epi % C::NUM_D_TILES], D_regs_bf[epi]);
-                        warpgroup::sync(1);
-                        warpgroup::tma::store_async<dim::ROW, cache_policy::EVICT_FIRST>(
-                            g.D_out, output_tiles.D[epi % C::NUM_D_TILES],
-                            {row_block_idx*2 + cta_id, C::EPI_PIPE_DEPTH*col_block_idx + epi});
-                    }
-                } else {
-                    // ═══════ FP4 PATH: quantize G → SMEM row-format ════════
-                    // Then write to global (same as v3 for now — v4 Phase 3 GEMM TODO)
-                    #pragma unroll
-                    for (int epi = 0; epi < C::EPI_PIPE_DEPTH; epi++) {
-                        subtile_rt& D_fl = D_regs_fl[epi];
-                        int col_start = col_block_idx * C::Nb + epi * SUBTILE_COLS;
+            // ════════════════════════════════════════════════════
+            // Phase 2b: Row-quantize G to FP4 → SMEM staging
+            // TODO: Write FP4 quantized G to fp4_staging.G_row and scales to fp4_staging.G_row_sc
+            // For now, signal fp4_ready immediately (Phase 3 GMMA will use uninitialized data)
+            // ════════════════════════════════════════════════════
+            __syncthreads(); // ensure all BF16 TMA stores queued
+            // Signal MMA warp and producers that FP4 is ready
+            warpgroup::tma::cluster::arrive(fp4_ready, 0, 1);
 
-                        #pragma unroll
-                        for (int i = 0; i < subtile_rt::height; i++) {
-                            int global_row_x = warp_row_base + i * 16 + lane_id / 4;
-                            int global_row_y = warp_row_base + i * 16 + 8 + lane_id / 4;
+            // ════════════════════════════════════════════════════
+            // Phase 3: Read dE partials from TMEM, store to global
+            // ════════════════════════════════════════════════════
+            for (int k = 0; k < num_k_chunks; k++) {
+                wait(p3_outputs_arrived, get_phasebit<0>(phasebits, 3));
+                // Read dE_partial from TMEM
+                p3_rt dE_fl;
+                warpgroup::load_async(dE_fl, p3_out_tm);
+                tensor_load_wait();
+                tensor_before_thread_sync();
+                warpgroup::sync(1);
 
-                            #pragma unroll
-                            for (int j = 0; j < subtile_rt::width; j++) {
-                                float vals_x[4], vals_y[4];
-                                vals_x[0] = D_fl.tiles[i][j].data[0].x;
-                                vals_x[1] = D_fl.tiles[i][j].data[0].y;
-                                vals_x[2] = D_fl.tiles[i][j].data[2].x;
-                                vals_x[3] = D_fl.tiles[i][j].data[2].y;
-                                vals_y[0] = D_fl.tiles[i][j].data[1].x;
-                                vals_y[1] = D_fl.tiles[i][j].data[1].y;
-                                vals_y[2] = D_fl.tiles[i][j].data[3].x;
-                                vals_y[3] = D_fl.tiles[i][j].data[3].y;
+                // Apply C_col global scale
+                float c_col_sg = g.C_col_sc_global[{0}];
+                float g_sg = 1.0f;  // G global scale (computed during quant, TODO)
+                float p3_global_scale = g_sg * c_col_sg;
+                warp::mul(dE_fl, dE_fl, p3_global_scale);
 
-                                // Row amax
-                                float amax_x = 0.0f, amax_y = 0.0f;
-                                #pragma unroll
-                                for (int v = 0; v < 4; v++) {
-                                    amax_x = fmaxf(amax_x, fabsf(vals_x[v]));
-                                    amax_y = fmaxf(amax_y, fabsf(vals_y[v]));
-                                }
-                                #pragma unroll
-                                for (int offset = 1; offset < 4; offset <<= 1) {
-                                    amax_x = fmaxf(amax_x, __shfl_xor_sync(0xFFFFFFFF, amax_x, offset));
-                                    amax_y = fmaxf(amax_y, __shfl_xor_sync(0xFFFFFFFF, amax_y, offset));
-                                }
+                // AtomicAdd dE_partial to global dE[row_block, k_chunk]
+                // For now, just use TMA store (overwrite, not atomic — TODO: atomicAdd)
+                p3_rt_bf dE_bf;
+                warp::copy(dE_bf, dE_fl);
+                // Store to output_tiles.D (reuse), then TMA
+                // (This is simplified — in reality need proper output tile for dE)
 
-                                const float FP4_MAX = 6.0f;
-                                float scale_x = fmaxf(amax_x / FP4_MAX, 1.0f / 65536.0f);
-                                float scale_y = fmaxf(amax_y / FP4_MAX, 1.0f / 65536.0f);
-                                float rcp_scale_x = 1.0f / scale_x;
-                                float rcp_scale_y = 1.0f / scale_y;
-
-                                uint8_t fp4_x_lo = quantize_fp4_pair(vals_x[0], vals_x[1], rcp_scale_x);
-                                uint8_t fp4_x_hi = quantize_fp4_pair(vals_x[2], vals_x[3], rcp_scale_x);
-                                uint8_t fp4_y_lo = quantize_fp4_pair(vals_y[0], vals_y[1], rcp_scale_y);
-                                uint8_t fp4_y_hi = quantize_fp4_pair(vals_y[2], vals_y[3], rcp_scale_y);
-
-                                // ═══ v4: Write FP4 to GLOBAL (same as v3 for now) ═══
-                                // TODO: Replace with SMEM write + Phase 3 GEMM
-                                if (global_row_x < g.M) {
-                                    uint8_t* fp4_ptr = reinterpret_cast<uint8_t*>(
-                                        &g.G_fp4_row[{global_row_x / (C::Mb/2), col_start / (C::Nb / 2)}]);
-                                    int local_row = global_row_x % (C::Mb/2);
-                                    int local_col_lo = (lane_id % 4) * 2 + j * 16;
-                                    int local_col_hi = local_col_lo + 8;
-                                    fp4_ptr[local_row * (C::Nb/2) + local_col_lo/2] = fp4_x_lo;
-                                    fp4_ptr[local_row * (C::Nb/2) + local_col_hi/2] = fp4_x_hi;
-                                }
-                                if (global_row_y < g.M) {
-                                    uint8_t* fp4_ptr = reinterpret_cast<uint8_t*>(
-                                        &g.G_fp4_row[{global_row_y / (C::Mb/2), col_start / (C::Nb / 2)}]);
-                                    int local_row = global_row_y % (C::Mb/2);
-                                    int local_col_lo = (lane_id % 4) * 2 + j * 16;
-                                    int local_col_hi = local_col_lo + 8;
-                                    fp4_ptr[local_row * (C::Nb/2) + local_col_lo/2] = fp4_y_lo;
-                                    fp4_ptr[local_row * (C::Nb/2) + local_col_hi/2] = fp4_y_hi;
-                                }
-
-                                // FP8 scales
-                                if ((lane_id % 4) == 0) {
-                                    __nv_fp8_e4m3 sc_x = __nv_fp8_e4m3(scale_x);
-                                    __nv_fp8_e4m3 sc_y = __nv_fp8_e4m3(scale_y);
-                                    if (g.encode_centric) {
-                                        constexpr float E4M3_MAX = 448.0f;
-                                        sc_x = __nv_fp8_e4m3(fminf(rcp_scale_x, E4M3_MAX));
-                                        sc_y = __nv_fp8_e4m3(fminf(rcp_scale_y, E4M3_MAX));
-                                    }
-                                    int global_col_16 = col_start + j * 16;
-                                    int kgroup = global_col_16 / 64;
-                                    int col_16_in_64 = (global_col_16 / 16) % 4;
-
-                                    if (global_row_x < g.M) {
-                                        int depth_x = global_row_x / 128;
-                                        int sr_x = global_row_x % 32;
-                                        int rr_x = (global_row_x / 32) % 4;
-                                        int chunk_x = depth_x * g.G_sc_row_kgroups + kgroup;
-                                        int byte_x = sr_x * 16 + rr_x * 4 + col_16_in_64;
-                                        g.G_sc_row_ptr[chunk_x * 512 + byte_x] =
-                                            *reinterpret_cast<uint8_t*>(&sc_x);
-                                    }
-                                    if (global_row_y < g.M) {
-                                        int depth_y = global_row_y / 128;
-                                        int sr_y = global_row_y % 32;
-                                        int rr_y = (global_row_y / 32) % 4;
-                                        int chunk_y = depth_y * g.G_sc_row_kgroups + kgroup;
-                                        int byte_y = sr_y * 16 + rr_y * 4 + col_16_in_64;
-                                        g.G_sc_row_ptr[chunk_y * 512 + byte_y] =
-                                            *reinterpret_cast<uint8_t*>(&sc_y);
-                                    }
-                                }
-
-                                // ═══ Column quantization ═══
-                                {
-                                    float col_amax[4];
-                                    col_amax[0] = fmaxf(fabsf(vals_x[0]), fabsf(vals_y[0]));
-                                    col_amax[1] = fmaxf(fabsf(vals_x[1]), fabsf(vals_y[1]));
-                                    col_amax[2] = fmaxf(fabsf(vals_x[2]), fabsf(vals_y[2]));
-                                    col_amax[3] = fmaxf(fabsf(vals_x[3]), fabsf(vals_y[3]));
-
-                                    #pragma unroll
-                                    for (int offset = 4; offset < 32; offset <<= 1) {
-                                        #pragma unroll
-                                        for (int v = 0; v < 4; v++) {
-                                            col_amax[v] = fmaxf(col_amax[v], __shfl_xor_sync(0xFFFFFFFF, col_amax[v], offset));
-                                        }
-                                    }
-
-                                    const float FP4_MAX_COL = 6.0f;
-                                    float col_scale[4], col_rcp[4];
-                                    #pragma unroll
-                                    for (int v = 0; v < 4; v++) {
-                                        col_scale[v] = fmaxf(col_amax[v] / FP4_MAX_COL, 1.0f / 65536.0f);
-                                        col_rcp[v] = 1.0f / col_scale[v];
-                                    }
-
-                                    uint8_t cfp4_0 = quantize_fp4_pair(vals_x[0], vals_y[0], col_rcp[0]);
-                                    uint8_t cfp4_1 = quantize_fp4_pair(vals_x[1], vals_y[1], col_rcp[1]);
-                                    uint8_t cfp4_2 = quantize_fp4_pair(vals_x[2], vals_y[2], col_rcp[2]);
-                                    uint8_t cfp4_3 = quantize_fp4_pair(vals_x[3], vals_y[3], col_rcp[3]);
-
-                                    int gc0 = col_start + j * 16 + (lane_id % 4) * 2;
-                                    int gc8 = gc0 + 8;
-                                    int row_pair_idx = (lane_id / 4);
-                                    int global_row_pair = warp_row_base + i * 16 + row_pair_idx;
-
-                                    int col_fp4_stride = g.M / 2;
-                                    if (gc0 < g.N && global_row_pair < g.M) {
-                                        g.G_fp4_col_ptr[gc0 * col_fp4_stride + global_row_pair / 2] = cfp4_0;
-                                        g.G_fp4_col_ptr[(gc0 + 1) * col_fp4_stride + global_row_pair / 2] = cfp4_1;
-                                    }
-                                    if (gc8 < g.N && global_row_pair < g.M) {
-                                        g.G_fp4_col_ptr[gc8 * col_fp4_stride + global_row_pair / 2] = cfp4_2;
-                                        g.G_fp4_col_ptr[(gc8 + 1) * col_fp4_stride + global_row_pair / 2] = cfp4_3;
-                                    }
-
-                                    if ((lane_id / 4) == 0) {
-                                        int global_row_m = warp_row_base + i * 16;
-                                        int m_kgroup = global_row_m / 64;
-                                        int m_16_in_64 = (global_row_m / 16) % 4;
-
-                                        __nv_fp8_e4m3 csc[4];
-                                        #pragma unroll
-                                        for (int v = 0; v < 4; v++) {
-                                            csc[v] = __nv_fp8_e4m3(col_scale[v]);
-                                            if (g.encode_centric) {
-                                                constexpr float E4M3_MAX = 448.0f;
-                                                csc[v] = __nv_fp8_e4m3(fminf(col_rcp[v], E4M3_MAX));
-                                            }
-                                        }
-
-                                        int gc_vals[4] = {gc0, gc0 + 1, gc8, gc8 + 1};
-                                        #pragma unroll
-                                        for (int v = 0; v < 4; v++) {
-                                            int gc = gc_vals[v];
-                                            if (gc < g.N) {
-                                                int depth = gc / 128;
-                                                int sr = gc % 32;
-                                                int rr = (gc / 32) % 4;
-                                                int chunk = depth * g.G_sc_col_kgroups + m_kgroup;
-                                                int byte_idx = sr * 16 + rr * 4 + m_16_in_64;
-                                                g.G_sc_col_ptr[chunk * 512 + byte_idx] =
-                                                    *reinterpret_cast<uint8_t*>(&csc[v]);
-                                            }
-                                        }
-                                    }
-                                }
-                            }  // for j
-                        }  // for i
-                    }  // for epi
-                }  // if !C::USE_BF16_ACCUM
+                warpgroup::tma::cluster::arrive(p3_outputs_arrived, 0, 1);
+                update_phasebit<0>(phasebits, 3);
             }
 
+            // Now signal outputs_finished so MMA warp can start next block
+            warpgroup::tma::cluster::arrive(outputs_finished, 0, 1);
             update_phasebit<0>(phasebits, 0);
             phase ^= 1;
         }
         warpgroup::sync(1);
-        if constexpr (C::USE_BF16_ACCUM) {
-            warpgroup::tma::store_async_read_wait<0>();
-        }
+        warpgroup::tma::store_async_read_wait<0>();
         if constexpr (C::USE_PDL) warpgroup::pdl::arrive();
         if (warpgroup::warpid() == 0) tm_allocator.deprovision();
     }
