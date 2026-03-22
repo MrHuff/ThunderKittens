@@ -322,16 +322,10 @@ __device__ inline void backward_kernel_v4(const globals<C>& g) {
                     stage = (stage + 1) % C::LOAD_PIPE_DEPTH;
                 }
 
-                // ─── Phase 3: Load C_col tiles for dE GEMM ───
-                // Wait for consumer to finish quantizing G to SMEM
-                wait(fp4_ready, get_phasebit<1>(phasebits, 1));
-                for (int k = 0; k < num_k_chunks; k++) {
-                    wait(p3_inputs_finished, get_phasebit<1>(phasebits, 2));
-                    // C_col is [K, V_padded] in fp4x2 → tiles indexed as [k_chunk, col_block]
-                    tma::cluster::load_async(p3_tiles.B, g.C_col, {k, col_block_idx*2 + cta_id}, p3_tiles_arrived, (uint16_t)(1<<cta_id), 0);
-                    update_phasebit<1>(phasebits, 2);
-                }
-                update_phasebit<1>(phasebits, 1);
+                // ─── Phase 3: DISABLED FOR TESTING ───
+                // wait(fp4_ready, get_phasebit<1>(phasebits, 5));
+                // for (int k = 0; k < num_k_chunks; k++) { ... }
+                // update_phasebit<1>(phasebits, 5);
             }
         } else if (warp_id == 2) {
             // Load input scales: Phase 1 + Phase 3
@@ -354,15 +348,10 @@ __device__ inline void backward_kernel_v4(const globals<C>& g) {
                     stage = (stage + 1) % C::LOAD_PIPE_DEPTH;
                 }
 
-                // ─── Phase 3: Load C_col scales ───
-                wait(fp4_ready, get_phasebit<1>(phasebits, 1));
-                for (int k = 0; k < num_k_chunks; k++) {
-                    wait(p3_inputs_finished, get_phasebit<1>(phasebits, 2));
-                    // C_col_sc indexed as [k_chunk, col_block]
-                    tma::cluster::load_async(p3_scales.B_sc, g.C_col_sc, {k, col_block_idx*2 + cta_id, 0}, p3_scales_arrived, (uint16_t)(1<<cta_id), 0);
-                    update_phasebit<1>(phasebits, 2);
-                }
-                update_phasebit<1>(phasebits, 1);
+                // ─── Phase 3: DISABLED FOR TESTING ───
+                // wait(fp4_ready, get_phasebit<1>(phasebits, 5));
+                // for (int k = 0; k < num_k_chunks; k++) { ... }
+                // update_phasebit<1>(phasebits, 5);
             }
         } else if (cta_id == 0 && warp_id == 0) {
             // ======================== MMA WARP ========================
@@ -424,48 +413,10 @@ __device__ inline void backward_kernel_v4(const globals<C>& g) {
                 else            do_mma_block(out_tm_1);
                 tensor_commit<2>(outputs_arrived);
 
-                // ─── Phase 3: dE GEMM ───
-                // Wait for consumer to quantize G to SMEM
-                wait(fp4_ready, get_phasebit<0>(phasebits, 1));
-
-                // Load G scales to TMEM (once per block, G is the A operand)
-                #pragma unroll
-                for (int ii = 0; ii < C::P3_MMA_PER_TILE; ii++) {
-                    auto p3_A_sc_sub = p3_A_sc_tm.template subtile<full_tt_fp8e4m3<16>>(ii*16);
-                    auto &G_sc_sm_sub = *reinterpret_cast<st_fp8e4m3<32, 16, false> *>(
-                        reinterpret_cast<uint64_t>(&fp4_staging.G_row_sc.data[0])+16*32*ii);
-                    load_mxnv_scale_async2(p3_A_sc_sub, G_sc_sm_sub);
-                }
-
-                // Inner K-loop
-                for (int k = 0; k < num_k_chunks; k++) {
-                    // Wait for C_col tile and scales to arrive
-                    tma::expect_bytes(p3_scales_arrived, 2*sizeof(G::p3_scales_t));
-                    wait(p3_scales_arrived, get_phasebit<0>(phasebits, 2));
-                    // Load C_col scales to TMEM
-                    #pragma unroll
-                    for (int ii = 0; ii < C::P3_MMA_PER_TILE; ii++) {
-                        auto p3_B_sc_sub = p3_B_sc_tm.template subtile<full_tt_fp8e4m3<16>>(ii*16);
-                        auto &Ccol_sc_sm_sub = *reinterpret_cast<st_fp8e4m3<32, 16, false> *>(
-                            reinterpret_cast<uint64_t>(&p3_scales.B_sc.data[0])+16*32*ii);
-                        load_mxnv_scale_async2(p3_B_sc_sub, Ccol_sc_sm_sub);
-                    }
-                    tma::expect_bytes(p3_tiles_arrived, 2*sizeof(G::p3_tiles_t));
-                    wait(p3_tiles_arrived, get_phasebit<0>(phasebits, 2));
-                    // GMMA: dE_partial = G_fp4_smem @ C_col_tile^T
-                    if (k == 0) mm2_ABt(p3_out_tm, fp4_staging.G_row, p3_tiles.B,
-                                        p3_A_sc_tm, p3_B_sc_tm, p3_inputs_finished);
-                    else        mm2_ABt(p3_out_tm, fp4_staging.G_row, p3_tiles.B,
-                                        p3_A_sc_tm, p3_B_sc_tm, p3_inputs_finished);
-                    // Signal consumer per K-chunk
-                    tensor_commit<2>(p3_outputs_arrived);
-                    // Wait for consumer to drain result before next K-chunk
-                    wait(p3_outputs_arrived, get_phasebit<0>(phasebits, 3));
-                    update_phasebit<0>(phasebits, 2);
-                    update_phasebit<0>(phasebits, 3);
-                }
-
-                update_phasebit<0>(phasebits, 1);
+                // ─── Phase 3: DISABLED FOR TESTING ───
+                // wait(fp4_ready, ...);
+                // K-loop skipped
+                // update_phasebit<0>(phasebits, 5);
                 update_phasebit<1>(phasebits, 0);
                 phase ^= 1;
             }
@@ -638,43 +589,26 @@ __device__ inline void backward_kernel_v4(const globals<C>& g) {
                     {row_block_idx*2 + cta_id, C::EPI_PIPE_DEPTH*col_block_idx + epi});
             }
 
-            // ════════════════════════════════════════════════════
-            // Phase 2b: Row-quantize G to FP4 → SMEM staging
-            // TODO: Write FP4 quantized G to fp4_staging.G_row and scales to fp4_staging.G_row_sc
-            // For now, signal fp4_ready immediately (Phase 3 GMMA will use uninitialized data)
-            // ════════════════════════════════════════════════════
-            __syncthreads(); // ensure all BF16 TMA stores queued
-            // Signal MMA warp and producers that FP4 is ready
-            warpgroup::tma::cluster::arrive(fp4_ready, 0, 1);
 
             // ════════════════════════════════════════════════════
-            // Phase 3: Read dE partials from TMEM, store to global
+            // Phase 2b: Minimal test — raw byte write to fp4_staging
             // ════════════════════════════════════════════════════
-            for (int k = 0; k < num_k_chunks; k++) {
-                wait(p3_outputs_arrived, get_phasebit<0>(phasebits, 3));
-                // Read dE_partial from TMEM
-                p3_rt dE_fl;
-                warpgroup::load_async(dE_fl, p3_out_tm);
-                tensor_load_wait();
-                tensor_before_thread_sync();
-                warpgroup::sync(1);
-
-                // Apply C_col global scale
-                float c_col_sg = g.C_col_sc_global[{0}];
-                float g_sg = 1.0f;  // G global scale (computed during quant, TODO)
-                float p3_global_scale = g_sg * c_col_sg;
-                warp::mul(dE_fl, dE_fl, p3_global_scale);
-
-                // AtomicAdd dE_partial to global dE[row_block, k_chunk]
-                // For now, just use TMA store (overwrite, not atomic — TODO: atomicAdd)
-                p3_rt_bf dE_bf;
-                warp::copy(dE_bf, dE_fl);
-                // Store to output_tiles.D (reuse), then TMA
-                // (This is simplified — in reality need proper output tile for dE)
-
-                warpgroup::tma::cluster::arrive(p3_outputs_arrived, 0, 1);
-                update_phasebit<0>(phasebits, 3);
+            {
+                // Write zeros directly to fp4_staging memory (no tile accessor)
+                uint8_t* base = reinterpret_cast<uint8_t*>(&fp4_staging);
+                int stride = lane_id + warpgroup::warpid() * 32;
+                // Just write a few safe bytes near the base
+                if (stride < 128) {
+                    base[stride] = 0;
+                }
             }
+            warpgroup::sync(1);
+            if (warpgroup::warpid() == 0) {
+                warpgroup::arrive(fp4_ready, 1);
+            }
+
+            // Phase 3 consumer: DISABLED FOR TESTING
+            // for (int k = 0; k < num_k_chunks; k++) { ... }
 
             // Now signal outputs_finished so MMA warp can start next block
             warpgroup::tma::cluster::arrive(outputs_finished, 0, 1);
