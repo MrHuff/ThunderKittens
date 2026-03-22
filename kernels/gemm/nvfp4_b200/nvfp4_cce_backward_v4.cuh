@@ -322,10 +322,16 @@ __device__ inline void backward_kernel_v4(const globals<C>& g) {
                     stage = (stage + 1) % C::LOAD_PIPE_DEPTH;
                 }
 
-                // ─── Phase 3: DISABLED FOR TESTING ───
-                // wait(fp4_ready, get_phasebit<1>(phasebits, 5));
-                // for (int k = 0; k < num_k_chunks; k++) { ... }
-                // update_phasebit<1>(phasebits, 5);
+                // ─── Phase 3: Load C_col tiles for dE GEMM (skip if K=0) ───
+                if (num_k_chunks > 0) {
+                    wait(fp4_ready, get_phasebit<1>(phasebits, 5));
+                    for (int k = 0; k < num_k_chunks; k++) {
+                        wait(p3_inputs_finished, get_phasebit<1>(phasebits, 6));
+                        tma::cluster::load_async(p3_tiles.B, g.C_col, {k, col_block_idx*2 + cta_id}, p3_tiles_arrived, (uint16_t)(1<<cta_id), 0);
+                        update_phasebit<1>(phasebits, 6);
+                    }
+                    update_phasebit<1>(phasebits, 5);
+                }
             }
         } else if (warp_id == 2) {
             // Load input scales: Phase 1 + Phase 3
@@ -348,10 +354,16 @@ __device__ inline void backward_kernel_v4(const globals<C>& g) {
                     stage = (stage + 1) % C::LOAD_PIPE_DEPTH;
                 }
 
-                // ─── Phase 3: DISABLED FOR TESTING ───
-                // wait(fp4_ready, get_phasebit<1>(phasebits, 5));
-                // for (int k = 0; k < num_k_chunks; k++) { ... }
-                // update_phasebit<1>(phasebits, 5);
+                // ─── Phase 3: Load C_col scales (skip if K=0) ───
+                if (num_k_chunks > 0) {
+                    wait(fp4_ready, get_phasebit<1>(phasebits, 5));
+                    for (int k = 0; k < num_k_chunks; k++) {
+                        wait(p3_inputs_finished, get_phasebit<1>(phasebits, 6));
+                        tma::cluster::load_async(p3_scales.B_sc, g.C_col_sc, {k, col_block_idx*2 + cta_id, 0}, p3_scales_arrived, (uint16_t)(1<<cta_id), 0);
+                        update_phasebit<1>(phasebits, 6);
+                    }
+                    update_phasebit<1>(phasebits, 5);
+                }
             }
         } else if (cta_id == 0 && warp_id == 0) {
             // ======================== MMA WARP ========================
@@ -413,10 +425,43 @@ __device__ inline void backward_kernel_v4(const globals<C>& g) {
                 else            do_mma_block(out_tm_1);
                 tensor_commit<2>(outputs_arrived);
 
-                // ─── Phase 3: DISABLED FOR TESTING ───
-                // wait(fp4_ready, ...);
-                // K-loop skipped
-                // update_phasebit<0>(phasebits, 5);
+                // ─── Phase 3: dE GEMM (skip if K=0) ───
+                if (num_k_chunks > 0) {
+                    wait(fp4_ready, get_phasebit<0>(phasebits, 5));
+
+                    // Load G scales to TMEM (once per block)
+                    #pragma unroll
+                    for (int ii = 0; ii < C::P3_MMA_PER_TILE; ii++) {
+                        auto p3_A_sc_sub = p3_A_sc_tm.template subtile<full_tt_fp8e4m3<16>>(ii*16);
+                        auto &G_sc_sm_sub = *reinterpret_cast<st_fp8e4m3<32, 16, false> *>(
+                            reinterpret_cast<uint64_t>(&fp4_staging.G_row_sc.data[0])+16*32*ii);
+                        load_mxnv_scale_async2(p3_A_sc_sub, G_sc_sm_sub);
+                    }
+
+                    for (int k = 0; k < num_k_chunks; k++) {
+                        tma::expect_bytes(p3_scales_arrived, 2*sizeof(G::p3_scales_t));
+                        wait(p3_scales_arrived, get_phasebit<0>(phasebits, 6));
+                        #pragma unroll
+                        for (int ii = 0; ii < C::P3_MMA_PER_TILE; ii++) {
+                            auto p3_B_sc_sub = p3_B_sc_tm.template subtile<full_tt_fp8e4m3<16>>(ii*16);
+                            auto &Ccol_sc_sm_sub = *reinterpret_cast<st_fp8e4m3<32, 16, false> *>(
+                                reinterpret_cast<uint64_t>(&p3_scales.B_sc.data[0])+16*32*ii);
+                            load_mxnv_scale_async2(p3_B_sc_sub, Ccol_sc_sm_sub);
+                        }
+                        tma::expect_bytes(p3_tiles_arrived, 2*sizeof(G::p3_tiles_t));
+                        wait(p3_tiles_arrived, get_phasebit<0>(phasebits, 6));
+                        mm2_ABt(p3_out_tm, fp4_staging.G_row, p3_tiles.B,
+                                            p3_A_sc_tm, p3_B_sc_tm, p3_inputs_finished);
+                        tensor_commit<2>(p3_outputs_arrived);
+                        if (k + 1 < num_k_chunks) {
+                            wait(p3_inputs_finished, get_phasebit<0>(phasebits, 7));
+                        }
+                        update_phasebit<0>(phasebits, 6);
+                        update_phasebit<0>(phasebits, 7);
+                    }
+
+                    update_phasebit<0>(phasebits, 5);
+                }
                 update_phasebit<1>(phasebits, 0);
                 phase ^= 1;
             }
@@ -685,12 +730,74 @@ __device__ inline void backward_kernel_v4(const globals<C>& g) {
                 }
             }
             warpgroup::sync(1);
-            if (warpgroup::warpid() == 0) {
+            if (num_k_chunks > 0 && warpgroup::warpid() == 0) {
                 warpgroup::arrive(fp4_ready, 1);
             }
 
-            // Phase 3 consumer: DISABLED FOR TESTING
-            // for (int k = 0; k < num_k_chunks; k++) { ... }
+            // ════════════════════════════════════════════════════
+            // Phase 3: Read dE partials from TMEM, store to global (skip if K=0)
+            // ════════════════════════════════════════════════════
+            for (int k = 0; k < num_k_chunks; k++) {
+                wait(p3_outputs_arrived, get_phasebit<0>(phasebits, 8));
+                p3_rt dE_fl;
+                warpgroup::load_async(dE_fl, p3_out_tm);
+                tensor_load_wait();
+                tensor_before_thread_sync();
+                warpgroup::sync(1);
+
+                // Apply global scale
+                float c_col_sg = g.C_col_sc_global[{0}];
+                float p3_global_scale = c_col_sg;  // G scales baked into E4M3
+                warp::mul(dE_fl, dE_fl, p3_global_scale);
+
+                // Convert to BF16 and accumulate to global dE
+                {
+                    const int wid = warpgroup::warpid();
+                    const int warp_row_base = wid * (C::Mb / 8);
+
+                    #pragma unroll
+                    for (int i = 0; i < p3_rt::height; i++) {
+                        int row_x = tile_row_base + warp_row_base + i * 16 + lane_id / 4;
+                        int row_y = tile_row_base + warp_row_base + i * 16 + 8 + lane_id / 4;
+                        #pragma unroll
+                        for (int j = 0; j < p3_rt::width; j++) {
+                            int col_base = k * C::Nb_out + j * 16 + (lane_id % 4) * 2;
+                            // data[0] = rows x, cols 0:1; data[1] = rows y, cols 0:1
+                            // data[2] = rows x, cols 8:9; data[3] = rows y, cols 8:9
+                            float2 d0 = dE_fl.tiles[i][j].data[0];
+                            float2 d1 = dE_fl.tiles[i][j].data[1];
+                            float2 d2 = dE_fl.tiles[i][j].data[2];
+                            float2 d3 = dE_fl.tiles[i][j].data[3];
+
+                            if (row_x < g.M && col_base < g.K) {
+                                __nv_bfloat16* ptr = reinterpret_cast<__nv_bfloat16*>(
+                                    &g.dE_out[{row_x / (C::Mb/2), (col_base) / C::Nb_out}]);
+                                int off = (row_x % (C::Mb/2)) * C::Nb_out + (col_base % C::Nb_out);
+                                atomicAdd(&ptr[off],   __float2bfloat16(d0.x));
+                                atomicAdd(&ptr[off+1], __float2bfloat16(d0.y));
+                                int off2 = off + 8;
+                                atomicAdd(&ptr[off2],   __float2bfloat16(d2.x));
+                                atomicAdd(&ptr[off2+1], __float2bfloat16(d2.y));
+                            }
+                            if (row_y < g.M && col_base < g.K) {
+                                __nv_bfloat16* ptr = reinterpret_cast<__nv_bfloat16*>(
+                                    &g.dE_out[{row_y / (C::Mb/2), (col_base) / C::Nb_out}]);
+                                int off = (row_y % (C::Mb/2)) * C::Nb_out + (col_base % C::Nb_out);
+                                atomicAdd(&ptr[off],   __float2bfloat16(d1.x));
+                                atomicAdd(&ptr[off+1], __float2bfloat16(d1.y));
+                                int off2 = off + 8;
+                                atomicAdd(&ptr[off2],   __float2bfloat16(d3.x));
+                                atomicAdd(&ptr[off2+1], __float2bfloat16(d3.y));
+                            }
+                        }
+                    }
+                }
+
+                if (warpgroup::warpid() == 0) {
+                    warpgroup::arrive(p3_inputs_finished, 1);
+                }
+                update_phasebit<0>(phasebits, 8);
+            }
 
             // Now signal outputs_finished so MMA warp can start next block
             warpgroup::tma::cluster::arrive(outputs_finished, 0, 1);
