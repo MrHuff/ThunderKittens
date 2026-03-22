@@ -27,7 +27,7 @@ static void launch_backward_v4_bf16(
     // dE_tile = st_bf<Mb/2, Nb_out> = <128, 128>
     auto dummy_dE  = A.new_empty({C::Mb/2, C::Nb_out}, A.options().dtype(c10::kBFloat16));
 
-    int K = A.dim() >= 2 ? A.size(1) * 2 : 256;  // FP4x2 cols → actual K
+    int K = 0;  // TEMP: disable Phase 3 K-loop for testing Phase 2b
 
     G g {
         .A = kittens::py::tensor_to_gl<typename G::A_fp4x2_gl>(A),
