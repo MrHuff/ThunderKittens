@@ -591,15 +591,97 @@ __device__ inline void backward_kernel_v4(const globals<C>& g) {
 
 
             // ════════════════════════════════════════════════════
-            // Phase 2b: Minimal test — raw byte write to fp4_staging
+            // Phase 2b: Row-quantize G to FP4 → SMEM staging tile
+            // Write FP4 bytes to fp4_staging.G_row (st_fp4e2m1_2)
+            // Write E4M3 scales to fp4_staging.G_row_sc (st_hf<4,256>)
             // ════════════════════════════════════════════════════
             {
-                // Write zeros directly to fp4_staging memory (no tile accessor)
-                uint8_t* base = reinterpret_cast<uint8_t*>(&fp4_staging);
-                int stride = lane_id + warpgroup::warpid() * 32;
-                // Just write a few safe bytes near the base
-                if (stride < 128) {
-                    base[stride] = 0;
+                const int warp_id = warpgroup::warpid();
+                const int local_warp_row_base = warp_id * (C::Mb / 8); // 32 rows per warp
+
+                #pragma unroll
+                for (int epi = 0; epi < C::EPI_PIPE_DEPTH; epi++) {
+                    subtile_rt& D_fl = D_regs_fl[epi];
+
+                    #pragma unroll
+                    for (int i = 0; i < subtile_rt::height; i++) {
+                        int local_row_x = local_warp_row_base + i * 16 + lane_id / 4;
+                        int local_row_y = local_warp_row_base + i * 16 + 8 + lane_id / 4;
+
+                        #pragma unroll
+                        for (int j = 0; j < subtile_rt::width; j++) {
+                            float vals_x[4], vals_y[4];
+                            vals_x[0] = D_fl.tiles[i][j].data[0].x;
+                            vals_x[1] = D_fl.tiles[i][j].data[0].y;
+                            vals_x[2] = D_fl.tiles[i][j].data[2].x;
+                            vals_x[3] = D_fl.tiles[i][j].data[2].y;
+                            vals_y[0] = D_fl.tiles[i][j].data[1].x;
+                            vals_y[1] = D_fl.tiles[i][j].data[1].y;
+                            vals_y[2] = D_fl.tiles[i][j].data[3].x;
+                            vals_y[3] = D_fl.tiles[i][j].data[3].y;
+
+                            // Row amax across 4 threads sharing a 16-col group
+                            float amax_x = 0.0f, amax_y = 0.0f;
+                            #pragma unroll
+                            for (int v = 0; v < 4; v++) {
+                                amax_x = fmaxf(amax_x, fabsf(vals_x[v]));
+                                amax_y = fmaxf(amax_y, fabsf(vals_y[v]));
+                            }
+                            #pragma unroll
+                            for (int offset = 1; offset < 4; offset <<= 1) {
+                                amax_x = fmaxf(amax_x, __shfl_xor_sync(0xFFFFFFFF, amax_x, offset));
+                                amax_y = fmaxf(amax_y, __shfl_xor_sync(0xFFFFFFFF, amax_y, offset));
+                            }
+
+                            const float FP4_MAX = 6.0f;
+                            float scale_x = fmaxf(amax_x / FP4_MAX, 1.0f / 65536.0f);
+                            float scale_y = fmaxf(amax_y / FP4_MAX, 1.0f / 65536.0f);
+                            float rcp_scale_x = 1.0f / scale_x;
+                            float rcp_scale_y = 1.0f / scale_y;
+
+                            // Quantize to fp4x2 bytes
+                            uint8_t fp4_x_lo = quantize_fp4_pair(vals_x[0], vals_x[1], rcp_scale_x);
+                            uint8_t fp4_x_hi = quantize_fp4_pair(vals_x[2], vals_x[3], rcp_scale_x);
+                            uint8_t fp4_y_lo = quantize_fp4_pair(vals_y[0], vals_y[1], rcp_scale_y);
+                            uint8_t fp4_y_hi = quantize_fp4_pair(vals_y[2], vals_y[3], rcp_scale_y);
+
+                            // Write FP4 bytes to SMEM via raw pointer
+                            // G_row is st_fp4e2m1_2<128, 64>: 128 rows × 64 fp4x2_cols
+                            // Each thread writes 4 bytes (2 per row-half)
+                            int fp4_col = (lane_id % 4) * 2 + j * 16 + epi * SUBTILE_COLS;
+                            int fp4x2_col_lo = fp4_col / 2;
+                            int fp4x2_col_hi = (fp4_col + 8) / 2;
+                            
+                            uint8_t* g_base = reinterpret_cast<uint8_t*>(&fp4_staging.G_row.data[0]);
+                            // Simple linear layout: row * 64 + col (unswizzled for now)
+                            g_base[local_row_x * 64 + fp4x2_col_lo] = fp4_x_lo;
+                            g_base[local_row_x * 64 + fp4x2_col_hi] = fp4_x_hi;
+                            g_base[local_row_y * 64 + fp4x2_col_lo] = fp4_y_lo;
+                            g_base[local_row_y * 64 + fp4x2_col_hi] = fp4_y_hi;
+
+                            // Write E4M3 scales
+                            if ((lane_id % 4) == 0) {
+                                __nv_fp8_e4m3 sc_x = __nv_fp8_e4m3(scale_x);
+                                __nv_fp8_e4m3 sc_y = __nv_fp8_e4m3(scale_y);
+
+                                int global_col_16 = epi * SUBTILE_COLS + j * 16;
+                                int kgroup = global_col_16 / 64;
+                                int col_16_in_64 = (global_col_16 / 16) % 4;
+
+                                int sr_x = local_row_x % 32;
+                                int rr_x = (local_row_x / 32) % 4;
+                                int byte_x = sr_x * 16 + rr_x * 4 + col_16_in_64;
+                                reinterpret_cast<uint8_t*>(&fp4_staging.G_row_sc.data[0])[kgroup * 512 + byte_x] =
+                                    *reinterpret_cast<uint8_t*>(&sc_x);
+
+                                int sr_y = local_row_y % 32;
+                                int rr_y = (local_row_y / 32) % 4;
+                                int byte_y = sr_y * 16 + rr_y * 4 + col_16_in_64;
+                                reinterpret_cast<uint8_t*>(&fp4_staging.G_row_sc.data[0])[kgroup * 512 + byte_y] =
+                                    *reinterpret_cast<uint8_t*>(&sc_y);
+                            }
+                        }
+                    }
                 }
             }
             warpgroup::sync(1);
