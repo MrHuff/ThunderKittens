@@ -41,6 +41,12 @@ static void launch_backward_v4_bf16(
         printf("P3_B_fp4x2_tile: rows=%d, cols=%d\n", (int)G::P3_B_fp4x2_tile::rows, (int)G::P3_B_fp4x2_tile::cols);
         printf("P3_B_sc_tile: rows=%d, cols=%d\n", (int)G::P3_B_sc_tile::rows, (int)G::P3_B_sc_tile::cols);
         printf("num_k_chunks=%d, Nb_out=%d, Nb=%d\n", K/(int)C::Nb_out, (int)C::Nb_out, (int)C::Nb);
+        int a_sc_depth = A_sc.dim()==2 ? A_sc.size(0)/128 : A_sc.size(0);
+        int a_sc_rows  = A_sc.dim()==2 ? A_sc.size(1)/4 : A_sc.size(1);
+        printf("A_sc GL: B=1, D=%d, R=%d, C=256 (tile rows=%d)\n", a_sc_depth, a_sc_rows, (int)G::A_sc_tile::rows);
+        int c_sc_depth = C_col_sc.dim()==2 ? C_col_sc.size(0)/128 : C_col_sc.size(0);
+        int c_sc_rows  = C_col_sc.dim()==2 ? C_col_sc.size(1)/4 : C_col_sc.size(1);
+        printf("C_col_sc GL: B=1, D=%d, R=%d, C=256 (tile rows=%d)\n", c_sc_depth, c_sc_rows, (int)G::P3_B_sc_tile::rows);
         fflush(stdout);
     }
 
