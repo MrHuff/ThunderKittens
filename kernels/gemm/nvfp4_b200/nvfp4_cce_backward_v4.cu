@@ -13,7 +13,7 @@ static void launch_backward_v4_bf16(
     const at::Tensor &B, const at::Tensor &B_sc, const at::Tensor &B_sc_global,
     at::Tensor &grad_out, const at::Tensor &lse, const at::Tensor &targets,
     float grad_scale, int M, int N, float filter_eps,
-    // Phase 3 inputs (optional — pass dummies if K=0):
+    // Phase 3 inputs (pass dummies if K=0):
     const at::Tensor &C_col, const at::Tensor &C_col_sc, const at::Tensor &C_col_sc_global,
     at::Tensor &dE_out, int K)
 {
@@ -26,8 +26,23 @@ static void launch_backward_v4_bf16(
     auto dummy_sg  = A.new_empty({1}, A.options().dtype(c10::kFloat));
     auto dummy_dE  = A.new_empty({C::Mb/2, C::Nb_out}, A.options().dtype(c10::kBFloat16));
 
-    // Use real tensors when K>0, dummies otherwise
     bool use_p3 = (K > 0);
+
+    if (use_p3) {
+        printf("C_col: dim=%d, sizes=[", (int)C_col.dim());
+        for (int i=0; i<C_col.dim(); i++) printf("%d%s", (int)C_col.size(i), i<C_col.dim()-1?",":"");
+        printf("], dtype=%d, contiguous=%d, ptr=%p\n", (int)C_col.scalar_type(), C_col.is_contiguous(), C_col.data_ptr());
+        printf("C_col_sc: dim=%d, sizes=[", (int)C_col_sc.dim());
+        for (int i=0; i<C_col_sc.dim(); i++) printf("%d%s", (int)C_col_sc.size(i), i<C_col_sc.dim()-1?",":"");
+        printf("], dtype=%d, contiguous=%d, ptr=%p\n", (int)C_col_sc.scalar_type(), C_col_sc.is_contiguous(), C_col_sc.data_ptr());
+        printf("dE_out: dim=%d, sizes=[", (int)dE_out.dim());
+        for (int i=0; i<dE_out.dim(); i++) printf("%d%s", (int)dE_out.size(i), i<dE_out.dim()-1?",":"");
+        printf("], ptr=%p\n", dE_out.data_ptr());
+        printf("P3_B_fp4x2_tile: rows=%d, cols=%d\n", (int)G::P3_B_fp4x2_tile::rows, (int)G::P3_B_fp4x2_tile::cols);
+        printf("P3_B_sc_tile: rows=%d, cols=%d\n", (int)G::P3_B_sc_tile::rows, (int)G::P3_B_sc_tile::cols);
+        printf("num_k_chunks=%d, Nb_out=%d, Nb=%d\n", K/(int)C::Nb_out, (int)C::Nb_out, (int)C::Nb);
+        fflush(stdout);
+    }
 
     G g {
         .A = kittens::py::tensor_to_gl<typename G::A_fp4x2_gl>(A),
@@ -42,12 +57,28 @@ static void launch_backward_v4_bf16(
             B_sc.dim()==2 ? B_sc.size(0)/128 : B_sc.size(0),
             B_sc.dim()==2 ? B_sc.size(1)/4 : B_sc.size(1), 256),
         .B_sc_global = kittens::py::tensor_to_gl<typename G::B_sc_global_gl>(B_sc_global),
-        // Phase 3 C_col: use dummy when K=0
+        // Phase 3 C_col: real tensors when K>0, dummies when K=0
         .C_col = use_p3
             ? kittens::py::tensor_to_gl<typename G::P3_B_fp4x2_gl>(C_col)
             : kittens::py::tensor_to_gl<typename G::P3_B_fp4x2_gl>(dummy_fp4_ccol),
-        .C_col_sc = kittens::py::tensor_to_gl<typename G::P3_B_sc_gl, false>(
-            dummy_sc, 1, 1, 1, 256),
+        // C_col_sc: pad rows to >=4 for P3_B_sc_tile compatibility
+        .C_col_sc = [&]() {
+            if (!use_p3) return kittens::py::tensor_to_gl<typename G::P3_B_sc_gl, false>(
+                dummy_sc, 1, 1, 1, 256);
+            int sc_depth = C_col_sc.dim()==2 ? C_col_sc.size(0)/128 : C_col_sc.size(0);
+            int sc_rows  = C_col_sc.dim()==2 ? C_col_sc.size(1)/4 : C_col_sc.size(1);
+            int padded_rows = std::max(sc_rows, 4);
+            if (sc_rows < 4) {
+                // Need to pad: create a padded tensor
+                auto padded = C_col_sc.new_zeros({sc_depth, padded_rows, 512},
+                    C_col_sc.options());
+                padded.narrow(1, 0, sc_rows).copy_(C_col_sc);
+                return kittens::py::tensor_to_gl<typename G::P3_B_sc_gl, false>(
+                    padded, 1, sc_depth, padded_rows, 256);
+            }
+            return kittens::py::tensor_to_gl<typename G::P3_B_sc_gl, false>(
+                C_col_sc, 1, sc_depth, sc_rows, 256);
+        }(),
         .C_col_sc_global = kittens::py::tensor_to_gl<typename G::P3_B_sc_global_gl>(
             use_p3 ? C_col_sc_global : dummy_sg),
         .D_out = kittens::py::tensor_to_gl<typename G::D_gl>(grad_out),
