@@ -97,12 +97,12 @@ struct globals {
     // Phase 3: C_col (column-quantized C for dE GEMM)
     // B operand: C_col[Nb_out/2, Nb/2] as fp4x2 tile = [64, 64] per CTA
     using P3_B_fp4x2_tile = st_fp4e2m1_2<C::Nb_out/2, C::Nb/2>;
-    using P3_B_sc_tile    = st_hf<4, 256, false>;  // 4 scale groups for 64 B rows
+    using P3_B_sc_tile    = st_hf<2, 256, false>;  // 2 x 512B scale groups for Nb=128
 
     // Phase 2: G_fp4 staging in SMEM (row-quantized softmax grad)
     // This is the A operand for Phase 3 GMMA
     using G_fp4_row_tile = st_fp4e2m1_2<C::Mb/2, C::Nb/2>;  // [128, 64] = 8KB
-    using G_sc_row_tile  = st_hf<4, 256, false>;              // scale tile (same as A_sc_tile)
+    using G_sc_row_tile  = st_hf<2, 256, false>;              // 1KB scale tile for Nb=128
 
     // BF16 output: grad_logits for dC GEMM
     using D_tile = st_bf<C::Mb/2, C::Nb/C::EPI_PIPE_DEPTH>;
@@ -191,7 +191,7 @@ struct globals {
     // Phase 2 SMEM staging for FP4 G
     struct fp4_staging_t {
         G_fp4_row_tile G_row;     // [128, 64] fp4x2 = 8KB
-        G_sc_row_tile  G_row_sc;  // scales for G (2KB)
+        G_sc_row_tile  G_row_sc;  // scales for G (1KB)
     };
 
     __host__ inline dim3 grid() const {
@@ -278,7 +278,11 @@ __device__ inline void backward_kernel_v4(const globals<C>& g) {
     __shared__ semaphore p3_scales_arrived;
     __shared__ semaphore p3_inputs_finished;
     __shared__ semaphore p3_outputs_arrived;
-    __shared__ semaphore fp4_ready;  // consumer→MMA: G is quantized in SMEM
+    __shared__ semaphore p3_outputs_finished;
+    __shared__ semaphore fp4_ready;          // consumer→producer: local CTA G staging is ready
+    __shared__ semaphore fp4_ready_cluster;  // both CTAs → MMA: cluster G staging is ready
+    __shared__ float fp4_row_amax[WARPGROUP_WARPS];
+    __shared__ float fp4_row_sg;
 
     if (threadIdx.x == 32) {
         init_semaphore(tmem_provisioned, 0, 1);
@@ -294,7 +298,9 @@ __device__ inline void backward_kernel_v4(const globals<C>& g) {
         init_semaphore(p3_scales_arrived, 0, 1);
         init_semaphore(p3_inputs_finished, 0, 1);
         init_semaphore(p3_outputs_arrived, 0, 1);
-        init_semaphore(fp4_ready, 1, 0);  // needs 1 arrive from consumer (NOTE: impl adds thread_count+transaction_count)
+        init_semaphore(p3_outputs_finished, 0, 1);
+        init_semaphore(fp4_ready, 1, 0);
+        init_semaphore(fp4_ready_cluster, 0, C::CLUSTER_SIZE);
     }
     everyone::tma::cluster::arrive_aligned();
 
@@ -322,17 +328,14 @@ __device__ inline void backward_kernel_v4(const globals<C>& g) {
                     stage = (stage + 1) % C::LOAD_PIPE_DEPTH;
                 }
 
-                // ─── Phase 3: Load C_col tiles (CTA 0 only — MMA only uses CTA 0 data) ───
-                if (num_k_chunks > 0 && cta_id == 0) {
+                // ─── Phase 3: Load C_col tiles for dE GEMM ───
+                if (num_k_chunks > 0) {
                     wait(fp4_ready, get_phasebit<1>(phasebits, 5));
                     for (int k = 0; k < num_k_chunks; k++) {
                         wait(p3_inputs_finished, get_phasebit<1>(phasebits, 6));
-                        tma::cluster::load_async(p3_tiles.B, g.C_col, {k, col_block_idx}, p3_tiles_arrived, (uint16_t)1, 0);
+                        tma::cluster::load_async(p3_tiles.B, g.C_col, {k*2 + cta_id, col_block_idx}, p3_tiles_arrived, (uint16_t)(1<<cta_id), 0);
                         update_phasebit<1>(phasebits, 6);
                     }
-                    update_phasebit<1>(phasebits, 5);
-                } else if (num_k_chunks > 0) {
-                    // CTA 1: just update phasebits, no TMA loads
                     update_phasebit<1>(phasebits, 5);
                 }
             }
@@ -357,17 +360,14 @@ __device__ inline void backward_kernel_v4(const globals<C>& g) {
                     stage = (stage + 1) % C::LOAD_PIPE_DEPTH;
                 }
 
-                // ─── Phase 3: DISABLED for debugging ───
-                if (num_k_chunks > 0 && cta_id == 0) {
+                // ─── Phase 3: Load C_col scales for dE GEMM ───
+                if (num_k_chunks > 0) {
                     wait(fp4_ready, get_phasebit<1>(phasebits, 5));
                     for (int k = 0; k < num_k_chunks; k++) {
                         wait(p3_inputs_finished, get_phasebit<1>(phasebits, 6));
-                        tma::cluster::load_async(p3_scales.B_sc, g.C_col_sc, {k, 0, 0}, p3_scales_arrived, (uint16_t)1, 0);
+                        tma::cluster::load_async(p3_scales.B_sc, g.C_col_sc, {k, col_block_idx, 0}, p3_scales_arrived, (uint16_t)(1<<cta_id), 0);
                         update_phasebit<1>(phasebits, 6);
                     }
-                    update_phasebit<1>(phasebits, 5);
-                } else if (num_k_chunks > 0) {
-                    // CTA 1: just update phasebits, no TMA loads
                     update_phasebit<1>(phasebits, 5);
                 }
             }
@@ -434,7 +434,7 @@ __device__ inline void backward_kernel_v4(const globals<C>& g) {
 
                 // ─── Phase 3: dE GEMM ───
                 if (num_k_chunks > 0) {
-                    wait(fp4_ready, get_phasebit<0>(phasebits, 5));
+                    wait(fp4_ready_cluster, get_phasebit<0>(phasebits, 5));
                     tensor_after_thread_sync();
 
                     // Load G scales to TMEM (A scales for Phase 3)
@@ -448,7 +448,7 @@ __device__ inline void backward_kernel_v4(const globals<C>& g) {
 
                     for (int k = 0; k < num_k_chunks; k++) {
                         // Wait for C_col scales from TMA
-                        tma::expect_bytes(p3_scales_arrived, sizeof(G::p3_scales_t));
+                        tma::expect_bytes(p3_scales_arrived, 2*sizeof(G::p3_scales_t));
                         wait(p3_scales_arrived, get_phasebit<0>(phasebits, 6));
 
                         // Load C_col scales to TMEM (B scales for Phase 3)
@@ -461,27 +461,23 @@ __device__ inline void backward_kernel_v4(const globals<C>& g) {
                         }
 
                         // Wait for C_col FP4 tiles from TMA
-                        tma::expect_bytes(p3_tiles_arrived, sizeof(G::p3_tiles_t));
+                        tma::expect_bytes(p3_tiles_arrived, 2*sizeof(G::p3_tiles_t));
                         wait(p3_tiles_arrived, get_phasebit<0>(phasebits, 6));
 
-                        // cta_group::2 GMMA
-                        if (k == 0) mm2_ABt(p3_out_tm, fp4_staging.G_row, p3_tiles.B,
-                                           p3_A_sc_tm.template subtile<full_tt_fp8e4m3<C::P3_MMA_PER_TILE*16>>(0),
-                                           p3_B_sc_tm.template subtile<full_tt_fp8e4m3<C::P3_MMA_PER_TILE*16>>(0),
-                                           p3_inputs_finished);
-                        else        mma2_ABt(p3_out_tm, fp4_staging.G_row, p3_tiles.B,
-                                           p3_A_sc_tm.template subtile<full_tt_fp8e4m3<C::P3_MMA_PER_TILE*16>>(0),
-                                           p3_B_sc_tm.template subtile<full_tt_fp8e4m3<C::P3_MMA_PER_TILE*16>>(0),
-                                           p3_inputs_finished);
+                        // Each k chunk is a distinct dE output tile, so use a fresh TMEM accumulator.
+                        mm2_ABt(p3_out_tm, fp4_staging.G_row, p3_tiles.B,
+                                p3_A_sc_tm.template subtile<full_tt_fp8e4m3<C::P3_MMA_PER_TILE*16>>(0),
+                                p3_B_sc_tm.template subtile<full_tt_fp8e4m3<C::P3_MMA_PER_TILE*32>>(0),
+                                p3_inputs_finished);
+
+                        tensor_commit<2>(p3_outputs_arrived);
 
                         if (k + 1 < num_k_chunks) {
-                            wait(p3_inputs_finished, get_phasebit<0>(phasebits, 7));
+                            wait(p3_outputs_finished, get_phasebit<0>(phasebits, 7));
                         }
                         update_phasebit<0>(phasebits, 6);
                         update_phasebit<0>(phasebits, 7);
                     }
-                    // Commit GMMA results after all k iterations (like Phase 1's outputs_arrived)
-                    tensor_commit<2>(p3_outputs_arrived);
 
                     update_phasebit<0>(phasebits, 5);
                 }
@@ -513,7 +509,6 @@ __device__ inline void backward_kernel_v4(const globals<C>& g) {
 
         // Phase 3 output registers
         using p3_rt = rt_fl<C::Mb / 8, C::Nb_out>;
-        using p3_rt_bf = rt_bf<C::Mb / 8, C::Nb_out>;
 
         const int lane_id = threadIdx.x % 32;
         int phase = 0;
@@ -644,125 +639,179 @@ __device__ inline void backward_kernel_v4(const globals<C>& g) {
             // (But first, MMA warp needs Phase 3, so we signal outputs_finished AFTER Phase 3)
 
             // ════════════════════════════════════════════════════
-            // Phase 2a: Store BF16 G output via TMA (for dC GEMM)
+            // Phase 2a/2b setup: compute one tile-global FP4 scale
             // ════════════════════════════════════════════════════
+            const int warp_id = warpgroup::warpid();
+            {
+                float local_tile_amax = 0.0f;
+
+                #pragma unroll
+                for (int epi = 0; epi < C::EPI_PIPE_DEPTH; epi++) {
+                    subtile_rt& D_fl = D_regs_fl[epi];
+                    #pragma unroll
+                    for (int i = 0; i < subtile_rt::height; i++) {
+                        #pragma unroll
+                        for (int j = 0; j < subtile_rt::width; j++) {
+                            #pragma unroll
+                            for (int kk = 0; kk < 4; kk++) {
+                                local_tile_amax = fmaxf(local_tile_amax, fabsf(D_fl.tiles[i][j].data[kk].x));
+                                local_tile_amax = fmaxf(local_tile_amax, fabsf(D_fl.tiles[i][j].data[kk].y));
+                            }
+                        }
+                    }
+                }
+
+                #pragma unroll
+                for (int offset = 16; offset > 0; offset >>= 1) {
+                    local_tile_amax = fmaxf(local_tile_amax, __shfl_xor_sync(0xFFFFFFFF, local_tile_amax, offset));
+                }
+                if (lane_id == 0) fp4_row_amax[warp_id] = local_tile_amax;
+                warpgroup::sync(1);
+
+                if (warp_id == 0) {
+                    float tile_amax = (lane_id < WARPGROUP_WARPS) ? fp4_row_amax[lane_id] : 0.0f;
+                    #pragma unroll
+                    for (int offset = 16; offset > 0; offset >>= 1) {
+                        tile_amax = fmaxf(tile_amax, __shfl_xor_sync(0xFFFFFFFF, tile_amax, offset));
+                    }
+                    if (lane_id == 0) fp4_row_sg = (tile_amax > 0.0f) ? (tile_amax / 2688.0f) : 1.0f;
+                }
+                warpgroup::sync(1);
+            }
+            const float fp4_row_senc = 1.0f / fp4_row_sg;
+
+            // ════════════════════════════════════════════════════
+            // Phase 2a: Store BF16 G output via TMA (for dC GEMM)
+            // Phase 2b: Quantize each canonical BF16 slice from shared memory
+            // ════════════════════════════════════════════════════
+            const uint32_t fp4_base = static_cast<uint32_t>(__cvta_generic_to_shared(&fp4_staging.G_row.data[0]));
             #pragma unroll
             for (int epi = 0; epi < C::EPI_PIPE_DEPTH; epi++) {
                 warpgroup::tma::store_async_read_wait<C::NUM_D_TILES-1>();
                 warpgroup::sync(1);
                 warpgroup::store(output_tiles.D[epi % C::NUM_D_TILES], D_regs_bf[epi]);
                 warpgroup::sync(1);
+
+                // Quantize the canonical BF16 slice from shared memory rather than
+                // depending on the MMA register packing inherited from v3.
+                const int quant_row = threadIdx.x;
+                if (quant_row < C::Mb / 2) {
+                    const uint32_t d_base = static_cast<uint32_t>(__cvta_generic_to_shared(&output_tiles.D[epi % C::NUM_D_TILES].data[0]));
+                    #pragma unroll
+                    for (int group16 = 0; group16 < SUBTILE_COLS / 16; group16++) {
+                        bf16_2 vals[8];
+                        float amax = 0.0f;
+                        #pragma unroll
+                        for (int pair = 0; pair < 8; pair++) {
+                            const int col = group16 * 16 + pair * 2;
+                            move<bf16_2>::lds(vals[pair], G::D_tile::idx(d_base, {quant_row, col}));
+                            amax = fmaxf(amax, fabsf(__bfloat162float(vals[pair].x)));
+                            amax = fmaxf(amax, fabsf(__bfloat162float(vals[pair].y)));
+                        }
+
+                        const float FP4_MAX = 6.0f;
+                        const float FP8_MAX = 448.0f;
+                        const float S_mult = (amax <= 1.0e-9f)
+                            ? FP8_MAX
+                            : fminf(FP4_MAX / (amax * fp4_row_senc), FP8_MAX);
+                        const __nv_fp8_e4m3 S_mult_fp8 = __nv_fp8_e4m3(S_mult);
+                        const float coeff = static_cast<float>(S_mult_fp8) * fp4_row_senc;
+
+                        #pragma unroll
+                        for (int pair = 0; pair < 8; pair++) {
+                            const float2 scaled = {
+                                __bfloat162float(vals[pair].x) * coeff,
+                                __bfloat162float(vals[pair].y) * coeff
+                            };
+                            const uint8_t fp4_pair = static_cast<uint8_t>(__nv_cvt_float2_to_fp4x2(
+                                scaled, __NV_E2M1, cudaRoundNearest));
+                            const int fp4x2_col = (epi * SUBTILE_COLS + group16 * 16 + pair * 2) / 2;
+                            const uint32_t fp4_addr = G::G_fp4_row_tile::idx(fp4_base, {quant_row, fp4x2_col});
+                            asm volatile("{st.shared.b8 [%0], %1;}" :: "r"(fp4_addr), "r"((uint32_t)fp4_pair));
+                        }
+
+                        const float S_mult_val = static_cast<float>(S_mult_fp8);
+                        __nv_fp8_e4m3 sc = __nv_fp8_e4m3(1.0f / S_mult_val);
+                        const int global_col_16 = epi * SUBTILE_COLS + group16 * 16;
+                        const int kgroup = global_col_16 / 64;
+                        const int col_16_in_64 = (global_col_16 / 16) % 4;
+                        const int sr = quant_row % 32;
+                        const int rr = (quant_row / 32) % 4;
+                        const int byte_idx = sr * 16 + rr * 4 + col_16_in_64;
+                        reinterpret_cast<uint8_t*>(&fp4_staging.G_row_sc.data[0])[kgroup * 512 + byte_idx] =
+                            *reinterpret_cast<uint8_t*>(&sc);
+                    }
+                }
+
                 warpgroup::tma::store_async<dim::ROW, cache_policy::EVICT_FIRST>(
                     g.D_out, output_tiles.D[epi % C::NUM_D_TILES],
                     {row_block_idx*2 + cta_id, C::EPI_PIPE_DEPTH*col_block_idx + epi});
             }
+            warpgroup::sync(1);
+            __threadfence_block();
+            asm volatile("fence.proxy.async.shared::cta;\n" ::: "memory");
+            if (num_k_chunks > 0 && warpgroup::warpid() == 0 && lane_id == 0) {
+                arrive(fp4_ready, 1);
+                if (cta_id == 0) {
+                    arrive(fp4_ready_cluster, 1);
+                } else {
+                    uint32_t local_addr = static_cast<uint32_t>(__cvta_generic_to_shared(&fp4_ready_cluster));
+                    uint32_t remote_addr;
+                    asm volatile("mapa.shared::cluster.u32 %0, %1, %2;\n" : "=r"(remote_addr) : "r"(local_addr), "r"(0));
+                    asm volatile("mbarrier.arrive.shared::cluster.b64 _, [%0], %1;\n" :: "r"(remote_addr), "r"((uint32_t)1) : "memory");
+                }
+            }
 
+            // Drain each Phase 3 TMEM tile and atomically accumulate it into global dE.
+            if (num_k_chunks > 0) {
+                const float p3_global_scale = fp4_row_sg * g.C_col_sc_global[{0}];
+                __nv_bfloat16* dE_ptr = reinterpret_cast<__nv_bfloat16*>(g.dE_out.raw_ptr);
+                for (int k = 0; k < num_k_chunks; k++) {
+                    wait(p3_outputs_arrived, get_phasebit<0>(phasebits, 8));
 
-            // ════════════════════════════════════════════════════
-            // Phase 2b: Row-quantize G to FP4 → SMEM staging tile
-            // Write FP4 bytes to fp4_staging.G_row (st_fp4e2m1_2)
-            // Write E4M3 scales to fp4_staging.G_row_sc (st_hf<4,256>)
-            // ════════════════════════════════════════════════════
-            {
-                const int warp_id = warpgroup::warpid();
-                const int local_warp_row_base = warp_id * (C::Mb / 8); // 32 rows per warp
+                    p3_rt dE_fl;
+                    warpgroup::load_async(dE_fl, p3_out_tm);
+                    tensor_load_wait();
+                    tensor_before_thread_sync();
+                    warpgroup::sync(1);
 
-                #pragma unroll
-                for (int epi = 0; epi < C::EPI_PIPE_DEPTH; epi++) {
-                    subtile_rt& D_fl = D_regs_fl[epi];
+                    warp::mul(dE_fl, dE_fl, p3_global_scale);
+
+                    const int wid = warpgroup::warpid();
+                    const int warp_row_base_p3 = wid * (C::Mb / 8);
 
                     #pragma unroll
-                    for (int i = 0; i < subtile_rt::height; i++) {
-                        int local_row_x = local_warp_row_base + i * 16 + lane_id / 4;
-                        int local_row_y = local_warp_row_base + i * 16 + 8 + lane_id / 4;
-
+                    for (int i = 0; i < p3_rt::height; i++) {
+                        int row_x = tile_row_base + warp_row_base_p3 + i * 16 + lane_id / 4;
+                        int row_y = tile_row_base + warp_row_base_p3 + i * 16 + 8 + lane_id / 4;
                         #pragma unroll
-                        for (int j = 0; j < subtile_rt::width; j++) {
-                            float vals_x[4], vals_y[4];
-                            vals_x[0] = D_fl.tiles[i][j].data[0].x;
-                            vals_x[1] = D_fl.tiles[i][j].data[0].y;
-                            vals_x[2] = D_fl.tiles[i][j].data[2].x;
-                            vals_x[3] = D_fl.tiles[i][j].data[2].y;
-                            vals_y[0] = D_fl.tiles[i][j].data[1].x;
-                            vals_y[1] = D_fl.tiles[i][j].data[1].y;
-                            vals_y[2] = D_fl.tiles[i][j].data[3].x;
-                            vals_y[3] = D_fl.tiles[i][j].data[3].y;
+                        for (int j = 0; j < p3_rt::width; j++) {
+                            int col_base = k * C::Nb_out + j * 16 + (lane_id % 4) * 2;
+                            float2 d0 = dE_fl.tiles[i][j].data[0];
+                            float2 d1 = dE_fl.tiles[i][j].data[1];
+                            float2 d2 = dE_fl.tiles[i][j].data[2];
+                            float2 d3 = dE_fl.tiles[i][j].data[3];
 
-                            // Row amax across 4 threads sharing a 16-col group
-                            float amax_x = 0.0f, amax_y = 0.0f;
-                            #pragma unroll
-                            for (int v = 0; v < 4; v++) {
-                                amax_x = fmaxf(amax_x, fabsf(vals_x[v]));
-                                amax_y = fmaxf(amax_y, fabsf(vals_y[v]));
+                            if (row_x < g.M && col_base < g.K) {
+                                int off = row_x * g.K + col_base;
+                                atomicAdd(&dE_ptr[off],   __float2bfloat16(d0.x));
+                                atomicAdd(&dE_ptr[off+1], __float2bfloat16(d0.y));
+                                int off2 = off + 8;
+                                atomicAdd(&dE_ptr[off2],   __float2bfloat16(d2.x));
+                                atomicAdd(&dE_ptr[off2+1], __float2bfloat16(d2.y));
                             }
-                            #pragma unroll
-                            for (int offset = 1; offset < 4; offset <<= 1) {
-                                amax_x = fmaxf(amax_x, __shfl_xor_sync(0xFFFFFFFF, amax_x, offset));
-                                amax_y = fmaxf(amax_y, __shfl_xor_sync(0xFFFFFFFF, amax_y, offset));
-                            }
-
-                            const float FP4_MAX = 6.0f;
-                            float scale_x = fmaxf(amax_x / FP4_MAX, 1.0f / 65536.0f);
-                            float scale_y = fmaxf(amax_y / FP4_MAX, 1.0f / 65536.0f);
-                            float rcp_scale_x = 1.0f / scale_x;
-                            float rcp_scale_y = 1.0f / scale_y;
-
-                            // Quantize to fp4x2 bytes
-                            uint8_t fp4_x_lo = quantize_fp4_pair(vals_x[0], vals_x[1], rcp_scale_x);
-                            uint8_t fp4_x_hi = quantize_fp4_pair(vals_x[2], vals_x[3], rcp_scale_x);
-                            uint8_t fp4_y_lo = quantize_fp4_pair(vals_y[0], vals_y[1], rcp_scale_y);
-                            uint8_t fp4_y_hi = quantize_fp4_pair(vals_y[2], vals_y[3], rcp_scale_y);
-
-                            // Write FP4 bytes to SMEM via raw pointer
-                            // G_row is st_fp4e2m1_2<128, 64>: 128 rows × 64 fp4x2_cols
-                            // Each thread writes 4 bytes (2 per row-half)
-                            int fp4_col = (lane_id % 4) * 2 + j * 16 + epi * SUBTILE_COLS;
-                            int fp4x2_col_lo = fp4_col / 2;
-                            int fp4x2_col_hi = (fp4_col + 8) / 2;
-                            
-                            uint8_t* g_base = reinterpret_cast<uint8_t*>(&fp4_staging.G_row.data[0]);
-                            // Simple linear layout: row * 64 + col (unswizzled for now)
-                            g_base[local_row_x * 64 + fp4x2_col_lo] = fp4_x_lo;
-                            g_base[local_row_x * 64 + fp4x2_col_hi] = fp4_x_hi;
-                            g_base[local_row_y * 64 + fp4x2_col_lo] = fp4_y_lo;
-                            g_base[local_row_y * 64 + fp4x2_col_hi] = fp4_y_hi;
-
-                            // Write E4M3 scales
-                            if ((lane_id % 4) == 0) {
-                                __nv_fp8_e4m3 sc_x = __nv_fp8_e4m3(scale_x);
-                                __nv_fp8_e4m3 sc_y = __nv_fp8_e4m3(scale_y);
-
-                                int global_col_16 = epi * SUBTILE_COLS + j * 16;
-                                int kgroup = global_col_16 / 64;
-                                int col_16_in_64 = (global_col_16 / 16) % 4;
-
-                                int sr_x = local_row_x % 32;
-                                int rr_x = (local_row_x / 32) % 4;
-                                int byte_x = sr_x * 16 + rr_x * 4 + col_16_in_64;
-                                reinterpret_cast<uint8_t*>(&fp4_staging.G_row_sc.data[0])[kgroup * 512 + byte_x] =
-                                    *reinterpret_cast<uint8_t*>(&sc_x);
-
-                                int sr_y = local_row_y % 32;
-                                int rr_y = (local_row_y / 32) % 4;
-                                int byte_y = sr_y * 16 + rr_y * 4 + col_16_in_64;
-                                reinterpret_cast<uint8_t*>(&fp4_staging.G_row_sc.data[0])[kgroup * 512 + byte_y] =
-                                    *reinterpret_cast<uint8_t*>(&sc_y);
+                            if (row_y < g.M && col_base < g.K) {
+                                int off = row_y * g.K + col_base;
+                                atomicAdd(&dE_ptr[off],   __float2bfloat16(d1.x));
+                                atomicAdd(&dE_ptr[off+1], __float2bfloat16(d1.y));
+                                int off2 = off + 8;
+                                atomicAdd(&dE_ptr[off2],   __float2bfloat16(d3.x));
+                                atomicAdd(&dE_ptr[off2+1], __float2bfloat16(d3.y));
                             }
                         }
                     }
-                }
-            }
-            warpgroup::sync(1);
-            if (num_k_chunks > 0 && warpgroup::warpid() == 0) {
 
-                warpgroup::arrive(fp4_ready, 1);
-
-            }
-
-            // Phase 3: DISABLED for debugging
-            // (just update phasebits)
-            if (cta_id == 0 && num_k_chunks > 0) {
-                for (int k = 0; k < num_k_chunks; k++) {
+                    if (warpgroup::warpid() == 0) warpgroup::arrive(p3_outputs_finished, 1);
                     update_phasebit<0>(phasebits, 8);
                 }
             }
