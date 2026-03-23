@@ -22,32 +22,38 @@ static void launch_backward_v4_bf16(
     // Dummies for unused TMA descriptors
     auto dummy_fp4_grow = A.new_empty({C::Mb/2, C::Nb/2}, A.options().dtype(at::kFloat4_e2m1fn_x2));
     auto dummy_fp4_ccol = A.new_empty({C::Nb_out/2, C::Nb/2}, A.options().dtype(at::kFloat4_e2m1fn_x2));
-    auto dummy_sc  = A.new_empty({4, 256}, A.options().dtype(c10::kHalf));
+    auto dummy_sc  = A.new_empty({1, 1, 256}, A.options().dtype(c10::kHalf));
     auto dummy_sg  = A.new_empty({1}, A.options().dtype(c10::kFloat));
     auto dummy_dE  = A.new_empty({C::Mb/2, C::Nb_out}, A.options().dtype(c10::kBFloat16));
 
     bool use_p3 = (K > 0);
+    at::Tensor c_col_sc_storage = dummy_sc;
+    int c_col_sc_depth = 1;
+    int c_col_sc_rows = 1;
 
     if (use_p3) {
-        printf("C_col: dim=%d, sizes=[", (int)C_col.dim());
-        for (int i=0; i<C_col.dim(); i++) printf("%d%s", (int)C_col.size(i), i<C_col.dim()-1?",":"");
-        printf("], dtype=%d, contiguous=%d, ptr=%p\n", (int)C_col.scalar_type(), C_col.is_contiguous(), C_col.data_ptr());
-        printf("C_col_sc: dim=%d, sizes=[", (int)C_col_sc.dim());
-        for (int i=0; i<C_col_sc.dim(); i++) printf("%d%s", (int)C_col_sc.size(i), i<C_col_sc.dim()-1?",":"");
-        printf("], dtype=%d, contiguous=%d, ptr=%p\n", (int)C_col_sc.scalar_type(), C_col_sc.is_contiguous(), C_col_sc.data_ptr());
-        printf("dE_out: dim=%d, sizes=[", (int)dE_out.dim());
-        for (int i=0; i<dE_out.dim(); i++) printf("%d%s", (int)dE_out.size(i), i<dE_out.dim()-1?",":"");
-        printf("], ptr=%p\n", dE_out.data_ptr());
-        printf("P3_B_fp4x2_tile: rows=%d, cols=%d\n", (int)G::P3_B_fp4x2_tile::rows, (int)G::P3_B_fp4x2_tile::cols);
-        printf("P3_B_sc_tile: rows=%d, cols=%d\n", (int)G::P3_B_sc_tile::rows, (int)G::P3_B_sc_tile::cols);
-        printf("num_k_chunks=%d, Nb_out=%d, Nb=%d\n", K/(int)C::Nb_out, (int)C::Nb_out, (int)C::Nb);
-        int a_sc_depth = A_sc.dim()==2 ? A_sc.size(0)/128 : A_sc.size(0);
-        int a_sc_rows  = A_sc.dim()==2 ? A_sc.size(1)/4 : A_sc.size(1);
-        printf("A_sc GL: B=1, D=%d, R=%d, C=256 (tile rows=%d)\n", a_sc_depth, a_sc_rows, (int)G::A_sc_tile::rows);
-        int c_sc_depth = C_col_sc.dim()==2 ? C_col_sc.size(0)/128 : C_col_sc.size(0);
-        int c_sc_rows  = C_col_sc.dim()==2 ? C_col_sc.size(1)/4 : C_col_sc.size(1);
-        printf("C_col_sc GL: B=1, D=%d, R=%d, C=256 (tile rows=%d)\n", c_sc_depth, c_sc_rows, (int)G::P3_B_sc_tile::rows);
-        fflush(stdout);
+        TORCH_CHECK(C_col.is_cuda() && C_col.is_contiguous(),
+                    "Phase 3 C_col must be a contiguous CUDA tensor from tk_quantize_for_gemm(...)[2].");
+        TORCH_CHECK(C_col_sc.is_cuda() && C_col_sc.is_contiguous(),
+                    "Phase 3 C_col_sc must be a contiguous CUDA tensor from tk_quantize_for_gemm(...)[3].");
+        TORCH_CHECK(C_col.dim() == 2,
+                    "Phase 3 C_col must have shape [K, V/2] from the column-quantized output.");
+        TORCH_CHECK(C_col.size(0) == K,
+                    "Phase 3 C_col first dimension must equal K. Got ", C_col.size(0), " vs ", K, ".");
+        TORCH_CHECK(C_col.size(1) == N / 2,
+                    "Phase 3 C_col second dimension must equal V/2. Got ", C_col.size(1), " vs ", N / 2, ".");
+        TORCH_CHECK(C_col_sc.dim() == 3 && C_col_sc.size(0) == K / 128 && C_col_sc.size(2) == 512,
+                    "Phase 3 C_col_sc must have shape [K/128, V/64, 512] from the column-quantized output.");
+
+        c_col_sc_depth = C_col_sc.size(0);
+        c_col_sc_rows = C_col_sc.size(1);
+        if (c_col_sc_rows < 2) {
+            c_col_sc_storage = C_col_sc.new_zeros({c_col_sc_depth, 2, 512}, C_col_sc.options());
+            c_col_sc_storage.narrow(1, 0, c_col_sc_rows).copy_(C_col_sc);
+            c_col_sc_rows = 2;
+        } else {
+            c_col_sc_storage = C_col_sc;
+        }
     }
 
     G g {
@@ -67,24 +73,8 @@ static void launch_backward_v4_bf16(
         .C_col = use_p3
             ? kittens::py::tensor_to_gl<typename G::P3_B_fp4x2_gl>(C_col)
             : kittens::py::tensor_to_gl<typename G::P3_B_fp4x2_gl>(dummy_fp4_ccol),
-        // C_col_sc: pad rows to >=4 for P3_B_sc_tile compatibility
-        .C_col_sc = [&]() {
-            if (!use_p3) return kittens::py::tensor_to_gl<typename G::P3_B_sc_gl, false>(
-                dummy_sc, 1, 1, 1, 256);
-            int sc_depth = C_col_sc.dim()==2 ? C_col_sc.size(0)/128 : C_col_sc.size(0);
-            int sc_rows  = C_col_sc.dim()==2 ? C_col_sc.size(1)/4 : C_col_sc.size(1);
-            int padded_rows = std::max(sc_rows, 4);
-            if (sc_rows < 4) {
-                // Need to pad: create a padded tensor
-                auto padded = C_col_sc.new_zeros({sc_depth, padded_rows, 512},
-                    C_col_sc.options());
-                padded.narrow(1, 0, sc_rows).copy_(C_col_sc);
-                return kittens::py::tensor_to_gl<typename G::P3_B_sc_gl, false>(
-                    padded, 1, sc_depth, padded_rows, 256);
-            }
-            return kittens::py::tensor_to_gl<typename G::P3_B_sc_gl, false>(
-                C_col_sc, 1, sc_depth, sc_rows, 256);
-        }(),
+        .C_col_sc = kittens::py::tensor_to_gl<typename G::P3_B_sc_gl, false>(
+            c_col_sc_storage, 1, c_col_sc_depth, c_col_sc_rows, 256),
         .C_col_sc_global = kittens::py::tensor_to_gl<typename G::P3_B_sc_global_gl>(
             use_p3 ? C_col_sc_global : dummy_sg),
         .D_out = kittens::py::tensor_to_gl<typename G::D_gl>(grad_out),
