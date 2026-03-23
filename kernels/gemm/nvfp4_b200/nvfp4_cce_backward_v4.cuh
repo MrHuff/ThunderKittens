@@ -298,7 +298,7 @@ __device__ inline void backward_kernel_v4(const globals<C>& g) {
         init_semaphore(p3_scales_arrived, 0, 1);
         init_semaphore(p3_inputs_finished, 0, 1);
         init_semaphore(p3_outputs_arrived, 0, 1);
-        init_semaphore(p3_outputs_finished, 0, 1);
+        init_semaphore(p3_outputs_finished, 0, C::CLUSTER_SIZE);
         init_semaphore(fp4_ready, 1, 0);
         init_semaphore(fp4_ready_cluster, 0, C::CLUSTER_SIZE);
     }
@@ -447,6 +447,11 @@ __device__ inline void backward_kernel_v4(const globals<C>& g) {
                     }
 
                     for (int k = 0; k < num_k_chunks; k++) {
+                        if (k > 0) {
+                            // The Phase 3 accumulator aliases cluster TMEM, so after the previous
+                            // drain completes we need the same reuse fence as the outer Phase 1 ring.
+                            tensor_after_thread_sync();
+                        }
                         // Wait for C_col scales from TMA
                         tma::expect_bytes(p3_scales_arrived, 2*sizeof(G::p3_scales_t));
                         wait(p3_scales_arrived, get_phasebit<0>(phasebits, 6));
@@ -750,6 +755,7 @@ __device__ inline void backward_kernel_v4(const globals<C>& g) {
             warpgroup::sync(1);
             __threadfence_block();
             asm volatile("fence.proxy.async.shared::cta;\n" ::: "memory");
+            asm volatile("fence.proxy.async.shared::cluster;\n" ::: "memory");
             if (num_k_chunks > 0 && warpgroup::warpid() == 0 && lane_id == 0) {
                 arrive(fp4_ready, 1);
                 if (cta_id == 0) {
@@ -765,7 +771,6 @@ __device__ inline void backward_kernel_v4(const globals<C>& g) {
             // Drain each Phase 3 TMEM tile and atomically accumulate it into global dE.
             if (num_k_chunks > 0) {
                 const float p3_global_scale = fp4_row_sg * g.C_col_sc_global[{0}];
-                __nv_bfloat16* dE_ptr = reinterpret_cast<__nv_bfloat16*>(g.dE_out.raw_ptr);
                 for (int k = 0; k < num_k_chunks; k++) {
                     wait(p3_outputs_arrived, get_phasebit<0>(phasebits, 8));
 
@@ -780,43 +785,52 @@ __device__ inline void backward_kernel_v4(const globals<C>& g) {
                     const int wid = warpgroup::warpid();
                     const int warp_row_base_p3 = wid * (C::Mb / 8);
 
+                    __nv_bfloat16* dE_ptr = reinterpret_cast<__nv_bfloat16*>(g.dE_out.raw_ptr);
                     #pragma unroll
                     for (int i = 0; i < p3_rt::height; i++) {
-                        int row_x = tile_row_base + warp_row_base_p3 + i * 16 + lane_id / 4;
-                        int row_y = tile_row_base + warp_row_base_p3 + i * 16 + 8 + lane_id / 4;
+                        const int row_x = tile_row_base + warp_row_base_p3 + i * 16 + lane_id / 4;
+                        const int row_y = tile_row_base + warp_row_base_p3 + i * 16 + 8 + lane_id / 4;
                         #pragma unroll
                         for (int j = 0; j < p3_rt::width; j++) {
-                            int col_base = k * C::Nb_out + j * 16 + (lane_id % 4) * 2;
-                            float2 d0 = dE_fl.tiles[i][j].data[0];
-                            float2 d1 = dE_fl.tiles[i][j].data[1];
-                            float2 d2 = dE_fl.tiles[i][j].data[2];
-                            float2 d3 = dE_fl.tiles[i][j].data[3];
+                            const int col_base = k * C::Nb_out + j * 16 + (lane_id % 4) * 2;
+                            const float2 d0 = dE_fl.tiles[i][j].data[0];
+                            const float2 d1 = dE_fl.tiles[i][j].data[1];
+                            const float2 d2 = dE_fl.tiles[i][j].data[2];
+                            const float2 d3 = dE_fl.tiles[i][j].data[3];
 
-                            if (row_x < g.M && col_base < g.K) {
-                                int off = row_x * g.K + col_base;
-                                atomicAdd(&dE_ptr[off],   __float2bfloat16(d0.x));
-                                atomicAdd(&dE_ptr[off+1], __float2bfloat16(d0.y));
-                                int off2 = off + 8;
-                                atomicAdd(&dE_ptr[off2],   __float2bfloat16(d2.x));
-                                atomicAdd(&dE_ptr[off2+1], __float2bfloat16(d2.y));
+                            if (row_x < g.M) {
+                                const size_t off = static_cast<size_t>(row_x) * g.K + col_base;
+                                if (col_base + 1 < g.K) {
+                                    atomicAdd(reinterpret_cast<__nv_bfloat162*>(&dE_ptr[off]),
+                                              __floats2bfloat162_rn(d0.x, d0.y));
+                                }
+                                if (col_base + 9 < g.K) {
+                                    atomicAdd(reinterpret_cast<__nv_bfloat162*>(&dE_ptr[off + 8]),
+                                              __floats2bfloat162_rn(d2.x, d2.y));
+                                }
                             }
-                            if (row_y < g.M && col_base < g.K) {
-                                int off = row_y * g.K + col_base;
-                                atomicAdd(&dE_ptr[off],   __float2bfloat16(d1.x));
-                                atomicAdd(&dE_ptr[off+1], __float2bfloat16(d1.y));
-                                int off2 = off + 8;
-                                atomicAdd(&dE_ptr[off2],   __float2bfloat16(d3.x));
-                                atomicAdd(&dE_ptr[off2+1], __float2bfloat16(d3.y));
+                            if (row_y < g.M) {
+                                const size_t off = static_cast<size_t>(row_y) * g.K + col_base;
+                                if (col_base + 1 < g.K) {
+                                    atomicAdd(reinterpret_cast<__nv_bfloat162*>(&dE_ptr[off]),
+                                              __floats2bfloat162_rn(d1.x, d1.y));
+                                }
+                                if (col_base + 9 < g.K) {
+                                    atomicAdd(reinterpret_cast<__nv_bfloat162*>(&dE_ptr[off + 8]),
+                                              __floats2bfloat162_rn(d3.x, d3.y));
+                                }
                             }
                         }
                     }
 
-                    if (warpgroup::warpid() == 0) warpgroup::arrive(p3_outputs_finished, 1);
+                    warpgroup::tma::cluster::arrive(p3_outputs_finished, 0, 1);
                     update_phasebit<0>(phasebits, 8);
                 }
             }
 
             // Now signal outputs_finished so MMA warp can start next block
+            warpgroup::sync(1);
+            tensor_after_thread_sync();
             warpgroup::tma::cluster::arrive(outputs_finished, 0, 1);
             update_phasebit<0>(phasebits, 0);
             phase ^= 1;
