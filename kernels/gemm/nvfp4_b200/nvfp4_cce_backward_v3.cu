@@ -1,4 +1,4 @@
-// NVFP4 CCE Backward v2 — Fused softmax gradient + optional FP4 quantization
+// NVFP4 CCE Backward v3 — Fused softmax gradient + optional FP4 quantization
 #include "nvfp4_cce_backward_v3.cuh"
 
 #ifndef TORCH_COMPILE
@@ -16,10 +16,11 @@ static void launch_backward_v3_bf16(
 {
     static_assert(C::USE_BF16_ACCUM, "Must use BF16 config for this function");
     using G = nvfp4_cce_backward_v3::globals<C>;
+    const auto padded_M = A.size(0);
+    const auto padded_N = B.size(0);
 
     // Create dummy tensors for unused FP4 output fields
-    auto dummy_fp4 = A.new_empty({1, 1}, A.options().dtype(c10::kByte));
-    auto dummy_sc  = A.new_empty({1, 1}, A.options().dtype(c10::kHalf));
+    auto dummy_fp4 = A.new_empty({padded_M, padded_N / 2}, A.options().dtype(c10::kFloat4_e2m1fn_x2));
     auto dummy_sg  = A.new_empty({1}, A.options().dtype(c10::kFloat));
 
     G g {
@@ -53,7 +54,9 @@ static void launch_backward_v3_bf16(
     kittens::py::launch_kernel<C, G, nvfp4_cce_backward_v3::backward_kernel_v3<C>>(g);
 }
 
-// FP4 mode: outputs quantized G in NVFP4 format for separate GEMM calls
+// FP4 mode: outputs quantized G in NVFP4 format for separate GEMM calls.
+// G_sg_row is derived analytically from grad_scale so the per-16 FP8
+// micro-scales stay within E4M3 range without a separate global-amax pass.
 template <typename C>
 static void launch_backward_v3_fp4(
     const at::Tensor &A, const at::Tensor &A_sc, const at::Tensor &A_sc_global,
@@ -66,9 +69,24 @@ static void launch_backward_v3_fp4(
 {
     static_assert(!C::USE_BF16_ACCUM, "Must use FP4 config for this function");
     using G = nvfp4_cce_backward_v3::globals<C>;
+    constexpr float kFp4Max = 6.0f;
+    constexpr float kE4M3Max = 448.0f;
 
     // Dummy BF16 output — D_out is unused in FP4 mode but TMA needs valid tensor
     auto dummy_bf16 = A.new_empty({M, N}, A.options().dtype(c10::kBFloat16));
+    TORCH_CHECK(G_sg_row.is_cuda() && G_sg_row.numel() == 1,
+                "Phase 3 G_sg_row must be a CUDA tensor with one float element.");
+    const float g_sg = fmaxf(grad_scale / (kFp4Max * kE4M3Max), 1.0e-12f);
+    const auto stream = at::cuda::getCurrentCUDAStream();
+    auto err = cudaMemcpyAsync(
+        G_sg_row.data_ptr<float>(),
+        &g_sg,
+        sizeof(float),
+        cudaMemcpyHostToDevice,
+        stream.stream());
+    TORCH_CHECK(err == cudaSuccess,
+                "Failed to update NVFP4 v3 analytic G_sg_row: ",
+                cudaGetErrorString(err));
 
     G g {
         .A = kittens::py::tensor_to_gl<typename G::A_fp4x2_gl>(A),
@@ -107,8 +125,8 @@ using bwd_v3_fp4_L4_SG8  = nvfp4_cce_backward_v3::config<4, 8, false, true>;
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("backward_v3_bf16_L4_SG8", &launch_backward_v3_bf16<bwd_v3_bf16_L4_SG8>,
-          "NVFP4 CCE backward v2 (BF16 output) L4 SG8");
+          "NVFP4 CCE backward v3 (BF16 output) L4 SG8");
     m.def("backward_v3_fp4_L4_SG8", &launch_backward_v3_fp4<bwd_v3_fp4_L4_SG8>,
-          "NVFP4 CCE backward v2 (FP4 output) L4 SG8");
+          "NVFP4 CCE backward v3 (FP4 output) L4 SG8");
 }
 #endif

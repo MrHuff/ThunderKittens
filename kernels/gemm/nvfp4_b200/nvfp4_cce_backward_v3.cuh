@@ -1,6 +1,6 @@
 #pragma once
 // ================================================================
-// NVFP4 CCE Backward v2 — Fused Softmax Gradient + FP4 Quantization
+// NVFP4 CCE Backward v3 — Fused Softmax Gradient + FP4 Quantization
 //
 // Phase 1: FP4 GEMM recomputes logits = E_fp4 @ C_fp4^T
 // Phase 2: Consumer computes G = grad_scale * (softmax(logits) - 1[target])
@@ -8,7 +8,8 @@
 //   BF16 mode (USE_BF16_ACCUM=true):  Store G as BF16 via TMA
 //   FP4  mode (USE_BF16_ACCUM=false): Quantize G to NVFP4 on-the-fly
 //          (row-wise for dE = G @ C, col-wise for dC = G.T @ E)
-//          Per-16-element FP8 micro scales, fixed global scale (bounded grad)
+//          Per-16-element FP8 micro scales plus an analytic tensor scale
+//          derived from grad_scale (no tensor-global G amax pass required)
 //
 // After this kernel, separate GEMM calls compute dE/dC:
 //   dE = G_output @ C_quantized   (FP4 or BF16 GEMM)
@@ -134,6 +135,9 @@ struct globals {
     // depth=row/128, k_group=col/64
     uint8_t*       G_sc_row_ptr;    // TK 3D scale tensor, cast to uint8_t
     int            G_sc_row_kgroups; // = V/64
+    // Tensor-wide decode scale for G. We derive this analytically from
+    // grad_scale so the FP8 micro-scales stay representable without a
+    // separate global-amax reduction over G.
     G_sg_row_gl    G_sg_row;
 
     // FP4 mode outputs (col-quantized G^T for dC = E^T @ G = (G^T)^T @ E)
@@ -164,14 +168,6 @@ struct globals {
         D_tile D[C::NUM_D_TILES];
     };
 
-    // Staging buffer for FP4 quant: stores softmax grad as BF16 in smem
-    // so consumer can free TMEM quickly and do quant from smem asynchronously.
-    // Each CTA processes Mb/2 rows × Nb cols. Double-buffered for pipelining.
-    using quant_staging_tile = st_bf<C::Mb/2, C::Nb>;
-    struct quant_staging_t {
-        quant_staging_tile staging[2];  // double-buffered
-    };
-
     __host__ inline dim3 grid() const {
         int padded_M = A.rows();
         int padded_N = B.rows();
@@ -185,12 +181,9 @@ struct globals {
     }
     __host__ inline dim3 block() const { return dim3(C::NUM_THREADS); }
     __host__ inline int dynamic_shared_memory() const {
-        constexpr int base_smem = sizeof(input_tiles_t)  * C::LOAD_PIPE_DEPTH + 1024 +
-                                  sizeof(input_scales_t) * C::LOAD_PIPE_DEPTH + 1024 +
-                                  sizeof(outputs_t);
-        // Add staging buffer only for FP4 mode
-        constexpr int quant_smem = C::USE_BF16_ACCUM ? 0 : sizeof(quant_staging_t);
-        constexpr int _dynamic_shared_memory = base_smem + quant_smem;
+        constexpr int _dynamic_shared_memory = sizeof(input_tiles_t)  * C::LOAD_PIPE_DEPTH + 1024 +
+                                               sizeof(input_scales_t) * C::LOAD_PIPE_DEPTH + 1024 +
+                                               sizeof(outputs_t);
         static_assert(_dynamic_shared_memory <= MAX_SHARED_MEMORY - 1024);
         return _dynamic_shared_memory;
     }
@@ -233,10 +226,6 @@ __device__ inline void backward_kernel_v3(const globals<C>& g) {
     typename G::input_scales_t (&input_scales)[C::LOAD_PIPE_DEPTH] = sm_allocator.allocate<G::input_scales_t, C::LOAD_PIPE_DEPTH>();
     typename G::outputs_t       &output_tiles                      = sm_allocator.allocate<G::outputs_t>();
 
-    // FP4 mode: allocate double-buffered staging for pipelined quant
-    // In BF16 mode this is unused, but must still be a valid reference
-    typename G::quant_staging_t &quant_staging = sm_allocator.allocate<G::quant_staging_t>();
-
     tensor_allocator<1, C::CLUSTER_SIZE, false> tm_allocator;
 
     __shared__ uint32_t tmem_addr;
@@ -246,10 +235,6 @@ __device__ inline void backward_kernel_v3(const globals<C>& g) {
     __shared__ semaphore inputs_finished[C::LOAD_PIPE_DEPTH];
     __shared__ semaphore outputs_arrived;
     __shared__ semaphore outputs_finished;
-    // Staging semaphores for pipelined quant
-    __shared__ semaphore staging_ready[2];    // consumer warp 0 → all warps: data is in smem
-    __shared__ semaphore staging_consumed[2]; // all warps → consumer warp 0: smem can be reused
-
     if (threadIdx.x == 32) {
         init_semaphore(tmem_provisioned, 0, 1);
         #pragma unroll
@@ -260,10 +245,6 @@ __device__ inline void backward_kernel_v3(const globals<C>& g) {
         }
         init_semaphore(outputs_arrived, 0, 1);
         init_semaphore(outputs_finished, 0, C::CLUSTER_SIZE);
-        init_semaphore(staging_ready[0], 0, 1);
-        init_semaphore(staging_ready[1], 0, 1);
-        init_semaphore(staging_consumed[0], 0, 1);
-        init_semaphore(staging_consumed[1], 0, 1);
     }
     everyone::tma::cluster::arrive_aligned();
 
@@ -373,6 +354,8 @@ __device__ inline void backward_kernel_v3(const globals<C>& g) {
         const float a_sg = g.A_sc_global[{0}];
         const float b_sg = g.B_sc_global[{0}];
         const float global_scale = a_sg * b_sg;
+        const float g_sg = g.G_sg_row[{0}];
+        const float g_sg_rcp = 1.0f / g_sg;
 
         constexpr int SUBTILE_COLS = C::Nb / C::EPI_PIPE_DEPTH;
         using subtile_rt = rt_fl<C::Mb / 8, SUBTILE_COLS>;
@@ -548,10 +531,17 @@ __device__ inline void backward_kernel_v3(const globals<C>& g) {
                     }
                 } else {
                     // ═══════ FP4 PATH: quantize G to NVFP4 on-the-fly ════════
-                    // Optimized: quantize in registers, write to smem staging,
-                    // then burst-copy to global with coalesced writes.
-
-                    int staging_phase = phase;  // which staging buffer to use
+                    // Quantize directly from registers and materialize only the
+                    // row/col FP4 outputs plus their micro-scales.
+                    uint8_t* row_fp4_ptr = reinterpret_cast<uint8_t*>(g.G_fp4_row.raw_ptr);
+                    uint8_t* row_sc_ptr = g.G_sc_row_ptr;
+                    uint8_t* col_fp4_ptr = g.G_fp4_col_ptr;
+                    uint8_t* col_sc_ptr = g.G_sc_col_ptr;
+                    const int row_fp4_stride = g.G_fp4_row.cols();
+                    const int row_sc_kgroups = g.G_sc_row_kgroups;
+                    const int col_fp4_stride = g.A.rows() / 2;
+                    const int col_sc_kgroups = g.G_sc_col_kgroups;
+                    const bool encode_centric = g.encode_centric;
 
                     // ═══ ROW QUANTIZATION: per-16-col-block scales ═══
                     #pragma unroll
@@ -589,11 +579,11 @@ __device__ inline void backward_kernel_v3(const globals<C>& g) {
                                     amax_y = fmaxf(amax_y, __shfl_xor_sync(0xFFFFFFFF, amax_y, offset));
                                 }
 
-                                const float FP4_MAX = 6.0f;
-                                float scale_x = fmaxf(amax_x / FP4_MAX, 1.0f / 65536.0f);
-                                float scale_y = fmaxf(amax_y / FP4_MAX, 1.0f / 65536.0f);
-                                float rcp_scale_x = 1.0f / scale_x;
-                                float rcp_scale_y = 1.0f / scale_y;
+                                constexpr float FP4_MAX = 6.0f;
+                                float scale_x = amax_x * (1.0f / FP4_MAX);
+                                float scale_y = amax_y * (1.0f / FP4_MAX);
+                                float rcp_scale_x = (amax_x > 0.0f) ? (FP4_MAX / amax_x) : 0.0f;
+                                float rcp_scale_y = (amax_y > 0.0f) ? (FP4_MAX / amax_y) : 0.0f;
 
                                 // Quantize to fp4x2 bytes
                                 uint8_t fp4_x_lo = quantize_fp4_pair(vals_x[0], vals_x[1], rcp_scale_x);
@@ -602,33 +592,27 @@ __device__ inline void backward_kernel_v3(const globals<C>& g) {
                                 uint8_t fp4_y_hi = quantize_fp4_pair(vals_y[2], vals_y[3], rcp_scale_y);
 
                                 // Write FP4 data to global memory
+                                int global_byte_lo = col_start / 2 + (lane_id % 4) + j * 8;
+                                int global_byte_hi = global_byte_lo + 4;
                                 if (global_row_x < g.M) {
-                                    uint8_t* fp4_ptr = reinterpret_cast<uint8_t*>(
-                                        &g.G_fp4_row[{global_row_x / (C::Mb/2), col_start / (C::Nb / 2)}]);
-                                    int local_row = global_row_x % (C::Mb/2);
-                                    int local_col_lo = (lane_id % 4) * 2 + j * 16;
-                                    int local_col_hi = local_col_lo + 8;
-                                    fp4_ptr[local_row * (C::Nb/2) + local_col_lo/2] = fp4_x_lo;
-                                    fp4_ptr[local_row * (C::Nb/2) + local_col_hi/2] = fp4_x_hi;
+                                    row_fp4_ptr[global_row_x * row_fp4_stride + global_byte_lo] = fp4_x_lo;
+                                    row_fp4_ptr[global_row_x * row_fp4_stride + global_byte_hi] = fp4_x_hi;
                                 }
                                 if (global_row_y < g.M) {
-                                    uint8_t* fp4_ptr = reinterpret_cast<uint8_t*>(
-                                        &g.G_fp4_row[{global_row_y / (C::Mb/2), col_start / (C::Nb / 2)}]);
-                                    int local_row = global_row_y % (C::Mb/2);
-                                    int local_col_lo = (lane_id % 4) * 2 + j * 16;
-                                    int local_col_hi = local_col_lo + 8;
-                                    fp4_ptr[local_row * (C::Nb/2) + local_col_lo/2] = fp4_y_lo;
-                                    fp4_ptr[local_row * (C::Nb/2) + local_col_hi/2] = fp4_y_hi;
+                                    row_fp4_ptr[global_row_y * row_fp4_stride + global_byte_lo] = fp4_y_lo;
+                                    row_fp4_ptr[global_row_y * row_fp4_stride + global_byte_hi] = fp4_y_hi;
                                 }
 
                                 // ── Write FP8 E4M3 scale ──
                                 if ((lane_id % 4) == 0) {
-                                    __nv_fp8_e4m3 sc_x = __nv_fp8_e4m3(scale_x);
-                                    __nv_fp8_e4m3 sc_y = __nv_fp8_e4m3(scale_y);
-                                    if (g.encode_centric) {
+                                    float stored_scale_x = scale_x * g_sg_rcp;
+                                    float stored_scale_y = scale_y * g_sg_rcp;
+                                    __nv_fp8_e4m3 sc_x = __nv_fp8_e4m3(stored_scale_x);
+                                    __nv_fp8_e4m3 sc_y = __nv_fp8_e4m3(stored_scale_y);
+                                    if (encode_centric) {
                                         constexpr float E4M3_MAX = 448.0f;
-                                        sc_x = __nv_fp8_e4m3(fminf(rcp_scale_x, E4M3_MAX));
-                                        sc_y = __nv_fp8_e4m3(fminf(rcp_scale_y, E4M3_MAX));
+                                        sc_x = __nv_fp8_e4m3(fminf(rcp_scale_x * g_sg, E4M3_MAX));
+                                        sc_y = __nv_fp8_e4m3(fminf(rcp_scale_y * g_sg, E4M3_MAX));
                                     }
                                     int global_col_16 = col_start + j * 16;
                                     int kgroup = global_col_16 / 64;
@@ -638,18 +622,18 @@ __device__ inline void backward_kernel_v3(const globals<C>& g) {
                                         int depth_x = global_row_x / 128;
                                         int sr_x = global_row_x % 32;
                                         int rr_x = (global_row_x / 32) % 4;
-                                        int chunk_x = depth_x * g.G_sc_row_kgroups + kgroup;
+                                        int chunk_x = depth_x * row_sc_kgroups + kgroup;
                                         int byte_x = sr_x * 16 + rr_x * 4 + col_16_in_64;
-                                        g.G_sc_row_ptr[chunk_x * 512 + byte_x] =
+                                        row_sc_ptr[chunk_x * 512 + byte_x] =
                                             *reinterpret_cast<uint8_t*>(&sc_x);
                                     }
                                     if (global_row_y < g.M) {
                                         int depth_y = global_row_y / 128;
                                         int sr_y = global_row_y % 32;
                                         int rr_y = (global_row_y / 32) % 4;
-                                        int chunk_y = depth_y * g.G_sc_row_kgroups + kgroup;
+                                        int chunk_y = depth_y * row_sc_kgroups + kgroup;
                                         int byte_y = sr_y * 16 + rr_y * 4 + col_16_in_64;
-                                        g.G_sc_row_ptr[chunk_y * 512 + byte_y] =
+                                        row_sc_ptr[chunk_y * 512 + byte_y] =
                                             *reinterpret_cast<uint8_t*>(&sc_y);
                                     }
                                 }
@@ -670,32 +654,69 @@ __device__ inline void backward_kernel_v3(const globals<C>& g) {
                                         }
                                     }
 
-                                    const float FP4_MAX_COL = 6.0f;
+                                    constexpr float FP4_MAX_COL = 6.0f;
                                     float col_scale[4], col_rcp[4];
                                     #pragma unroll
                                     for (int v = 0; v < 4; v++) {
-                                        col_scale[v] = fmaxf(col_amax[v] / FP4_MAX_COL, 1.0f / 65536.0f);
-                                        col_rcp[v] = 1.0f / col_scale[v];
+                                        col_scale[v] = col_amax[v] * (1.0f / FP4_MAX_COL);
+                                        col_rcp[v] = (col_amax[v] > 0.0f) ? (FP4_MAX_COL / col_amax[v]) : 0.0f;
                                     }
-
-                                    uint8_t cfp4_0 = quantize_fp4_pair(vals_x[0], vals_y[0], col_rcp[0]);
-                                    uint8_t cfp4_1 = quantize_fp4_pair(vals_x[1], vals_y[1], col_rcp[1]);
-                                    uint8_t cfp4_2 = quantize_fp4_pair(vals_x[2], vals_y[2], col_rcp[2]);
-                                    uint8_t cfp4_3 = quantize_fp4_pair(vals_x[3], vals_y[3], col_rcp[3]);
 
                                     int gc0 = col_start + j * 16 + (lane_id % 4) * 2;
                                     int gc8 = gc0 + 8;
                                     int row_pair_idx = (lane_id / 4);
-                                    int global_row_pair = warp_row_base + i * 16 + row_pair_idx;
+                                    int global_row_pair_lo = warp_row_base + i * 16 + row_pair_idx;
+                                    int global_row_pair_hi = global_row_pair_lo + 8;
 
-                                    int col_fp4_stride = g.M / 2;
-                                    if (gc0 < g.N && global_row_pair < g.M) {
-                                        g.G_fp4_col_ptr[gc0 * col_fp4_stride + global_row_pair / 2] = cfp4_0;
-                                        g.G_fp4_col_ptr[(gc0 + 1) * col_fp4_stride + global_row_pair / 2] = cfp4_1;
+                                    float row_x_pair_hi[4];
+                                    float row_y_pair_hi[4];
+                                    #pragma unroll
+                                    for (int v = 0; v < 4; v++) {
+                                        row_x_pair_hi[v] = __shfl_xor_sync(0xFFFFFFFF, vals_x[v], 4);
+                                        row_y_pair_hi[v] = __shfl_xor_sync(0xFFFFFFFF, vals_y[v], 4);
                                     }
-                                    if (gc8 < g.N && global_row_pair < g.M) {
-                                        g.G_fp4_col_ptr[gc8 * col_fp4_stride + global_row_pair / 2] = cfp4_2;
-                                        g.G_fp4_col_ptr[(gc8 + 1) * col_fp4_stride + global_row_pair / 2] = cfp4_3;
+                                    if ((row_pair_idx % 2) == 0) {
+                                        if (gc0 < g.N && global_row_pair_lo < g.M) {
+                                            float pair_hi = (global_row_pair_lo + 1 < g.M) ? row_x_pair_hi[0] : 0.0f;
+                                            col_fp4_ptr[gc0 * col_fp4_stride + global_row_pair_lo / 2] =
+                                                quantize_fp4_pair(vals_x[0], pair_hi, col_rcp[0]);
+                                        }
+                                        if (gc0 + 1 < g.N && global_row_pair_lo < g.M) {
+                                            float pair_hi = (global_row_pair_lo + 1 < g.M) ? row_x_pair_hi[1] : 0.0f;
+                                            col_fp4_ptr[(gc0 + 1) * col_fp4_stride + global_row_pair_lo / 2] =
+                                                quantize_fp4_pair(vals_x[1], pair_hi, col_rcp[1]);
+                                        }
+                                        if (gc8 < g.N && global_row_pair_lo < g.M) {
+                                            float pair_hi = (global_row_pair_lo + 1 < g.M) ? row_x_pair_hi[2] : 0.0f;
+                                            col_fp4_ptr[gc8 * col_fp4_stride + global_row_pair_lo / 2] =
+                                                quantize_fp4_pair(vals_x[2], pair_hi, col_rcp[2]);
+                                        }
+                                        if (gc8 + 1 < g.N && global_row_pair_lo < g.M) {
+                                            float pair_hi = (global_row_pair_lo + 1 < g.M) ? row_x_pair_hi[3] : 0.0f;
+                                            col_fp4_ptr[(gc8 + 1) * col_fp4_stride + global_row_pair_lo / 2] =
+                                                quantize_fp4_pair(vals_x[3], pair_hi, col_rcp[3]);
+                                        }
+
+                                        if (gc0 < g.N && global_row_pair_hi < g.M) {
+                                            float pair_hi = (global_row_pair_hi + 1 < g.M) ? row_y_pair_hi[0] : 0.0f;
+                                            col_fp4_ptr[gc0 * col_fp4_stride + global_row_pair_hi / 2] =
+                                                quantize_fp4_pair(vals_y[0], pair_hi, col_rcp[0]);
+                                        }
+                                        if (gc0 + 1 < g.N && global_row_pair_hi < g.M) {
+                                            float pair_hi = (global_row_pair_hi + 1 < g.M) ? row_y_pair_hi[1] : 0.0f;
+                                            col_fp4_ptr[(gc0 + 1) * col_fp4_stride + global_row_pair_hi / 2] =
+                                                quantize_fp4_pair(vals_y[1], pair_hi, col_rcp[1]);
+                                        }
+                                        if (gc8 < g.N && global_row_pair_hi < g.M) {
+                                            float pair_hi = (global_row_pair_hi + 1 < g.M) ? row_y_pair_hi[2] : 0.0f;
+                                            col_fp4_ptr[gc8 * col_fp4_stride + global_row_pair_hi / 2] =
+                                                quantize_fp4_pair(vals_y[2], pair_hi, col_rcp[2]);
+                                        }
+                                        if (gc8 + 1 < g.N && global_row_pair_hi < g.M) {
+                                            float pair_hi = (global_row_pair_hi + 1 < g.M) ? row_y_pair_hi[3] : 0.0f;
+                                            col_fp4_ptr[(gc8 + 1) * col_fp4_stride + global_row_pair_hi / 2] =
+                                                quantize_fp4_pair(vals_y[3], pair_hi, col_rcp[3]);
+                                        }
                                     }
 
                                     if ((lane_id / 4) == 0) {
@@ -706,10 +727,10 @@ __device__ inline void backward_kernel_v3(const globals<C>& g) {
                                         __nv_fp8_e4m3 csc[4];
                                         #pragma unroll
                                         for (int v = 0; v < 4; v++) {
-                                            csc[v] = __nv_fp8_e4m3(col_scale[v]);
-                                            if (g.encode_centric) {
+                                            csc[v] = __nv_fp8_e4m3(col_scale[v] * g_sg_rcp);
+                                            if (encode_centric) {
                                                 constexpr float E4M3_MAX = 448.0f;
-                                                csc[v] = __nv_fp8_e4m3(fminf(col_rcp[v], E4M3_MAX));
+                                                csc[v] = __nv_fp8_e4m3(fminf(col_rcp[v] * g_sg, E4M3_MAX));
                                             }
                                         }
 
@@ -721,9 +742,9 @@ __device__ inline void backward_kernel_v3(const globals<C>& g) {
                                                 int depth = gc / 128;
                                                 int sr = gc % 32;
                                                 int rr = (gc / 32) % 4;
-                                                int chunk = depth * g.G_sc_col_kgroups + m_kgroup;
+                                                int chunk = depth * col_sc_kgroups + m_kgroup;
                                                 int byte_idx = sr * 16 + rr * 4 + m_16_in_64;
-                                                g.G_sc_col_ptr[chunk * 512 + byte_idx] =
+                                                col_sc_ptr[chunk * 512 + byte_idx] =
                                                     *reinterpret_cast<uint8_t*>(&csc[v]);
                                             }
                                         }
