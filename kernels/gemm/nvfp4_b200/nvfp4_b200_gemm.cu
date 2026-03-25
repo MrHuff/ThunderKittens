@@ -5,6 +5,7 @@
 #include "nvfp4_gemm.cuh"
 #include "nvfp4_quantize.cuh"
 #include "nvfp4_batched_accum_gemm.cuh"
+#include "nvfp4_fused_gemm.cuh"
 #include <optional>
 
 #ifndef TORCH_COMPILE
@@ -1150,6 +1151,122 @@ void nvfp4_batched_accum_gemm_entrypoint(
             numel);
     }
 }
+
+// ================================================================
+// Standalone fused 3-way bf16 sum: out = A + B + C
+// Reads 3 inputs, writes 1 output in a single kernel launch.
+// ================================================================
+void sum3_bf16_entrypoint(
+    const at::Tensor &A,
+    const at::Tensor &B,
+    const at::Tensor &C,
+    at::Tensor &out
+) {
+    TORCH_CHECK(A.is_contiguous() && B.is_contiguous() && C.is_contiguous() && out.is_contiguous());
+    const int64_t numel = A.numel();
+    TORCH_CHECK(numel == B.numel() && numel == C.numel() && numel == out.numel());
+    const int threads = 256;
+    const int blocks = (int)((numel + threads - 1) / threads);
+    auto stream = at::cuda::getCurrentCUDAStream();
+    sum3_tensors_kernel<<<blocks, threads, 0, stream>>>(
+        reinterpret_cast<const __nv_bfloat16*>(A.data_ptr()),
+        reinterpret_cast<const __nv_bfloat16*>(B.data_ptr()),
+        reinterpret_cast<const __nv_bfloat16*>(C.data_ptr()),
+        reinterpret_cast<__nv_bfloat16*>(out.data_ptr()),
+        numel);
+}
+// ================================================================
+// Fused Quantize+GEMM: A is bf16, B is pre-quantized NVFP4
+// Mode 1: constant SCALE_MAX (USE_CTA_AMAX=false) — fastest
+// Mode 2: CTA-level amax (USE_CTA_AMAX=true) — better accuracy
+// ================================================================
+void nvfp4_fused_gemm_entrypoint(
+    const at::Tensor &A_bf16,       // [M, K] bf16 activations
+    const at::Tensor &B,            // [N, K/2] fp4x2
+    const at::Tensor &B_sc,         // [N/128, K/64, 512] fp8
+    const at::Tensor &B_sc_global,  // [1] float32
+    at::Tensor &D                   // [M, N] bf16 output
+) {
+    int M = A_bf16.size(0);
+    int K = A_bf16.size(1);
+    int N = D.size(1);
+
+    TORCH_CHECK(A_bf16.dtype() == at::kBFloat16, "A must be bf16");
+    TORCH_CHECK(B.dtype() == at::kFloat4_e2m1fn_x2, "B must be fp4x2");
+    TORCH_CHECK(M % 256 == 0, "M must be multiple of 256");
+    TORCH_CHECK(K % 256 == 0, "K must be multiple of 256");
+    TORCH_CHECK(N % 128 == 0, "N must be multiple of 128");
+
+    //                             Nb   PD  EP  SG  DT  OVL    CTA_AMAX
+    using C = nvfp4_fused_gemm::config<256, 3, 4, 4, 2, false, false>;
+    using G = nvfp4_fused_gemm::globals<C>;
+
+    G g {
+        .A_bf16 = kittens::py::tensor_to_gl<typename G::A_bf16_gl>(A_bf16),
+        .B = kittens::py::tensor_to_gl<typename G::B_fp4x2_gl>(B),
+        .B_sc = kittens::py::tensor_to_gl<typename G::B_sc_gl, false>(
+            B_sc, 1,
+            B_sc.dim() == 2 ? B_sc.size(0)/128 : B_sc.size(0),
+            B_sc.dim() == 2 ? B_sc.size(1)/4 : B_sc.size(1),
+            256),
+        .B_sc_global = kittens::py::tensor_to_gl<typename G::B_sc_global_gl>(B_sc_global),
+        .D = kittens::py::tensor_to_gl<typename G::D_gl>(D),
+        .D_K = kittens::py::tensor_to_gl<typename G::D_gl>(D),
+        .D_V = kittens::py::tensor_to_gl<typename G::D_gl>(D),
+        .q_dim = 0,
+        .k_dim = 0,
+        .use_split_D = false,
+        .b_sg_per_tile = nullptr,
+        .silu_dim = 0
+    };
+
+    kittens::py::launch_kernel<C, G, nvfp4_fused_gemm::kernel<C>>(g);
+}
+
+// CTA-level amax version — pre-scans A for per-CTA max|A|
+void nvfp4_fused_gemm_cta_amax_entrypoint(
+    const at::Tensor &A_bf16,
+    const at::Tensor &B,
+    const at::Tensor &B_sc,
+    const at::Tensor &B_sc_global,
+    at::Tensor &D
+) {
+    int M = A_bf16.size(0);
+    int K = A_bf16.size(1);
+    int N = D.size(1);
+
+    TORCH_CHECK(A_bf16.dtype() == at::kBFloat16, "A must be bf16");
+    TORCH_CHECK(B.dtype() == at::kFloat4_e2m1fn_x2, "B must be fp4x2");
+    TORCH_CHECK(M % 256 == 0, "M must be multiple of 256");
+    TORCH_CHECK(K % 256 == 0, "K must be multiple of 256");
+    TORCH_CHECK(N % 128 == 0, "N must be multiple of 128");
+
+    //                             Nb   PD  EP  SG  DT  OVL    CTA_AMAX
+    using C = nvfp4_fused_gemm::config<256, 3, 4, 4, 2, false, true>;
+    using G = nvfp4_fused_gemm::globals<C>;
+
+    G g {
+        .A_bf16 = kittens::py::tensor_to_gl<typename G::A_bf16_gl>(A_bf16),
+        .B = kittens::py::tensor_to_gl<typename G::B_fp4x2_gl>(B),
+        .B_sc = kittens::py::tensor_to_gl<typename G::B_sc_gl, false>(
+            B_sc, 1,
+            B_sc.dim() == 2 ? B_sc.size(0)/128 : B_sc.size(0),
+            B_sc.dim() == 2 ? B_sc.size(1)/4 : B_sc.size(1),
+            256),
+        .B_sc_global = kittens::py::tensor_to_gl<typename G::B_sc_global_gl>(B_sc_global),
+        .D = kittens::py::tensor_to_gl<typename G::D_gl>(D),
+        .D_K = kittens::py::tensor_to_gl<typename G::D_gl>(D),
+        .D_V = kittens::py::tensor_to_gl<typename G::D_gl>(D),
+        .q_dim = 0,
+        .k_dim = 0,
+        .use_split_D = false,
+        .b_sg_per_tile = nullptr,
+        .silu_dim = 0
+    };
+
+    kittens::py::launch_kernel<C, G, nvfp4_fused_gemm::kernel<C>>(g);
+}
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("nvfp4_gemm", &nvfp4_gemm_entrypoint);
     m.def("nvfp4_gemm_nopdl", &nvfp4_gemm_nopdl_entrypoint,
@@ -1198,8 +1315,21 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           pybind11::arg("B_list"), pybind11::arg("B_sc_list"), pybind11::arg("B_sg_list"),
           pybind11::arg("D_list"));
     m.def("nvfp4_quantize", &nvfp4_quantize_entrypoint);
+    m.def("sum3_bf16", &sum3_bf16_entrypoint,
+          "Fused 3-way bf16 sum: out = A + B + C (single kernel)",
+          pybind11::arg("A"), pybind11::arg("B"), pybind11::arg("C"), pybind11::arg("out"));
     m.def("fp32_to_fp4x2", &fp32_to_fp4x2_entrypoint);
     m.def("fp4x2_to_fp32", &fp4x2_to_fp32_entrypoint);
+    m.def("nvfp4_fused_gemm", &nvfp4_fused_gemm_entrypoint,
+          "Fused Quantize+GEMM: constant SCALE_MAX (fastest, no pre-scan)",
+          pybind11::arg("A_bf16"), pybind11::arg("B"),
+          pybind11::arg("B_sc"), pybind11::arg("B_sc_global"),
+          pybind11::arg("D"));
+    m.def("nvfp4_fused_gemm_cta_amax", &nvfp4_fused_gemm_cta_amax_entrypoint,
+          "Fused Quantize+GEMM: CTA-level amax pre-scan (better accuracy)",
+          pybind11::arg("A_bf16"), pybind11::arg("B"),
+          pybind11::arg("B_sc"), pybind11::arg("B_sc_global"),
+          pybind11::arg("D"));
 
     // Fused TE→TK GEMM: takes raw TE NVFP4 tensors + dimensions.
     // ALL tensor manipulation (view, reshape, amax*recip) happens in C++.
