@@ -530,9 +530,12 @@ __device__ inline void backward_kernel_v3(const globals<C>& g) {
                             {row_block_idx*2 + cta_id, C::EPI_PIPE_DEPTH*col_block_idx + epi});
                     }
                 } else {
-                    // ═══════ FP4 PATH: quantize G to NVFP4 on-the-fly ════════
-                    // Quantize directly from registers and materialize only the
-                    // row/col FP4 outputs plus their micro-scales.
+                    // ═══════ FP4 PATH: quantize G to NVFP4 from canonical BF16 shared slices ════════
+                    // Materialize each epilogue slice once to shared memory, then
+                    // derive both row- and col-quantized outputs from the same
+                    // canonical BF16 layout. This keeps the existing CTA-local
+                    // micro-scale contract while avoiding the old register-layout-
+                    // dependent scatter path.
                     uint8_t* row_fp4_ptr = reinterpret_cast<uint8_t*>(g.G_fp4_row.raw_ptr);
                     uint8_t* row_sc_ptr = g.G_sc_row_ptr;
                     uint8_t* col_fp4_ptr = g.G_fp4_col_ptr;
@@ -542,216 +545,131 @@ __device__ inline void backward_kernel_v3(const globals<C>& g) {
                     const int col_fp4_stride = g.A.rows() / 2;
                     const int col_sc_kgroups = g.G_sc_col_kgroups;
                     const bool encode_centric = g.encode_centric;
+                    constexpr float FP4_MAX = 6.0f;
+                    constexpr float E4M3_MAX = 448.0f;
 
-                    // ═══ ROW QUANTIZATION: per-16-col-block scales ═══
                     #pragma unroll
                     for (int epi = 0; epi < C::EPI_PIPE_DEPTH; epi++) {
-                        subtile_rt& D_fl = D_regs_fl[epi];
+                        const int smem_slot = epi % C::NUM_D_TILES;
                         int col_start = col_block_idx * C::Nb + epi * SUBTILE_COLS;
+                        warpgroup::sync(1);
+                        warpgroup::store(output_tiles.D[smem_slot], D_regs_bf[epi]);
+                        warpgroup::sync(1);
 
-                        #pragma unroll
-                        for (int i = 0; i < subtile_rt::height; i++) {
-                            int global_row_x = warp_row_base + i * 16 + lane_id / 4;
-                            int global_row_y = warp_row_base + i * 16 + 8 + lane_id / 4;
+                        const uint32_t d_base = static_cast<uint32_t>(
+                            __cvta_generic_to_shared(&output_tiles.D[smem_slot].data[0]));
 
+                        // ═══ ROW QUANTIZATION: per-row, per-16-col micro-scales ═══
+                        const int quant_row = threadIdx.x;
+                        if (quant_row < C::Mb / 2) {
+                            const int global_row = tile_row_base + quant_row;
                             #pragma unroll
-                            for (int j = 0; j < subtile_rt::width; j++) {
-                                float vals_x[4], vals_y[4];
-                                vals_x[0] = D_fl.tiles[i][j].data[0].x;
-                                vals_x[1] = D_fl.tiles[i][j].data[0].y;
-                                vals_x[2] = D_fl.tiles[i][j].data[2].x;
-                                vals_x[3] = D_fl.tiles[i][j].data[2].y;
-                                vals_y[0] = D_fl.tiles[i][j].data[1].x;
-                                vals_y[1] = D_fl.tiles[i][j].data[1].y;
-                                vals_y[2] = D_fl.tiles[i][j].data[3].x;
-                                vals_y[3] = D_fl.tiles[i][j].data[3].y;
-
-                                // Row amax: reduce across 4 threads sharing a row
-                                float amax_x = 0.0f, amax_y = 0.0f;
+                            for (int group16 = 0; group16 < SUBTILE_COLS / 16; ++group16) {
+                                bf16_2 vals[8];
+                                float amax = 0.0f;
                                 #pragma unroll
-                                for (int v = 0; v < 4; v++) {
-                                    amax_x = fmaxf(amax_x, fabsf(vals_x[v]));
-                                    amax_y = fmaxf(amax_y, fabsf(vals_y[v]));
-                                }
-                                #pragma unroll
-                                for (int offset = 1; offset < 4; offset <<= 1) {
-                                    amax_x = fmaxf(amax_x, __shfl_xor_sync(0xFFFFFFFF, amax_x, offset));
-                                    amax_y = fmaxf(amax_y, __shfl_xor_sync(0xFFFFFFFF, amax_y, offset));
+                                for (int pair = 0; pair < 8; ++pair) {
+                                    const int col = group16 * 16 + pair * 2;
+                                    move<bf16_2>::lds(vals[pair], G::D_tile::idx(d_base, {quant_row, col}));
+                                    amax = fmaxf(amax, fabsf(__bfloat162float(vals[pair].x)));
+                                    amax = fmaxf(amax, fabsf(__bfloat162float(vals[pair].y)));
                                 }
 
-                                constexpr float FP4_MAX = 6.0f;
-                                float scale_x = amax_x * (1.0f / FP4_MAX);
-                                float scale_y = amax_y * (1.0f / FP4_MAX);
-                                float rcp_scale_x = (amax_x > 0.0f) ? (FP4_MAX / amax_x) : 0.0f;
-                                float rcp_scale_y = (amax_y > 0.0f) ? (FP4_MAX / amax_y) : 0.0f;
+                                const float scale = amax * (1.0f / FP4_MAX);
+                                const float rcp_scale = (amax > 0.0f) ? (FP4_MAX / amax) : 0.0f;
 
-                                // Quantize to fp4x2 bytes
-                                uint8_t fp4_x_lo = quantize_fp4_pair(vals_x[0], vals_x[1], rcp_scale_x);
-                                uint8_t fp4_x_hi = quantize_fp4_pair(vals_x[2], vals_x[3], rcp_scale_x);
-                                uint8_t fp4_y_lo = quantize_fp4_pair(vals_y[0], vals_y[1], rcp_scale_y);
-                                uint8_t fp4_y_hi = quantize_fp4_pair(vals_y[2], vals_y[3], rcp_scale_y);
+                                if (global_row < g.M) {
+                                    #pragma unroll
+                                    for (int pair = 0; pair < 8; ++pair) {
+                                        const uint8_t fp4_pair = quantize_fp4_pair(
+                                            __bfloat162float(vals[pair].x),
+                                            __bfloat162float(vals[pair].y),
+                                            rcp_scale);
+                                        const int fp4x2_col = (col_start + group16 * 16 + pair * 2) / 2;
+                                        row_fp4_ptr[global_row * row_fp4_stride + fp4x2_col] = fp4_pair;
+                                    }
 
-                                // Write FP4 data to global memory
-                                int global_byte_lo = col_start / 2 + (lane_id % 4) + j * 8;
-                                int global_byte_hi = global_byte_lo + 4;
-                                if (global_row_x < g.M) {
-                                    row_fp4_ptr[global_row_x * row_fp4_stride + global_byte_lo] = fp4_x_lo;
-                                    row_fp4_ptr[global_row_x * row_fp4_stride + global_byte_hi] = fp4_x_hi;
-                                }
-                                if (global_row_y < g.M) {
-                                    row_fp4_ptr[global_row_y * row_fp4_stride + global_byte_lo] = fp4_y_lo;
-                                    row_fp4_ptr[global_row_y * row_fp4_stride + global_byte_hi] = fp4_y_hi;
-                                }
-
-                                // ── Write FP8 E4M3 scale ──
-                                if ((lane_id % 4) == 0) {
-                                    float stored_scale_x = scale_x * g_sg_rcp;
-                                    float stored_scale_y = scale_y * g_sg_rcp;
-                                    __nv_fp8_e4m3 sc_x = __nv_fp8_e4m3(stored_scale_x);
-                                    __nv_fp8_e4m3 sc_y = __nv_fp8_e4m3(stored_scale_y);
+                                    float stored_scale = scale * g_sg_rcp;
                                     if (encode_centric) {
-                                        constexpr float E4M3_MAX = 448.0f;
-                                        sc_x = __nv_fp8_e4m3(fminf(rcp_scale_x * g_sg, E4M3_MAX));
-                                        sc_y = __nv_fp8_e4m3(fminf(rcp_scale_y * g_sg, E4M3_MAX));
+                                        stored_scale = fminf(rcp_scale * g_sg, E4M3_MAX);
                                     }
-                                    int global_col_16 = col_start + j * 16;
-                                    int kgroup = global_col_16 / 64;
-                                    int col_16_in_64 = (global_col_16 / 16) % 4;
+                                    const __nv_fp8_e4m3 sc = __nv_fp8_e4m3(stored_scale);
+                                    const int global_col_16 = col_start + group16 * 16;
+                                    const int kgroup = global_col_16 / 64;
+                                    const int col_16_in_64 = (global_col_16 / 16) % 4;
+                                    const int depth = global_row / 128;
+                                    const int sr = global_row % 32;
+                                    const int rr = (global_row / 32) % 4;
+                                    const int chunk = depth * row_sc_kgroups + kgroup;
+                                    const int byte_idx = sr * 16 + rr * 4 + col_16_in_64;
+                                    row_sc_ptr[chunk * 512 + byte_idx] =
+                                        *reinterpret_cast<const uint8_t*>(&sc);
+                                }
+                            }
+                        }
 
-                                    if (global_row_x < g.M) {
-                                        int depth_x = global_row_x / 128;
-                                        int sr_x = global_row_x % 32;
-                                        int rr_x = (global_row_x / 32) % 4;
-                                        int chunk_x = depth_x * row_sc_kgroups + kgroup;
-                                        int byte_x = sr_x * 16 + rr_x * 4 + col_16_in_64;
-                                        row_sc_ptr[chunk_x * 512 + byte_x] =
-                                            *reinterpret_cast<uint8_t*>(&sc_x);
-                                    }
-                                    if (global_row_y < g.M) {
-                                        int depth_y = global_row_y / 128;
-                                        int sr_y = global_row_y % 32;
-                                        int rr_y = (global_row_y / 32) % 4;
-                                        int chunk_y = depth_y * row_sc_kgroups + kgroup;
-                                        int byte_y = sr_y * 16 + rr_y * 4 + col_16_in_64;
-                                        row_sc_ptr[chunk_y * 512 + byte_y] =
-                                            *reinterpret_cast<uint8_t*>(&sc_y);
+                        // ═══ COLUMN QUANTIZATION: per-column, per-16-row micro-scales ═══
+                        constexpr int ROW16_BLOCKS = C::Mb / 32;
+                        constexpr int ROW16_BLOCKS_PER_PASS = C::NUM_THREADS / 2 / SUBTILE_COLS;
+                        const int col_in_epi = threadIdx.x % SUBTILE_COLS;
+                        const int row16_block_base = threadIdx.x / SUBTILE_COLS;
+                        #pragma unroll
+                        for (int row16_pass = 0; row16_pass < ROW16_BLOCKS / ROW16_BLOCKS_PER_PASS; ++row16_pass) {
+                            const int row16_block = row16_block_base + row16_pass * ROW16_BLOCKS_PER_PASS;
+                            const int global_col = col_start + col_in_epi;
+                            if (row16_block < ROW16_BLOCKS && global_col < g.N) {
+                                const int local_row_base = row16_block * 16;
+                                const int global_row_base = tile_row_base + local_row_base;
+                                float col_amax = 0.0f;
+                                #pragma unroll
+                                for (int r = 0; r < 16; ++r) {
+                                    bf16 value;
+                                    move<bf16>::lds(value, G::D_tile::idx(d_base, {local_row_base + r, col_in_epi}));
+                                    if (global_row_base + r < g.M) {
+                                        col_amax = fmaxf(col_amax, fabsf(__bfloat162float(value)));
                                     }
                                 }
 
-                                // ═══ Column quantization ═══
-                                {
-                                    float col_amax[4];
-                                    col_amax[0] = fmaxf(fabsf(vals_x[0]), fabsf(vals_y[0]));
-                                    col_amax[1] = fmaxf(fabsf(vals_x[1]), fabsf(vals_y[1]));
-                                    col_amax[2] = fmaxf(fabsf(vals_x[2]), fabsf(vals_y[2]));
-                                    col_amax[3] = fmaxf(fabsf(vals_x[3]), fabsf(vals_y[3]));
+                                const float col_scale = col_amax * (1.0f / FP4_MAX);
+                                const float col_rcp = (col_amax > 0.0f) ? (FP4_MAX / col_amax) : 0.0f;
 
-                                    #pragma unroll
-                                    for (int offset = 4; offset < 32; offset <<= 1) {
-                                        #pragma unroll
-                                        for (int v = 0; v < 4; v++) {
-                                            col_amax[v] = fmaxf(col_amax[v], __shfl_xor_sync(0xFFFFFFFF, col_amax[v], offset));
+                                const int global_row_pair_base = global_row_base / 2;
+                                #pragma unroll
+                                for (int pair = 0; pair < 8; ++pair) {
+                                    const int global_row = global_row_base + pair * 2;
+                                    if (global_row < g.M) {
+                                        bf16 value0_bf;
+                                        move<bf16>::lds(value0_bf, G::D_tile::idx(d_base, {local_row_base + pair * 2, col_in_epi}));
+                                        const float v0 = __bfloat162float(value0_bf);
+                                        float v1 = 0.0f;
+                                        if (global_row + 1 < g.M) {
+                                            bf16 value1_bf;
+                                            move<bf16>::lds(value1_bf, G::D_tile::idx(d_base, {local_row_base + pair * 2 + 1, col_in_epi}));
+                                            v1 = __bfloat162float(value1_bf);
                                         }
-                                    }
-
-                                    constexpr float FP4_MAX_COL = 6.0f;
-                                    float col_scale[4], col_rcp[4];
-                                    #pragma unroll
-                                    for (int v = 0; v < 4; v++) {
-                                        col_scale[v] = col_amax[v] * (1.0f / FP4_MAX_COL);
-                                        col_rcp[v] = (col_amax[v] > 0.0f) ? (FP4_MAX_COL / col_amax[v]) : 0.0f;
-                                    }
-
-                                    int gc0 = col_start + j * 16 + (lane_id % 4) * 2;
-                                    int gc8 = gc0 + 8;
-                                    int row_pair_idx = (lane_id / 4);
-                                    int global_row_pair_lo = warp_row_base + i * 16 + row_pair_idx;
-                                    int global_row_pair_hi = global_row_pair_lo + 8;
-
-                                    float row_x_pair_hi[4];
-                                    float row_y_pair_hi[4];
-                                    #pragma unroll
-                                    for (int v = 0; v < 4; v++) {
-                                        row_x_pair_hi[v] = __shfl_xor_sync(0xFFFFFFFF, vals_x[v], 4);
-                                        row_y_pair_hi[v] = __shfl_xor_sync(0xFFFFFFFF, vals_y[v], 4);
-                                    }
-                                    if ((row_pair_idx % 2) == 0) {
-                                        if (gc0 < g.N && global_row_pair_lo < g.M) {
-                                            float pair_hi = (global_row_pair_lo + 1 < g.M) ? row_x_pair_hi[0] : 0.0f;
-                                            col_fp4_ptr[gc0 * col_fp4_stride + global_row_pair_lo / 2] =
-                                                quantize_fp4_pair(vals_x[0], pair_hi, col_rcp[0]);
-                                        }
-                                        if (gc0 + 1 < g.N && global_row_pair_lo < g.M) {
-                                            float pair_hi = (global_row_pair_lo + 1 < g.M) ? row_x_pair_hi[1] : 0.0f;
-                                            col_fp4_ptr[(gc0 + 1) * col_fp4_stride + global_row_pair_lo / 2] =
-                                                quantize_fp4_pair(vals_x[1], pair_hi, col_rcp[1]);
-                                        }
-                                        if (gc8 < g.N && global_row_pair_lo < g.M) {
-                                            float pair_hi = (global_row_pair_lo + 1 < g.M) ? row_x_pair_hi[2] : 0.0f;
-                                            col_fp4_ptr[gc8 * col_fp4_stride + global_row_pair_lo / 2] =
-                                                quantize_fp4_pair(vals_x[2], pair_hi, col_rcp[2]);
-                                        }
-                                        if (gc8 + 1 < g.N && global_row_pair_lo < g.M) {
-                                            float pair_hi = (global_row_pair_lo + 1 < g.M) ? row_x_pair_hi[3] : 0.0f;
-                                            col_fp4_ptr[(gc8 + 1) * col_fp4_stride + global_row_pair_lo / 2] =
-                                                quantize_fp4_pair(vals_x[3], pair_hi, col_rcp[3]);
-                                        }
-
-                                        if (gc0 < g.N && global_row_pair_hi < g.M) {
-                                            float pair_hi = (global_row_pair_hi + 1 < g.M) ? row_y_pair_hi[0] : 0.0f;
-                                            col_fp4_ptr[gc0 * col_fp4_stride + global_row_pair_hi / 2] =
-                                                quantize_fp4_pair(vals_y[0], pair_hi, col_rcp[0]);
-                                        }
-                                        if (gc0 + 1 < g.N && global_row_pair_hi < g.M) {
-                                            float pair_hi = (global_row_pair_hi + 1 < g.M) ? row_y_pair_hi[1] : 0.0f;
-                                            col_fp4_ptr[(gc0 + 1) * col_fp4_stride + global_row_pair_hi / 2] =
-                                                quantize_fp4_pair(vals_y[1], pair_hi, col_rcp[1]);
-                                        }
-                                        if (gc8 < g.N && global_row_pair_hi < g.M) {
-                                            float pair_hi = (global_row_pair_hi + 1 < g.M) ? row_y_pair_hi[2] : 0.0f;
-                                            col_fp4_ptr[gc8 * col_fp4_stride + global_row_pair_hi / 2] =
-                                                quantize_fp4_pair(vals_y[2], pair_hi, col_rcp[2]);
-                                        }
-                                        if (gc8 + 1 < g.N && global_row_pair_hi < g.M) {
-                                            float pair_hi = (global_row_pair_hi + 1 < g.M) ? row_y_pair_hi[3] : 0.0f;
-                                            col_fp4_ptr[(gc8 + 1) * col_fp4_stride + global_row_pair_hi / 2] =
-                                                quantize_fp4_pair(vals_y[3], pair_hi, col_rcp[3]);
-                                        }
-                                    }
-
-                                    if ((lane_id / 4) == 0) {
-                                        int global_row_m = warp_row_base + i * 16;
-                                        int m_kgroup = global_row_m / 64;
-                                        int m_16_in_64 = (global_row_m / 16) % 4;
-
-                                        __nv_fp8_e4m3 csc[4];
-                                        #pragma unroll
-                                        for (int v = 0; v < 4; v++) {
-                                            csc[v] = __nv_fp8_e4m3(col_scale[v] * g_sg_rcp);
-                                            if (encode_centric) {
-                                                constexpr float E4M3_MAX = 448.0f;
-                                                csc[v] = __nv_fp8_e4m3(fminf(col_rcp[v] * g_sg, E4M3_MAX));
-                                            }
-                                        }
-
-                                        int gc_vals[4] = {gc0, gc0 + 1, gc8, gc8 + 1};
-                                        #pragma unroll
-                                        for (int v = 0; v < 4; v++) {
-                                            int gc = gc_vals[v];
-                                            if (gc < g.N) {
-                                                int depth = gc / 128;
-                                                int sr = gc % 32;
-                                                int rr = (gc / 32) % 4;
-                                                int chunk = depth * col_sc_kgroups + m_kgroup;
-                                                int byte_idx = sr * 16 + rr * 4 + m_16_in_64;
-                                                col_sc_ptr[chunk * 512 + byte_idx] =
-                                                    *reinterpret_cast<uint8_t*>(&csc[v]);
-                                            }
-                                        }
+                                        col_fp4_ptr[global_col * col_fp4_stride + global_row_pair_base + pair] =
+                                            quantize_fp4_pair(v0, v1, col_rcp);
                                     }
                                 }
-                            }  // for j
-                        }  // for i
+
+                                float stored_scale = col_scale * g_sg_rcp;
+                                if (encode_centric) {
+                                    stored_scale = fminf(col_rcp * g_sg, E4M3_MAX);
+                                }
+                                const __nv_fp8_e4m3 csc = __nv_fp8_e4m3(stored_scale);
+                                const int depth = global_col / 128;
+                                const int sr = global_col % 32;
+                                const int rr = (global_col / 32) % 4;
+                                const int m_kgroup = global_row_base / 64;
+                                const int m_16_in_64 = (global_row_base / 16) % 4;
+                                const int chunk = depth * col_sc_kgroups + m_kgroup;
+                                const int byte_idx = sr * 16 + rr * 4 + m_16_in_64;
+                                col_sc_ptr[chunk * 512 + byte_idx] =
+                                    *reinterpret_cast<const uint8_t*>(&csc);
+                            }
+                        }
+
+                        warpgroup::sync(1);
                     }  // for epi
                 }  // if !C::USE_BF16_ACCUM
             }
