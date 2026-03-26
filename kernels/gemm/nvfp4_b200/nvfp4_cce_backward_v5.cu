@@ -46,8 +46,8 @@ static void launch_backward_v5_dE(
     kittens::py::launch_kernel<C, G, nvfp4_cce_backward_v5_dE::kernel<C>>(g);
 }
 
-using bwd_v5_dE_fp4_L4_SG8 = nvfp4_cce_backward_v5_dE::config<4, 8, true>;
-using bwd_v5_dC_fp4_L4_SG8 = nvfp4_cce_backward_v5_dC::config<4, 8, true>;
+using bwd_v5_dE_fp4_L4_SG8 = nvfp4_cce_backward_v5_dE::config<2, 8, true>;
+using bwd_v5_dC_fp4_L4_SG8 = nvfp4_cce_backward_v5_dC::config<2, 8, true>;
 
 template <typename C>
 static void launch_backward_v5_dC(

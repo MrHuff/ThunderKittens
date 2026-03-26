@@ -342,8 +342,9 @@ __device__ inline void kernel_impl(const G& g) {
     __shared__ semaphore tiles_arrived[C::LOAD_PIPE_DEPTH];
     __shared__ semaphore scales_arrived[C::LOAD_PIPE_DEPTH];
     __shared__ semaphore inputs_finished[C::LOAD_PIPE_DEPTH];
-    __shared__ semaphore outputs_arrived;
-                    __shared__ semaphore a_super_ready;
+    __shared__ semaphore outputs_arrived[2];
+    __shared__ semaphore outputs_finished[2];
+    __shared__ semaphore a_super_ready[2];
     __shared__ semaphore epi_finished;
     __shared__ semaphore p3_tiles_arrived;
     __shared__ semaphore p3_scales_arrived;
@@ -359,8 +360,12 @@ __device__ inline void kernel_impl(const G& g) {
             init_semaphore(scales_arrived[i], 0, 1);
             init_semaphore(inputs_finished[i], 0, 1);
         }
-        init_semaphore(outputs_arrived, 0, 1);
-        init_semaphore(a_super_ready, C::CLUSTER_SIZE, 0);
+        #pragma unroll
+        for (int s = 0; s < 2; ++s) {
+            init_semaphore(outputs_arrived[s], 0, 1);
+            init_semaphore(outputs_finished[s], 0, C::CLUSTER_SIZE);
+            init_semaphore(a_super_ready[s], C::CLUSTER_SIZE, 0);
+        }
         init_semaphore(epi_finished, 1, 0);
         init_semaphore(p3_tiles_arrived, 0, 1);
         init_semaphore(p3_scales_arrived, 0, 1);
@@ -383,7 +388,6 @@ __device__ inline void kernel_impl(const G& g) {
                 const int vocab_superblock_within_group = idx_within_supergroup % vocab_superblocks_in_group;
                 const int vocab_superblock_idx = supergroup_idx * C::SUPERGROUP_SIZE + vocab_superblock_within_group;
                 const int k_block_idx = idx_within_supergroup / vocab_superblocks_in_group;
-
                 for (int row_block_idx = 0; row_block_idx < num_row_blocks; ++row_block_idx) {
                     if (should_stop_row_block(row_block_idx)) break;
                     for (int subpass = 0; subpass < 2; ++subpass) {
@@ -423,7 +427,6 @@ __device__ inline void kernel_impl(const G& g) {
                 const int vocab_superblock_within_group = idx_within_supergroup % vocab_superblocks_in_group;
                 const int vocab_superblock_idx = supergroup_idx * C::SUPERGROUP_SIZE + vocab_superblock_within_group;
                 const int k_block_idx = idx_within_supergroup / vocab_superblocks_in_group;
-
                 for (int row_block_idx = 0; row_block_idx < num_row_blocks; ++row_block_idx) {
                     if (should_stop_row_block(row_block_idx)) break;
                     for (int subpass = 0; subpass < 2; ++subpass) {
@@ -461,13 +464,14 @@ __device__ inline void kernel_impl(const G& g) {
             int produced_blocks = 0;
             int epi_phase = 1;
 
-            auto phase1_tm = tm_allocator.template allocate<full_tt_fl<C::Nb>>(0);
-            auto p3_tm     = tm_allocator.template allocate<full_tt_fl<C::Nb>>(128);
-            auto A_sc_tm   = tm_allocator.template allocate<full_tt_fp8e4m3<16 * C::MMA_PER_TILE * C::LOAD_PIPE_DEPTH>>(256);
-            auto B_sc_tm   = tm_allocator.template allocate<full_tt_fp8e4m3<32 * C::MMA_PER_TILE * C::LOAD_PIPE_DEPTH>>(
-                256 + 4 * C::MMA_PER_TILE * C::LOAD_PIPE_DEPTH);
+            auto phase1_tm_0 = tm_allocator.template allocate<full_tt_fl<C::Nb>>(0);
+            auto phase1_tm_1 = tm_allocator.template allocate<full_tt_fl<C::Nb>>(128);
+            auto p3_tm       = tm_allocator.template allocate<full_tt_fl<C::Nb>>(256);
+            auto A_sc_tm     = tm_allocator.template allocate<full_tt_fp8e4m3<16 * C::MMA_PER_TILE * C::LOAD_PIPE_DEPTH>>(384);
+            auto B_sc_tm     = tm_allocator.template allocate<full_tt_fp8e4m3<32 * C::MMA_PER_TILE * C::LOAD_PIPE_DEPTH>>(
+                384 + 4 * C::MMA_PER_TILE * C::LOAD_PIPE_DEPTH);
 
-            constexpr int p3_sc_offset = 256;
+            constexpr int p3_sc_offset = 384;
             auto p3_A_sc_tm = tm_allocator.template allocate<full_tt_fp8e4m3<16 * C::P3_A_SCALE_CHUNKS>>(p3_sc_offset);
             auto p3_B_sc_tm = tm_allocator.template allocate<full_tt_fp8e4m3<32 * C::P3_SCALE_CHUNKS>>(
                 p3_sc_offset + 4 * C::P3_A_SCALE_CHUNKS);
@@ -521,31 +525,35 @@ __device__ inline void kernel_impl(const G& g) {
 
                 if (produced_blocks > 0) {
                     wait(epi_finished, epi_phase);
-                    update_phasebit<1>(phasebits, 9);
                     epi_phase ^= 1;
                 }
 
-                int phase0 = 0;
+                int a_phase[2] = {0, 0};
                 for (int row_block_idx = 0; row_block_idx < num_row_blocks; ++row_block_idx) {
                     if (should_stop_row_block(row_block_idx)) break;
+                    bool valid_subpass[2];
 
                     for (int subpass = 0; subpass < 2; ++subpass) {
                         const int vocab_block_idx = vocab_superblock_idx * 2 + subpass;
-                        const int iter_phase = phase0;
+                        valid_subpass[subpass] = vocab_block_idx < num_vocab_blocks;
+                        if (!valid_subpass[subpass]) continue;
 
+                        wait(outputs_finished[subpass], get_phasebit<1>(phasebits, 9 + subpass));
                         tensor_after_thread_sync();
 
-                        if (vocab_block_idx < num_vocab_blocks) {
-                            do_phase1(phase1_tm);
-                            tensor_commit<2>(outputs_arrived);
-                            tensor_after_thread_sync();
-                            asm volatile("fence.proxy.async.shared::cluster;\n" ::: "memory");
-                            wait(a_super_ready, iter_phase);
-                        } else {
-                            // Tail: leave the peer-local A tile zero-filled.
-                            wait(a_super_ready, iter_phase);
-                        }
-                        phase0 ^= 1;
+                        auto &phase1_tm = (subpass == 0) ? phase1_tm_0 : phase1_tm_1;
+                        do_phase1(phase1_tm);
+                        tensor_commit<2>(outputs_arrived[subpass]);
+                        tensor_after_thread_sync();
+                        asm volatile("fence.proxy.async.shared::cluster;\n" ::: "memory");
+                        update_phasebit<1>(phasebits, 9 + subpass);
+                    }
+
+                    #pragma unroll
+                    for (int subpass = 0; subpass < 2; ++subpass) {
+                        if (!valid_subpass[subpass]) continue;
+                        wait(a_super_ready[subpass], a_phase[subpass]);
+                        a_phase[subpass] ^= 1;
                     }
 
                     wait(p3_outputs_finished, get_phasebit<1>(phasebits, 8));
@@ -593,8 +601,9 @@ __device__ inline void kernel_impl(const G& g) {
         wait(tmem_provisioned, 0);
         tm_allocator.set_addr(tmem_addr);
 
-        auto phase1_tm = tm_allocator.template allocate<full_tt_fl<C::Nb>>(0);
-        auto p3_tm     = tm_allocator.template allocate<full_tt_fl<C::Nb>>(128);
+        auto phase1_tm_0 = tm_allocator.template allocate<full_tt_fl<C::Nb>>(0);
+        auto phase1_tm_1 = tm_allocator.template allocate<full_tt_fl<C::Nb>>(128);
+        auto p3_tm       = tm_allocator.template allocate<full_tt_fl<C::Nb>>(256);
         const float global_scale = g.A_sc_global[{0}] * g.B_sc_global[{0}];
         const int lane_id = threadIdx.x % 32;
         using logits_rt = rt_fl<C::Mb / 8, C::Nb / C::EPI_PIPE_DEPTH>;
@@ -629,7 +638,6 @@ __device__ inline void kernel_impl(const G& g) {
                 }
             };
 
-            int phase0 = 0;
             for (int row_block_idx = 0; row_block_idx < num_row_blocks; ++row_block_idx) {
                 if (should_stop_row_block(row_block_idx)) break;
                 clear_a_super();
@@ -639,11 +647,10 @@ __device__ inline void kernel_impl(const G& g) {
 
                 for (int subpass = 0; subpass < 2; ++subpass) {
                     const int vocab_block_idx = vocab_superblock_idx * 2 + subpass;
-                    const int iter_phase = phase0;
                     const bool valid_subpass = vocab_block_idx < num_vocab_blocks;
 
                     if (valid_subpass) {
-                        wait(outputs_arrived, iter_phase);
+                        wait(outputs_arrived[subpass], get_phasebit<0>(phasebits, 9 + subpass));
 
                         const int tile_row_base = row_block_idx * C::Mb + cta_id * (C::Mb / 2);
                         const int warp_row_base = tile_row_base + warpgroup::warpid() * (C::Mb / 8);
@@ -671,6 +678,7 @@ __device__ inline void kernel_impl(const G& g) {
 
                         logits_rt D_pipe[2];
                         logits_rt_bf D_bf;
+                        auto &phase1_tm = (subpass == 0) ? phase1_tm_0 : phase1_tm_1;
                         warpgroup::load_async(
                             D_pipe[0],
                             phase1_tm.template subtile<full_tt_fl<C::Nb / C::EPI_PIPE_DEPTH>>(0, 0));
@@ -844,10 +852,11 @@ __device__ inline void kernel_impl(const G& g) {
                     asm volatile("fence.proxy.async.shared::cluster;\n" ::: "memory");
 
                     if (warpgroup::warpid() == 0 && lane_id == 0) {
-                        arrive(a_super_ready, 1);
-                        arrive_remote_cluster_v5(a_super_ready, 1 - cta_id, 1);
+                        warpgroup::tma::cluster::arrive(outputs_finished[subpass], 0, 1);
+                        arrive(a_super_ready[subpass], 1);
+                        arrive_remote_cluster_v5(a_super_ready[subpass], 1 - cta_id, 1);
                     }
-                    phase0 ^= 1;
+                    update_phasebit<0>(phasebits, 9 + subpass);
                 }
 
                 wait(p3_outputs_arrived, get_phasebit<0>(phasebits, 8));
