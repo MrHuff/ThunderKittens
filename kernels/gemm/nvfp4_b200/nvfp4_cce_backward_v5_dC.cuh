@@ -82,7 +82,7 @@ struct config {
 };
 
 template <typename C>
-struct globals {
+struct debug_globals {
     using A_fp4x2_tile = st_fp4e2m1_2<C::Mb/2, C::Kb/2>;
     using A_sc_tile    = st_hf<4, 256, false>;
     using B_fp4x2_tile = st_fp4e2m1_2<C::Nb/2, C::Kb/2>;
@@ -191,8 +191,101 @@ struct globals {
 };
 
 template <typename C>
-__device__ inline void kernel(const globals<C>& g) {
-    using G = globals<C>;
+struct globals {
+    using A_fp4x2_tile = st_fp4e2m1_2<C::Mb/2, C::Kb/2>;
+    using A_sc_tile    = st_hf<4, 256, false>;
+    using B_fp4x2_tile = st_fp4e2m1_2<C::Nb/2, C::Kb/2>;
+    using B_sc_tile    = st_hf<4, 256, false>;
+
+    using P3_B_fp4x2_tile = st_fp4e2m1_2<C::Nb_out/2, C::Mb/2>;
+    using P3_B_sc_tile    = st_hf<4, 256, false>;
+
+    using Gt_fp4_row_tile = st_fp4e2m1_2<C::Nb, C::Mb/2>;
+    using Gt_sc_row_tile  = st_hf<4, 256, false>;
+
+    using Out_tile       = st_bf<C::Nb, C::Nb_out / C::EPI_PIPE_DEPTH>;
+    using Out_sm_tile    = st_bf<C::Nb, C::Nb_out / C::EPI_PIPE_DEPTH, false>;
+    using Debug_raw_tile = st_fl<C::Nb, C::Nb_out / C::EPI_PIPE_DEPTH, false>;
+
+    using A_fp4x2_gl     = gl<fp4e2m1_2,  1,  1, -1, -1, A_fp4x2_tile>;
+    using A_sc_gl        = gl<half,       1, -1, -1, 256, A_sc_tile>;
+    using A_sc_global_gl = gl<float,      1,  1,  1,  1>;
+    using B_fp4x2_gl     = gl<fp4e2m1_2,  1,  1, -1, -1, B_fp4x2_tile>;
+    using B_sc_gl        = gl<half,       1, -1, -1, 256, B_sc_tile>;
+    using B_sc_global_gl = gl<float,      1,  1,  1,  1>;
+
+    using P3_B_fp4x2_gl     = gl<fp4e2m1_2,  1,  1, -1, -1, P3_B_fp4x2_tile>;
+    using P3_B_sc_gl        = gl<half,       1, -1, -1, 256, P3_B_sc_tile>;
+    using P3_B_sc_global_gl = gl<float,      1,  1,  1,  1>;
+    using Out_gl            = gl<bf16,       1,  1, -1, -1, Out_tile>;
+
+    A_fp4x2_gl     A;
+    A_sc_gl        A_sc;
+    A_sc_global_gl A_sc_global;
+    B_fp4x2_gl     B;
+    B_sc_gl        B_sc;
+    B_sc_global_gl B_sc_global;
+
+    P3_B_fp4x2_gl     E_col;
+    P3_B_sc_gl        E_col_sc;
+    P3_B_sc_global_gl E_col_sc_global;
+    Out_gl            dC_out;
+
+    const float* lse;
+    const int64_t* targets;
+    float grad_scale;
+    float filter_eps;
+    int M;
+    int N;
+    int K;
+
+    struct input_tiles_t {
+        A_fp4x2_tile A;
+        B_fp4x2_tile B;
+    };
+    struct input_scales_t {
+        A_sc_tile A;
+        B_sc_tile B[C::B_SC_SIZE];
+    };
+    struct output_tiles_t {
+        Out_sm_tile D[1];
+    };
+    struct fp4_staging_t {
+        Gt_fp4_row_tile Gt_row;
+        Gt_sc_row_tile  Gt_row_sc;
+    };
+    struct p3_tiles_t {
+        P3_B_fp4x2_tile B;
+    };
+    struct p3_scales_t {
+        P3_B_sc_tile B_sc;
+    };
+
+    __host__ inline dim3 grid() const {
+        const int num_vocab_blocks = B.rows() / C::Nb;
+        const int num_vocab_superblocks = (num_vocab_blocks + 1) / 2;
+        const int num_k_blocks = dC_out.cols() / C::Nb_out;
+        int total = num_vocab_superblocks * num_k_blocks;
+        int grid_size = min(total, num_sms());
+        grid_size = (grid_size / C::CLUSTER_SIZE) * C::CLUSTER_SIZE;
+        return dim3(max(grid_size, C::CLUSTER_SIZE));
+    }
+    __host__ inline dim3 block() const { return dim3(C::NUM_THREADS); }
+    __host__ inline int dynamic_shared_memory() const {
+        constexpr int phase1_smem = sizeof(input_tiles_t) * C::LOAD_PIPE_DEPTH + 1024 +
+                                    sizeof(input_scales_t) * C::LOAD_PIPE_DEPTH + 1024 +
+                                    sizeof(output_tiles_t);
+        constexpr int fp4_smem = sizeof(fp4_staging_t) + 1024;
+        constexpr int p3_smem = sizeof(p3_tiles_t) + 1024 +
+                                sizeof(p3_scales_t) + 1024;
+        constexpr int base_total = phase1_smem + fp4_smem + p3_smem;
+        static_assert(base_total <= MAX_SHARED_MEMORY - 1024);
+        return base_total;
+    }
+};
+
+template <typename C, typename G, bool Debug>
+__device__ inline void kernel_impl(const G& g) {
 
     if (threadIdx.x == 0) {
         g.A.template prefetch_tma<typename G::A_fp4x2_tile>();
@@ -228,9 +321,19 @@ __device__ inline void kernel(const globals<C>& g) {
     typename G::p3_tiles_t     &p3_tiles = sm_allocator.allocate<G::p3_tiles_t>();
     typename G::p3_scales_t    &p3_scales = sm_allocator.allocate<G::p3_scales_t>();
     typename G::Debug_raw_tile *debug_raw = nullptr;
-    if (g.debug_p3_out_raw_ptr) {
-        debug_raw = &sm_allocator.allocate<typename G::Debug_raw_tile>();
+    if constexpr (Debug) {
+        if (g.debug_p3_out_raw_ptr) {
+            debug_raw = &sm_allocator.allocate<typename G::Debug_raw_tile>();
+        }
     }
+    auto should_stop_block = [&](int block_idx) {
+        if constexpr (Debug) return g.debug_trace_mode > 0 && block_idx >= g.debug_trace_mode;
+        else                  return false;
+    };
+    auto should_stop_row_block = [&](int row_block_idx) {
+        if constexpr (Debug) return g.debug_trace_mode > 0 && row_block_idx > 0;
+        else                  return false;
+    };
 
     tensor_allocator<1, C::CLUSTER_SIZE, false> tm_allocator;
 
@@ -275,7 +378,7 @@ __device__ inline void kernel(const globals<C>& g) {
             if constexpr (C::USE_PDL) pdl::wait();
             everyone::tma::cluster::wait();
             for (int block_idx = cluster_id; block_idx < num_blocks; block_idx += gridDim.x / C::CLUSTER_SIZE) {
-                if (g.debug_trace_mode > 0 && block_idx >= g.debug_trace_mode) break;
+                if (should_stop_block(block_idx)) break;
                 const int supergroup_idx = block_idx / num_blocks_per_supergroup;
                 const int idx_within_supergroup = block_idx % num_blocks_per_supergroup;
                 const int vocab_superblocks_in_group = min(C::SUPERGROUP_SIZE, num_vocab_superblocks - supergroup_idx * C::SUPERGROUP_SIZE);
@@ -284,7 +387,7 @@ __device__ inline void kernel(const globals<C>& g) {
                 const int k_block_idx = idx_within_supergroup / vocab_superblocks_in_group;
 
                 for (int row_block_idx = 0; row_block_idx < num_row_blocks; ++row_block_idx) {
-                    if (g.debug_trace_mode > 0 && row_block_idx > 0) break;
+                    if (should_stop_row_block(row_block_idx)) break;
                     for (int subpass = 0; subpass < 2; ++subpass) {
                         const int vocab_block_idx = vocab_superblock_idx * 2 + subpass;
                         if (vocab_block_idx >= num_vocab_blocks) continue;
@@ -315,7 +418,7 @@ __device__ inline void kernel(const globals<C>& g) {
             if constexpr (C::USE_PDL) pdl::wait();
             everyone::tma::cluster::wait();
             for (int block_idx = cluster_id; block_idx < num_blocks; block_idx += gridDim.x / C::CLUSTER_SIZE) {
-                if (g.debug_trace_mode > 0 && block_idx >= g.debug_trace_mode) break;
+                if (should_stop_block(block_idx)) break;
                 const int supergroup_idx = block_idx / num_blocks_per_supergroup;
                 const int idx_within_supergroup = block_idx % num_blocks_per_supergroup;
                 const int vocab_superblocks_in_group = min(C::SUPERGROUP_SIZE, num_vocab_superblocks - supergroup_idx * C::SUPERGROUP_SIZE);
@@ -324,7 +427,7 @@ __device__ inline void kernel(const globals<C>& g) {
                 const int k_block_idx = idx_within_supergroup / vocab_superblocks_in_group;
 
                 for (int row_block_idx = 0; row_block_idx < num_row_blocks; ++row_block_idx) {
-                    if (g.debug_trace_mode > 0 && row_block_idx > 0) break;
+                    if (should_stop_row_block(row_block_idx)) break;
                     for (int subpass = 0; subpass < 2; ++subpass) {
                         const int vocab_block_idx = vocab_superblock_idx * 2 + subpass;
                         if (vocab_block_idx >= num_vocab_blocks) continue;
@@ -411,7 +514,7 @@ __device__ inline void kernel(const globals<C>& g) {
             };
 
             for (int block_idx = cluster_id; block_idx < num_blocks; block_idx += gridDim.x / C::CLUSTER_SIZE) {
-                if (g.debug_trace_mode > 0 && block_idx >= g.debug_trace_mode) break;
+                if (should_stop_block(block_idx)) break;
                 const int supergroup_idx = block_idx / num_blocks_per_supergroup;
                 const int idx_within_supergroup = block_idx % num_blocks_per_supergroup;
                 const int vocab_superblocks_in_group = min(C::SUPERGROUP_SIZE, num_vocab_superblocks - supergroup_idx * C::SUPERGROUP_SIZE);
@@ -427,7 +530,7 @@ __device__ inline void kernel(const globals<C>& g) {
 
                 int phase0 = 0;
                 for (int row_block_idx = 0; row_block_idx < num_row_blocks; ++row_block_idx) {
-                    if (g.debug_trace_mode > 0 && row_block_idx > 0) break;
+                    if (should_stop_row_block(row_block_idx)) break;
 
                     for (int subpass = 0; subpass < 2; ++subpass) {
                         const int vocab_block_idx = vocab_superblock_idx * 2 + subpass;
@@ -498,11 +601,12 @@ __device__ inline void kernel(const globals<C>& g) {
         const float global_scale = g.A_sc_global[{0}] * g.B_sc_global[{0}];
         const int lane_id = threadIdx.x % 32;
         using logits_rt = rt_fl<C::Mb / 8, C::Nb / C::EPI_PIPE_DEPTH>;
+        using logits_rt_bf = rt_bf<C::Mb / 8, C::Nb / C::EPI_PIPE_DEPTH>;
         using out_rt    = rt_fl<C::Nb / 4, C::Nb_out / C::EPI_PIPE_DEPTH>;
         using out_rt_bf = rt_bf<C::Nb / 4, C::Nb_out / C::EPI_PIPE_DEPTH>;
 
         for (int block_idx = cluster_id; block_idx < num_blocks; block_idx += gridDim.x / C::CLUSTER_SIZE) {
-            if (g.debug_trace_mode > 0 && block_idx >= g.debug_trace_mode) break;
+            if (should_stop_block(block_idx)) break;
             const int supergroup_idx = block_idx / num_blocks_per_supergroup;
             const int idx_within_supergroup = block_idx % num_blocks_per_supergroup;
             const int vocab_superblocks_in_group = min(C::SUPERGROUP_SIZE, num_vocab_superblocks - supergroup_idx * C::SUPERGROUP_SIZE);
@@ -526,7 +630,7 @@ __device__ inline void kernel(const globals<C>& g) {
 
             int phase0 = 0;
             for (int row_block_idx = 0; row_block_idx < num_row_blocks; ++row_block_idx) {
-                if (g.debug_trace_mode > 0 && row_block_idx > 0) break;
+                if (should_stop_row_block(row_block_idx)) break;
                 clear_a_super();
                 warpgroup::sync(1);
                 __threadfence_block();
@@ -544,6 +648,7 @@ __device__ inline void kernel(const globals<C>& g) {
                         const int warp_row_base = tile_row_base + warpgroup::warpid() * (C::Mb / 8);
 
                         logits_rt D_regs_fl[C::EPI_PIPE_DEPTH];
+                        logits_rt_bf D_regs_bf[C::EPI_PIPE_DEPTH];
                         #pragma unroll
                         for (int epi = 0; epi < C::EPI_PIPE_DEPTH; ++epi) {
                             warpgroup::load_async(
@@ -640,6 +745,7 @@ __device__ inline void kernel(const globals<C>& g) {
                             }
 
                             warp::mul(D_fl, D_fl, g.grad_scale);
+                            warp::copy(D_regs_bf[epi], D_fl);
                         }
 
                         if (warpgroup::warpid() == 0 && lane_id == 0) {
@@ -654,118 +760,75 @@ __device__ inline void kernel(const globals<C>& g) {
                         const uint32_t gt_fp4_base = static_cast<uint32_t>(__cvta_generic_to_shared(&fp4_staging.Gt_row.data[0]));
                         const uint32_t gt_sc_base  = static_cast<uint32_t>(__cvta_generic_to_shared(&fp4_staging.Gt_row_sc.data[0]));
                         constexpr int SUBTILE_COLS = C::Nb / C::EPI_PIPE_DEPTH;
+                        constexpr int CONSUMER_THREADS = WARPGROUP_WARPS * WARP_THREADS;
+                        constexpr int LOCAL_ROW16_BLOCKS = (C::Mb / 2) / 16;
+                        constexpr int ROW16_BLOCKS_PER_PASS = CONSUMER_THREADS / SUBTILE_COLS;
+                        static_assert(LOCAL_ROW16_BLOCKS % ROW16_BLOCKS_PER_PASS == 0);
 
                         #pragma unroll
                         for (int epi = 0; epi < C::EPI_PIPE_DEPTH; ++epi) {
-                            auto &D_fl = D_regs_fl[epi];
-                            const int col_start = vocab_block_idx * C::Nb + epi * SUBTILE_COLS;
+                            warpgroup::sync(1);
+                            warpgroup::store(output_tiles.D[0], D_regs_bf[epi]);
+                            warpgroup::sync(1);
+
+                            const uint32_t d_base = static_cast<uint32_t>(__cvta_generic_to_shared(&output_tiles.D[0].data[0]));
+                            const int col_in_epi = threadIdx.x % SUBTILE_COLS;
+                            const int row16_block_base = threadIdx.x / SUBTILE_COLS;
+                            const int local_gc = epi * SUBTILE_COLS + col_in_epi;
 
                             #pragma unroll
-                            for (int i = 0; i < logits_rt::height; ++i) {
-                                const int global_row_x = warp_row_base + i * 16 + lane_id / 4;
-                                const int global_row_y = global_row_x + 8;
+                            for (int row16_pass = 0; row16_pass < LOCAL_ROW16_BLOCKS / ROW16_BLOCKS_PER_PASS; ++row16_pass) {
+                                const int row16_block = row16_block_base + row16_pass * ROW16_BLOCKS_PER_PASS;
+                                if (row16_block >= LOCAL_ROW16_BLOCKS) continue;
 
+                                const int local_row_base = row16_block * 16;
+                                const int global_row_base = tile_row_base + local_row_base;
+                                float col_amax = 0.0f;
                                 #pragma unroll
-                                for (int j = 0; j < logits_rt::width; ++j) {
-                                    float vals_x[4], vals_y[4];
-                                    vals_x[0] = D_fl.tiles[i][j].data[0].x;
-                                    vals_x[1] = D_fl.tiles[i][j].data[0].y;
-                                    vals_x[2] = D_fl.tiles[i][j].data[2].x;
-                                    vals_x[3] = D_fl.tiles[i][j].data[2].y;
-                                    vals_y[0] = D_fl.tiles[i][j].data[1].x;
-                                    vals_y[1] = D_fl.tiles[i][j].data[1].y;
-                                    vals_y[2] = D_fl.tiles[i][j].data[3].x;
-                                    vals_y[3] = D_fl.tiles[i][j].data[3].y;
-
-                                    float col_amax[4];
-                                    col_amax[0] = fmaxf(fabsf(vals_x[0]), fabsf(vals_y[0]));
-                                    col_amax[1] = fmaxf(fabsf(vals_x[1]), fabsf(vals_y[1]));
-                                    col_amax[2] = fmaxf(fabsf(vals_x[2]), fabsf(vals_y[2]));
-                                    col_amax[3] = fmaxf(fabsf(vals_x[3]), fabsf(vals_y[3]));
-
-                                    #pragma unroll
-                                    for (int offset = 4; offset < 32; offset <<= 1) {
-                                        #pragma unroll
-                                        for (int v = 0; v < 4; ++v) {
-                                            col_amax[v] = fmaxf(col_amax[v], __shfl_xor_sync(0xFFFFFFFF, col_amax[v], offset));
-                                        }
-                                    }
-
-                                    float col_scale[4], col_rcp[4];
-                                    #pragma unroll
-                                    for (int v = 0; v < 4; ++v) {
-                                        col_scale[v] = col_amax[v] * (1.0f / 6.0f);
-                                        col_rcp[v] = (col_amax[v] > 0.0f) ? (6.0f / col_amax[v]) : 0.0f;
-                                    }
-
-                                    const int gc0 = col_start + j * 16 + (lane_id % 4) * 2;
-                                    const int gc8 = gc0 + 8;
-                                    const int gc_vals[4] = {gc0, gc0 + 1, gc8, gc8 + 1};
-                                    const int row_pair_idx = lane_id / 4;
-                                    const int global_row_pair_lo = warp_row_base + i * 16 + row_pair_idx;
-                                    const int global_row_pair_hi = global_row_pair_lo + 8;
-
-                                    float row_x_pair_hi[4];
-                                    float row_y_pair_hi[4];
-                                    #pragma unroll
-                                    for (int v = 0; v < 4; ++v) {
-                                        row_x_pair_hi[v] = __shfl_xor_sync(0xFFFFFFFF, vals_x[v], 4);
-                                        row_y_pair_hi[v] = __shfl_xor_sync(0xFFFFFFFF, vals_y[v], 4);
-                                    }
-
-                                    if ((row_pair_idx % 2) == 0) {
-                                        auto store_pair = [&](int local_gc, float v_lo, float v_hi_src, float rcp, int global_row_pair) {
-                                            if (local_gc < 0 || local_gc >= C::Nb) return;
-                                            const int local_row_pair = global_row_pair - row_block_idx * C::Mb;
-                                            if (local_row_pair < 0 || local_row_pair >= C::Mb) return;
-                                            const float v_hi = (global_row_pair + 1 < g.M) ? v_hi_src : 0.0f;
-                                            const uint8_t pair = quantize_fp4_pair_v5(v_lo, v_hi, rcp);
-                                            const uint32_t fp4_addr = G::Gt_fp4_row_tile::idx(
-                                                gt_fp4_base, {local_gc, local_row_pair / 2});
-                                            if (subpass == cta_id) store_b8_local_v5(fp4_addr, pair);
-                                            else                  store_b8_cluster_v5(fp4_addr, subpass, pair);
-                                        };
-
-                                        if (global_row_x < g.M) {
-                                            store_pair(gc0 - vocab_block_idx * C::Nb,     vals_x[0], row_x_pair_hi[0], col_rcp[0], global_row_pair_lo);
-                                            store_pair(gc0 + 1 - vocab_block_idx * C::Nb, vals_x[1], row_x_pair_hi[1], col_rcp[1], global_row_pair_lo);
-                                            store_pair(gc8 - vocab_block_idx * C::Nb,     vals_x[2], row_x_pair_hi[2], col_rcp[2], global_row_pair_lo);
-                                            store_pair(gc8 + 1 - vocab_block_idx * C::Nb, vals_x[3], row_x_pair_hi[3], col_rcp[3], global_row_pair_lo);
-                                        }
-                                        if (global_row_y < g.M) {
-                                            store_pair(gc0 - vocab_block_idx * C::Nb,     vals_y[0], row_y_pair_hi[0], col_rcp[0], global_row_pair_hi);
-                                            store_pair(gc0 + 1 - vocab_block_idx * C::Nb, vals_y[1], row_y_pair_hi[1], col_rcp[1], global_row_pair_hi);
-                                            store_pair(gc8 - vocab_block_idx * C::Nb,     vals_y[2], row_y_pair_hi[2], col_rcp[2], global_row_pair_hi);
-                                            store_pair(gc8 + 1 - vocab_block_idx * C::Nb, vals_y[3], row_y_pair_hi[3], col_rcp[3], global_row_pair_hi);
-                                        }
-                                    }
-
-                                    if ((lane_id / 4) == 0) {
-                                        const int global_row_m = warp_row_base + i * 16;
-                                        const int local_row_m = global_row_m - row_block_idx * C::Mb;
-                                        const int m_kgroup = local_row_m / 64;
-                                        const int m_16_in_64 = (local_row_m / 16) % 4;
-
-                                        const __nv_fp8_e4m3 csc[4] = {
-                                            __nv_fp8_e4m3(col_scale[0] * g_sg_rcp),
-                                            __nv_fp8_e4m3(col_scale[1] * g_sg_rcp),
-                                            __nv_fp8_e4m3(col_scale[2] * g_sg_rcp),
-                                            __nv_fp8_e4m3(col_scale[3] * g_sg_rcp),
-                                        };
-
-                                        #pragma unroll
-                                        for (int v = 0; v < 4; ++v) {
-                                            const int gc_local = gc_vals[v] - vocab_block_idx * C::Nb;
-                                            if (gc_local < 0 || gc_local >= C::Nb) continue;
-                                            const int sr = gc_local % 32;
-                                            const int rr = (gc_local / 32) % 4;
-                                            const int byte_idx = m_kgroup * 512 + sr * 16 + rr * 4 + m_16_in_64;
-                                            const uint8_t sc_byte = *reinterpret_cast<const uint8_t*>(&csc[v]);
-                                            if (subpass == cta_id) store_b8_local_v5(gt_sc_base + byte_idx, sc_byte);
-                                            else                  store_b8_cluster_v5(gt_sc_base + byte_idx, subpass, sc_byte);
-                                        }
+                                for (int r = 0; r < 16; ++r) {
+                                    bf16 value_bf;
+                                    move<bf16>::lds(value_bf, G::Out_sm_tile::idx(d_base, {local_row_base + r, col_in_epi}));
+                                    if (global_row_base + r < g.M) {
+                                        col_amax = fmaxf(col_amax, fabsf(__bfloat162float(value_bf)));
                                     }
                                 }
+
+                                const float col_scale = col_amax * (1.0f / 6.0f);
+                                const float col_rcp = (col_amax > 0.0f) ? (6.0f / col_amax) : 0.0f;
+                                const int local_row_pair_base = cta_id * (C::Mb / 4) + local_row_base / 2;
+
+                                #pragma unroll
+                                for (int pair = 0; pair < 8; ++pair) {
+                                    const int global_row = global_row_base + pair * 2;
+                                    if (global_row >= g.M) continue;
+
+                                    bf16 value0_bf;
+                                    move<bf16>::lds(value0_bf, G::Out_sm_tile::idx(d_base, {local_row_base + pair * 2, col_in_epi}));
+                                    const float v0 = __bfloat162float(value0_bf);
+                                    float v1 = 0.0f;
+                                    if (global_row + 1 < g.M) {
+                                        bf16 value1_bf;
+                                        move<bf16>::lds(value1_bf, G::Out_sm_tile::idx(d_base, {local_row_base + pair * 2 + 1, col_in_epi}));
+                                        v1 = __bfloat162float(value1_bf);
+                                    }
+
+                                    const uint8_t fp4_pair = quantize_fp4_pair_v5(v0, v1, col_rcp);
+                                    const uint32_t fp4_addr = G::Gt_fp4_row_tile::idx(
+                                        gt_fp4_base, {local_gc, local_row_pair_base + pair});
+                                    if (subpass == cta_id) store_b8_local_v5(fp4_addr, fp4_pair);
+                                    else                  store_b8_cluster_v5(fp4_addr, subpass, fp4_pair);
+                                }
+
+                                const __nv_fp8_e4m3 csc = __nv_fp8_e4m3(col_scale * g_sg_rcp);
+                                const int local_row_m = cta_id * (C::Mb / 2) + local_row_base;
+                                const int m_kgroup = local_row_m / 64;
+                                const int m_16_in_64 = (local_row_m / 16) % 4;
+                                const int sr = local_gc % 32;
+                                const int rr = (local_gc / 32) % 4;
+                                const int byte_idx = m_kgroup * 512 + sr * 16 + rr * 4 + m_16_in_64;
+                                const uint8_t sc_byte = *reinterpret_cast<const uint8_t*>(&csc);
+                                if (subpass == cta_id) store_b8_local_v5(gt_sc_base + byte_idx, sc_byte);
+                                else                  store_b8_cluster_v5(gt_sc_base + byte_idx, subpass, sc_byte);
                             }
                         }
                     }
@@ -801,23 +864,25 @@ __device__ inline void kernel(const globals<C>& g) {
                 const float p3_scale = gt_row_sg * g.E_col_sc_global[{0}];
                 #pragma unroll
                 for (int epi = 0; epi < C::EPI_PIPE_DEPTH; ++epi) {
-                    if (g.debug_p3_out_raw_ptr &&
-                        cluster_id == 0 &&
-                        block_idx == 0 &&
-                        row_block_idx == 0) {
-                        warpgroup::store(*debug_raw, D_reg_fl[epi]);
-                        warpgroup::sync(1);
-                        const uint32_t raw_base = static_cast<uint32_t>(__cvta_generic_to_shared(&debug_raw->data[0]));
-                        constexpr int CONSUMER_THREADS = WARPGROUP_WARPS * WARP_THREADS;
-                        for (int idx = threadIdx.x; idx < C::Nb * (C::Nb_out / C::EPI_PIPE_DEPTH); idx += CONSUMER_THREADS) {
-                            const int row = idx / (C::Nb_out / C::EPI_PIPE_DEPTH);
-                            const int col = idx % (C::Nb_out / C::EPI_PIPE_DEPTH);
-                            float value;
-                            move<float>::lds(value, G::Debug_raw_tile::idx(raw_base, {row, col}));
-                            g.debug_p3_out_raw_ptr[(cta_id * C::Nb + row) * g.debug_p3_out_raw_stride +
-                                                   epi * (C::Nb_out / C::EPI_PIPE_DEPTH) + col] = value;
+                    if constexpr (Debug) {
+                        if (g.debug_p3_out_raw_ptr &&
+                            cluster_id == 0 &&
+                            block_idx == 0 &&
+                            row_block_idx == 0) {
+                            warpgroup::store(*debug_raw, D_reg_fl[epi]);
+                            warpgroup::sync(1);
+                            const uint32_t raw_base = static_cast<uint32_t>(__cvta_generic_to_shared(&debug_raw->data[0]));
+                            constexpr int CONSUMER_THREADS = WARPGROUP_WARPS * WARP_THREADS;
+                            for (int idx = threadIdx.x; idx < C::Nb * (C::Nb_out / C::EPI_PIPE_DEPTH); idx += CONSUMER_THREADS) {
+                                const int row = idx / (C::Nb_out / C::EPI_PIPE_DEPTH);
+                                const int col = idx % (C::Nb_out / C::EPI_PIPE_DEPTH);
+                                float value;
+                                move<float>::lds(value, G::Debug_raw_tile::idx(raw_base, {row, col}));
+                                g.debug_p3_out_raw_ptr[(cta_id * C::Nb + row) * g.debug_p3_out_raw_stride +
+                                                       epi * (C::Nb_out / C::EPI_PIPE_DEPTH) + col] = value;
+                            }
+                            warpgroup::sync(1);
                         }
-                        warpgroup::sync(1);
                     }
                     warp::mul(D_reg_fl[epi], D_reg_fl[epi], p3_scale);
                     if (row_block_idx == 0) warp::copy(D_acc[epi], D_reg_fl[epi]);
@@ -838,20 +903,22 @@ __device__ inline void kernel(const globals<C>& g) {
                 warpgroup::store(output_tiles.D[0], D_reg_bf[epi]);
                 warpgroup::sync(1);
 
-                if (g.debug_p3_out_ptr &&
-                    cluster_id == 0 &&
-                    block_idx == 0) {
-                    const uint32_t d_base = static_cast<uint32_t>(__cvta_generic_to_shared(&output_tiles.D[0].data[0]));
-                    constexpr int CONSUMER_THREADS = WARPGROUP_WARPS * WARP_THREADS;
-                    for (int idx = threadIdx.x; idx < C::Nb * (C::Nb_out / C::EPI_PIPE_DEPTH); idx += CONSUMER_THREADS) {
-                        const int row = idx / (C::Nb_out / C::EPI_PIPE_DEPTH);
-                        const int col = idx % (C::Nb_out / C::EPI_PIPE_DEPTH);
-                        bf16 value;
-                        move<bf16>::lds(value, G::Out_sm_tile::idx(d_base, {row, col}));
-                        g.debug_p3_out_ptr[(cta_id * C::Nb + row) * g.debug_p3_out_stride +
-                                           epi * (C::Nb_out / C::EPI_PIPE_DEPTH) + col] = value;
+                if constexpr (Debug) {
+                    if (g.debug_p3_out_ptr &&
+                        cluster_id == 0 &&
+                        block_idx == 0) {
+                        const uint32_t d_base = static_cast<uint32_t>(__cvta_generic_to_shared(&output_tiles.D[0].data[0]));
+                        constexpr int CONSUMER_THREADS = WARPGROUP_WARPS * WARP_THREADS;
+                        for (int idx = threadIdx.x; idx < C::Nb * (C::Nb_out / C::EPI_PIPE_DEPTH); idx += CONSUMER_THREADS) {
+                            const int row = idx / (C::Nb_out / C::EPI_PIPE_DEPTH);
+                            const int col = idx % (C::Nb_out / C::EPI_PIPE_DEPTH);
+                            bf16 value;
+                            move<bf16>::lds(value, G::Out_sm_tile::idx(d_base, {row, col}));
+                            g.debug_p3_out_ptr[(cta_id * C::Nb + row) * g.debug_p3_out_stride +
+                                               epi * (C::Nb_out / C::EPI_PIPE_DEPTH) + col] = value;
+                        }
+                        warpgroup::sync(1);
                     }
-                    warpgroup::sync(1);
                 }
 
                 warpgroup::sync(1);
@@ -879,20 +946,22 @@ __device__ inline void kernel(const globals<C>& g) {
                 arrive(epi_finished, 1);
             }
 
-            if (g.debug_gt_fp4_ptr && cluster_id == 0 && block_idx == 0) {
-                constexpr int CONSUMER_THREADS = WARPGROUP_WARPS * WARP_THREADS;
-                const uint32_t gt_fp4_base = static_cast<uint32_t>(__cvta_generic_to_shared(&fp4_staging.Gt_row.data[0]));
-                const uint32_t gt_sc_base = static_cast<uint32_t>(__cvta_generic_to_shared(&fp4_staging.Gt_row_sc.data[0]));
-                for (int idx = threadIdx.x; idx < C::Nb * (C::Mb / 2); idx += CONSUMER_THREADS) {
-                    const int row = idx / (C::Mb / 2);
-                    const int col = idx % (C::Mb / 2);
-                    uint32_t value_u32;
-                    asm volatile("ld.shared.b8 %0, [%1];\n" : "=r"(value_u32) : "r"(G::Gt_fp4_row_tile::idx(gt_fp4_base, {row, col})));
-                    g.debug_gt_fp4_ptr[(cta_id * C::Nb + row) * g.debug_gt_fp4_stride + col] = static_cast<uint8_t>(value_u32);
-                }
-                for (int idx = threadIdx.x; idx < (int)sizeof(typename G::Gt_sc_row_tile); idx += CONSUMER_THREADS) {
-                    g.debug_gt_sc_ptr[cta_id * (int)sizeof(typename G::Gt_sc_row_tile) + idx] =
-                        reinterpret_cast<const uint8_t*>(&fp4_staging.Gt_row_sc.data[0])[idx];
+            if constexpr (Debug) {
+                if (g.debug_gt_fp4_ptr && cluster_id == 0 && block_idx == 0) {
+                    constexpr int CONSUMER_THREADS = WARPGROUP_WARPS * WARP_THREADS;
+                    const uint32_t gt_fp4_base = static_cast<uint32_t>(__cvta_generic_to_shared(&fp4_staging.Gt_row.data[0]));
+                    const uint32_t gt_sc_base = static_cast<uint32_t>(__cvta_generic_to_shared(&fp4_staging.Gt_row_sc.data[0]));
+                    for (int idx = threadIdx.x; idx < C::Nb * (C::Mb / 2); idx += CONSUMER_THREADS) {
+                        const int row = idx / (C::Mb / 2);
+                        const int col = idx % (C::Mb / 2);
+                        uint32_t value_u32;
+                        asm volatile("ld.shared.b8 %0, [%1];\n" : "=r"(value_u32) : "r"(G::Gt_fp4_row_tile::idx(gt_fp4_base, {row, col})));
+                        g.debug_gt_fp4_ptr[(cta_id * C::Nb + row) * g.debug_gt_fp4_stride + col] = static_cast<uint8_t>(value_u32);
+                    }
+                    for (int idx = threadIdx.x; idx < (int)sizeof(typename G::Gt_sc_row_tile); idx += CONSUMER_THREADS) {
+                        g.debug_gt_sc_ptr[cta_id * (int)sizeof(typename G::Gt_sc_row_tile) + idx] =
+                            reinterpret_cast<const uint8_t*>(&fp4_staging.Gt_row_sc.data[0])[idx];
+                    }
                 }
             }
         }
@@ -901,6 +970,16 @@ __device__ inline void kernel(const globals<C>& g) {
         if constexpr (C::USE_PDL) warpgroup::pdl::arrive();
         if (warpgroup::warpid() == 0) tm_allocator.deprovision();
     }
+}
+
+template <typename C>
+__device__ inline void kernel(const globals<C>& g) {
+    kernel_impl<C, globals<C>, false>(g);
+}
+
+template <typename C>
+__device__ inline void debug_kernel(const debug_globals<C>& g) {
+    kernel_impl<C, debug_globals<C>, true>(g);
 }
 
 // Developer-only probe placeholder. The benchmark path does not rely on it.

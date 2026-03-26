@@ -77,14 +77,6 @@ static void launch_backward_v5_dC(
             E_col_sc, 1, E_col_sc.size(0), E_col_sc.size(1), 256),
         .E_col_sc_global = kittens::py::tensor_to_gl<typename G::P3_B_sc_global_gl>(E_col_sc_global),
         .dC_out = kittens::py::tensor_to_gl<typename G::Out_gl>(dC_out),
-        .debug_gt_fp4_ptr = nullptr,
-        .debug_gt_sc_ptr = nullptr,
-        .debug_p3_out_ptr = nullptr,
-        .debug_p3_out_raw_ptr = nullptr,
-        .debug_gt_fp4_stride = 0,
-        .debug_p3_out_stride = 0,
-        .debug_p3_out_raw_stride = 0,
-        .debug_trace_mode = 0,
         .lse = lse.data_ptr<float>(),
         .targets = targets.data_ptr<int64_t>(),
         .grad_scale = grad_scale,
@@ -107,7 +99,7 @@ static void launch_debug_backward_v5_dC_stage(
     const at::Tensor &lse, const at::Tensor &targets,
     float grad_scale, int M, int N, int K, float filter_eps = 0.0f)
 {
-    using G = nvfp4_cce_backward_v5_dC::globals<C>;
+    using G = nvfp4_cce_backward_v5_dC::debug_globals<C>;
 
     G g {
         .A = kittens::py::tensor_to_gl<typename G::A_fp4x2_gl>(A),
@@ -143,7 +135,7 @@ static void launch_debug_backward_v5_dC_stage(
         .N = N,
         .K = K,
     };
-    kittens::py::launch_kernel<C, G, nvfp4_cce_backward_v5_dC::kernel<C>>(g);
+    kittens::py::launch_kernel<C, G, nvfp4_cce_backward_v5_dC::debug_kernel<C>>(g);
 }
 
 template <typename C>
@@ -160,7 +152,7 @@ static void launch_debug_backward_v5_dC_p3_probe(
     float grad_scale, int M, int N, int K, int debug_trace_mode, int debug_p3_contract, int debug_b_payload_source, int debug_b_sc_source,
     float filter_eps = 0.0f)
 {
-    using G = nvfp4_cce_backward_v5_dC::globals<C>;
+    using G = nvfp4_cce_backward_v5_dC::debug_globals<C>;
 
     G g {
         .A = kittens::py::tensor_to_gl<typename G::A_fp4x2_gl>(A),
@@ -196,7 +188,7 @@ static void launch_debug_backward_v5_dC_p3_probe(
         .N = N,
         .K = K,
     };
-    kittens::py::launch_kernel<C, G, nvfp4_cce_backward_v5_dC::kernel<C>>(g);
+    kittens::py::launch_kernel<C, G, nvfp4_cce_backward_v5_dC::debug_kernel<C>>(g);
 }
 
 template <typename C>
