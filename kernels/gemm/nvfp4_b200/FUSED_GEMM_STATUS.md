@@ -127,6 +127,9 @@ The same approach works for the 4-byte scale writes via `st.shared.b32`.
   - `N % 256 != 0`: single-column fallback `config<128, *, *, 4, 2, false, USE_CTA_AMAX>`
 - The dual-column constant-scale kernels currently compile with small but nonzero spills:
   `8` bytes spill stores / `12` bytes spill loads.
+- A cross-CTA shared-A prototype exists in-tree, but it is **not** currently dispatched. It still
+  miscomputes CTA1's imported A tile on `256 x 512 x 256` (left-half cosine `~0.988`, right-half
+  cosine `~0.56` against the separate baseline), so it is gated off until the DSMEM handoff is correct.
 
 ## Current Measurements
 
@@ -213,3 +216,6 @@ The next meaningful optimization is structural:
    - a wider multi-output backend that reuses A across more than `256` columns
    - or a cluster/dataflow change where multiple output-column workers consume the same quantized A stage
 3. Keep CTA-amax as a secondary mode; its `4096` accuracy collapse should not block constant-scale tuning.
+4. If the cross-CTA route is revisited, fix the DSMEM A-tile handoff before re-enabling dispatch.
+   The current prototype compiles and runs, but the copied/imported A payload on CTA1 is not bitwise
+   equivalent to a local quantize.
