@@ -75,6 +75,7 @@ struct globals {
     D_gl           D_V;         // M x N_v
     int            q_dim;       // Columns for Q
     int            k_dim;       // Columns for K
+    int            v_dim;       // Columns for V
     bool           use_split_D; // Trigger manual splitting logic
 
     // Per-tile B global scale (raw pointer, not TMA)
@@ -99,7 +100,7 @@ struct globals {
     };
 
     __host__ inline dim3 grid() const {
-        int d_cols = use_split_D ? (q_dim + k_dim + D_V.cols()) : D.cols();
+        int d_cols = use_split_D ? (q_dim + k_dim + v_dim) : D.cols();
         return dim3(min((D.rows()/(C::Mb/2))*(d_cols/C::Nb), num_sms()));
     }
     __host__ inline dim3 block() const { return dim3(C::NUM_THREADS); }
@@ -142,7 +143,9 @@ __device__ inline void kernel(const globals<C> &g) {
         g.D.template prefetch_tma<typename G::D_tile>();
         if (g.use_split_D) {
             g.D_K.template prefetch_tma<typename G::D_tile>();
-            g.D_V.template prefetch_tma<typename G::D_tile>();
+            if (g.v_dim > 0) {
+                g.D_V.template prefetch_tma<typename G::D_tile>();
+            }
         }
     }
 
@@ -150,7 +153,7 @@ __device__ inline void kernel(const globals<C> &g) {
     const int cta_id = cluster_ctarank();
     const int cluster_id = clusterIdx().x;
     const int num_row_blocks = g.D.rows() / C::Mb;
-    const int N_total = g.use_split_D ? (g.q_dim + g.k_dim + g.D_V.cols()) : g.D.cols();
+    const int N_total = g.use_split_D ? (g.q_dim + g.k_dim + g.v_dim) : g.D.cols();
     const int num_col_blocks = N_total / C::Nb;
     const int num_blocks = num_row_blocks * num_col_blocks;
     const int num_red_blocks = 2 * g.A.cols() / C::Kb;
