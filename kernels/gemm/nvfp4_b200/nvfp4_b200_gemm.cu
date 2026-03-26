@@ -1180,27 +1180,15 @@ void sum3_bf16_entrypoint(
 // Mode 1: constant SCALE_MAX (USE_CTA_AMAX=false) — fastest
 // Mode 2: CTA-level amax (USE_CTA_AMAX=true) — better accuracy
 // ================================================================
-void nvfp4_fused_gemm_entrypoint(
-    const at::Tensor &A_bf16,       // [M, K] bf16 activations
-    const at::Tensor &B,            // [N, K/2] fp4x2
-    const at::Tensor &B_sc,         // [N/128, K/64, 512] fp8
-    const at::Tensor &B_sc_global,  // [1] float32
-    at::Tensor &D                   // [M, N] bf16 output
+template <typename C>
+static inline void launch_fused_gemm_with_config(
+    const at::Tensor &A_bf16,
+    const at::Tensor &B,
+    const at::Tensor &B_sc,
+    const at::Tensor &B_sc_global,
+    at::Tensor &D
 ) {
-    int M = A_bf16.size(0);
-    int K = A_bf16.size(1);
-    int N = D.size(1);
-
-    TORCH_CHECK(A_bf16.dtype() == at::kBFloat16, "A must be bf16");
-    TORCH_CHECK(B.dtype() == at::kFloat4_e2m1fn_x2, "B must be fp4x2");
-    TORCH_CHECK(M % 256 == 0, "M must be multiple of 256");
-    TORCH_CHECK(K % 256 == 0, "K must be multiple of 256");
-    TORCH_CHECK(N % 128 == 0, "N must be multiple of 128");
-
-    //                             Nb   PD  EP  SG  DT  OVL    CTA_AMAX
-    using C = nvfp4_fused_gemm::config<256, 3, 4, 4, 2, false, false>;
     using G = nvfp4_fused_gemm::globals<C>;
-
     G g {
         .A_bf16 = kittens::py::tensor_to_gl<typename G::A_bf16_gl>(A_bf16),
         .B = kittens::py::tensor_to_gl<typename G::B_fp4x2_gl>(B),
@@ -1223,6 +1211,55 @@ void nvfp4_fused_gemm_entrypoint(
     kittens::py::launch_kernel<C, G, nvfp4_fused_gemm::kernel<C>>(g);
 }
 
+template <bool USE_CTA_AMAX>
+static inline void dispatch_fused_gemm(
+    const at::Tensor &A_bf16,
+    const at::Tensor &B,
+    const at::Tensor &B_sc,
+    const at::Tensor &B_sc_global,
+    at::Tensor &D
+) {
+    const int K = A_bf16.size(1);
+    const int N = D.size(1);
+
+    if (N % 256 == 0 && N <= 2048) {
+        if (K <= 256 && N <= 256) {
+            launch_fused_gemm_with_config<nvfp4_fused_gemm::config<128, 4, 4, 4, 2, false, USE_CTA_AMAX, 256, true, 2, 2>>(
+                A_bf16, B, B_sc, B_sc_global, D);
+        } else {
+            launch_fused_gemm_with_config<nvfp4_fused_gemm::config<128, 4, 8, 4, 2, false, USE_CTA_AMAX, 256, true, 2, 2>>(
+                A_bf16, B, B_sc, B_sc_global, D);
+        }
+    } else {
+        if (N % 256 != 0) {
+            launch_fused_gemm_with_config<nvfp4_fused_gemm::config<128, 5, 4, 4, 2, false, USE_CTA_AMAX>>(
+                A_bf16, B, B_sc, B_sc_global, D);
+        } else {
+            launch_fused_gemm_with_config<nvfp4_fused_gemm::config<256, 4, 8, 4, 2, false, USE_CTA_AMAX>>(
+                A_bf16, B, B_sc, B_sc_global, D);
+        }
+    }
+}
+
+void nvfp4_fused_gemm_entrypoint(
+    const at::Tensor &A_bf16,       // [M, K] bf16 activations
+    const at::Tensor &B,            // [N, K/2] fp4x2
+    const at::Tensor &B_sc,         // [N/128, K/64, 512] fp8
+    const at::Tensor &B_sc_global,  // [1] float32
+    at::Tensor &D                   // [M, N] bf16 output
+) {
+    int M = A_bf16.size(0);
+    int K = A_bf16.size(1);
+    int N = D.size(1);
+
+    TORCH_CHECK(A_bf16.dtype() == at::kBFloat16, "A must be bf16");
+    TORCH_CHECK(B.dtype() == at::kFloat4_e2m1fn_x2, "B must be fp4x2");
+    TORCH_CHECK(M % 256 == 0, "M must be multiple of 256");
+    TORCH_CHECK(K % 256 == 0, "K must be multiple of 256");
+    TORCH_CHECK(N % 128 == 0, "N must be multiple of 128");
+    dispatch_fused_gemm<false>(A_bf16, B, B_sc, B_sc_global, D);
+}
+
 // CTA-level amax version — pre-scans A for per-CTA max|A|
 void nvfp4_fused_gemm_cta_amax_entrypoint(
     const at::Tensor &A_bf16,
@@ -1240,31 +1277,7 @@ void nvfp4_fused_gemm_cta_amax_entrypoint(
     TORCH_CHECK(M % 256 == 0, "M must be multiple of 256");
     TORCH_CHECK(K % 256 == 0, "K must be multiple of 256");
     TORCH_CHECK(N % 128 == 0, "N must be multiple of 128");
-
-    //                             Nb   PD  EP  SG  DT  OVL    CTA_AMAX
-    using C = nvfp4_fused_gemm::config<256, 3, 4, 4, 2, false, true>;
-    using G = nvfp4_fused_gemm::globals<C>;
-
-    G g {
-        .A_bf16 = kittens::py::tensor_to_gl<typename G::A_bf16_gl>(A_bf16),
-        .B = kittens::py::tensor_to_gl<typename G::B_fp4x2_gl>(B),
-        .B_sc = kittens::py::tensor_to_gl<typename G::B_sc_gl, false>(
-            B_sc, 1,
-            B_sc.dim() == 2 ? B_sc.size(0)/128 : B_sc.size(0),
-            B_sc.dim() == 2 ? B_sc.size(1)/4 : B_sc.size(1),
-            256),
-        .B_sc_global = kittens::py::tensor_to_gl<typename G::B_sc_global_gl>(B_sc_global),
-        .D = kittens::py::tensor_to_gl<typename G::D_gl>(D),
-        .D_K = kittens::py::tensor_to_gl<typename G::D_gl>(D),
-        .D_V = kittens::py::tensor_to_gl<typename G::D_gl>(D),
-        .q_dim = 0,
-        .k_dim = 0,
-        .use_split_D = false,
-        .b_sg_per_tile = nullptr,
-        .silu_dim = 0
-    };
-
-    kittens::py::launch_kernel<C, G, nvfp4_fused_gemm::kernel<C>>(g);
+    dispatch_fused_gemm<true>(A_bf16, B, B_sc, B_sc_global, D);
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {

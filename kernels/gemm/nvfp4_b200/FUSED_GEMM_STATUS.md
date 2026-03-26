@@ -32,11 +32,27 @@ The quantizer's `wait(bf16_sub_arrived[sub], 0)` used a hardcoded phase. Since t
 are reused across K iterations, the phase must alternate. Fixed with a `bf16_sub_phase` counter
 that XORs after each K iteration.
 
-### 5. **SMEM layout mismatch** (current blocker)
+### 5. SMEM layout mismatch
 The quantizer writes FP4 bytes via raw `st.shared.b8` with **linear offsets**, but
 `st_fp4e2m1_2<128,128>` uses TK's **128-byte swizzle** layout. When TMA loads FP4 from GMEM,
 it applies the swizzle on the way into SMEM. Our direct writes skip TMA → data lands in wrong
 locations → `unspecified launch failure`.
+
+Fixed by switching direct FP4 writes to `out_tile.A.idx(...)`, which applies the same
+128-byte swizzle the GEMM path expects.
+
+### 6. CTA_AMAX warpgroup sync bugs
+The CTA-level amax path had two synchronization problems:
+1. `__syncthreads()` after `running_amax = 0.0f`, which deadlocked because only the
+   quantizer warpgroup reaches that point.
+2. `__syncwarp()` around the shared `warp_max_buf[4]` reduction scratch, which only
+   synchronized each 32-thread warp rather than the full 128-thread quantizer warpgroup.
+
+Fixed by using a dedicated `warpgroup::sync(bar_id)` sequence for:
+- `running_amax` reset visibility
+- `warp_max_buf` write completion before the inter-warp read
+- `warp_max_buf` reuse safety
+- `quant_buf` reuse safety before the next BF16 sub-tile TMA overwrites it
 
 ## Swizzle Analysis
 
@@ -87,10 +103,113 @@ asm volatile("{st.shared.b8 [%0], %1;}" :: "r"(smem_addr), "r"(value));
 This uses the tile's own `idx()` method which applies the swizzle formula correctly.
 The same approach works for the 4-byte scale writes via `st.shared.b32`.
 
-## Remaining Issues
+## Build / Run Notes
 
-1. **`__syncthreads()` in CTA_AMAX mode**: The warpgroup-local amax reduction uses
-   `__syncthreads()` which syncs ALL 384 threads across 3 warpgroups → deadlock.
-   Must replace with warpgroup-scoped sync (named barrier or `__syncwarp` chain).
+- `common.mk` now resolves `nvcc` from `CUDA_HOME` or `/usr/local/cuda/bin/nvcc`, so
+  `make` does not depend on the caller's `PATH` being pre-populated.
+- PyTorch extension builds embed Torch's library path as an rpath, so `_C` imports
+  without a manual `LD_LIBRARY_PATH` export.
+- `test_fused_gemm.py` now fails fast with a clear error when CUDA device access is unavailable.
 
-2. **Performance**: Register spilling (152-204 bytes) may need tuning after correctness.
+## Current Validation
+
+- `compute-sanitizer --tool memcheck python3 -u test_fused_gemm.py 256 256 256`
+  completed with `0` errors.
+- `python3 -u test_fused_gemm.py 256 256 256`
+- `python3 -u test_fused_gemm.py 1024 1024 1024`
+- `python3 -u test_fused_gemm.py 2048 2048 2048`
+- `python3 -u test_fused_gemm.py 4096 4096 4096`
+- `python3 -u test_fused_gemm.py 256 384 256`
+  all complete successfully.
+- The current fused dispatch is:
+  - `N % 256 == 0 && N <= 2048`: dual-column prototype `config<128, *, *, 4, 2, false, USE_CTA_AMAX, 256, true, 2, 2>`
+  - `N % 256 == 0 && N > 2048`: single-column wide-tile `config<256, 4, 8, 4, 2, false, USE_CTA_AMAX>`
+  - `N % 256 != 0`: single-column fallback `config<128, *, *, 4, 2, false, USE_CTA_AMAX>`
+- The dual-column constant-scale kernels currently compile with small but nonzero spills:
+  `8` bytes spill stores / `12` bytes spill loads.
+
+## Current Measurements
+
+### Sweep Summary
+
+- `256`: fused constant is faster than separate.
+- `1024`: fused constant is effectively at parity with separate.
+- `2048`: fused constant remains slower than separate.
+- `4096`: the restored wide-tile path is still much slower than separate; CTA-amax accuracy also collapses.
+
+### Key Benchmark Breakdowns
+
+`256 x 256 x 256`
+
+- Separate quantize only: `0.018 ms`
+- Separate GEMM only: `0.006 ms`
+- Separate quantize + GEMM: `0.024 ms`
+- Fused constant: `0.010 ms`
+- Fused CTA-amax: `0.010 ms`
+
+`1024 x 1024 x 1024`
+
+- Separate quantize only: `0.020 ms`
+- Separate GEMM only: `0.007 ms`
+- Separate quantize + GEMM: `0.026 ms`
+- Fused constant: `0.026 ms`
+- Fused CTA-amax: `0.028 ms`
+
+`2048 x 2048 x 2048`
+
+- Separate quantize only: `0.020 ms`
+- Separate GEMM only: `0.009 ms`
+- Separate quantize + GEMM: `0.028 ms`
+- Fused constant: `0.049 ms`
+- Fused CTA-amax: `0.053 ms`
+
+`4096 x 4096 x 4096`
+
+- Separate quantize only: `0.026 ms`
+- Separate GEMM only: `0.031 ms`
+- Separate quantize + GEMM: `0.062 ms`
+- Fused constant: `0.592 ms`
+- Fused CTA-amax: `0.643 ms`
+
+## Root Cause of Large-Shape Slowdown
+
+The fused kernel quantizes A inside the per-output-tile loop:
+
+- the quantizer loop iterates over `block_idx`, which encodes both `row_block_idx` and `col_block_idx`
+- the BF16 A tile load depends only on `row_block_idx`
+- therefore the same A row block is re-quantized once per output-column tile
+
+This is why the current fused path behaves well at `256` but loses as `N` grows:
+
+- `256` with `Nb=128`: only `2` column tiles, so duplicated A work is still small
+- `1024` with `Nb=256`: `4` column tiles
+- `2048` with `Nb=256`: `8` column tiles
+- `4096` with `Nb=256`: `16` column tiles
+
+The standalone pipeline quantizes A once and reuses it across all column tiles, so the current
+fused design has an algorithmic disadvantage at larger `N`, independent of register spilling.
+
+## Dual-Column Prototype Result
+
+The literal `2 x 128` dual-column prototype was implemented and validated for both constant-scale
+and CTA-amax paths. It is sanitizer-clean, and it helps at small/mid sizes:
+
+- `256`: clear win over separate
+- `1024`: near parity
+
+But it does **not** fix the `2048+` wall, because its effective block width is still `256` columns.
+That means it rearranges the wide-tile work into two `128`-wide accumulators without increasing how
+many output columns a single A quantization feeds. At `4096`, the prototype was actually worse than
+the existing wide-tile backend, so dispatch is currently gated to use it only up to `2048`.
+
+## Updated Next Step
+
+Further config tuning alone is unlikely to beat separate `quantize + gemm` on large shapes.
+The next meaningful optimization is structural:
+
+1. Increase the *effective* fused output width beyond the current `256` columns, so one A quantization
+   genuinely feeds more output-column work.
+2. The most plausible routes are:
+   - a wider multi-output backend that reuses A across more than `256` columns
+   - or a cluster/dataflow change where multiple output-column workers consume the same quantized A stage
+3. Keep CTA-amax as a secondary mode; its `4096` accuracy collapse should not block constant-scale tuning.
