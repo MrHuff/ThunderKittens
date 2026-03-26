@@ -9,6 +9,7 @@ All compared against PyTorch bf16 matmul reference.
 
 Usage:
   python test_fused_gemm.py [M] [N] [K]
+  python test_fused_gemm.py --sweep
 """
 import sys
 import torch
@@ -32,12 +33,18 @@ def check_diff(name: str, A: torch.Tensor, A_ref: torch.Tensor) -> None:
     print(f"  Cos sim:   {cos_sim:.10f}")
 
 
-if __name__ == '__main__':
-    M = int(sys.argv[1]) if len(sys.argv) > 1 else 2048
-    N = int(sys.argv[2]) if len(sys.argv) > 2 else 2048
-    K = int(sys.argv[3]) if len(sys.argv) > 3 else 2048
+def fused_backend_label(N: int) -> str:
+    if N % 256 == 0 and N <= 2048:
+        return "dual-column reuse backend"
+    if N % 256 == 0:
+        return "single-column wide-tile backend"
+    return "single-column fallback"
+
+
+def run_case(M: int, N: int, K: int) -> None:
     print(f"{'='*72}")
     print(f"  M={M}, N={N}, K={K}")
+    print(f"  Fused backend: {fused_backend_label(N)}")
     print(f"{'='*72}")
 
     A_bf16 = torch.randn(M, K, dtype=torch.bfloat16, device="cuda") / K**0.25
@@ -101,6 +108,10 @@ if __name__ == '__main__':
 
     print(f"\n{'='*72}")
     print("Benchmarks:")
+    bench(lambda: nvfp4_quantize(A_bf16, A_fp4x2, A_sc, A_sc_global, False),
+          "Separate quantize only  ")
+    bench(lambda: nvfp4_gemm(A_fp4x2, A_sc, A_sc_global, B_fp4x2, B_sc, B_sc_global, D_separate),
+          "Separate GEMM only      ")
     bench(lambda: [nvfp4_quantize(A_bf16, A_fp4x2, A_sc, A_sc_global, False),
                    nvfp4_gemm(A_fp4x2, A_sc, A_sc_global, B_fp4x2, B_sc, B_sc_global, D_separate)],
           "Separate (quantize+GEMM)  ")
@@ -109,3 +120,20 @@ if __name__ == '__main__':
     bench(lambda: nvfp4_fused_gemm_cta_amax(A_bf16, B_fp4x2, B_sc, B_sc_global, D_fused_cta),
           "Fused (CTA amax)          ")
     print(f"{'='*72}")
+
+
+if __name__ == '__main__':
+    if not torch.cuda.is_available():
+        raise RuntimeError(
+            "CUDA device unavailable. Run test_fused_gemm.py on a GPU-enabled B200 host."
+        )
+
+    if len(sys.argv) > 1 and sys.argv[1] == "--sweep":
+        for size in (256, 1024, 2048, 4096):
+            run_case(size, size, size)
+            print()
+    else:
+        M = int(sys.argv[1]) if len(sys.argv) > 1 else 2048
+        N = int(sys.argv[2]) if len(sys.argv) > 2 else 2048
+        K = int(sys.argv[3]) if len(sys.argv) > 3 else 2048
+        run_case(M, N, K)
