@@ -134,15 +134,20 @@ Architecture:
   - WG2: B quantizer
   - WG3: MMA orchestrator
 - Tile shape is currently fixed at `128 x 128 x 256`.
+- The current prototype uses a `LOAD_PIPE_DEPTH=2` ping-pong pipeline for
+  quantized FP4 tiles and FP8 scales.
 - CTA-amax mode tracks separate running amax values for A and B, then applies
   `a_sg_dec * b_sg_dec` in the epilogue.
 
-Important limitations of this first version:
+Important limitations of the current version:
 
 - It is a single-CTA prototype with no cross-tile reuse for either operand.
-- It compiles and runs, but ptxas reports very large spills:
-  - constant-scale: `868` bytes spill stores / `868` bytes spill loads
-  - CTA-amax: `876` bytes spill stores / `876` bytes spill loads
+- The first pipelined attempt broke correctness until two handoff bugs were fixed:
+  - the BF16-subtile TMA semaphore phase must toggle per reduction block, not per stage slot
+  - the TMEM scale scratch needs true per-stage storage rather than aliasing stage `0`
+- The repaired ping-pong version compiles with much smaller spills:
+  - constant-scale: `108` bytes spill stores / `120` bytes spill loads
+  - CTA-amax: `0` bytes spill stores / `0` bytes spill loads
 - Because it does not reuse quantized A or B across neighboring output tiles, it is
   not performance-competitive with the separate baseline yet.
 
@@ -189,8 +194,8 @@ Important limitations of this first version:
 - Separate quantize + GEMM: `0.023 ms`
 - Fused constant: `0.010 ms`
 - Fused CTA-amax: `0.011 ms`
-- Both-bf16 fused constant: `0.021 ms`
-- Both-bf16 fused CTA-amax: `0.021 ms`
+- Both-bf16 fused constant: `0.011 ms`
+- Both-bf16 fused CTA-amax: `0.012 ms`
 
 `1024 x 1024 x 1024`
 
@@ -199,8 +204,8 @@ Important limitations of this first version:
 - Separate quantize + GEMM: `0.025 ms`
 - Fused constant: `0.026 ms`
 - Fused CTA-amax: `0.029 ms`
-- Both-bf16 fused constant: `0.043 ms`
-- Both-bf16 fused CTA-amax: `0.045 ms`
+- Both-bf16 fused constant: `0.029 ms`
+- Both-bf16 fused CTA-amax: `0.030 ms`
 
 `2048 x 2048 x 2048`
 
@@ -209,8 +214,8 @@ Important limitations of this first version:
 - Separate quantize + GEMM: `0.029 ms`
 - Fused constant: `0.049 ms`
 - Fused CTA-amax: `0.054 ms`
-- Both-bf16 fused constant: `0.151 ms`
-- Both-bf16 fused CTA-amax: `0.155 ms`
+- Both-bf16 fused constant: `0.122 ms`
+- Both-bf16 fused CTA-amax: `0.127 ms`
 
 `4096 x 4096 x 4096`
 
@@ -219,8 +224,8 @@ Important limitations of this first version:
 - Separate quantize + GEMM: `0.060 ms`
 - Fused constant: `0.345 ms`
 - Fused CTA-amax: `0.382 ms`
-- Both-bf16 fused constant: `1.002 ms`
-- Both-bf16 fused CTA-amax: `1.039 ms`
+- Both-bf16 fused constant: `0.866 ms`
+- Both-bf16 fused CTA-amax: `0.901 ms`
 
 ## Root Cause of Large-Shape Slowdown
 
@@ -270,13 +275,23 @@ The next meaningful optimization is structural:
 
 ## Both-BF16 Takeaway
 
-The new two-sided prototype answers the immediate question: simply quantizing both bf16
-operands inside one CTA is not enough to beat separate `quantize + gemm`.
+The two-sided prototype now answers a more specific question: a real ping-pong fused kernel
+that quantizes both bf16 operands in one CTA can be made correct and materially faster than
+the first cut, but it still does not beat separate `quantize + gemm`.
 
-- It is slower than the current A-only fused kernel at every tested size.
-- It is much slower than the separate baseline at `2048` and `4096`.
-- Its CTA-amax mode is numerically better than the current A-only fused CTA-amax at `4096`,
-  but that comes with very large spill cost and no meaningful throughput win.
+- The repaired ping-pong path is much faster than the original both-bf16 prototype:
+  - `256`: `0.021 ms` -> `0.011 ms`
+  - `1024`: `0.043 ms` -> `0.029 ms`
+  - `2048`: `0.151 ms` -> `0.122 ms`
+  - `4096`: `1.002 ms` -> `0.866 ms`
+- A same-CTA dual-column follow-up (`COL_TILES_PER_BLOCK=2`) was also tried and kept
+  correct, but it was slower than the single-column ping-pong baseline:
+  - `256`: `0.023 ms`
+  - `1024`: `0.064 ms`
+  - `2048`: `0.137 ms`
+  so it is currently gated off.
+- It is still slower than the current A-only fused kernel at every tested size.
+- It is still much slower than the separate baseline at `2048` and `4096`.
 
 So the next meaningful speed path is still structural reuse, not “just fuse more work into
 one CTA.” A winning both-bf16 design needs a 2D reuse schedule where quantized A and
