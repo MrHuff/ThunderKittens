@@ -16,6 +16,11 @@
 
 namespace nvfp4_cce_backward_v5_dE {
 
+__device__ __forceinline__ uint8_t quantize_fp4_pair_v5_dE(float v0, float v1, float rcp_scale) {
+    const float2 scaled = {v0 * rcp_scale, v1 * rcp_scale};
+    return static_cast<uint8_t>(__nv_cvt_float2_to_fp4x2(scaled, __NV_E2M1, cudaRoundNearest));
+}
+
 template <int _LOAD_PIPE_DEPTH, int _SUPERGROUP_SIZE, bool _PINGPONG = true>
 struct config {
     static_assert(_LOAD_PIPE_DEPTH > 0 && _LOAD_PIPE_DEPTH <= 5);
@@ -188,9 +193,6 @@ __device__ inline void kernel(const globals<C>& g) {
     __shared__ semaphore p3_outputs_arrived;
     __shared__ semaphore fp4_ready;
     __shared__ semaphore fp4_ready_cluster;
-    __shared__ float fp4_row_amax[WARPGROUP_WARPS];
-    __shared__ float fp4_row_sg[2];
-
     if (threadIdx.x == 32) {
         init_semaphore(tmem_provisioned, 0, 1);
         #pragma unroll
@@ -405,6 +407,10 @@ __device__ inline void kernel(const globals<C>& g) {
         using logits_rt = rt_fl<C::Mb / 8, C::Nb / C::EPI_PIPE_DEPTH>;
         using logits_rt_bf = rt_bf<C::Mb / 8, C::Nb / C::EPI_PIPE_DEPTH>;
         using out_rt = rt_fl<C::Mb / 8, C::Nb_out / C::EPI_PIPE_DEPTH>;
+        constexpr float kFp4Max = 6.0f;
+        constexpr float kE4M3Max = 448.0f;
+        const float fp4_row_sg = fmaxf(g.grad_scale / (kFp4Max * kE4M3Max), 1.0e-12f);
+        const float fp4_row_senc = 1.0f / fp4_row_sg;
 
         int phase = 0;
 
@@ -424,19 +430,9 @@ __device__ inline void kernel(const globals<C>& g) {
                 const int tile_row_base = row_block_idx * C::Mb + cta_id * (C::Mb / 2);
                 const int warp_row_base = tile_row_base + warpgroup::warpid() * (C::Mb / 8);
 
-                logits_rt D_regs_fl[C::EPI_PIPE_DEPTH];
-                logits_rt_bf D_regs_bf[C::EPI_PIPE_DEPTH];
-
-                auto load_from_accum = [&](auto &accum) {
-                    #pragma unroll
-                    for (int epi = 0; epi < C::EPI_PIPE_DEPTH; ++epi) {
-                        warpgroup::load_async(
-                            D_regs_fl[epi],
-                            accum.template subtile<full_tt_fl<C::Nb / C::EPI_PIPE_DEPTH>>(0, epi * (C::Nb / C::EPI_PIPE_DEPTH)));
-                    }
-                };
-                if (phase == 0) load_from_accum(out_tm_0);
-                else            load_from_accum(out_tm_1);
+                auto &phase1_accum = (phase == 0) ? out_tm_0 : out_tm_1;
+                const uint32_t fp4_base = static_cast<uint32_t>(__cvta_generic_to_shared(&fp4_staging[phase].G_row.data[0]));
+                uint8_t *fp4_sc_bytes = reinterpret_cast<uint8_t*>(&fp4_staging[phase].G_row_sc.data[0]);
 
                 int my_targets_x[logits_rt::height];
                 int my_targets_y[logits_rt::height];
@@ -452,13 +448,28 @@ __device__ inline void kernel(const globals<C>& g) {
                     my_lse_y[i] = (global_row_y < g.M) ? g.lse[global_row_y] : INFINITY;
                 }
 
+                logits_rt D_pipe[2];
+                logits_rt_bf D_bf;
+                warpgroup::load_async(
+                    D_pipe[0],
+                    phase1_accum.template subtile<full_tt_fl<C::Nb / C::EPI_PIPE_DEPTH>>(0, 0));
                 tensor_load_wait();
                 tensor_before_thread_sync();
                 warpgroup::sync(1);
+                int cur_slot = 0;
 
                 #pragma unroll
                 for (int epi = 0; epi < C::EPI_PIPE_DEPTH; ++epi) {
-                    auto &D_fl = D_regs_fl[epi];
+                    const int next_slot = cur_slot ^ 1;
+                    if constexpr (C::EPI_PIPE_DEPTH > 1) {
+                        if (epi + 1 < C::EPI_PIPE_DEPTH) {
+                            warpgroup::load_async(
+                                D_pipe[next_slot],
+                                phase1_accum.template subtile<full_tt_fl<C::Nb / C::EPI_PIPE_DEPTH>>(0, (epi + 1) * (C::Nb / C::EPI_PIPE_DEPTH)));
+                        }
+                    }
+
+                    auto &D_fl = D_pipe[cur_slot];
                     warp::mul(D_fl, D_fl, global_scale);
                     const int col_start = vocab_block_idx * C::Nb + epi * (C::Nb / C::EPI_PIPE_DEPTH);
 
@@ -528,57 +539,14 @@ __device__ inline void kernel(const globals<C>& g) {
                     }
 
                     warp::mul(D_fl, D_fl, g.grad_scale);
-                    warp::copy(D_regs_bf[epi], D_fl);
-                }
-
-                {
-                    float local_tile_amax = 0.0f;
-                    #pragma unroll
-                    for (int epi = 0; epi < C::EPI_PIPE_DEPTH; ++epi) {
-                        auto &D_fl = D_regs_fl[epi];
-                        #pragma unroll
-                        for (int i = 0; i < logits_rt::height; ++i) {
-                            #pragma unroll
-                            for (int j = 0; j < logits_rt::width; ++j) {
-                                #pragma unroll
-                                for (int kk = 0; kk < 4; ++kk) {
-                                    local_tile_amax = fmaxf(local_tile_amax, fabsf(D_fl.tiles[i][j].data[kk].x));
-                                    local_tile_amax = fmaxf(local_tile_amax, fabsf(D_fl.tiles[i][j].data[kk].y));
-                                }
-                            }
-                        }
-                    }
-                    #pragma unroll
-                    for (int offset = 16; offset > 0; offset >>= 1) {
-                        local_tile_amax = fmaxf(local_tile_amax, __shfl_xor_sync(0xFFFFFFFF, local_tile_amax, offset));
-                    }
-                    if (lane_id == 0) fp4_row_amax[warpgroup::warpid()] = local_tile_amax;
+                    warp::copy(D_bf, D_fl);
                     warpgroup::sync(1);
-
-                    if (warpgroup::warpid() == 0) {
-                        float tile_amax = (lane_id < WARPGROUP_WARPS) ? fp4_row_amax[lane_id] : 0.0f;
-                        #pragma unroll
-                        for (int offset = 16; offset > 0; offset >>= 1) {
-                            tile_amax = fmaxf(tile_amax, __shfl_xor_sync(0xFFFFFFFF, tile_amax, offset));
-                        }
-                        if (lane_id == 0) {
-                            fp4_row_sg[phase] = (tile_amax > 0.0f) ? (tile_amax / 2688.0f) : 1.0f;
-                        }
-                    }
-                    warpgroup::sync(1);
-                }
-                const float fp4_row_senc = 1.0f / fp4_row_sg[phase];
-                const uint32_t fp4_base = static_cast<uint32_t>(__cvta_generic_to_shared(&fp4_staging[phase].G_row.data[0]));
-
-                #pragma unroll
-                for (int epi = 0; epi < C::EPI_PIPE_DEPTH; ++epi) {
-                    warpgroup::sync(1);
-                    warpgroup::store(output_tiles.D[epi % C::NUM_D_TILES], D_regs_bf[epi]);
+                    warpgroup::store(output_tiles.D[0], D_bf);
                     warpgroup::sync(1);
 
                     const int quant_row = threadIdx.x;
                     if (quant_row < C::Mb / 2) {
-                        const uint32_t d_base = static_cast<uint32_t>(__cvta_generic_to_shared(&output_tiles.D[epi % C::NUM_D_TILES].data[0]));
+                        const uint32_t d_base = static_cast<uint32_t>(__cvta_generic_to_shared(&output_tiles.D[0].data[0]));
                         #pragma unroll
                         for (int group16 = 0; group16 < (C::Nb / C::EPI_PIPE_DEPTH) / 16; ++group16) {
                             bf16_2 vals[8];
@@ -591,33 +559,39 @@ __device__ inline void kernel(const globals<C>& g) {
                                 amax = fmaxf(amax, fabsf(__bfloat162float(vals[pair].y)));
                             }
 
-                            const float s_mult = (amax <= 1.0e-9f) ? 448.0f : fminf(6.0f / (amax * fp4_row_senc), 448.0f);
-                            const __nv_fp8_e4m3 s_mult_fp8 = __nv_fp8_e4m3(s_mult);
-                            const float coeff = static_cast<float>(s_mult_fp8) * fp4_row_senc;
+                            const float row_scale = amax * (1.0f / kFp4Max);
+                            const float row_rcp = (amax > 0.0f) ? (kFp4Max / amax) : 0.0f;
 
                             #pragma unroll
                             for (int pair = 0; pair < 8; ++pair) {
-                                const float2 scaled = {
-                                    __bfloat162float(vals[pair].x) * coeff,
-                                    __bfloat162float(vals[pair].y) * coeff,
-                                };
-                                const uint8_t fp4_pair = static_cast<uint8_t>(
-                                    __nv_cvt_float2_to_fp4x2(scaled, __NV_E2M1, cudaRoundNearest));
+                                const uint8_t fp4_pair = quantize_fp4_pair_v5_dE(
+                                    __bfloat162float(vals[pair].x),
+                                    __bfloat162float(vals[pair].y),
+                                    row_rcp);
                                 const int fp4x2_col = (epi * (C::Nb / C::EPI_PIPE_DEPTH) + group16 * 16 + pair * 2) / 2;
                                 const uint32_t fp4_addr = G::G_fp4_row_tile::idx(fp4_base, {quant_row, fp4x2_col});
                                 asm volatile("{st.shared.b8 [%0], %1;}" :: "r"(fp4_addr), "r"((uint32_t)fp4_pair));
                             }
 
-                            const float s_mult_val = static_cast<float>(s_mult_fp8);
-                            const __nv_fp8_e4m3 sc = __nv_fp8_e4m3(1.0f / s_mult_val);
+                            const __nv_fp8_e4m3 sc = __nv_fp8_e4m3(row_scale * fp4_row_senc);
                             const int global_col_16 = epi * (C::Nb / C::EPI_PIPE_DEPTH) + group16 * 16;
                             const int kgroup = global_col_16 / 64;
                             const int col_16_in_64 = (global_col_16 / 16) % 4;
                             const int sr = quant_row % 32;
                             const int rr = (quant_row / 32) % 4;
                             const int byte_idx = sr * 16 + rr * 4 + col_16_in_64;
-                            reinterpret_cast<uint8_t*>(&fp4_staging[phase].G_row_sc.data[0])[kgroup * 512 + byte_idx] =
-                                *reinterpret_cast<const uint8_t*>(&sc);
+                            fp4_sc_bytes[kgroup * 512 + byte_idx] = *reinterpret_cast<const uint8_t*>(&sc);
+                        }
+                    }
+
+                    warpgroup::sync(1);
+
+                    if constexpr (C::EPI_PIPE_DEPTH > 1) {
+                        if (epi + 1 < C::EPI_PIPE_DEPTH) {
+                            tensor_load_wait();
+                            tensor_before_thread_sync();
+                            warpgroup::sync(1);
+                            cur_slot = next_slot;
                         }
                     }
                 }
@@ -639,28 +613,24 @@ __device__ inline void kernel(const globals<C>& g) {
                 }
 
                 wait(p3_outputs_arrived, get_phasebit<0>(phasebits, 8));
-                out_rt D_reg_fl[C::EPI_PIPE_DEPTH];
                 auto &p3_accum = (phase == 0) ? out_tm_0 : out_tm_1;
+                const float p3_scale = fp4_row_sg * g.C_col_sc_global[{0}];
                 #pragma unroll
                 for (int epi = 0; epi < C::EPI_PIPE_DEPTH; ++epi) {
+                    out_rt D_reg_fl;
                     warpgroup::load_async(
-                        D_reg_fl[epi],
+                        D_reg_fl,
                         p3_accum.template subtile<full_tt_fl<C::Nb_out / C::EPI_PIPE_DEPTH>>(0, epi * (C::Nb_out / C::EPI_PIPE_DEPTH)));
-                }
-                tensor_load_wait();
-                tensor_before_thread_sync();
-                warpgroup::sync(1);
-
-                const float p3_scale = fp4_row_sg[phase] * g.C_col_sc_global[{0}];
-                #pragma unroll
-                for (int epi = 0; epi < C::EPI_PIPE_DEPTH; ++epi) {
-                    warp::mul(D_reg_fl[epi], D_reg_fl[epi], p3_scale);
-                    if (vocab_block_idx == 0) warp::copy(D_acc[epi], D_reg_fl[epi]);
-                    else                      warp::add(D_acc[epi], D_acc[epi], D_reg_fl[epi]);
+                    tensor_load_wait();
+                    tensor_before_thread_sync();
+                    warpgroup::sync(1);
+                    warp::mul(D_reg_fl, D_reg_fl, p3_scale);
+                    if (vocab_block_idx == 0) warp::copy(D_acc[epi], D_reg_fl);
+                    else                      warp::add(D_acc[epi], D_acc[epi], D_reg_fl);
+                    warpgroup::sync(1);
+                    tensor_after_thread_sync();
                 }
 
-                warpgroup::sync(1);
-                tensor_after_thread_sync();
                 warpgroup::tma::cluster::arrive(outputs_finished, 0, 1);
                 update_phasebit<0>(phasebits, 8);
                 update_phasebit<0>(phasebits, 0);
