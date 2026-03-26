@@ -1278,7 +1278,7 @@ static inline void dispatch_fused_gemm_both_bf16(
     at::Tensor &D
 ) {
     launch_fused_gemm_both_bf16_with_config<
-        nvfp4_fused_gemm_both_bf16::config<USE_CTA_AMAX, 1>>(
+        nvfp4_fused_gemm_both_bf16::config<USE_CTA_AMAX, 1, 2, 4, 4>>(
             A_bf16, B_bf16, D);
 }
 
