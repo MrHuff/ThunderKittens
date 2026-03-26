@@ -6,6 +6,7 @@
 #include "nvfp4_quantize.cuh"
 #include "nvfp4_batched_accum_gemm.cuh"
 #include "nvfp4_fused_gemm.cuh"
+#include "nvfp4_fused_gemm_both_bf16.cuh"
 #include <optional>
 
 #ifndef TORCH_COMPILE
@@ -1195,7 +1196,11 @@ static inline void launch_fused_gemm_with_config(
     const at::Tensor &B,
     const at::Tensor &B_sc,
     const at::Tensor &B_sc_global,
-    at::Tensor &D
+    at::Tensor &D,
+    at::Tensor *debug_cta0_a = nullptr,
+    at::Tensor *debug_cta1_a = nullptr,
+    at::Tensor *debug_cta0_sc = nullptr,
+    at::Tensor *debug_cta1_sc = nullptr
 ) {
     using G = nvfp4_fused_gemm::globals<C>;
     G g {
@@ -1214,7 +1219,13 @@ static inline void launch_fused_gemm_with_config(
         .k_dim = 0,
         .use_split_D = false,
         .b_sg_per_tile = nullptr,
-        .silu_dim = 0
+        .silu_dim = 0,
+        .debug_cta0_a_ptr = debug_cta0_a ? reinterpret_cast<uint8_t*>(debug_cta0_a->data_ptr()) : nullptr,
+        .debug_cta1_a_ptr = debug_cta1_a ? reinterpret_cast<uint8_t*>(debug_cta1_a->data_ptr()) : nullptr,
+        .debug_cta0_sc_ptr = debug_cta0_sc ? reinterpret_cast<uint8_t*>(debug_cta0_sc->data_ptr()) : nullptr,
+        .debug_cta1_sc_ptr = debug_cta1_sc ? reinterpret_cast<uint8_t*>(debug_cta1_sc->data_ptr()) : nullptr,
+        .debug_a_stride = debug_cta0_a ? static_cast<int>(debug_cta0_a->size(1))
+                       : (debug_cta1_a ? static_cast<int>(debug_cta1_a->size(1)) : 0)
     };
 
     kittens::py::launch_kernel<C, G, nvfp4_fused_gemm::kernel<C>>(g);
@@ -1243,6 +1254,79 @@ static inline void dispatch_fused_gemm(
         launch_fused_gemm_with_config<nvfp4_fused_gemm::config<128, 5, 4, 4, 2, false, USE_CTA_AMAX>>(
             A_bf16, B, B_sc, B_sc_global, D);
     }
+}
+
+template <typename C>
+static inline void launch_fused_gemm_both_bf16_with_config(
+    const at::Tensor &A_bf16,
+    const at::Tensor &B_bf16,
+    at::Tensor &D
+) {
+    using G = nvfp4_fused_gemm_both_bf16::globals<C>;
+    G g{
+        .A_bf16 = kittens::py::tensor_to_gl<typename G::A_bf16_gl>(A_bf16),
+        .B_bf16 = kittens::py::tensor_to_gl<typename G::B_bf16_gl>(B_bf16),
+        .D = kittens::py::tensor_to_gl<typename G::D_gl>(D),
+    };
+    kittens::py::launch_kernel<C, G, nvfp4_fused_gemm_both_bf16::kernel<C>>(g);
+}
+
+template <bool USE_CTA_AMAX>
+static inline void dispatch_fused_gemm_both_bf16(
+    const at::Tensor &A_bf16,
+    const at::Tensor &B_bf16,
+    at::Tensor &D
+) {
+    launch_fused_gemm_both_bf16_with_config<nvfp4_fused_gemm_both_bf16::config<USE_CTA_AMAX>>(
+        A_bf16, B_bf16, D);
+}
+
+template <bool USE_CTA_AMAX>
+static inline void dispatch_fused_gemm_shared_a_debug(
+    const at::Tensor &A_bf16,
+    const at::Tensor &B,
+    const at::Tensor &B_sc,
+    const at::Tensor &B_sc_global,
+    at::Tensor &D,
+    at::Tensor *debug_cta0_a = nullptr,
+    at::Tensor *debug_cta1_a = nullptr,
+    at::Tensor *debug_cta0_sc = nullptr,
+    at::Tensor *debug_cta1_sc = nullptr
+) {
+    launch_fused_gemm_with_config<
+        nvfp4_fused_gemm::config<256, 2, 8, 4, 2, false, USE_CTA_AMAX, 128, true, 2, 1, 1, true>>(
+            A_bf16, B, B_sc, B_sc_global, D,
+            debug_cta0_a, debug_cta1_a, debug_cta0_sc, debug_cta1_sc);
+}
+
+template <typename C>
+static inline void check_shared_a_dump_tensor_shapes(
+    const at::Tensor &debug_cta0_a,
+    const at::Tensor &debug_cta1_a,
+    const at::Tensor &debug_cta0_sc,
+    const at::Tensor &debug_cta1_sc
+) {
+    const int expected_a_rows = C::ROW_SLICE;
+    const int expected_a_cols = C::Kb / 2;
+    const int expected_sc_bytes = sizeof(typename nvfp4_fused_gemm::globals<C>::A_sc_tile);
+    TORCH_CHECK(debug_cta0_a.is_cuda() && debug_cta1_a.is_cuda(), "debug A dump tensors must be CUDA tensors");
+    TORCH_CHECK(debug_cta0_sc.is_cuda() && debug_cta1_sc.is_cuda(), "debug scale dump tensors must be CUDA tensors");
+    TORCH_CHECK(debug_cta0_a.is_contiguous() && debug_cta1_a.is_contiguous(),
+                "debug A dump tensors must be contiguous");
+    TORCH_CHECK(debug_cta0_sc.is_contiguous() && debug_cta1_sc.is_contiguous(),
+                "debug scale dump tensors must be contiguous");
+    TORCH_CHECK(debug_cta0_a.dtype() == at::kByte && debug_cta1_a.dtype() == at::kByte,
+                "debug A dump tensors must be uint8");
+    TORCH_CHECK(debug_cta0_sc.dtype() == at::kByte && debug_cta1_sc.dtype() == at::kByte,
+                "debug scale dump tensors must be uint8");
+    TORCH_CHECK(debug_cta0_a.dim() == 2 && debug_cta1_a.dim() == 2,
+                "debug A dump tensors must be 2D");
+    TORCH_CHECK(debug_cta0_a.size(0) == expected_a_rows && debug_cta0_a.size(1) == expected_a_cols,
+                "debug_cta0_a must have shape [", expected_a_rows, ", ", expected_a_cols, "]");
+    TORCH_CHECK(debug_cta1_a.size(0) == expected_a_rows && debug_cta1_a.size(1) == expected_a_cols,
+                "debug_cta1_a must have shape [", expected_a_rows, ", ", expected_a_cols, "]");
+    TORCH_CHECK(debug_cta0_sc.numel() == expected_sc_bytes && debug_cta1_sc.numel() == expected_sc_bytes,
+                "debug scale dump tensors must each have ", expected_sc_bytes, " bytes");
 }
 
 void nvfp4_fused_gemm_entrypoint(
@@ -1282,6 +1366,153 @@ void nvfp4_fused_gemm_cta_amax_entrypoint(
     TORCH_CHECK(K % 256 == 0, "K must be multiple of 256");
     TORCH_CHECK(N % 128 == 0, "N must be multiple of 128");
     dispatch_fused_gemm<true>(A_bf16, B, B_sc, B_sc_global, D);
+}
+
+void nvfp4_fused_gemm_both_bf16_entrypoint(
+    const at::Tensor &A_bf16,
+    const at::Tensor &B_bf16,
+    at::Tensor &D
+) {
+    const int M = A_bf16.size(0);
+    const int K = A_bf16.size(1);
+    const int N = B_bf16.size(0);
+
+    TORCH_CHECK(A_bf16.dtype() == at::kBFloat16, "A must be bf16");
+    TORCH_CHECK(B_bf16.dtype() == at::kBFloat16, "B must be bf16");
+    TORCH_CHECK(D.dtype() == at::kBFloat16, "D must be bf16");
+    TORCH_CHECK(A_bf16.is_cuda() && B_bf16.is_cuda() && D.is_cuda(), "all tensors must be CUDA tensors");
+    TORCH_CHECK(A_bf16.is_contiguous() && B_bf16.is_contiguous() && D.is_contiguous(),
+                "A, B, and D must be contiguous");
+    TORCH_CHECK(B_bf16.size(1) == K, "B second dimension must match A second dimension");
+    TORCH_CHECK(D.size(0) == M && D.size(1) == N, "D must have shape [M, N]");
+    TORCH_CHECK(M % 128 == 0, "M must be a multiple of 128");
+    TORCH_CHECK(N % 128 == 0, "N must be a multiple of 128");
+    TORCH_CHECK(K % 256 == 0, "K must be a multiple of 256");
+
+    dispatch_fused_gemm_both_bf16<false>(A_bf16, B_bf16, D);
+}
+
+void nvfp4_fused_gemm_both_bf16_cta_amax_entrypoint(
+    const at::Tensor &A_bf16,
+    const at::Tensor &B_bf16,
+    at::Tensor &D
+) {
+    const int M = A_bf16.size(0);
+    const int K = A_bf16.size(1);
+    const int N = B_bf16.size(0);
+
+    TORCH_CHECK(A_bf16.dtype() == at::kBFloat16, "A must be bf16");
+    TORCH_CHECK(B_bf16.dtype() == at::kBFloat16, "B must be bf16");
+    TORCH_CHECK(D.dtype() == at::kBFloat16, "D must be bf16");
+    TORCH_CHECK(A_bf16.is_cuda() && B_bf16.is_cuda() && D.is_cuda(), "all tensors must be CUDA tensors");
+    TORCH_CHECK(A_bf16.is_contiguous() && B_bf16.is_contiguous() && D.is_contiguous(),
+                "A, B, and D must be contiguous");
+    TORCH_CHECK(B_bf16.size(1) == K, "B second dimension must match A second dimension");
+    TORCH_CHECK(D.size(0) == M && D.size(1) == N, "D must have shape [M, N]");
+    TORCH_CHECK(M % 128 == 0, "M must be a multiple of 128");
+    TORCH_CHECK(N % 128 == 0, "N must be a multiple of 128");
+    TORCH_CHECK(K % 256 == 0, "K must be a multiple of 256");
+
+    dispatch_fused_gemm_both_bf16<true>(A_bf16, B_bf16, D);
+}
+
+template <bool USE_CTA_AMAX>
+static inline void check_shared_a_debug_inputs(
+    const at::Tensor &A_bf16,
+    const at::Tensor &B,
+    const at::Tensor &B_sc,
+    const at::Tensor &B_sc_global,
+    const at::Tensor &D
+) {
+    const int M = A_bf16.size(0);
+    const int K = A_bf16.size(1);
+    const int N = D.size(1);
+    TORCH_CHECK(A_bf16.dtype() == at::kBFloat16, "A must be bf16");
+    TORCH_CHECK(B.dtype() == at::kFloat4_e2m1fn_x2, "B must be fp4x2");
+    TORCH_CHECK(B_sc_global.dtype() == at::kFloat, "B_sc_global must be float32");
+    TORCH_CHECK(M % 256 == 0, "M must be multiple of 256");
+    TORCH_CHECK(K % 256 == 0, "K must be multiple of 256");
+    TORCH_CHECK(N % 512 == 0, "Shared-A debug backend requires N to be a multiple of 512");
+}
+
+void nvfp4_fused_gemm_shared_a_debug_entrypoint(
+    const at::Tensor &A_bf16,
+    const at::Tensor &B,
+    const at::Tensor &B_sc,
+    const at::Tensor &B_sc_global,
+    at::Tensor &D
+) {
+    check_shared_a_debug_inputs<false>(A_bf16, B, B_sc, B_sc_global, D);
+    dispatch_fused_gemm_shared_a_debug<false>(A_bf16, B, B_sc, B_sc_global, D);
+}
+
+void nvfp4_fused_gemm_cta_amax_shared_a_debug_entrypoint(
+    const at::Tensor &A_bf16,
+    const at::Tensor &B,
+    const at::Tensor &B_sc,
+    const at::Tensor &B_sc_global,
+    at::Tensor &D
+) {
+    check_shared_a_debug_inputs<true>(A_bf16, B, B_sc, B_sc_global, D);
+    dispatch_fused_gemm_shared_a_debug<true>(A_bf16, B, B_sc, B_sc_global, D);
+}
+
+template <bool USE_CTA_AMAX>
+static inline void dispatch_fused_gemm_shared_a_debug_dump(
+    const at::Tensor &A_bf16,
+    const at::Tensor &B,
+    const at::Tensor &B_sc,
+    const at::Tensor &B_sc_global,
+    at::Tensor &D,
+    at::Tensor &debug_cta0_a,
+    at::Tensor &debug_cta1_a,
+    at::Tensor &debug_cta0_sc,
+    at::Tensor &debug_cta1_sc
+) {
+    using DebugConfig =
+        nvfp4_fused_gemm::config<256, 2, 8, 4, 2, false, USE_CTA_AMAX, 128, true, 2, 1, 1, true>;
+    check_shared_a_dump_tensor_shapes<DebugConfig>(debug_cta0_a, debug_cta1_a, debug_cta0_sc, debug_cta1_sc);
+    dispatch_fused_gemm_shared_a_debug<USE_CTA_AMAX>(
+        A_bf16, B, B_sc, B_sc_global, D,
+        &debug_cta0_a, &debug_cta1_a, &debug_cta0_sc, &debug_cta1_sc);
+}
+
+void nvfp4_fused_gemm_shared_a_debug_dump_entrypoint(
+    const at::Tensor &A_bf16,
+    const at::Tensor &B,
+    const at::Tensor &B_sc,
+    const at::Tensor &B_sc_global,
+    at::Tensor &D,
+    at::Tensor &debug_cta0_a,
+    at::Tensor &debug_cta1_a,
+    at::Tensor &debug_cta0_sc,
+    at::Tensor &debug_cta1_sc
+) {
+    check_shared_a_debug_inputs<false>(A_bf16, B, B_sc, B_sc_global, D);
+    TORCH_CHECK(A_bf16.size(0) == 256 && D.size(1) == 512 && A_bf16.size(1) == 256,
+                "Shared-A dump helper is fixed to shape 256 x 512 x 256");
+    dispatch_fused_gemm_shared_a_debug_dump<false>(
+        A_bf16, B, B_sc, B_sc_global, D,
+        debug_cta0_a, debug_cta1_a, debug_cta0_sc, debug_cta1_sc);
+}
+
+void nvfp4_fused_gemm_cta_amax_shared_a_debug_dump_entrypoint(
+    const at::Tensor &A_bf16,
+    const at::Tensor &B,
+    const at::Tensor &B_sc,
+    const at::Tensor &B_sc_global,
+    at::Tensor &D,
+    at::Tensor &debug_cta0_a,
+    at::Tensor &debug_cta1_a,
+    at::Tensor &debug_cta0_sc,
+    at::Tensor &debug_cta1_sc
+) {
+    check_shared_a_debug_inputs<true>(A_bf16, B, B_sc, B_sc_global, D);
+    TORCH_CHECK(A_bf16.size(0) == 256 && D.size(1) == 512 && A_bf16.size(1) == 256,
+                "Shared-A dump helper is fixed to shape 256 x 512 x 256");
+    dispatch_fused_gemm_shared_a_debug_dump<true>(
+        A_bf16, B, B_sc, B_sc_global, D,
+        debug_cta0_a, debug_cta1_a, debug_cta0_sc, debug_cta1_sc);
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
@@ -1347,6 +1578,38 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           pybind11::arg("A_bf16"), pybind11::arg("B"),
           pybind11::arg("B_sc"), pybind11::arg("B_sc_global"),
           pybind11::arg("D"));
+    m.def("nvfp4_fused_gemm_both_bf16", &nvfp4_fused_gemm_both_bf16_entrypoint,
+          "Experimental fused GEMM: quantize both bf16 operands on the fly (constant scale)",
+          pybind11::arg("A_bf16"), pybind11::arg("B_bf16"),
+          pybind11::arg("D"));
+    m.def("nvfp4_fused_gemm_both_bf16_cta_amax", &nvfp4_fused_gemm_both_bf16_cta_amax_entrypoint,
+          "Experimental fused GEMM: quantize both bf16 operands on the fly (CTA amax)",
+          pybind11::arg("A_bf16"), pybind11::arg("B_bf16"),
+          pybind11::arg("D"));
+    m.def("nvfp4_fused_gemm_shared_a_debug", &nvfp4_fused_gemm_shared_a_debug_entrypoint,
+          "Developer-only isolated cross-CTA shared-A fused GEMM",
+          pybind11::arg("A_bf16"), pybind11::arg("B"),
+          pybind11::arg("B_sc"), pybind11::arg("B_sc_global"),
+          pybind11::arg("D"));
+    m.def("nvfp4_fused_gemm_cta_amax_shared_a_debug", &nvfp4_fused_gemm_cta_amax_shared_a_debug_entrypoint,
+          "Developer-only isolated cross-CTA shared-A fused GEMM (CTA amax)",
+          pybind11::arg("A_bf16"), pybind11::arg("B"),
+          pybind11::arg("B_sc"), pybind11::arg("B_sc_global"),
+          pybind11::arg("D"));
+    m.def("nvfp4_fused_gemm_shared_a_debug_dump", &nvfp4_fused_gemm_shared_a_debug_dump_entrypoint,
+          "Developer-only isolated cross-CTA shared-A dump helper for 256x512x256",
+          pybind11::arg("A_bf16"), pybind11::arg("B"),
+          pybind11::arg("B_sc"), pybind11::arg("B_sc_global"),
+          pybind11::arg("D"),
+          pybind11::arg("debug_cta0_a"), pybind11::arg("debug_cta1_a"),
+          pybind11::arg("debug_cta0_sc"), pybind11::arg("debug_cta1_sc"));
+    m.def("nvfp4_fused_gemm_cta_amax_shared_a_debug_dump", &nvfp4_fused_gemm_cta_amax_shared_a_debug_dump_entrypoint,
+          "Developer-only isolated cross-CTA shared-A dump helper for 256x512x256 (CTA amax)",
+          pybind11::arg("A_bf16"), pybind11::arg("B"),
+          pybind11::arg("B_sc"), pybind11::arg("B_sc_global"),
+          pybind11::arg("D"),
+          pybind11::arg("debug_cta0_a"), pybind11::arg("debug_cta1_a"),
+          pybind11::arg("debug_cta0_sc"), pybind11::arg("debug_cta1_sc"));
 
     // Fused TE→TK GEMM: takes raw TE NVFP4 tensors + dimensions.
     // ALL tensor manipulation (view, reshape, amax*recip) happens in C++.
