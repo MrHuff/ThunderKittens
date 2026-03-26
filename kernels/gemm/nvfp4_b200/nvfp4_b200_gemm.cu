@@ -1222,7 +1222,7 @@ static inline void dispatch_fused_gemm(
     const int K = A_bf16.size(1);
     const int N = D.size(1);
 
-    if (N % 256 == 0 && N <= 2048) {
+    if (N % 256 == 0) {
         if (K <= 256 && N <= 256) {
             launch_fused_gemm_with_config<nvfp4_fused_gemm::config<128, 4, 4, 4, 2, false, USE_CTA_AMAX, 256, true, 2, 2>>(
                 A_bf16, B, B_sc, B_sc_global, D);
@@ -1231,13 +1231,8 @@ static inline void dispatch_fused_gemm(
                 A_bf16, B, B_sc, B_sc_global, D);
         }
     } else {
-        if (N % 256 != 0) {
-            launch_fused_gemm_with_config<nvfp4_fused_gemm::config<128, 5, 4, 4, 2, false, USE_CTA_AMAX>>(
-                A_bf16, B, B_sc, B_sc_global, D);
-        } else {
-            launch_fused_gemm_with_config<nvfp4_fused_gemm::config<256, 4, 8, 4, 2, false, USE_CTA_AMAX>>(
-                A_bf16, B, B_sc, B_sc_global, D);
-        }
+        launch_fused_gemm_with_config<nvfp4_fused_gemm::config<128, 5, 4, 4, 2, false, USE_CTA_AMAX>>(
+            A_bf16, B, B_sc, B_sc_global, D);
     }
 }
 

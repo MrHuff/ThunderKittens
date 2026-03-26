@@ -34,10 +34,8 @@ def check_diff(name: str, A: torch.Tensor, A_ref: torch.Tensor) -> None:
 
 
 def fused_backend_label(N: int) -> str:
-    if N % 256 == 0 and N <= 2048:
-        return "dual-column reuse backend"
     if N % 256 == 0:
-        return "single-column wide-tile backend"
+        return "dual-column reuse backend"
     return "single-column fallback"
 
 
