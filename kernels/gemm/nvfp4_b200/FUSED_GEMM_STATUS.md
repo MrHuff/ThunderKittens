@@ -150,6 +150,18 @@ Important limitations of the current version:
   - CTA-amax: `0` bytes spill stores / `0` bytes spill loads
 - Because it does not reuse quantized A or B across neighboring output tiles, it is
   not performance-competitive with the separate baseline yet.
+- Follow-up tuning on 2026-03-26 added compile-time support for deeper load-pipe variants,
+  but that alone did not move the large shapes:
+  - a 3-stage single-column variant kept `2048` roughly flat (`0.122 ms`) and made `4096`
+    much worse (`1.951 ms` constant-scale)
+  - a same-CTA dual-column `4096+` experiment reduced the constant-scale regression versus
+    the 3-stage try, but was still slower than the known-good 2-stage single-column path and
+    the CTA-amax sweep stopped making forward progress at `4096`
+  - a 5-warpgroup "parallel B quantizer" follow-up for the dual-column constant path also lost:
+    it compiled only after shrinking epilogue staging, but ptxas reported `356/404` bytes of
+    spills and `16` barriers, and the `4096` both-bf16 constant path regressed to `2.050 ms`
+  - the public both-bf16 dispatcher is therefore back on the original 2-stage single-column
+    ping-pong path while the generalized config plumbing stays available for future experiments
 
 ## Current Validation
 

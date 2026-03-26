@@ -24,10 +24,20 @@ static constexpr int QUANT_TILE_M = 128;
 static constexpr int QUANT_TILE_N = 128;
 static constexpr int K_BLOCK_SIZE = 16;
 
-template <bool _USE_CTA_AMAX, int _COL_TILES_PER_BLOCK = 1>
+template <
+    bool _USE_CTA_AMAX,
+    int _COL_TILES_PER_BLOCK = 1,
+    int _LOAD_PIPE_DEPTH = 2,
+    int _EPI_PIPE_DEPTH = 4,
+    int _NUM_D_TILES = (_EPI_PIPE_DEPTH > 1 ? 4 : 1)>
 struct config {
     static_assert(_COL_TILES_PER_BLOCK == 1 || _COL_TILES_PER_BLOCK == 2,
                   "Both-bf16 fused kernel supports 1 or 2 column tiles per block");
+    static_assert(_LOAD_PIPE_DEPTH > 0 && _LOAD_PIPE_DEPTH <= 4,
+                  "Both-bf16 fused kernel supports load pipe depth 1..4");
+    static_assert(_EPI_PIPE_DEPTH > 0 && 128 % _EPI_PIPE_DEPTH == 0,
+                  "Both-bf16 fused kernel requires EPI_PIPE_DEPTH to divide Nb=128");
+    static_assert(_NUM_D_TILES > 0, "NUM_D_TILES must be positive");
     static constexpr bool USE_CTA_AMAX = _USE_CTA_AMAX;
     static constexpr int COL_TILES_PER_BLOCK = _COL_TILES_PER_BLOCK;
     static constexpr int CLUSTER_SIZE = 1;
@@ -44,12 +54,12 @@ struct config {
     static constexpr int Mb = 128;
     static constexpr int Nb = 128;
     static constexpr int Kb = 256;
-    static constexpr int LOAD_PIPE_DEPTH = 2;
+    static constexpr int LOAD_PIPE_DEPTH = _LOAD_PIPE_DEPTH;
     static constexpr int QUANT_SUB_TILES = Kb / QUANT_TILE_N;
     static constexpr int MMA_PER_TILE = Kb / 64;
 
-    static constexpr int EPI_PIPE_DEPTH = 4;
-    static constexpr int NUM_D_TILES = 4;
+    static constexpr int EPI_PIPE_DEPTH = _EPI_PIPE_DEPTH;
+    static constexpr int NUM_D_TILES = _NUM_D_TILES;
     static constexpr auto D_CACHE_POLICY = cache_policy::EVICT_FIRST;
 };
 

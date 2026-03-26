@@ -51,6 +51,10 @@ def fused_backend_label(N: int) -> str:
     return "single-column fallback"
 
 
+def both_bf16_backend_label(N: int, K: int) -> str:
+    return "single-CTA ping-pong (2-stage)"
+
+
 def compare_byte_dump(name: str, lhs: torch.Tensor, rhs: torch.Tensor) -> None:
     equal = torch.equal(lhs, rhs)
     diff = (lhs.to(torch.int16) - rhs.to(torch.int16)).abs()
@@ -84,6 +88,7 @@ def run_case(M: int, N: int, K: int) -> None:
     print(f"{'='*72}")
     print(f"  M={M}, N={N}, K={K}")
     print(f"  Fused backend: {fused_backend_label(N)}")
+    print(f"  Both-bf16 backend: {both_bf16_backend_label(N, K)}")
     print(f"{'='*72}")
 
     A_bf16 = torch.randn(M, K, dtype=torch.bfloat16, device="cuda") / K**0.25
