@@ -129,6 +129,9 @@ struct globals {
     struct quant_buf_t {
         A_bf16_tile bf16_tile;
     };
+    struct a_export_t {
+        alignas(16) uint8_t data[C::ROW_SLICE * (C::Kb/2)];
+    };
 
     __host__ inline dim3 grid() const {
         int d_cols = use_split_D ? (q_dim + k_dim + D_V.cols()) : D.cols();
@@ -144,10 +147,18 @@ struct globals {
         static_assert(_dynamic_shared_memory <= MAX_SHARED_MEMORY - 1024);
         return _dynamic_shared_memory;
     }
+
+    uint8_t*       debug_cta0_a_ptr;
+    uint8_t*       debug_cta1_a_ptr;
+    uint8_t*       debug_cta0_sc_ptr;
+    uint8_t*       debug_cta1_sc_ptr;
+    int            debug_a_stride;
 };
 
 __device__ inline void st_shared_cluster_b8(uint32_t dst_addr, uint32_t value);
 __device__ inline void st_shared_cluster_b32(uint32_t dst_addr, uint32_t value);
+__device__ inline uint32_t map_cluster_addr(uint32_t local_addr, int target_cta);
+__device__ inline void arrive_remote_cluster(semaphore &sem, int target_cta, uint32_t count = 1);
 
 
 // ================================================================
@@ -162,9 +173,10 @@ __device__ inline void quantize_subtile_constant(
     typename G::input_tiles_t &out_tile,
     typename G::input_scales_t &out_scales,
     int sub_tile_idx,
-    uint32_t remote_a_tile_smem_base = 0,
-    uint32_t remote_a_scale_smem_base = 0,
-    bool mirror_remote = false
+    uint32_t export_a_canonical_smem_base = 0,
+    uint32_t remote_a_scale_local_smem_base = 0,
+    int remote_target_cta = -1,
+    bool mirror_remote_scale = false
 ) {
     const int local_tid = threadIdx.x % 128;
     const int tile_row = local_tid;
@@ -230,14 +242,15 @@ __device__ inline void quantize_subtile_constant(
                     __bfloat162float(A_bf16_reg[col_half][i][j].x)*s_enc,
                     __bfloat162float(A_bf16_reg[col_half][i][j].y)*s_enc
                 };
+                const uint32_t packed_fp4 =
+                    static_cast<uint32_t>(__nv_cvt_float2_to_fp4x2(scaled, __NV_E2M1, cudaRoundNearest));
                 asm volatile("{st.shared.b8 [%0], %1;}"
                     :: "r"(swizzled_addr),
-                       "r"(static_cast<uint32_t>(__nv_cvt_float2_to_fp4x2(scaled, __NV_E2M1, cudaRoundNearest))));
-                if (mirror_remote) {
-                    const uint32_t remote_swizzled_addr = decltype(out_tile.A)::idx(
-                        remote_a_tile_smem_base, {tile_row, fp4_col});
-                    st_shared_cluster_b8(remote_swizzled_addr,
-                        static_cast<uint32_t>(__nv_cvt_float2_to_fp4x2(scaled, __NV_E2M1, cudaRoundNearest)));
+                       "r"(packed_fp4));
+                if (export_a_canonical_smem_base != 0) {
+                    asm volatile("{st.shared.b8 [%0], %1;}"
+                        :: "r"(export_a_canonical_smem_base + tile_row * (QUANT_TILE_N) + fp4_col),
+                           "r"(packed_fp4));
                 }
             }
         }
@@ -255,10 +268,10 @@ __device__ inline void quantize_subtile_constant(
         asm volatile("{st.shared.b32 [%0], %1;}"
             :: "r"(static_cast<uint32_t>(__cvta_generic_to_shared(sc_base + mma_base_1)) + scale_offset),
                "r"(*reinterpret_cast<uint32_t*>(&A_sc_reg[1][0])));
-        if (mirror_remote) {
-            st_shared_cluster_b32(remote_a_scale_smem_base + mma_base_0 + scale_offset,
+        if (mirror_remote_scale) {
+            st_shared_cluster_b32(map_cluster_addr(remote_a_scale_local_smem_base + mma_base_0 + scale_offset, remote_target_cta),
                                   *reinterpret_cast<uint32_t*>(&A_sc_reg[0][0]));
-            st_shared_cluster_b32(remote_a_scale_smem_base + mma_base_1 + scale_offset,
+            st_shared_cluster_b32(map_cluster_addr(remote_a_scale_local_smem_base + mma_base_1 + scale_offset, remote_target_cta),
                                   *reinterpret_cast<uint32_t*>(&A_sc_reg[1][0]));
         }
     }
@@ -279,9 +292,10 @@ __device__ inline void quantize_subtile_cta_amax(
     int quant_sync_bar_id,
     float *running_amax,
     float *warp_max_buf,
-    uint32_t remote_a_tile_smem_base = 0,
-    uint32_t remote_a_scale_smem_base = 0,
-    bool mirror_remote = false
+    uint32_t export_a_canonical_smem_base = 0,
+    uint32_t remote_a_scale_local_smem_base = 0,
+    int remote_target_cta = -1,
+    bool mirror_remote_scale = false
 ) {
     const int local_tid = threadIdx.x % 128;
     const int tile_row = local_tid;
@@ -379,14 +393,15 @@ __device__ inline void quantize_subtile_cta_amax(
                     __bfloat162float(A_bf16_reg[col_half][i][j].x)*s_enc,
                     __bfloat162float(A_bf16_reg[col_half][i][j].y)*s_enc
                 };
+                const uint32_t packed_fp4 =
+                    static_cast<uint32_t>(__nv_cvt_float2_to_fp4x2(scaled, __NV_E2M1, cudaRoundNearest));
                 asm volatile("{st.shared.b8 [%0], %1;}"
                     :: "r"(swizzled_addr),
-                       "r"(static_cast<uint32_t>(__nv_cvt_float2_to_fp4x2(scaled, __NV_E2M1, cudaRoundNearest))));
-                if (mirror_remote) {
-                    const uint32_t remote_swizzled_addr = decltype(out_tile.A)::idx(
-                        remote_a_tile_smem_base, {tile_row, fp4_col});
-                    st_shared_cluster_b8(remote_swizzled_addr,
-                        static_cast<uint32_t>(__nv_cvt_float2_to_fp4x2(scaled, __NV_E2M1, cudaRoundNearest)));
+                       "r"(packed_fp4));
+                if (export_a_canonical_smem_base != 0) {
+                    asm volatile("{st.shared.b8 [%0], %1;}"
+                        :: "r"(export_a_canonical_smem_base + tile_row * (QUANT_TILE_N) + fp4_col),
+                           "r"(packed_fp4));
                 }
             }
         }
@@ -404,10 +419,10 @@ __device__ inline void quantize_subtile_cta_amax(
         asm volatile("{st.shared.b32 [%0], %1;}"
             :: "r"(static_cast<uint32_t>(__cvta_generic_to_shared(sc_base + mma_base_1)) + scale_offset),
                "r"(*reinterpret_cast<uint32_t*>(&A_sc_reg[1][0])));
-        if (mirror_remote) {
-            st_shared_cluster_b32(remote_a_scale_smem_base + mma_base_0 + scale_offset,
+        if (mirror_remote_scale) {
+            st_shared_cluster_b32(map_cluster_addr(remote_a_scale_local_smem_base + mma_base_0 + scale_offset, remote_target_cta),
                                   *reinterpret_cast<uint32_t*>(&A_sc_reg[0][0]));
-            st_shared_cluster_b32(remote_a_scale_smem_base + mma_base_1 + scale_offset,
+            st_shared_cluster_b32(map_cluster_addr(remote_a_scale_local_smem_base + mma_base_1 + scale_offset, remote_target_cta),
                                   *reinterpret_cast<uint32_t*>(&A_sc_reg[1][0]));
         }
     }
@@ -450,12 +465,44 @@ __device__ inline uint32_t ld_shared_cluster_u32(uint32_t src_addr) {
     return value;
 }
 
+__device__ inline uint32_t ld_shared_cluster_u8(uint32_t src_addr) {
+    uint32_t value;
+    asm volatile("ld.shared::cluster.b8 %0, [%1];\n"
+                 : "=r"(value)
+                 : "r"(src_addr));
+    return value;
+}
+
+__device__ inline uint32_t ld_shared_u8(uint32_t src_addr) {
+    uint32_t value;
+    asm volatile("ld.shared.b8 %0, [%1];\n"
+                 : "=r"(value)
+                 : "r"(src_addr));
+    return value;
+}
+
+__device__ inline uint32_t ld_shared_u32(uint32_t src_addr) {
+    uint32_t value;
+    asm volatile("ld.shared.b32 %0, [%1];\n"
+                 : "=r"(value)
+                 : "r"(src_addr));
+    return value;
+}
+
 __device__ inline void st_shared_cluster_b8(uint32_t dst_addr, uint32_t value) {
     asm volatile("st.shared::cluster.b8 [%0], %1;\n" :: "r"(dst_addr), "r"(value));
 }
 
 __device__ inline void st_shared_cluster_b32(uint32_t dst_addr, uint32_t value) {
     asm volatile("st.shared::cluster.b32 [%0], %1;\n" :: "r"(dst_addr), "r"(value));
+}
+
+__device__ inline void arrive_remote_cluster(semaphore &sem, int target_cta, uint32_t count) {
+    const uint32_t local_addr = static_cast<uint32_t>(__cvta_generic_to_shared(&sem));
+    const uint32_t remote_addr = map_cluster_addr(local_addr, target_cta);
+    asm volatile("mbarrier.arrive.shared::cluster.b64 _, [%0], %1;\n"
+                 :: "r"(remote_addr), "r"(count)
+                 : "memory");
 }
 
 template <typename T>
@@ -473,10 +520,135 @@ __device__ inline void copy_shared_cluster_bytes(
     int thread_linear_idx,
     int thread_count
 ) {
-    const uint32_t src_remote_addr = map_cluster_addr(src_local_addr, src_cta);
     for (int byte_off = thread_linear_idx * 4; byte_off < bytes; byte_off += thread_count * 4) {
-        const uint32_t value = ld_shared_cluster_u32(src_remote_addr + byte_off);
+        const uint32_t value = ld_shared_cluster_u32(
+            map_cluster_addr(src_local_addr + byte_off, src_cta));
         asm volatile("st.shared.b32 [%0], %1;\n" :: "r"(dst_local_addr + byte_off), "r"(value));
+    }
+}
+
+__device__ inline void copy_shared_cluster_bytes_b8(
+    uint32_t dst_local_addr,
+    uint32_t src_local_addr,
+    int src_cta,
+    int bytes,
+    int thread_linear_idx,
+    int thread_count
+) {
+    for (int byte_off = thread_linear_idx; byte_off < bytes; byte_off += thread_count) {
+        asm volatile("st.shared.b8 [%0], %1;\n"
+                     :: "r"(dst_local_addr + byte_off),
+                        "r"(ld_shared_cluster_u8(map_cluster_addr(src_local_addr + byte_off, src_cta))));
+    }
+}
+
+__device__ inline void copy_shared_local_bytes(
+    uint32_t dst_local_addr,
+    uint32_t src_local_addr,
+    int bytes,
+    int thread_linear_idx,
+    int thread_count
+) {
+    for (int byte_off = thread_linear_idx * 4; byte_off < bytes; byte_off += thread_count * 4) {
+        asm volatile("st.shared.b32 [%0], %1;\n" :: "r"(dst_local_addr + byte_off), "r"(ld_shared_u32(src_local_addr + byte_off)));
+    }
+}
+
+__device__ inline void mirror_shared_bytes_to_cluster(
+    uint32_t src_local_addr,
+    uint32_t dst_local_addr,
+    int dst_cta,
+    int bytes,
+    int thread_linear_idx,
+    int thread_count
+) {
+    for (int byte_off = thread_linear_idx * 4; byte_off < bytes; byte_off += thread_count * 4) {
+        st_shared_cluster_b32(
+            map_cluster_addr(dst_local_addr + byte_off, dst_cta),
+            ld_shared_u32(src_local_addr + byte_off));
+    }
+}
+
+template <typename Tile>
+__device__ inline void import_shared_cluster_canonical_fp4_tile(
+    Tile &dst_tile,
+    int rows,
+    int cols,
+    uint32_t src_local_addr,
+    int src_cta,
+    int thread_linear_idx,
+    int thread_count
+) {
+    const uint32_t dst_local_base = static_cast<uint32_t>(__cvta_generic_to_shared(&dst_tile.data[0]));
+    const int total_bytes = rows * cols;
+    for (int byte_off = thread_linear_idx * 4; byte_off < total_bytes; byte_off += thread_count * 4) {
+        const uint32_t packed = ld_shared_cluster_u32(
+            map_cluster_addr(src_local_addr + byte_off, src_cta));
+        #pragma unroll
+        for (int lane_byte = 0; lane_byte < 4; ++lane_byte) {
+            const int linear_idx = byte_off + lane_byte;
+            if (linear_idx < total_bytes) {
+                const int row = linear_idx / cols;
+                const int col = linear_idx % cols;
+                const uint32_t dst_addr = Tile::idx(dst_local_base, {row, col});
+                asm volatile("{st.shared.b8 [%0], %1;}"
+                    :: "r"(dst_addr),
+                       "r"((packed >> (8 * lane_byte)) & 0xFFu));
+            }
+        }
+    }
+}
+
+template <typename Tile>
+__device__ inline void import_local_canonical_fp4_tile(
+    Tile &dst_tile,
+    int rows,
+    int cols,
+    uint32_t src_local_addr,
+    int thread_linear_idx,
+    int thread_count
+) {
+    const uint32_t dst_local_base = static_cast<uint32_t>(__cvta_generic_to_shared(&dst_tile.data[0]));
+    const int total_bytes = rows * cols;
+    for (int linear_idx = thread_linear_idx; linear_idx < total_bytes; linear_idx += thread_count) {
+        const int row = linear_idx / cols;
+        const int col = linear_idx % cols;
+        const uint32_t dst_addr = Tile::idx(dst_local_base, {row, col});
+        asm volatile("{st.shared.b8 [%0], %1;}"
+            :: "r"(dst_addr),
+               "r"(ld_shared_u8(src_local_addr + linear_idx)));
+    }
+}
+
+template <typename Tile>
+__device__ inline void dump_swizzled_fp4_tile_canonical(
+    const Tile &tile,
+    int rows,
+    int cols,
+    uint8_t *dst_ptr,
+    int dst_stride,
+    int thread_linear_idx,
+    int thread_count
+) {
+    const uint32_t tile_base = static_cast<uint32_t>(__cvta_generic_to_shared(&tile.data[0]));
+    for (int linear_idx = thread_linear_idx; linear_idx < rows * cols; linear_idx += thread_count) {
+        const int row = linear_idx / cols;
+        const int col = linear_idx % cols;
+        dst_ptr[row * dst_stride + col] =
+            static_cast<uint8_t>(ld_shared_u8(Tile::idx(tile_base, {row, col})));
+    }
+}
+
+__device__ inline void dump_shared_raw_bytes(
+    const void *src_ptr,
+    uint8_t *dst_ptr,
+    int bytes,
+    int thread_linear_idx,
+    int thread_count
+) {
+    const uint32_t src_base = static_cast<uint32_t>(__cvta_generic_to_shared(src_ptr));
+    for (int idx = thread_linear_idx; idx < bytes; idx += thread_count) {
+        dst_ptr[idx] = static_cast<uint8_t>(ld_shared_u8(src_base + idx));
     }
 }
 
@@ -537,6 +709,8 @@ __device__ inline void kernel_shared_a_cross_cta(const globals<C> &g) {
 
     __shared__ float running_amax;
     __shared__ float warp_max_buf[4];
+    alignas(16) __shared__ uint8_t a_remote_fp4[C::LOAD_PIPE_DEPTH][C::ROW_SLICE * (C::Kb / 2)];
+    alignas(16) __shared__ uint8_t a_remote_sc[C::LOAD_PIPE_DEPTH][sizeof(typename G::A_sc_tile)];
 
     tensor_allocator<1, C::TMEM_NCTA, false> tm_allocator;
 
@@ -624,17 +798,36 @@ __device__ inline void kernel_shared_a_cross_cta(const globals<C> &g) {
                             );
                         }
                         wait(bf16_sub_arrived[sub], bf16_sub_phase);
+                        const uint32_t export_a_canonical_smem_base = static_cast<uint32_t>(
+                            __cvta_generic_to_shared(&a_remote_fp4[stage][0]));
+                        const uint32_t remote_a_scale_local_smem_base = static_cast<uint32_t>(
+                            __cvta_generic_to_shared(&a_remote_sc[stage][0]));
                         if constexpr (C::USE_CTA_AMAX) {
                             quantize_subtile_cta_amax<G>(
                                 quant_buf, input_tiles[stage], input_scales[stage],
-                                sub, quant_sync_bar_id, &running_amax, warp_max_buf);
+                                sub, quant_sync_bar_id, &running_amax, warp_max_buf,
+                                export_a_canonical_smem_base,
+                                remote_a_scale_local_smem_base,
+                                1,
+                                false);
                         } else {
                             quantize_subtile_constant<G>(
-                                quant_buf, input_tiles[stage], input_scales[stage], sub);
+                                quant_buf, input_tiles[stage], input_scales[stage], sub,
+                                export_a_canonical_smem_base,
+                                remote_a_scale_local_smem_base,
+                                1,
+                                false);
                         }
                         warpgroup::sync(quant_sync_bar_id);
                     }
                     bf16_sub_phase ^= 1;
+                    copy_shared_local_bytes(
+                        static_cast<uint32_t>(__cvta_generic_to_shared(&a_remote_sc[stage][0])),
+                        static_cast<uint32_t>(__cvta_generic_to_shared(&input_scales[stage].A.data[0])),
+                        sizeof(input_scales[stage].A),
+                        local_tid,
+                        128);
+                    warpgroup::sync(quant_sync_bar_id);
 
                     __threadfence_block();
                     asm volatile("fence.proxy.async.shared::cta;\n" ::: "memory");
@@ -642,33 +835,70 @@ __device__ inline void kernel_shared_a_cross_cta(const globals<C> &g) {
 
                     if (is_leader) {
                         arrive(a_quant_done[stage], 1);
-                        tma::cluster::arrive(a_remote_ready[stage], 1, 1);
+                        arrive_remote_cluster(a_remote_ready[stage], 1, 1);
+                    }
+                    if (cluster_id == 0 && block_idx == 0 && i == 0) {
+                        if (g.debug_cta0_a_ptr != nullptr) {
+                            dump_shared_raw_bytes(
+                                &a_remote_fp4[stage][0], g.debug_cta0_a_ptr,
+                                C::ROW_SLICE * (C::Kb/2), local_tid, 128);
+                        }
+                        if (g.debug_cta0_sc_ptr != nullptr) {
+                            dump_shared_raw_bytes(
+                                &a_remote_sc[stage][0], g.debug_cta0_sc_ptr,
+                                sizeof(input_scales[stage].A), local_tid, 128);
+                        }
                     }
                     if (iter_idx >= C::LOAD_PIPE_DEPTH) {
                         update_phasebit<1>(release_phasebits, stage);
                     }
                 } else {
                     if (iter_idx >= C::LOAD_PIPE_DEPTH && is_leader) {
-                        tma::cluster::arrive(a_stage_released[stage], 0, 1);
+                        arrive_remote_cluster(a_stage_released[stage], 0, 1);
                     }
                     wait(a_remote_ready[stage], get_phasebit<1>(remote_ready_phasebits, stage));
                     asm volatile("fence.proxy.async.shared::cluster;\n" ::: "memory");
                     copy_shared_cluster_bytes(
-                        static_cast<uint32_t>(__cvta_generic_to_shared(&input_tiles[stage].A.data[0])),
-                        static_cast<uint32_t>(__cvta_generic_to_shared(&input_tiles[stage].A.data[0])),
-                        0,
-                        sizeof(input_tiles[stage].A),
-                        local_tid,
-                        128);
-                    copy_shared_cluster_bytes(
-                        static_cast<uint32_t>(__cvta_generic_to_shared(&input_scales[stage].A.data[0])),
-                        static_cast<uint32_t>(__cvta_generic_to_shared(&input_scales[stage].A.data[0])),
+                        static_cast<uint32_t>(__cvta_generic_to_shared(&a_remote_sc[stage][0])),
+                        static_cast<uint32_t>(__cvta_generic_to_shared(&a_remote_sc[stage][0])),
                         0,
                         sizeof(input_scales[stage].A),
                         local_tid,
                         128);
+                    copy_shared_local_bytes(
+                        static_cast<uint32_t>(__cvta_generic_to_shared(&input_scales[stage].A.data[0])),
+                        static_cast<uint32_t>(__cvta_generic_to_shared(&a_remote_sc[stage][0])),
+                        sizeof(input_scales[stage].A),
+                        local_tid,
+                        128);
+                    copy_shared_cluster_bytes(
+                        static_cast<uint32_t>(__cvta_generic_to_shared(&a_remote_fp4[stage][0])),
+                        static_cast<uint32_t>(__cvta_generic_to_shared(&a_remote_fp4[stage][0])),
+                        0,
+                        C::ROW_SLICE * (C::Kb / 2),
+                        local_tid,
+                        128);
+                    import_local_canonical_fp4_tile(
+                        input_tiles[stage].A,
+                        C::ROW_SLICE,
+                        C::Kb / 2,
+                        static_cast<uint32_t>(__cvta_generic_to_shared(&a_remote_fp4[stage][0])),
+                        local_tid,
+                        128);
 
                     warpgroup::sync(quant_sync_bar_id);
+                    if (cluster_id == 0 && block_idx == 0 && i == 0) {
+                        if (g.debug_cta1_a_ptr != nullptr) {
+                            dump_shared_raw_bytes(
+                                &a_remote_fp4[stage][0], g.debug_cta1_a_ptr,
+                                C::ROW_SLICE * (C::Kb/2), local_tid, 128);
+                        }
+                        if (g.debug_cta1_sc_ptr != nullptr) {
+                            dump_shared_raw_bytes(
+                                &a_remote_sc[stage][0], g.debug_cta1_sc_ptr,
+                                sizeof(input_scales[stage].A), local_tid, 128);
+                        }
+                    }
                     __threadfence_block();
                     asm volatile("fence.proxy.async.shared::cta;\n" ::: "memory");
 

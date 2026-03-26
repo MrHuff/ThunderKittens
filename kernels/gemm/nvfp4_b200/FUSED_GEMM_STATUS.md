@@ -110,6 +110,41 @@ The same approach works for the 4-byte scale writes via `st.shared.b32`.
 - PyTorch extension builds embed Torch's library path as an rpath, so `_C` imports
   without a manual `LD_LIBRARY_PATH` export.
 - `test_fused_gemm.py` now fails fast with a clear error when CUDA device access is unavailable.
+- `test_fused_gemm.py` now benchmarks five paths:
+  - separate `quantize + gemm`
+  - fused A-only constant-scale
+  - fused A-only CTA-amax
+  - experimental both-bf16 fused constant-scale
+  - experimental both-bf16 fused CTA-amax
+- New public APIs for the experimental two-sided prototype:
+  - `nvfp4_fused_gemm_both_bf16(A_bf16, B_bf16, D)`
+  - `nvfp4_fused_gemm_both_bf16_cta_amax(A_bf16, B_bf16, D)`
+
+## Experimental Both-BF16 Prototype
+
+There is now a separate experimental kernel in
+`nvfp4_fused_gemm_both_bf16.cuh`. It is a real one-kernel prototype that accepts
+both operands as bf16 and quantizes both on the fly before MMA.
+
+Architecture:
+
+- 4 warpgroups per CTA
+  - WG0: consumer / epilogue
+  - WG1: A quantizer
+  - WG2: B quantizer
+  - WG3: MMA orchestrator
+- Tile shape is currently fixed at `128 x 128 x 256`.
+- CTA-amax mode tracks separate running amax values for A and B, then applies
+  `a_sg_dec * b_sg_dec` in the epilogue.
+
+Important limitations of this first version:
+
+- It is a single-CTA prototype with no cross-tile reuse for either operand.
+- It compiles and runs, but ptxas reports very large spills:
+  - constant-scale: `868` bytes spill stores / `868` bytes spill loads
+  - CTA-amax: `876` bytes spill stores / `876` bytes spill loads
+- Because it does not reuse quantized A or B across neighboring output tiles, it is
+  not performance-competitive with the separate baseline yet.
 
 ## Current Validation
 
@@ -121,6 +156,11 @@ The same approach works for the 4-byte scale writes via `st.shared.b32`.
 - `python3 -u test_fused_gemm.py 4096 4096 4096`
 - `python3 -u test_fused_gemm.py 256 384 256`
   all complete successfully.
+- The new experimental both-bf16 public APIs also complete successfully on:
+  - `256 x 256 x 256`
+  - `1024 x 1024 x 1024`
+  - `2048 x 2048 x 2048`
+  - `4096 x 4096 x 4096`
 - The current fused dispatch is:
   - `N % 256 == 0 && N <= 2048`: dual-column prototype `config<128, *, *, 4, 2, false, USE_CTA_AMAX, 256, true, 2, 2>`
   - `N % 256 == 0 && N > 2048`: single-column wide-tile `config<256, 4, 8, 4, 2, false, USE_CTA_AMAX>`
@@ -146,33 +186,41 @@ The same approach works for the 4-byte scale writes via `st.shared.b32`.
 
 - Separate quantize only: `0.018 ms`
 - Separate GEMM only: `0.006 ms`
-- Separate quantize + GEMM: `0.024 ms`
+- Separate quantize + GEMM: `0.023 ms`
 - Fused constant: `0.010 ms`
-- Fused CTA-amax: `0.010 ms`
+- Fused CTA-amax: `0.011 ms`
+- Both-bf16 fused constant: `0.021 ms`
+- Both-bf16 fused CTA-amax: `0.021 ms`
 
 `1024 x 1024 x 1024`
 
-- Separate quantize only: `0.020 ms`
+- Separate quantize only: `0.019 ms`
 - Separate GEMM only: `0.007 ms`
-- Separate quantize + GEMM: `0.026 ms`
+- Separate quantize + GEMM: `0.025 ms`
 - Fused constant: `0.026 ms`
-- Fused CTA-amax: `0.028 ms`
+- Fused CTA-amax: `0.029 ms`
+- Both-bf16 fused constant: `0.043 ms`
+- Both-bf16 fused CTA-amax: `0.045 ms`
 
 `2048 x 2048 x 2048`
 
-- Separate quantize only: `0.020 ms`
+- Separate quantize only: `0.021 ms`
 - Separate GEMM only: `0.009 ms`
-- Separate quantize + GEMM: `0.028 ms`
+- Separate quantize + GEMM: `0.029 ms`
 - Fused constant: `0.049 ms`
-- Fused CTA-amax: `0.053 ms`
+- Fused CTA-amax: `0.054 ms`
+- Both-bf16 fused constant: `0.151 ms`
+- Both-bf16 fused CTA-amax: `0.155 ms`
 
 `4096 x 4096 x 4096`
 
 - Separate quantize only: `0.026 ms`
 - Separate GEMM only: `0.031 ms`
-- Separate quantize + GEMM: `0.062 ms`
-- Fused constant: `0.592 ms`
-- Fused CTA-amax: `0.643 ms`
+- Separate quantize + GEMM: `0.060 ms`
+- Fused constant: `0.345 ms`
+- Fused CTA-amax: `0.382 ms`
+- Both-bf16 fused constant: `1.002 ms`
+- Both-bf16 fused CTA-amax: `1.039 ms`
 
 ## Root Cause of Large-Shape Slowdown
 
@@ -219,3 +267,17 @@ The next meaningful optimization is structural:
 4. If the cross-CTA route is revisited, fix the DSMEM A-tile handoff before re-enabling dispatch.
    The current prototype compiles and runs, but the copied/imported A payload on CTA1 is not bitwise
    equivalent to a local quantize.
+
+## Both-BF16 Takeaway
+
+The new two-sided prototype answers the immediate question: simply quantizing both bf16
+operands inside one CTA is not enough to beat separate `quantize + gemm`.
+
+- It is slower than the current A-only fused kernel at every tested size.
+- It is much slower than the separate baseline at `2048` and `4096`.
+- Its CTA-amax mode is numerically better than the current A-only fused CTA-amax at `4096`,
+  but that comes with very large spill cost and no meaningful throughput win.
+
+So the next meaningful speed path is still structural reuse, not “just fuse more work into
+one CTA.” A winning both-bf16 design needs a 2D reuse schedule where quantized A and
+quantized B each feed multiple output tiles before being discarded.
