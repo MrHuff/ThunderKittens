@@ -162,6 +162,39 @@ Important limitations of the current version:
     spills and `16` barriers, and the `4096` both-bf16 constant path regressed to `2.050 ms`
   - the public both-bf16 dispatcher is therefore back on the original 2-stage single-column
     ping-pong path while the generalized config plumbing stays available for future experiments
+- A new developer-only same-CTA quad-column experiment is now wired in-tree:
+  - kernel support exists for `COL_TILES_PER_BLOCK=4`, so one quantized A stage can feed
+    four adjacent `128`-column bf16-B tiles inside a single CTA before the stage is recycled
+  - to fit shared memory and cut bring-up overhead, the current debug dispatch uses
+    `LOAD_PIPE_DEPTH=1`, `EPI_PIPE_DEPTH=1`, and `NUM_D_TILES=1`; this keeps the experiment
+    focused on column reuse rather than overlapping loads or a deep epilogue
+  - new debug entrypoints:
+    - `nvfp4_fused_gemm_both_bf16_quadcol_debug`
+    - `nvfp4_fused_gemm_both_bf16_cta_amax_quadcol_debug`
+  - test harness entry:
+    - `python3 -u test_fused_gemm.py --both-bf16-quadcol 1024 4096 4096`
+  - this experiment is intentionally **not** the default public both-bf16 path yet; it was
+    added during a no-GPU session and still needs B200 correctness/perf validation
+  - compile-only signal is poor even after trimming the config:
+    - constant-scale: `1984` bytes stack, `2300` bytes spill stores / `2300` bytes spill loads
+    - CTA-amax: `2000` bytes stack, `2312` bytes spill stores / `2348` bytes spill loads
+    - so wider same-CTA reuse by itself does not currently look promising without a deeper
+      register-pressure rewrite or a different work partition
+- A new developer-only both-bf16 cross-CTA shared-A experiment is also wired in-tree:
+  - one CTA quantizes A once and exports canonical FP4 bytes plus A scales
+  - the sibling CTA imports that A stage through cluster shared memory, then quantizes its own B locally
+  - each CTA still owns one local `128`-column output tile, so the cluster gets A reuse without the
+    quad-column same-CTA register blow-up
+  - new debug entrypoints:
+    - `nvfp4_fused_gemm_both_bf16_shared_a_2cta_debug`
+    - `nvfp4_fused_gemm_both_bf16_cta_amax_shared_a_2cta_debug`
+  - test harness entry:
+    - `python3 -u test_fused_gemm.py --both-bf16-shared-a-2cta 1024 2048 2048`
+  - compile-only signal is encouraging relative to the quad-column path:
+    - constant-scale: `96` bytes stack, `44` bytes spill stores / `56` bytes spill loads
+    - CTA-amax: `48` bytes stack, `0` bytes spill stores / `0` bytes spill loads
+  - this backend is still debug-only and unvalidated at runtime in the current session because CUDA
+    device access is unavailable here
 
 ## Current Validation
 
@@ -178,6 +211,10 @@ Important limitations of the current version:
   - `1024 x 1024 x 1024`
   - `2048 x 2048 x 2048`
   - `4096 x 4096 x 4096`
+- The quad-column same-CTA both-bf16 experiment currently has compile coverage only from this
+  session; runtime validation is still pending on a GPU-enabled B200 host.
+- The cross-CTA shared-A both-bf16 experiment also currently has compile coverage only from this
+  session; runtime validation is pending on a GPU-enabled B200 host.
 - The current fused dispatch is:
   - `N % 256 == 0 && N <= 2048`: dual-column prototype `config<128, *, *, 4, 2, false, USE_CTA_AMAX, 256, true, 2, 2>`
   - `N % 256 == 0 && N > 2048`: single-column wide-tile `config<256, 4, 8, 4, 2, false, USE_CTA_AMAX>`

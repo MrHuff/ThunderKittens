@@ -12,6 +12,8 @@ All compared against PyTorch bf16 matmul reference.
 Usage:
   python test_fused_gemm.py [M] [N] [K]
   python test_fused_gemm.py --sweep
+  python test_fused_gemm.py --both-bf16-quadcol [M] [N] [K]
+  python test_fused_gemm.py --both-bf16-shared-a-2cta [M] [N] [K]
 """
 import sys
 import torch
@@ -20,6 +22,10 @@ torch.set_printoptions(sci_mode=False)
 
 from _C import (nvfp4_fused_gemm, nvfp4_fused_gemm_cta_amax,
                 nvfp4_fused_gemm_both_bf16, nvfp4_fused_gemm_both_bf16_cta_amax,
+                nvfp4_fused_gemm_both_bf16_quadcol_debug,
+                nvfp4_fused_gemm_both_bf16_cta_amax_quadcol_debug,
+                nvfp4_fused_gemm_both_bf16_shared_a_2cta_debug,
+                nvfp4_fused_gemm_both_bf16_cta_amax_shared_a_2cta_debug,
                 nvfp4_fused_gemm_shared_a_debug,
                 nvfp4_fused_gemm_cta_amax_shared_a_debug,
                 nvfp4_fused_gemm_shared_a_debug_dump,
@@ -55,6 +61,18 @@ def both_bf16_backend_label(N: int, K: int) -> str:
     return "single-CTA ping-pong (2-stage)"
 
 
+def both_bf16_quadcol_backend_label(N: int, K: int) -> str:
+    if N % 512 == 0:
+        return "same-CTA quad-column A-reuse debug backend (1-stage, 1-epi)"
+    return "unsupported"
+
+
+def both_bf16_shared_a_2cta_backend_label(N: int, K: int) -> str:
+    if N % 256 == 0:
+        return "cross-CTA shared-A debug backend"
+    return "unsupported"
+
+
 def compare_byte_dump(name: str, lhs: torch.Tensor, rhs: torch.Tensor) -> None:
     equal = torch.equal(lhs, rhs)
     diff = (lhs.to(torch.int16) - rhs.to(torch.int16)).abs()
@@ -82,6 +100,27 @@ def print_split_diff(name: str, A: torch.Tensor, A_ref: torch.Tensor) -> None:
     check_diff(f"{name}_left", A[:, :half], A_ref[:, :half])
     print(f"  {name} right half:")
     check_diff(f"{name}_right", A[:, half:], A_ref[:, half:])
+
+
+def print_tile_cos_matrix(name: str, A: torch.Tensor, A_ref: torch.Tensor, tile_cols: int = 128) -> None:
+    if A.size(1) % tile_cols != 0 or A_ref.size(1) % tile_cols != 0:
+        return
+    tiles = A.size(1) // tile_cols
+    if tiles > 8:
+        return
+    A32 = A.to(torch.float32)
+    R32 = A_ref.to(torch.float32)
+    print(f"  {name} tile cosine matrix ({tile_cols}-col tiles):")
+    for i in range(tiles):
+        row = []
+        Ai = A32[:, i * tile_cols:(i + 1) * tile_cols].flatten()
+        for j in range(tiles):
+            Rj = R32[:, j * tile_cols:(j + 1) * tile_cols].flatten()
+            cos = torch.nn.functional.cosine_similarity(
+                Ai.unsqueeze(0), Rj.unsqueeze(0)
+            ).item()
+            row.append(f"{cos: .4f}")
+        print("   ", i, " ".join(row))
 
 
 def run_case(M: int, N: int, K: int) -> None:
@@ -294,6 +333,138 @@ def run_shared_a_debug_case(M: int, N: int, K: int) -> None:
     print(f"{'='*72}")
 
 
+def run_both_bf16_quadcol_debug_case(M: int, N: int, K: int) -> None:
+    print(f"{'='*72}")
+    print(f"  Both-BF16 Quad-Column Debug  M={M}, N={N}, K={K}")
+    print(f"  Experimental backend: {both_bf16_quadcol_backend_label(N, K)}")
+    print("  Public both-bf16 backend remains unchanged during this run")
+    print(f"{'='*72}")
+
+    A_bf16 = torch.randn(M, K, dtype=torch.bfloat16, device="cuda") / K**0.25
+    B_bf16 = torch.randn(N, K, dtype=torch.bfloat16, device="cuda") / K**0.25
+    D_ref = torch.matmul(A_bf16, B_bf16.T).to(torch.bfloat16)
+
+    A_fp4x2 = torch.empty(M, K // 2, dtype=torch.float4_e2m1fn_x2, device="cuda")
+    A_sc = torch.empty(M // 128, K // 64, 512, dtype=torch.float8_e4m3fn, device="cuda")
+    A_sc_global = torch.empty(1, dtype=torch.float32, device="cuda")
+    nvfp4_quantize(A_bf16, A_fp4x2, A_sc, A_sc_global, False)
+
+    B_fp4x2 = torch.empty(N, K // 2, dtype=torch.float4_e2m1fn_x2, device="cuda")
+    B_sc = torch.empty(N // 128, K // 64, 512, dtype=torch.float8_e4m3fn, device="cuda")
+    B_sc_global = torch.empty(1, dtype=torch.float32, device="cuda")
+    nvfp4_quantize(B_bf16, B_fp4x2, B_sc, B_sc_global, False)
+
+    D_separate = torch.zeros(M, N, dtype=torch.bfloat16, device="cuda")
+    nvfp4_gemm(A_fp4x2, A_sc, A_sc_global, B_fp4x2, B_sc, B_sc_global, D_separate)
+    torch.cuda.synchronize()
+
+    D_public_const = torch.zeros(M, N, dtype=torch.bfloat16, device="cuda")
+    D_public_cta = torch.zeros(M, N, dtype=torch.bfloat16, device="cuda")
+    D_quad_const = torch.zeros(M, N, dtype=torch.bfloat16, device="cuda")
+    D_quad_cta = torch.zeros(M, N, dtype=torch.bfloat16, device="cuda")
+
+    nvfp4_fused_gemm_both_bf16(A_bf16, B_bf16, D_public_const)
+    nvfp4_fused_gemm_both_bf16_cta_amax(A_bf16, B_bf16, D_public_cta)
+    nvfp4_fused_gemm_both_bf16_quadcol_debug(A_bf16, B_bf16, D_quad_const)
+    nvfp4_fused_gemm_both_bf16_cta_amax_quadcol_debug(A_bf16, B_bf16, D_quad_cta)
+    torch.cuda.synchronize()
+
+    print("\n[0] Separate quantize->GEMM vs bf16 ref:")
+    check_diff("sep vs ref", D_separate, D_ref)
+
+    print("\n[1] Public both-bf16 (constant) vs separate:")
+    check_diff("public_both_const vs sep", D_public_const, D_separate)
+    print("\n[2] Quad-column debug (constant) vs separate:")
+    check_diff("quadcol_const vs sep", D_quad_const, D_separate)
+    print("\n[3] Public both-bf16 (CTA amax) vs separate:")
+    check_diff("public_both_cta vs sep", D_public_cta, D_separate)
+    print("\n[4] Quad-column debug (CTA amax) vs separate:")
+    check_diff("quadcol_cta vs sep", D_quad_cta, D_separate)
+
+    NUM_WARMUPS = 5
+    NUM_ITERS = 10
+    start = torch.cuda.Event(enable_timing=True)
+    end = torch.cuda.Event(enable_timing=True)
+
+    def bench(fn, label):
+        for _ in range(NUM_WARMUPS):
+            fn()
+        torch.cuda.synchronize()
+        start.record()
+        for _ in range(NUM_ITERS):
+            fn()
+        end.record()
+        torch.cuda.synchronize()
+        ms = start.elapsed_time(end) / NUM_ITERS
+        flops = 2.0 * M * N * K
+        tflops = flops * 1e-12
+        print(f"  {label}: {ms:.3f} ms  ({tflops/ms*1e3:.2f} TFLOPs)")
+
+    print(f"\n{'='*72}")
+    print("Both-BF16 Quad-Column Debug Benchmarks:")
+    bench(lambda: nvfp4_fused_gemm_both_bf16(A_bf16, B_bf16, D_public_const),
+          "Public both-bf16 (const)      ")
+    bench(lambda: nvfp4_fused_gemm_both_bf16_cta_amax(A_bf16, B_bf16, D_public_cta),
+          "Public both-bf16 (CTA)        ")
+    bench(lambda: nvfp4_fused_gemm_both_bf16_quadcol_debug(A_bf16, B_bf16, D_quad_const),
+          "Quad-column debug (const)     ")
+    bench(lambda: nvfp4_fused_gemm_both_bf16_cta_amax_quadcol_debug(A_bf16, B_bf16, D_quad_cta),
+          "Quad-column debug (CTA)       ")
+    print(f"{'='*72}")
+
+
+def run_both_bf16_shared_a_2cta_debug_case(M: int, N: int, K: int) -> None:
+    print(f"{'='*72}")
+    print(f"  Both-BF16 Shared-A 2CTA Debug  M={M}, N={N}, K={K}")
+    print(f"  Experimental backend: {both_bf16_shared_a_2cta_backend_label(N, K)}")
+    print("  Public both-bf16 backend remains unchanged during this run")
+    print(f"{'='*72}")
+
+    A_bf16 = torch.randn(M, K, dtype=torch.bfloat16, device="cuda") / K**0.25
+    B_bf16 = torch.randn(N, K, dtype=torch.bfloat16, device="cuda") / K**0.25
+    D_ref = torch.matmul(A_bf16, B_bf16.T).to(torch.bfloat16)
+
+    A_fp4x2 = torch.empty(M, K // 2, dtype=torch.float4_e2m1fn_x2, device="cuda")
+    A_sc = torch.empty(M // 128, K // 64, 512, dtype=torch.float8_e4m3fn, device="cuda")
+    A_sc_global = torch.empty(1, dtype=torch.float32, device="cuda")
+    nvfp4_quantize(A_bf16, A_fp4x2, A_sc, A_sc_global, False)
+
+    B_fp4x2 = torch.empty(N, K // 2, dtype=torch.float4_e2m1fn_x2, device="cuda")
+    B_sc = torch.empty(N // 128, K // 64, 512, dtype=torch.float8_e4m3fn, device="cuda")
+    B_sc_global = torch.empty(1, dtype=torch.float32, device="cuda")
+    nvfp4_quantize(B_bf16, B_fp4x2, B_sc, B_sc_global, False)
+
+    D_separate = torch.zeros(M, N, dtype=torch.bfloat16, device="cuda")
+    nvfp4_gemm(A_fp4x2, A_sc, A_sc_global, B_fp4x2, B_sc, B_sc_global, D_separate)
+    torch.cuda.synchronize()
+
+    D_public = torch.zeros(M, N, dtype=torch.bfloat16, device="cuda")
+    D_public_cta = torch.zeros(M, N, dtype=torch.bfloat16, device="cuda")
+    D_shared = torch.zeros(M, N, dtype=torch.bfloat16, device="cuda")
+    D_shared_cta = torch.zeros(M, N, dtype=torch.bfloat16, device="cuda")
+
+    nvfp4_fused_gemm_both_bf16(A_bf16, B_bf16, D_public)
+    nvfp4_fused_gemm_both_bf16_cta_amax(A_bf16, B_bf16, D_public_cta)
+    nvfp4_fused_gemm_both_bf16_shared_a_2cta_debug(A_bf16, B_bf16, D_shared)
+    nvfp4_fused_gemm_both_bf16_cta_amax_shared_a_2cta_debug(A_bf16, B_bf16, D_shared_cta)
+    torch.cuda.synchronize()
+
+    print("\n[0] Separate quantize->GEMM vs bf16 ref:")
+    check_diff("sep vs ref", D_separate, D_ref)
+    print("\n[1] Public both-bf16 (constant) vs separate:")
+    check_diff("public_both_const vs sep", D_public, D_separate)
+    print("\n[2] Shared-A 2CTA debug (constant) vs separate:")
+    check_diff("shared_a_2cta_const vs sep", D_shared, D_separate)
+    print_split_diff("shared_a_2cta_const vs sep", D_shared, D_separate)
+    print_tile_cos_matrix("shared_a_2cta_const vs sep", D_shared, D_separate)
+    print("\n[3] Public both-bf16 (CTA amax) vs separate:")
+    check_diff("public_both_cta vs sep", D_public_cta, D_separate)
+    print("\n[4] Shared-A 2CTA debug (CTA amax) vs separate:")
+    check_diff("shared_a_2cta_cta vs sep", D_shared_cta, D_separate)
+    print_split_diff("shared_a_2cta_cta vs sep", D_shared_cta, D_separate)
+    print_tile_cos_matrix("shared_a_2cta_cta vs sep", D_shared_cta, D_separate)
+
+
 if __name__ == '__main__':
     if not torch.cuda.is_available():
         raise RuntimeError(
@@ -309,6 +480,16 @@ if __name__ == '__main__':
         N = int(sys.argv[3]) if len(sys.argv) > 3 else 512
         K = int(sys.argv[4]) if len(sys.argv) > 4 else 256
         run_shared_a_debug_case(M, N, K)
+    elif len(sys.argv) > 1 and sys.argv[1] == "--both-bf16-quadcol":
+        M = int(sys.argv[2]) if len(sys.argv) > 2 else 1024
+        N = int(sys.argv[3]) if len(sys.argv) > 3 else 4096
+        K = int(sys.argv[4]) if len(sys.argv) > 4 else 4096
+        run_both_bf16_quadcol_debug_case(M, N, K)
+    elif len(sys.argv) > 1 and sys.argv[1] == "--both-bf16-shared-a-2cta":
+        M = int(sys.argv[2]) if len(sys.argv) > 2 else 1024
+        N = int(sys.argv[3]) if len(sys.argv) > 3 else 2048
+        K = int(sys.argv[4]) if len(sys.argv) > 4 else 2048
+        run_both_bf16_shared_a_2cta_debug_case(M, N, K)
     else:
         M = int(sys.argv[1]) if len(sys.argv) > 1 else 2048
         N = int(sys.argv[2]) if len(sys.argv) > 2 else 2048
