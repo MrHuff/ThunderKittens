@@ -1,6 +1,8 @@
 // NVFP4 CCE Backward v5 — owner-flipped fused passes
 #include "nvfp4_cce_backward_v5_dE.cuh"
 #include "nvfp4_cce_backward_v5_dC.cuh"
+#include "nvfp4_cce_backward_v5_dE_superk4_experimental.cuh"
+#include "nvfp4_cce_backward_v5_dC_superk4_experimental.cuh"
 
 #ifndef TORCH_COMPILE
 int main() { return 0; }
@@ -48,6 +50,86 @@ static void launch_backward_v5_dE(
 
 using bwd_v5_dE_fp4_L4_SG8 = nvfp4_cce_backward_v5_dE::config<2, 8, true>;
 using bwd_v5_dC_fp4_L4_SG8 = nvfp4_cce_backward_v5_dC::config<2, 8, true>;
+using exp_bwd_v5_dE_fp4_L4_SG8 = nvfp4_cce_backward_v5_dE_superk4_experimental::config<2, 8, true>;
+using exp_bwd_v5_dC_fp4_L4_SG8 = nvfp4_cce_backward_v5_dC_superk4_experimental::config<2, 8, true>;
+
+template <typename C>
+static void launch_experimental_backward_v5_dE(
+    const at::Tensor &A, const at::Tensor &A_sc, const at::Tensor &A_sc_global,
+    const at::Tensor &B, const at::Tensor &B_sc, const at::Tensor &B_sc_global,
+    const at::Tensor &C_col, const at::Tensor &C_col_sc, const at::Tensor &C_col_sc_global,
+    at::Tensor &dE_out, const at::Tensor &lse, const at::Tensor &targets,
+    float grad_scale, int M, int N, int K, float filter_eps = 0.0f)
+{
+    using G = nvfp4_cce_backward_v5_dE_superk4_experimental::globals<C>;
+
+    G g {
+        .A = kittens::py::tensor_to_gl<typename G::A_fp4x2_gl>(A),
+        .A_sc = kittens::py::tensor_to_gl<typename G::A_sc_gl, false>(
+            A_sc, 1,
+            A_sc.dim() == 2 ? A_sc.size(0) / 128 : A_sc.size(0),
+            A_sc.dim() == 2 ? A_sc.size(1) / 4 : A_sc.size(1), 256),
+        .A_sc_global = kittens::py::tensor_to_gl<typename G::A_sc_global_gl>(A_sc_global),
+        .B = kittens::py::tensor_to_gl<typename G::B_fp4x2_gl>(B),
+        .B_sc = kittens::py::tensor_to_gl<typename G::B_sc_gl, false>(
+            B_sc, 1,
+            B_sc.dim() == 2 ? B_sc.size(0) / 128 : B_sc.size(0),
+            B_sc.dim() == 2 ? B_sc.size(1) / 4 : B_sc.size(1), 256),
+        .B_sc_global = kittens::py::tensor_to_gl<typename G::B_sc_global_gl>(B_sc_global),
+        .C_col = kittens::py::tensor_to_gl<typename G::P3_B_fp4x2_gl>(C_col),
+        .C_col_sc = kittens::py::tensor_to_gl<typename G::P3_B_sc_gl, false>(
+            C_col_sc, 1, C_col_sc.size(0), C_col_sc.size(1), 256),
+        .C_col_sc_global = kittens::py::tensor_to_gl<typename G::P3_B_sc_global_gl>(C_col_sc_global),
+        .dE_out = kittens::py::tensor_to_gl<typename G::Out_gl>(dE_out),
+        .lse = lse.data_ptr<float>(),
+        .targets = targets.data_ptr<int64_t>(),
+        .grad_scale = grad_scale,
+        .filter_eps = filter_eps,
+        .M = M,
+        .N = N,
+        .K = K,
+    };
+    kittens::py::launch_kernel<C, G, nvfp4_cce_backward_v5_dE_superk4_experimental::kernel<C>>(g);
+}
+
+template <typename C>
+static void launch_experimental_backward_v5_dC(
+    const at::Tensor &A, const at::Tensor &A_sc, const at::Tensor &A_sc_global,
+    const at::Tensor &B, const at::Tensor &B_sc, const at::Tensor &B_sc_global,
+    const at::Tensor &E_col, const at::Tensor &E_col_sc, const at::Tensor &E_col_sc_global,
+    at::Tensor &dC_out, const at::Tensor &lse, const at::Tensor &targets,
+    float grad_scale, int M, int N, int K, float filter_eps = 0.0f)
+{
+    using G = nvfp4_cce_backward_v5_dC_superk4_experimental::globals<C>;
+
+    G g {
+        .A = kittens::py::tensor_to_gl<typename G::A_fp4x2_gl>(A),
+        .A_sc = kittens::py::tensor_to_gl<typename G::A_sc_gl, false>(
+            A_sc, 1,
+            A_sc.dim() == 2 ? A_sc.size(0) / 128 : A_sc.size(0),
+            A_sc.dim() == 2 ? A_sc.size(1) / 4 : A_sc.size(1), 256),
+        .A_sc_global = kittens::py::tensor_to_gl<typename G::A_sc_global_gl>(A_sc_global),
+        .B = kittens::py::tensor_to_gl<typename G::B_fp4x2_gl>(B),
+        .B_sc = kittens::py::tensor_to_gl<typename G::B_sc_gl, false>(
+            B_sc, 1,
+            B_sc.dim() == 2 ? B_sc.size(0) / 128 : B_sc.size(0),
+            B_sc.dim() == 2 ? B_sc.size(1) / 4 : B_sc.size(1), 256),
+        .B_sc_global = kittens::py::tensor_to_gl<typename G::B_sc_global_gl>(B_sc_global),
+        .E_col = kittens::py::tensor_to_gl<typename G::P3_B_fp4x2_gl>(E_col),
+        .E_col_sc = kittens::py::tensor_to_gl<typename G::P3_B_sc_gl, false>(
+            E_col_sc, 1, E_col_sc.size(0), E_col_sc.size(1), 256),
+        .E_col_sc_global = kittens::py::tensor_to_gl<typename G::P3_B_sc_global_gl>(E_col_sc_global),
+        .dC_out = kittens::py::tensor_to_gl<typename G::Out_gl>(dC_out),
+        .lse = lse.data_ptr<float>(),
+        .targets = targets.data_ptr<int64_t>(),
+        .grad_scale = grad_scale,
+        .filter_eps = filter_eps,
+        .M = M,
+        .N = N,
+        .K = K,
+    };
+    kittens::py::launch_kernel<C, G, nvfp4_cce_backward_v5_dC_superk4_experimental::kernel<C>>(g);
+}
 
 template <typename C>
 static void launch_backward_v5_dC(
@@ -241,5 +323,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           "Developer-only NVFP4 CCE v5 dC tiny trace L4 SG8");
     m.def("debug_v5_dC_mm2_probe_fp4_L4_SG8", &launch_debug_backward_v5_dC_mm2_probe<bwd_v5_dC_fp4_L4_SG8>,
           "Developer-only isolated NVFP4 dC phase-3 mm2 probe L4 SG8");
+    m.def("experimental_backward_v5_dE_fp4_L4_SG8", &launch_experimental_backward_v5_dE<exp_bwd_v5_dE_fp4_L4_SG8>,
+          "Developer-only NVFP4 CCE v5 dE experimental sandbox");
+    m.def("experimental_backward_v5_dC_fp4_L4_SG8", &launch_experimental_backward_v5_dC<exp_bwd_v5_dC_fp4_L4_SG8>,
+          "Developer-only NVFP4 CCE v5 dC experimental sandbox");
 }
 #endif
