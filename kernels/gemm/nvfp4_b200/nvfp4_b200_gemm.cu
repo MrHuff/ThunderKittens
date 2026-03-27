@@ -1283,6 +1283,28 @@ static inline void dispatch_fused_gemm_both_bf16(
 }
 
 template <bool USE_CTA_AMAX>
+static inline void dispatch_fused_gemm_both_bf16_quadcol_debug(
+    const at::Tensor &A_bf16,
+    const at::Tensor &B_bf16,
+    at::Tensor &D
+) {
+    launch_fused_gemm_both_bf16_with_config<
+        nvfp4_fused_gemm_both_bf16::config<USE_CTA_AMAX, 4, 1, 1, 1>>(
+            A_bf16, B_bf16, D);
+}
+
+template <bool USE_CTA_AMAX>
+static inline void dispatch_fused_gemm_both_bf16_shared_a_2cta_debug(
+    const at::Tensor &A_bf16,
+    const at::Tensor &B_bf16,
+    at::Tensor &D
+) {
+    launch_fused_gemm_both_bf16_with_config<
+        nvfp4_fused_gemm_both_bf16::config<USE_CTA_AMAX, 1, 2, 4, 4, 2, true>>(
+            A_bf16, B_bf16, D);
+}
+
+template <bool USE_CTA_AMAX>
 static inline void dispatch_fused_gemm_shared_a_debug(
     const at::Tensor &A_bf16,
     const at::Tensor &B,
@@ -1415,6 +1437,78 @@ void nvfp4_fused_gemm_both_bf16_cta_amax_entrypoint(
     TORCH_CHECK(K % 256 == 0, "K must be a multiple of 256");
 
     dispatch_fused_gemm_both_bf16<true>(A_bf16, B_bf16, D);
+}
+
+void nvfp4_fused_gemm_both_bf16_quadcol_debug_entrypoint(
+    const at::Tensor &A_bf16,
+    const at::Tensor &B_bf16,
+    at::Tensor &D
+) {
+    TORCH_CHECK(A_bf16.is_cuda() && B_bf16.is_cuda() && D.is_cuda(), "all tensors must be CUDA");
+    TORCH_CHECK(A_bf16.dtype() == at::kBFloat16, "A_bf16 must be bfloat16");
+    TORCH_CHECK(B_bf16.dtype() == at::kBFloat16, "B_bf16 must be bfloat16");
+    TORCH_CHECK(D.dtype() == at::kBFloat16, "D must be bfloat16");
+    TORCH_CHECK(A_bf16.dim() == 2 && B_bf16.dim() == 2 && D.dim() == 2, "all tensors must be 2D");
+    TORCH_CHECK(A_bf16.size(1) == B_bf16.size(1), "A and B inner dimensions must match");
+    TORCH_CHECK(A_bf16.size(0) == D.size(0), "D rows must match A rows");
+    TORCH_CHECK(B_bf16.size(0) == D.size(1), "D cols must match B rows");
+    TORCH_CHECK(A_bf16.size(0) % 128 == 0 && A_bf16.size(1) % 256 == 0 && B_bf16.size(0) % 512 == 0,
+                "quad-column debug path requires M multiple of 128, K multiple of 256, N multiple of 512");
+    dispatch_fused_gemm_both_bf16_quadcol_debug<false>(A_bf16, B_bf16, D);
+}
+
+void nvfp4_fused_gemm_both_bf16_cta_amax_quadcol_debug_entrypoint(
+    const at::Tensor &A_bf16,
+    const at::Tensor &B_bf16,
+    at::Tensor &D
+) {
+    TORCH_CHECK(A_bf16.is_cuda() && B_bf16.is_cuda() && D.is_cuda(), "all tensors must be CUDA");
+    TORCH_CHECK(A_bf16.dtype() == at::kBFloat16, "A_bf16 must be bfloat16");
+    TORCH_CHECK(B_bf16.dtype() == at::kBFloat16, "B_bf16 must be bfloat16");
+    TORCH_CHECK(D.dtype() == at::kBFloat16, "D must be bfloat16");
+    TORCH_CHECK(A_bf16.dim() == 2 && B_bf16.dim() == 2 && D.dim() == 2, "all tensors must be 2D");
+    TORCH_CHECK(A_bf16.size(1) == B_bf16.size(1), "A and B inner dimensions must match");
+    TORCH_CHECK(A_bf16.size(0) == D.size(0), "D rows must match A rows");
+    TORCH_CHECK(B_bf16.size(0) == D.size(1), "D cols must match B rows");
+    TORCH_CHECK(A_bf16.size(0) % 128 == 0 && A_bf16.size(1) % 256 == 0 && B_bf16.size(0) % 512 == 0,
+                "quad-column debug path requires M multiple of 128, K multiple of 256, N multiple of 512");
+    dispatch_fused_gemm_both_bf16_quadcol_debug<true>(A_bf16, B_bf16, D);
+}
+
+void nvfp4_fused_gemm_both_bf16_shared_a_2cta_debug_entrypoint(
+    const at::Tensor &A_bf16,
+    const at::Tensor &B_bf16,
+    at::Tensor &D
+) {
+    TORCH_CHECK(A_bf16.is_cuda() && B_bf16.is_cuda() && D.is_cuda(), "all tensors must be CUDA");
+    TORCH_CHECK(A_bf16.dtype() == at::kBFloat16, "A_bf16 must be bfloat16");
+    TORCH_CHECK(B_bf16.dtype() == at::kBFloat16, "B_bf16 must be bfloat16");
+    TORCH_CHECK(D.dtype() == at::kBFloat16, "D must be bfloat16");
+    TORCH_CHECK(A_bf16.dim() == 2 && B_bf16.dim() == 2 && D.dim() == 2, "all tensors must be 2D");
+    TORCH_CHECK(A_bf16.size(1) == B_bf16.size(1), "A and B inner dimensions must match");
+    TORCH_CHECK(A_bf16.size(0) == D.size(0), "D rows must match A rows");
+    TORCH_CHECK(B_bf16.size(0) == D.size(1), "D cols must match B rows");
+    TORCH_CHECK(A_bf16.size(0) % 128 == 0 && A_bf16.size(1) % 256 == 0 && B_bf16.size(0) % 256 == 0,
+                "shared-A 2CTA debug path requires M multiple of 128, K multiple of 256, N multiple of 256");
+    dispatch_fused_gemm_both_bf16_shared_a_2cta_debug<false>(A_bf16, B_bf16, D);
+}
+
+void nvfp4_fused_gemm_both_bf16_cta_amax_shared_a_2cta_debug_entrypoint(
+    const at::Tensor &A_bf16,
+    const at::Tensor &B_bf16,
+    at::Tensor &D
+) {
+    TORCH_CHECK(A_bf16.is_cuda() && B_bf16.is_cuda() && D.is_cuda(), "all tensors must be CUDA");
+    TORCH_CHECK(A_bf16.dtype() == at::kBFloat16, "A_bf16 must be bfloat16");
+    TORCH_CHECK(B_bf16.dtype() == at::kBFloat16, "B_bf16 must be bfloat16");
+    TORCH_CHECK(D.dtype() == at::kBFloat16, "D must be bfloat16");
+    TORCH_CHECK(A_bf16.dim() == 2 && B_bf16.dim() == 2 && D.dim() == 2, "all tensors must be 2D");
+    TORCH_CHECK(A_bf16.size(1) == B_bf16.size(1), "A and B inner dimensions must match");
+    TORCH_CHECK(A_bf16.size(0) == D.size(0), "D rows must match A rows");
+    TORCH_CHECK(B_bf16.size(0) == D.size(1), "D cols must match B rows");
+    TORCH_CHECK(A_bf16.size(0) % 128 == 0 && A_bf16.size(1) % 256 == 0 && B_bf16.size(0) % 256 == 0,
+                "shared-A 2CTA debug path requires M multiple of 128, K multiple of 256, N multiple of 256");
+    dispatch_fused_gemm_both_bf16_shared_a_2cta_debug<true>(A_bf16, B_bf16, D);
 }
 
 template <bool USE_CTA_AMAX>
@@ -1585,6 +1679,22 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           pybind11::arg("D"));
     m.def("nvfp4_fused_gemm_both_bf16_cta_amax", &nvfp4_fused_gemm_both_bf16_cta_amax_entrypoint,
           "Experimental fused GEMM: quantize both bf16 operands on the fly (CTA amax)",
+          pybind11::arg("A_bf16"), pybind11::arg("B_bf16"),
+          pybind11::arg("D"));
+    m.def("nvfp4_fused_gemm_both_bf16_quadcol_debug", &nvfp4_fused_gemm_both_bf16_quadcol_debug_entrypoint,
+          "Developer-only both-bf16 fused GEMM: same-CTA quad-column A-reuse experiment (constant scale)",
+          pybind11::arg("A_bf16"), pybind11::arg("B_bf16"),
+          pybind11::arg("D"));
+    m.def("nvfp4_fused_gemm_both_bf16_cta_amax_quadcol_debug", &nvfp4_fused_gemm_both_bf16_cta_amax_quadcol_debug_entrypoint,
+          "Developer-only both-bf16 fused GEMM: same-CTA quad-column A-reuse experiment (CTA amax)",
+          pybind11::arg("A_bf16"), pybind11::arg("B_bf16"),
+          pybind11::arg("D"));
+    m.def("nvfp4_fused_gemm_both_bf16_shared_a_2cta_debug", &nvfp4_fused_gemm_both_bf16_shared_a_2cta_debug_entrypoint,
+          "Developer-only both-bf16 fused GEMM: cross-CTA shared-A experiment (constant scale)",
+          pybind11::arg("A_bf16"), pybind11::arg("B_bf16"),
+          pybind11::arg("D"));
+    m.def("nvfp4_fused_gemm_both_bf16_cta_amax_shared_a_2cta_debug", &nvfp4_fused_gemm_both_bf16_cta_amax_shared_a_2cta_debug_entrypoint,
+          "Developer-only both-bf16 fused GEMM: cross-CTA shared-A experiment (CTA amax)",
           pybind11::arg("A_bf16"), pybind11::arg("B_bf16"),
           pybind11::arg("D"));
     m.def("nvfp4_fused_gemm_shared_a_debug", &nvfp4_fused_gemm_shared_a_debug_entrypoint,
