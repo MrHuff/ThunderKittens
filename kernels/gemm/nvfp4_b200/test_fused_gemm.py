@@ -26,6 +26,8 @@ from _C import (nvfp4_fused_gemm, nvfp4_fused_gemm_cta_amax,
                 nvfp4_fused_gemm_both_bf16_cta_amax_quadcol_debug,
                 nvfp4_fused_gemm_both_bf16_shared_a_2cta_debug,
                 nvfp4_fused_gemm_both_bf16_cta_amax_shared_a_2cta_debug,
+                nvfp4_fused_gemm_both_bf16_shared_a_2cta_debug_dump,
+                nvfp4_fused_gemm_both_bf16_cta_amax_shared_a_2cta_debug_dump,
                 nvfp4_fused_gemm_shared_a_debug,
                 nvfp4_fused_gemm_cta_amax_shared_a_debug,
                 nvfp4_fused_gemm_shared_a_debug_dump,
@@ -442,6 +444,28 @@ def run_both_bf16_shared_a_2cta_debug_case(M: int, N: int, K: int) -> None:
     D_public_cta = torch.zeros(M, N, dtype=torch.bfloat16, device="cuda")
     D_shared = torch.zeros(M, N, dtype=torch.bfloat16, device="cuda")
     D_shared_cta = torch.zeros(M, N, dtype=torch.bfloat16, device="cuda")
+
+    if (M, N, K) == (256, 512, 256):
+        dump_cta0_a = torch.empty((DEBUG_A_ROWS, DEBUG_A_COLS), dtype=torch.uint8, device="cuda")
+        dump_cta1_a = torch.empty((DEBUG_A_ROWS, DEBUG_A_COLS), dtype=torch.uint8, device="cuda")
+        dump_cta0_sc = torch.empty(DEBUG_A_SC_BYTES, dtype=torch.uint8, device="cuda")
+        dump_cta1_sc = torch.empty(DEBUG_A_SC_BYTES, dtype=torch.uint8, device="cuda")
+
+        nvfp4_fused_gemm_both_bf16_shared_a_2cta_debug_dump(
+            A_bf16, B_bf16, D_shared,
+            dump_cta0_a, dump_cta1_a, dump_cta0_sc, dump_cta1_sc)
+        torch.cuda.synchronize()
+        print("\n[-] Both-bf16 Shared-A 2CTA dump checks (constant SCALE_MAX):")
+        compare_byte_dump("A tile", dump_cta0_a, dump_cta1_a)
+        compare_byte_dump("A scales", dump_cta0_sc, dump_cta1_sc)
+
+        nvfp4_fused_gemm_both_bf16_cta_amax_shared_a_2cta_debug_dump(
+            A_bf16, B_bf16, D_shared_cta,
+            dump_cta0_a, dump_cta1_a, dump_cta0_sc, dump_cta1_sc)
+        torch.cuda.synchronize()
+        print("\n[-] Both-bf16 Shared-A 2CTA dump checks (CTA amax):")
+        compare_byte_dump("A tile", dump_cta0_a, dump_cta1_a)
+        compare_byte_dump("A scales", dump_cta0_sc, dump_cta1_sc)
 
     nvfp4_fused_gemm_both_bf16(A_bf16, B_bf16, D_public)
     nvfp4_fused_gemm_both_bf16_cta_amax(A_bf16, B_bf16, D_public_cta)
