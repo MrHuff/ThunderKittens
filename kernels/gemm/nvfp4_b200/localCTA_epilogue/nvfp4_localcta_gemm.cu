@@ -20,6 +20,10 @@
 namespace {
 
 constexpr int kScaleBytesPerTile = 512;
+using localcta_regular_smalln_config = nvfp4_localcta_gemm::config<128, 5, 4, 12, 2, true, 256, true, 2, 128>;
+using localcta_regular_smallk_config = nvfp4_localcta_gemm::config<256, 5, 8, 4, 2, false, 256, true, 2, 128>;
+using localcta_regular_largek_config = nvfp4_localcta_gemm::config<256, 5, 8, 12, 2, false, 256, true, 2, 128>;
+using localcta_parity_config = nvfp4_localcta_gemm::config<256, 5, 8, 4, 2, false, 256, true, 2, 128>;
 
 void check_fp4_matrix(const at::Tensor& t, const char* name) {
     TORCH_CHECK(t.is_cuda(), name, " must be CUDA");
@@ -161,8 +165,19 @@ void launch_regular_gemm(
     const at::Tensor& B_sg_chunks,
     at::Tensor& D
 ) {
-    launch_gemm_with_config<nvfp4_localcta_gemm::config<256, 4, 8, 12, 2, false>>(
-        A, A_sc, A_sg_chunks, B, B_sc, B_sg_chunks, D);
+    const int64_t M = D.size(0);
+    const int64_t K = A.size(1) * 2;
+    const int64_t N = D.size(1);
+    if (K <= 2048 && M <= 1024 && N <= 2048) {
+        launch_gemm_with_config<localcta_regular_smalln_config>(
+            A, A_sc, A_sg_chunks, B, B_sc, B_sg_chunks, D);
+    } else if (K <= 2048) {
+        launch_gemm_with_config<localcta_regular_smallk_config>(
+            A, A_sc, A_sg_chunks, B, B_sc, B_sg_chunks, D);
+    } else {
+        launch_gemm_with_config<localcta_regular_largek_config>(
+            A, A_sc, A_sg_chunks, B, B_sc, B_sg_chunks, D);
+    }
 }
 
 void launch_grouped_gemm(
@@ -177,7 +192,7 @@ void launch_grouped_gemm(
     std::optional<at::Tensor> D_V_opt,
     int silu_dim
 ) {
-    launch_grouped_gemm_with_config<nvfp4_localcta_gemm::config<256, 4, 8, 12, 2, false>>(
+    launch_grouped_gemm_with_config<localcta_parity_config>(
         A, A_sc, A_sg_chunks, B, B_sc, B_sg_chunks,
         D, D_K_opt, D_V_opt, silu_dim);
 }
@@ -261,7 +276,7 @@ void launch_batched_gemm(
     const std::vector<at::Tensor>& B_sg_chunks_list,
     std::vector<at::Tensor>& D_list
 ) {
-    launch_batched_gemm_with_config<nvfp4_localcta_gemm::config<256, 4, 8, 12, 2, false>>(
+    launch_batched_gemm_with_config<localcta_parity_config>(
         A_list, A_sc_list, A_sg_chunks_list, B_list, B_sc_list, B_sg_chunks_list, D_list);
 }
 
