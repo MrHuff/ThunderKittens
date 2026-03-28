@@ -735,6 +735,7 @@ using bwd_v3_exp3wg_fp4_L4_SG8 = nvfp4_cce_backward_v3::experimental_config_3wg<
 using bwd_v3_exp3wg_fp4_L5_SG8 = nvfp4_cce_backward_v3::experimental_config_3wg<5, 8, true>;
 using bwd_v3_exp3wg_fp4_L4_E2_SG8 = nvfp4_cce_backward_v3::experimental_config_3wg<4, 8, true, 2>;
 using bwd_v3_expcolwg_fp4_L4_SG8 = nvfp4_cce_backward_v3::experimental_config_colwg<4, 8, true>;
+using bwd_v3_expcol2wg_fp4_L4_SG8 = nvfp4_cce_backward_v3::experimental_config_col2wg<4, 8, true>;
 using bwd_v3_exp4wg_fp4_L4_SG8 = nvfp4_cce_backward_v3::experimental_config_4wg<4, 8, true>;
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
@@ -777,6 +778,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           "NVFP4 CCE backward v3 experimental consumer-row/col-WG (FP4 output) L4 SG8");
     m.def("experimental_backward_v3_fp4_colwg_replayonly_L4_SG8", &launch_experimental_backward_v3_fp4_3wg_replayonly<bwd_v3_expcolwg_fp4_L4_SG8>,
           "NVFP4 CCE backward v3 experimental consumer-row/col-WG replay-only (FP4 output) L4 SG8");
+    m.def("experimental_backward_v3_fp4_col2wg_L4_SG8", &launch_experimental_backward_v3_fp4_3wg<bwd_v3_expcol2wg_fp4_L4_SG8>,
+          "NVFP4 CCE backward v3 experimental consumer-row/two-col-WG (FP4 output) L4 SG8");
+    m.def("experimental_backward_v3_fp4_col2wg_replayonly_L4_SG8", &launch_experimental_backward_v3_fp4_3wg_replayonly<bwd_v3_expcol2wg_fp4_L4_SG8>,
+          "NVFP4 CCE backward v3 experimental consumer-row/two-col-WG replay-only (FP4 output) L4 SG8");
     m.def("experimental_backward_v3_fp4_4wg_L4_SG8", &launch_experimental_backward_v3_fp4_3wg<bwd_v3_exp4wg_fp4_L4_SG8>,
           "NVFP4 CCE backward v3 experimental 4WG (FP4 output) L4 SG8");
     m.def("experimental_backward_v3_fp4_4wg_replayonly_L4_SG8", &launch_experimental_backward_v3_fp4_3wg_replayonly<bwd_v3_exp4wg_fp4_L4_SG8>,

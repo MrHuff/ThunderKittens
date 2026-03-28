@@ -128,6 +128,43 @@ struct experimental_config_colwg {
     static constexpr bool CACHE_COL_VALUES = false;
 };
 
+template <int _LOAD_PIPE_DEPTH, int _SUPERGROUP_SIZE, bool _PINGPONG = true, int _EPI_PIPE_DEPTH = 4>
+struct experimental_config_col2wg {
+    static_assert(_LOAD_PIPE_DEPTH > 0 && _LOAD_PIPE_DEPTH <= 5);
+    static_assert(_SUPERGROUP_SIZE > 0);
+    static_assert(_EPI_PIPE_DEPTH > 0 && (128 % _EPI_PIPE_DEPTH) == 0);
+
+    static constexpr int CLUSTER_SIZE = 2;
+    static constexpr bool USE_PDL = true;
+
+    static constexpr int CONSUMER_WARPGROUPS = 1;
+    static constexpr int ROW_QUANTIZER_WARPGROUPS = 0;
+    static constexpr int COL_QUANTIZER_WARPGROUPS = 2;
+    static constexpr int QUANTIZER_WARPGROUPS = ROW_QUANTIZER_WARPGROUPS + COL_QUANTIZER_WARPGROUPS;
+    static constexpr int PRODUCER_WARPGROUPS = 1;
+    static constexpr int NUM_WARPGROUPS = CONSUMER_WARPGROUPS + QUANTIZER_WARPGROUPS + PRODUCER_WARPGROUPS;
+    static constexpr int NUM_WARPS = NUM_WARPGROUPS * WARPGROUP_WARPS;
+    static constexpr int NUM_THREADS = NUM_WARPS * WARP_THREADS;
+
+    static constexpr int LOAD_PIPE_DEPTH = _LOAD_PIPE_DEPTH;
+    static constexpr int EPI_PIPE_DEPTH = _EPI_PIPE_DEPTH;
+    static constexpr bool OVERLAP_EPI = false;
+    static constexpr bool PINGPONG = _PINGPONG;
+
+    static constexpr int SUPERGROUP_SIZE = _SUPERGROUP_SIZE;
+    static constexpr int Mb = 256;
+    static constexpr int Nb = 128;
+    static constexpr int Kb = 256;
+    static constexpr int B_SC_SIZE = Nb/128;
+    static constexpr int MMA_PER_TILE = Kb/64;
+
+    static constexpr int BF16_STAGE_COUNT = 2;
+    static constexpr int NUM_D_TILES = BF16_STAGE_COUNT;
+    static constexpr bool USE_BF16_ACCUM = false;
+    static constexpr bool CONSUMER_DO_ROW = true;
+    static constexpr bool CACHE_COL_VALUES = false;
+};
+
 template <int _LOAD_PIPE_DEPTH, int _SUPERGROUP_SIZE, bool _PINGPONG = true>
 struct experimental_config_4wg {
     static_assert(_LOAD_PIPE_DEPTH > 0 && _LOAD_PIPE_DEPTH <= 5);
@@ -1935,12 +1972,14 @@ __device__ inline void backward_kernel_v3_streaming_3wg_impl(const globals_3wg<C
         }
         init_semaphore(outputs_arrived, 0, 1);
         init_semaphore(outputs_finished, 0, C::CLUSTER_SIZE);
+        constexpr int row_recycle_arrivals = (C::QUANTIZER_WARPGROUPS == 1) ? 1 : (C::ROW_QUANTIZER_WARPGROUPS > 0 ? C::ROW_QUANTIZER_WARPGROUPS : 1);
+        constexpr int col_recycle_arrivals = (C::QUANTIZER_WARPGROUPS == 1) ? 1 : (C::COL_QUANTIZER_WARPGROUPS > 0 ? C::COL_QUANTIZER_WARPGROUPS : 1);
         #pragma unroll
         for (int i = 0; i < C::BF16_STAGE_COUNT; ++i) {
             init_semaphore(slice_row_ready[i], 0, 1);
             init_semaphore(slice_col_ready[i], 0, 1);
-            init_semaphore(slice_row_recycled[i], 0, 1);
-            init_semaphore(slice_col_recycled[i], 0, 1);
+            init_semaphore(slice_row_recycled[i], 0, row_recycle_arrivals);
+            init_semaphore(slice_col_recycled[i], 0, col_recycle_arrivals);
         }
     }
     everyone::tma::cluster::arrive_aligned();
@@ -2501,10 +2540,11 @@ __device__ inline void backward_kernel_v3_streaming_3wg_impl(const globals_3wg<C
                             }
                         }
                     } else if (is_col_quantizer_wg) {
-                        constexpr int COL_THREADS = QUANTIZER_WG_THREADS;
+                        constexpr int COL_THREADS = QUANTIZER_WG_THREADS * C::COL_QUANTIZER_WARPGROUPS;
                         constexpr int COL_ROW16_BLOCKS_PER_PASS = COL_THREADS / SUBTILE_COLS;
                         static_assert(COL_ROW16_BLOCKS_PER_PASS > 0);
-                        const int col_thread = quant_thread;
+                        const int col_quantizer_rank = warpgroup_id - first_col_quantizer_wg;
+                        const int col_thread = col_quantizer_rank * QUANTIZER_WG_THREADS + quant_thread;
                         const int col_in_epi = col_thread % SUBTILE_COLS;
                         const int row16_block_base = col_thread / SUBTILE_COLS;
                         #pragma unroll
