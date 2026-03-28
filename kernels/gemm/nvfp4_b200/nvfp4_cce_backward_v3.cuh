@@ -189,6 +189,87 @@ struct globals {
     }
 };
 
+template <typename C>
+struct globals_2ctaSdupB {
+    using base = globals<C>;
+
+    using A_fp4x2_tile = typename base::A_fp4x2_tile;
+    using A_sc_tile    = typename base::A_sc_tile;
+    using B_fp4x2_tile = typename base::B_fp4x2_tile;
+    using B_sc_tile    = typename base::B_sc_tile;
+    using D_tile       = st_bf<C::Mb/2, C::Nb/(2 * C::EPI_PIPE_DEPTH)>;
+    using G_fp4_row_tile = typename base::G_fp4_row_tile;
+    using G_sc_row_tile  = typename base::G_sc_row_tile;
+
+    using A_fp4x2_gl     = typename base::A_fp4x2_gl;
+    using A_sc_gl        = typename base::A_sc_gl;
+    using A_sc_global_gl = typename base::A_sc_global_gl;
+    using B_fp4x2_gl     = typename base::B_fp4x2_gl;
+    using B_sc_gl        = typename base::B_sc_gl;
+    using B_sc_global_gl = typename base::B_sc_global_gl;
+    using D_gl           = typename base::D_gl;
+    using G_fp4_row_gl   = typename base::G_fp4_row_gl;
+    using G_sc_row_gl    = typename base::G_sc_row_gl;
+    using G_sg_row_gl    = typename base::G_sg_row_gl;
+
+    A_fp4x2_gl     A;
+    A_sc_gl        A_sc;
+    A_sc_global_gl A_sc_global;
+    B_fp4x2_gl     B;
+    B_sc_gl        B_sc;
+    B_sc_global_gl B_sc_global;
+    D_gl           D_out;
+
+    G_fp4_row_gl   G_fp4_row;
+    uint8_t*       G_sc_row_ptr;
+    int            G_sc_row_kgroups;
+    G_sg_row_gl    G_sg_row;
+
+    uint8_t*       G_fp4_col_ptr;
+    uint8_t*       G_sc_col_ptr;
+    int            G_sc_col_kgroups;
+
+    const float*   lse;
+    const int64_t* targets;
+    float          grad_scale;
+    float          filter_eps;
+    int            M;
+    int            N;
+    bool           encode_centric;
+
+    struct input_tiles_t {
+        A_fp4x2_tile A;
+        B_fp4x2_tile B[2];
+    };
+    struct input_scales_t {
+        A_sc_tile A;
+        B_sc_tile B[2][C::B_SC_SIZE];
+    };
+    struct outputs_t {
+        D_tile D[C::NUM_D_TILES];
+    };
+
+    __host__ inline dim3 grid() const {
+        int padded_M = A.rows();
+        int padded_N = B.rows();
+        int num_row_blocks = padded_M / C::Mb;
+        int num_col_blocks = padded_N / C::Nb;
+        int total = num_row_blocks * num_col_blocks;
+        int max_blocks = num_sms();
+        int grid_size = min(total, max_blocks);
+        grid_size = (grid_size / C::CLUSTER_SIZE) * C::CLUSTER_SIZE;
+        return dim3(grid_size);
+    }
+    __host__ inline dim3 block() const { return dim3(C::NUM_THREADS); }
+    __host__ inline int dynamic_shared_memory() const {
+        constexpr int _dynamic_shared_memory = sizeof(input_tiles_t)  * C::LOAD_PIPE_DEPTH + 1024 +
+                                               sizeof(input_scales_t) * C::LOAD_PIPE_DEPTH + 1024 +
+                                               sizeof(outputs_t);
+        static_assert(_dynamic_shared_memory <= MAX_SHARED_MEMORY - 1024);
+        return _dynamic_shared_memory;
+    }
+};
+
 // =========================================================================
 // Main kernel
 // =========================================================================
@@ -753,7 +834,7 @@ __device__ inline void backward_kernel_v3_impl(const globals<C>& g) {
     }
 }
 
-template <typename C, bool DO_ROW, bool DO_COL>
+template <typename C, bool DO_ROW, bool DO_COL, bool LOCAL_S_PER_CTA = false>
 __device__ inline void backward_kernel_v3_streaming_impl(const globals<C>& g) {
     if (g.filter_eps > 0.0f) {
         backward_kernel_v3_impl<C, false>(g);
@@ -807,7 +888,8 @@ __device__ inline void backward_kernel_v3_streaming_impl(const globals<C>& g) {
             init_semaphore(inputs_finished[i], 0, 1);
         }
         init_semaphore(outputs_arrived, 0, 1);
-        init_semaphore(outputs_finished, 0, C::CLUSTER_SIZE);
+        if constexpr (LOCAL_S_PER_CTA) init_semaphore(outputs_finished, 0, 1);
+        else                           init_semaphore(outputs_finished, 0, C::CLUSTER_SIZE);
     }
     everyone::tma::cluster::arrive_aligned();
 
@@ -849,7 +931,8 @@ __device__ inline void backward_kernel_v3_streaming_impl(const globals<C>& g) {
                     stage = (stage + 1) % C::LOAD_PIPE_DEPTH;
                 }
             }
-        } else if (cta_id == 0 && warp_id == 0) {
+        } else if ((LOCAL_S_PER_CTA && warp_id == 0) ||
+                   (!LOCAL_S_PER_CTA && cta_id == 0 && warp_id == 0)) {
             everyone::tma::cluster::wait();
             wait(tmem_provisioned, 0);
             tm_allocator.set_addr(tmem_addr);
@@ -894,7 +977,8 @@ __device__ inline void backward_kernel_v3_streaming_impl(const globals<C>& g) {
                 tensor_after_thread_sync();
                 if (phase == 0) do_mma_block(out_tm_0);
                 else            do_mma_block(out_tm_1);
-                tensor_commit<2>(outputs_arrived);
+                if constexpr (LOCAL_S_PER_CTA) tensor_commit<2>(outputs_arrived, static_cast<uint16_t>(1u << cta_id));
+                else                           tensor_commit<2>(outputs_arrived);
                 update_phasebit<1>(phasebits, 0);
                 phase ^= 1;
             }
@@ -1043,7 +1127,10 @@ __device__ inline void backward_kernel_v3_streaming_impl(const globals<C>& g) {
                 warp::copy(D_bf, D_fl);
 
                 if (epi == C::EPI_PIPE_DEPTH - 1) {
-                    warpgroup::tma::cluster::arrive(outputs_finished, 0, 1);
+                    if constexpr (LOCAL_S_PER_CTA) {
+                        if (warpgroup::warpid() == 0 && warp::laneid() == 0) arrive(outputs_finished);
+                    }
+                    else                           warpgroup::tma::cluster::arrive(outputs_finished, 0, 1);
                 }
 
                 const int smem_slot = epi % C::NUM_D_TILES;
@@ -1176,6 +1263,432 @@ __device__ inline void backward_kernel_v3_streaming_impl(const globals<C>& g) {
     }
 }
 
+template <typename C, bool DO_ROW, bool DO_COL>
+__device__ inline void backward_kernel_v3_streaming_2ctaSdupB_impl(const globals_2ctaSdupB<C>& g) {
+    using G = globals_2ctaSdupB<C>;
+
+    if (threadIdx.x == 0) {
+        g.A.template prefetch_tma<typename G::A_fp4x2_tile>();
+        g.A_sc.template prefetch_tma<typename G::A_sc_tile>();
+        g.B.template prefetch_tma<typename G::B_fp4x2_tile>();
+        g.B_sc.template prefetch_tma<typename G::B_sc_tile>();
+    }
+
+    const int warpgroup_id = warpgroup::groupid();
+    const int cta_id = cluster_ctarank();
+    const int cluster_id = clusterIdx().x;
+
+    const int padded_M = g.A.rows();
+    const int padded_N = g.B.rows();
+    const int num_row_blocks = padded_M / C::Mb;
+    const int num_col_blocks = padded_N / C::Nb;
+    const int num_blocks = num_row_blocks * num_col_blocks;
+    const int num_iters_per_block = 2 * g.A.cols() / C::Kb;
+    const int num_blocks_per_supergroup = C::SUPERGROUP_SIZE * num_col_blocks;
+    uint32_t stage = 0;
+    uint32_t phasebits = 0xFFFF0000;
+
+    extern __shared__ int __shm[];
+    tma_swizzle_allocator sm_allocator((int*)&__shm[0]);
+    typename G::input_tiles_t  (&input_tiles) [C::LOAD_PIPE_DEPTH] = sm_allocator.allocate<typename G::input_tiles_t, C::LOAD_PIPE_DEPTH>();
+    typename G::input_scales_t (&input_scales)[C::LOAD_PIPE_DEPTH] = sm_allocator.allocate<typename G::input_scales_t, C::LOAD_PIPE_DEPTH>();
+    typename G::outputs_t       &output_tiles                      = sm_allocator.allocate<typename G::outputs_t>();
+
+    tensor_allocator<1, 1, false> tm_allocator;
+
+    __shared__ uint32_t tmem_addr;
+    __shared__ semaphore tmem_provisioned;
+    __shared__ semaphore tiles_arrived[C::LOAD_PIPE_DEPTH];
+    __shared__ semaphore scales_arrived[C::LOAD_PIPE_DEPTH];
+    __shared__ semaphore inputs_finished[C::LOAD_PIPE_DEPTH];
+    __shared__ semaphore outputs_arrived;
+    __shared__ semaphore outputs_finished;
+    if (threadIdx.x == 32) {
+        init_semaphore(tmem_provisioned, 0, 1);
+        #pragma unroll
+        for (int i = 0; i < C::LOAD_PIPE_DEPTH; ++i) {
+            init_semaphore(tiles_arrived[i], 0, 1);
+            init_semaphore(scales_arrived[i], 0, 1);
+            init_semaphore(inputs_finished[i], 0, 1);
+        }
+        init_semaphore(outputs_arrived, 0, 1);
+        init_semaphore(outputs_finished, 0, 1);
+    }
+    everyone::tma::cluster::arrive_aligned();
+
+    if (warpgroup_id >= C::CONSUMER_WARPGROUPS && warp::elect_leader()) {
+        int warp_id = group<WARPGROUP_WARPS * C::PRODUCER_WARPGROUPS>::warpid();
+        if (warp_id == 3) {
+            if constexpr (C::USE_PDL) pdl::wait();
+            everyone::tma::cluster::wait();
+            for (int block_idx = cluster_id; block_idx < num_blocks; block_idx += gridDim.x / C::CLUSTER_SIZE) {
+                int supergroup_idx = block_idx / num_blocks_per_supergroup;
+                int idx_within_supergroup = block_idx % num_blocks_per_supergroup;
+                int rows_in_supergroup = min(C::SUPERGROUP_SIZE, num_row_blocks - supergroup_idx * C::SUPERGROUP_SIZE);
+                int row_within_supergroup = idx_within_supergroup % rows_in_supergroup;
+                int row_block_idx = supergroup_idx * C::SUPERGROUP_SIZE + row_within_supergroup;
+                int col_block_idx = idx_within_supergroup / rows_in_supergroup;
+                for (int i = 0; i < num_iters_per_block; ++i) {
+                    wait(inputs_finished[stage], get_phasebit<1>(phasebits, stage));
+                    tma::load_async(input_tiles[stage].A, g.A, {row_block_idx * 2 + cta_id, i}, tiles_arrived[stage]);
+                    tma::load_async(input_tiles[stage].B[0], g.B, {col_block_idx * 2 + 0, i}, tiles_arrived[stage]);
+                    tma::load_async(input_tiles[stage].B[1], g.B, {col_block_idx * 2 + 1, i}, tiles_arrived[stage]);
+                    update_phasebit<1>(phasebits, stage);
+                    stage = (stage + 1) % C::LOAD_PIPE_DEPTH;
+                }
+            }
+        } else if (warp_id == 2) {
+            if constexpr (C::USE_PDL) pdl::wait();
+            everyone::tma::cluster::wait();
+            for (int block_idx = cluster_id; block_idx < num_blocks; block_idx += gridDim.x / C::CLUSTER_SIZE) {
+                int supergroup_idx = block_idx / num_blocks_per_supergroup;
+                int idx_within_supergroup = block_idx % num_blocks_per_supergroup;
+                int rows_in_supergroup = min(C::SUPERGROUP_SIZE, num_row_blocks - supergroup_idx * C::SUPERGROUP_SIZE);
+                int row_within_supergroup = idx_within_supergroup % rows_in_supergroup;
+                int row_block_idx = supergroup_idx * C::SUPERGROUP_SIZE + row_within_supergroup;
+                int col_block_idx = idx_within_supergroup / rows_in_supergroup;
+                for (int i = 0; i < num_iters_per_block; ++i) {
+                    wait(inputs_finished[stage], get_phasebit<1>(phasebits, stage));
+                    tma::load_async(input_scales[stage].A, g.A_sc, {row_block_idx * 2 + cta_id, i, 0}, scales_arrived[stage]);
+                    #pragma unroll
+                    for (int sc = 0; sc < C::B_SC_SIZE; ++sc) {
+                        tma::load_async(input_scales[stage].B[0][sc], g.B_sc, {col_block_idx * 2 + 0, i, sc}, scales_arrived[stage]);
+                        tma::load_async(input_scales[stage].B[1][sc], g.B_sc, {col_block_idx * 2 + 1, i, sc}, scales_arrived[stage]);
+                    }
+                    update_phasebit<1>(phasebits, stage);
+                    stage = (stage + 1) % C::LOAD_PIPE_DEPTH;
+                }
+            }
+        } else if (warp_id == 0) {
+            if constexpr (C::USE_PDL) pdl::wait();
+            everyone::tma::cluster::wait();
+            wait(tmem_provisioned, 0);
+            tm_allocator.set_addr(tmem_addr);
+
+            auto out_tm_0 = tm_allocator.template allocate<full_tt_fl<C::Nb / 2>>(0);
+            auto out_tm_1 = tm_allocator.template allocate<full_tt_fl<C::Nb / 2>>(128);
+            auto A_sc_tm = tm_allocator.template allocate<full_tt_fp8e4m3<16 * C::MMA_PER_TILE * C::LOAD_PIPE_DEPTH>>(256);
+            auto B_sc_tm_0 = tm_allocator.template allocate<full_tt_fp8e4m3<16 * C::MMA_PER_TILE>>(256 + 4 * C::MMA_PER_TILE * C::LOAD_PIPE_DEPTH);
+            auto B_sc_tm_1 = tm_allocator.template allocate<full_tt_fp8e4m3<16 * C::MMA_PER_TILE>>(256 + 4 * C::MMA_PER_TILE * (C::LOAD_PIPE_DEPTH + 1));
+
+            constexpr uint32_t SCALE_BYTES = sizeof(typename G::A_sc_tile) + 2 * C::B_SC_SIZE * sizeof(typename G::B_sc_tile);
+            constexpr uint32_t TILE_BYTES = sizeof(typename G::A_fp4x2_tile) + 2 * sizeof(typename G::B_fp4x2_tile);
+
+            for (int block_idx = cluster_id; block_idx < num_blocks; block_idx += gridDim.x / C::CLUSTER_SIZE) {
+                wait(outputs_finished, get_phasebit<1>(phasebits, 0));
+                tensor_after_thread_sync();
+                for (int i = 0; i < num_iters_per_block; ++i) {
+                    tma::expect_bytes(scales_arrived[stage], SCALE_BYTES);
+                    wait(scales_arrived[stage], get_phasebit<0>(phasebits, stage));
+
+                    #pragma unroll
+                    for (int ii = 0; ii < C::MMA_PER_TILE; ++ii) {
+                        auto A_sc_tm_sub = A_sc_tm.template subtile<full_tt_fp8e4m3<16>>(stage * C::MMA_PER_TILE * 16 + ii * 16);
+                        auto &A_sc_sm_sub = *reinterpret_cast<st_fp8e4m3<32, 16, false> *>(reinterpret_cast<uint64_t>(&input_scales[stage].A.data[0]) + 16 * 32 * ii);
+                        load_mxnv_scale_async<1>(A_sc_tm_sub, A_sc_sm_sub);
+
+                        auto B_sc_tm_sub_0 = B_sc_tm_0.template subtile<full_tt_fp8e4m3<16>>(ii * 16);
+                        auto &B_sc_sm_sub_0 = *reinterpret_cast<st_fp8e4m3<32, 16, false> *>(reinterpret_cast<uint64_t>(&input_scales[stage].B[0][0].data[0]) + 16 * 32 * ii);
+                        load_mxnv_scale_async<1>(B_sc_tm_sub_0, B_sc_sm_sub_0);
+
+                        auto B_sc_tm_sub_1 = B_sc_tm_1.template subtile<full_tt_fp8e4m3<16>>(ii * 16);
+                        auto &B_sc_sm_sub_1 = *reinterpret_cast<st_fp8e4m3<32, 16, false> *>(reinterpret_cast<uint64_t>(&input_scales[stage].B[1][0].data[0]) + 16 * 32 * ii);
+                        load_mxnv_scale_async<1>(B_sc_tm_sub_1, B_sc_sm_sub_1);
+                    }
+
+                    tma::expect_bytes(tiles_arrived[stage], TILE_BYTES);
+                    wait(tiles_arrived[stage], get_phasebit<0>(phasebits, stage));
+                    asm volatile("fence.proxy.async.shared::cta;\n" ::: "memory");
+
+                    auto A_sc_tm_tile = A_sc_tm.template subtile<full_tt_fp8e4m3<C::MMA_PER_TILE * 16>>(stage * C::MMA_PER_TILE * 16);
+                    auto B_sc_tm_tile_0 = B_sc_tm_0.template subtile<full_tt_fp8e4m3<C::MMA_PER_TILE * 16>>(0);
+                    auto B_sc_tm_tile_1 = B_sc_tm_1.template subtile<full_tt_fp8e4m3<C::MMA_PER_TILE * 16>>(0);
+
+                    if (i == 0) {
+                        mm_ABt(out_tm_0, input_tiles[stage].A, input_tiles[stage].B[0], A_sc_tm_tile, B_sc_tm_tile_0);
+                        mm_ABt(out_tm_1, input_tiles[stage].A, input_tiles[stage].B[1], A_sc_tm_tile, B_sc_tm_tile_1);
+                    } else {
+                        mma_ABt(out_tm_0, input_tiles[stage].A, input_tiles[stage].B[0], A_sc_tm_tile, B_sc_tm_tile_0);
+                        mma_ABt(out_tm_1, input_tiles[stage].A, input_tiles[stage].B[1], A_sc_tm_tile, B_sc_tm_tile_1);
+                    }
+                    kittens::detail::tcgen05::commit<1>(inputs_finished[stage]);
+                    update_phasebit<0>(phasebits, stage);
+                    stage = (stage + 1) % C::LOAD_PIPE_DEPTH;
+                }
+                tensor_commit<1>(outputs_arrived);
+                update_phasebit<1>(phasebits, 0);
+            }
+        }
+    } else if (warpgroup_id < C::CONSUMER_WARPGROUPS) {
+        everyone::tma::cluster::wait_aligned();
+        if (warpgroup::warpid() == 0) {
+            tm_allocator.provision(tmem_addr);
+            warp::arrive(tmem_provisioned);
+        }
+        wait(tmem_provisioned, 0);
+        tm_allocator.set_addr(tmem_addr);
+
+        auto out_tm_0 = tm_allocator.template allocate<full_tt_fl<C::Nb / 2>>(0);
+        auto out_tm_1 = tm_allocator.template allocate<full_tt_fl<C::Nb / 2>>(128);
+
+        const float a_sg = g.A_sc_global[{0}];
+        const float b_sg = g.B_sc_global[{0}];
+        const float global_scale = a_sg * b_sg;
+        const float g_sg = g.G_sg_row[{0}];
+        const float g_sg_rcp = 1.0f / g_sg;
+
+        constexpr int LOCAL_N = C::Nb / 2;
+        constexpr int SUBTILE_COLS = LOCAL_N / C::EPI_PIPE_DEPTH;
+        constexpr int ROW16_BLOCKS = C::Mb / 32;
+        constexpr int ROW16_BLOCKS_PER_PASS = C::NUM_THREADS / 2 / SUBTILE_COLS;
+        using subtile_rt = rt_fl<C::Mb / 8, SUBTILE_COLS>;
+        using subtile_rt_bf = rt_bf<C::Mb / 8, SUBTILE_COLS>;
+        const int lane_id = threadIdx.x % 32;
+
+        for (int block_idx = cluster_id; block_idx < num_blocks; block_idx += gridDim.x / C::CLUSTER_SIZE) {
+            int supergroup_idx = block_idx / num_blocks_per_supergroup;
+            int idx_within_supergroup = block_idx % num_blocks_per_supergroup;
+            int rows_in_supergroup = min(C::SUPERGROUP_SIZE, num_row_blocks - supergroup_idx * C::SUPERGROUP_SIZE);
+            int row_within_supergroup = idx_within_supergroup % rows_in_supergroup;
+            int row_block_idx = supergroup_idx * C::SUPERGROUP_SIZE + row_within_supergroup;
+            int col_block_idx = idx_within_supergroup / rows_in_supergroup;
+
+            wait(outputs_arrived, get_phasebit<0>(phasebits, 0));
+
+            const int tile_row_base = row_block_idx * C::Mb + cta_id * (C::Mb / 2);
+            const int warp_row_base = tile_row_base + warpgroup::warpid() * (C::Mb / 8);
+
+            int my_targets_x[subtile_rt::height];
+            int my_targets_y[subtile_rt::height];
+            float my_lse_x[subtile_rt::height];
+            float my_lse_y[subtile_rt::height];
+            #pragma unroll
+            for (int i = 0; i < subtile_rt::height; ++i) {
+                int global_row_x = warp_row_base + i * 16 + lane_id / 4;
+                int global_row_y = warp_row_base + i * 16 + 8 + lane_id / 4;
+                my_targets_x[i] = (global_row_x < g.M) ? (int)g.targets[global_row_x] : -1;
+                my_targets_y[i] = (global_row_y < g.M) ? (int)g.targets[global_row_y] : -1;
+                my_lse_x[i] = (global_row_x < g.M) ? g.lse[global_row_x] : INFINITY;
+                my_lse_y[i] = (global_row_y < g.M) ? g.lse[global_row_y] : INFINITY;
+            }
+
+            uint8_t* row_fp4_ptr = reinterpret_cast<uint8_t*>(g.G_fp4_row.raw_ptr);
+            uint8_t* row_sc_ptr = g.G_sc_row_ptr;
+            uint8_t* col_fp4_ptr = g.G_fp4_col_ptr;
+            uint8_t* col_sc_ptr = g.G_sc_col_ptr;
+            const int row_fp4_stride = g.G_fp4_row.cols();
+            const int row_sc_kgroups = g.G_sc_row_kgroups;
+            const int col_fp4_stride = g.A.rows() / 2;
+            const int col_sc_kgroups = g.G_sc_col_kgroups;
+            const bool encode_centric = g.encode_centric;
+            constexpr float FP4_MAX = 6.0f;
+            constexpr float E4M3_MAX = 448.0f;
+
+            auto consume_local_tile = [&](auto& accum, int col_tile_offset, bool release_outputs) {
+                #pragma unroll
+                for (int epi = 0; epi < C::EPI_PIPE_DEPTH; ++epi) {
+                    subtile_rt D_fl;
+                    subtile_rt_bf D_bf;
+                    warpgroup::load_async(D_fl, accum.template subtile<full_tt_fl<SUBTILE_COLS>>(0, SUBTILE_COLS * epi));
+                    tensor_load_wait();
+                    tensor_before_thread_sync();
+                    warpgroup::sync(1);
+
+                    warp::mul(D_fl, D_fl, global_scale);
+                    const int col_start = col_block_idx * C::Nb + col_tile_offset * LOCAL_N + epi * SUBTILE_COLS;
+
+                    #pragma unroll
+                    for (int i = 0; i < subtile_rt::height; ++i) {
+                        const float lse_x = my_lse_x[i];
+                        const float lse_y = my_lse_y[i];
+                        #pragma unroll
+                        for (int j = 0; j < subtile_rt::width; ++j) {
+                            #pragma unroll
+                            for (int k = 0; k < 4; ++k) {
+                                const float lse_val = (k % 2 == 0) ? lse_x : lse_y;
+                                D_fl.tiles[i][j].data[k].x = __expf(D_fl.tiles[i][j].data[k].x - lse_val);
+                                D_fl.tiles[i][j].data[k].y = __expf(D_fl.tiles[i][j].data[k].y - lse_val);
+                            }
+                        }
+                    }
+                    #pragma unroll
+                    for (int i = 0; i < subtile_rt::height; ++i) {
+                        const int tgt_x = my_targets_x[i];
+                        if (tgt_x >= col_start && tgt_x < col_start + SUBTILE_COLS) {
+                            const int local_col = tgt_x - col_start;
+                            const int j_idx = local_col / 16;
+                            const int within_tile = local_col % 16;
+                            const int k_half = within_tile / 8;
+                            const int pair_pos = (within_tile % 8) / 2;
+                            if ((lane_id % 4) == pair_pos) {
+                                const int k_idx = k_half * 2;
+                                if ((local_col & 1) == 0) D_fl.tiles[i][j_idx].data[k_idx].x -= 1.0f;
+                                else                      D_fl.tiles[i][j_idx].data[k_idx].y -= 1.0f;
+                            }
+                        }
+                        const int tgt_y = my_targets_y[i];
+                        if (tgt_y >= col_start && tgt_y < col_start + SUBTILE_COLS) {
+                            const int local_col = tgt_y - col_start;
+                            const int j_idx = local_col / 16;
+                            const int within_tile = local_col % 16;
+                            const int k_half = within_tile / 8;
+                            const int pair_pos = (within_tile % 8) / 2;
+                            if ((lane_id % 4) == pair_pos) {
+                                const int k_idx = k_half * 2 + 1;
+                                if ((local_col & 1) == 0) D_fl.tiles[i][j_idx].data[k_idx].x -= 1.0f;
+                                else                      D_fl.tiles[i][j_idx].data[k_idx].y -= 1.0f;
+                            }
+                        }
+                    }
+                    #pragma unroll
+                    for (int i = 0; i < subtile_rt::height; ++i) {
+                        const int global_row_x = warp_row_base + i * 16 + lane_id / 4;
+                        const int global_row_y = warp_row_base + i * 16 + 8 + lane_id / 4;
+                        #pragma unroll
+                        for (int j = 0; j < subtile_rt::width; ++j) {
+                            #pragma unroll
+                            for (int k = 0; k < 4; ++k) {
+                                if (k % 2 == 0 && global_row_x >= g.M) {
+                                    D_fl.tiles[i][j].data[k].x = 0.0f;
+                                    D_fl.tiles[i][j].data[k].y = 0.0f;
+                                }
+                                if (k % 2 == 1 && global_row_y >= g.M) {
+                                    D_fl.tiles[i][j].data[k].x = 0.0f;
+                                    D_fl.tiles[i][j].data[k].y = 0.0f;
+                                }
+                            }
+                        }
+                    }
+                    warp::mul(D_fl, D_fl, g.grad_scale);
+                    warp::copy(D_bf, D_fl);
+
+                    if (release_outputs && epi == C::EPI_PIPE_DEPTH - 1) {
+                        if (warpgroup::warpid() == 0 && warp::laneid() == 0) arrive(outputs_finished);
+                    }
+
+                    const int smem_slot = epi % C::NUM_D_TILES;
+                    warpgroup::sync(1);
+                    warpgroup::store(output_tiles.D[smem_slot], D_bf);
+                    warpgroup::sync(1);
+
+                    const uint32_t d_base = static_cast<uint32_t>(__cvta_generic_to_shared(&output_tiles.D[smem_slot].data[0]));
+
+                    if constexpr (DO_ROW) {
+                        const int quant_row = threadIdx.x;
+                        if (quant_row < C::Mb / 2) {
+                            const int global_row = tile_row_base + quant_row;
+                            #pragma unroll
+                            for (int group16 = 0; group16 < SUBTILE_COLS / 16; ++group16) {
+                                bf16_2 vals[8];
+                                float amax = 0.0f;
+                                #pragma unroll
+                                for (int pair = 0; pair < 8; ++pair) {
+                                    const int col = group16 * 16 + pair * 2;
+                                    move<bf16_2>::lds(vals[pair], G::D_tile::idx(d_base, {quant_row, col}));
+                                    amax = fmaxf(amax, fabsf(__bfloat162float(vals[pair].x)));
+                                    amax = fmaxf(amax, fabsf(__bfloat162float(vals[pair].y)));
+                                }
+                                const float scale = amax * (1.0f / FP4_MAX);
+                                const float rcp_scale = (amax > 0.0f) ? (FP4_MAX / amax) : 0.0f;
+                                if (global_row < g.M) {
+                                    #pragma unroll
+                                    for (int pair = 0; pair < 8; ++pair) {
+                                        const uint8_t fp4_pair = quantize_fp4_pair(
+                                            __bfloat162float(vals[pair].x),
+                                            __bfloat162float(vals[pair].y),
+                                            rcp_scale);
+                                        const int fp4x2_col = (col_start + group16 * 16 + pair * 2) / 2;
+                                        row_fp4_ptr[global_row * row_fp4_stride + fp4x2_col] = fp4_pair;
+                                    }
+
+                                    float stored_scale = scale * g_sg_rcp;
+                                    if (encode_centric) stored_scale = fminf(rcp_scale * g_sg, E4M3_MAX);
+                                    const __nv_fp8_e4m3 sc = __nv_fp8_e4m3(stored_scale);
+                                    const int global_col_16 = col_start + group16 * 16;
+                                    const int kgroup = global_col_16 / 64;
+                                    const int col_16_in_64 = (global_col_16 / 16) % 4;
+                                    const int depth = global_row / 128;
+                                    const int sr = global_row % 32;
+                                    const int rr = (global_row / 32) % 4;
+                                    const int chunk = depth * row_sc_kgroups + kgroup;
+                                    const int byte_idx = sr * 16 + rr * 4 + col_16_in_64;
+                                    row_sc_ptr[chunk * 512 + byte_idx] = *reinterpret_cast<const uint8_t*>(&sc);
+                                }
+                            }
+                        }
+                    }
+
+                    if constexpr (DO_COL) {
+                        const int col_in_epi = threadIdx.x % SUBTILE_COLS;
+                        const int row16_block_base = threadIdx.x / SUBTILE_COLS;
+                        #pragma unroll
+                        for (int row16_pass = 0; row16_pass < ROW16_BLOCKS / ROW16_BLOCKS_PER_PASS; ++row16_pass) {
+                            const int row16_block = row16_block_base + row16_pass * ROW16_BLOCKS_PER_PASS;
+                            const int global_col = col_start + col_in_epi;
+                            if (row16_block < ROW16_BLOCKS && global_col < g.N) {
+                                const int local_row_base = row16_block * 16;
+                                const int global_row_base = tile_row_base + local_row_base;
+                                float col_amax = 0.0f;
+                                #pragma unroll
+                                for (int r = 0; r < 16; ++r) {
+                                    bf16 value;
+                                    move<bf16>::lds(value, G::D_tile::idx(d_base, {local_row_base + r, col_in_epi}));
+                                    if (global_row_base + r < g.M) col_amax = fmaxf(col_amax, fabsf(__bfloat162float(value)));
+                                }
+
+                                const float col_scale = col_amax * (1.0f / FP4_MAX);
+                                const float col_rcp = (col_amax > 0.0f) ? (FP4_MAX / col_amax) : 0.0f;
+                                const int global_row_pair_base = global_row_base / 2;
+
+                                #pragma unroll
+                                for (int pair = 0; pair < 8; ++pair) {
+                                    const int global_row = global_row_base + pair * 2;
+                                    if (global_row < g.M) {
+                                        bf16 value0_bf;
+                                        move<bf16>::lds(value0_bf, G::D_tile::idx(d_base, {local_row_base + pair * 2, col_in_epi}));
+                                        const float v0 = __bfloat162float(value0_bf);
+                                        float v1 = 0.0f;
+                                        if (global_row + 1 < g.M) {
+                                            bf16 value1_bf;
+                                            move<bf16>::lds(value1_bf, G::D_tile::idx(d_base, {local_row_base + pair * 2 + 1, col_in_epi}));
+                                            v1 = __bfloat162float(value1_bf);
+                                        }
+                                        col_fp4_ptr[global_col * col_fp4_stride + global_row_pair_base + pair] =
+                                            quantize_fp4_pair(v0, v1, col_rcp);
+                                    }
+                                }
+
+                                float stored_scale = col_scale * g_sg_rcp;
+                                if (encode_centric) stored_scale = fminf(col_rcp * g_sg, E4M3_MAX);
+                                const __nv_fp8_e4m3 csc = __nv_fp8_e4m3(stored_scale);
+                                const int depth = global_col / 128;
+                                const int sr = global_col % 32;
+                                const int rr = (global_col / 32) % 4;
+                                const int m_kgroup = global_row_base / 64;
+                                const int m_16_in_64 = (global_row_base / 16) % 4;
+                                const int chunk = depth * col_sc_kgroups + m_kgroup;
+                                const int byte_idx = sr * 16 + rr * 4 + m_16_in_64;
+                                col_sc_ptr[chunk * 512 + byte_idx] = *reinterpret_cast<const uint8_t*>(&csc);
+                            }
+                        }
+                    }
+
+                    warpgroup::sync(1);
+                }
+            };
+
+            consume_local_tile(out_tm_0, 0, false);
+            consume_local_tile(out_tm_1, 1, true);
+
+            update_phasebit<0>(phasebits, 0);
+        }
+
+        warpgroup::sync(1);
+        if constexpr (C::USE_PDL) warpgroup::pdl::arrive();
+        if (warpgroup::warpid() == 0) tm_allocator.deprovision();
+    }
+}
+
 template <typename C>
 __device__ inline void backward_kernel_v3(const globals<C>& g) {
     backward_kernel_v3_impl<C, false>(g);
@@ -1188,22 +1701,42 @@ __device__ inline void backward_kernel_v3_colscratch(const globals<C>& g) {
 
 template <typename C>
 __device__ inline void backward_kernel_v3_streaming(const globals<C>& g) {
-    backward_kernel_v3_streaming_impl<C, true, true>(g);
+    backward_kernel_v3_streaming_impl<C, true, true, false>(g);
 }
 
 template <typename C>
 __device__ inline void backward_kernel_v3_streaming_replayonly(const globals<C>& g) {
-    backward_kernel_v3_streaming_impl<C, false, false>(g);
+    backward_kernel_v3_streaming_impl<C, false, false, false>(g);
 }
 
 template <typename C>
 __device__ inline void backward_kernel_v3_streaming_rowonly(const globals<C>& g) {
-    backward_kernel_v3_streaming_impl<C, true, false>(g);
+    backward_kernel_v3_streaming_impl<C, true, false, false>(g);
 }
 
 template <typename C>
 __device__ inline void backward_kernel_v3_streaming_colonly(const globals<C>& g) {
-    backward_kernel_v3_streaming_impl<C, false, true>(g);
+    backward_kernel_v3_streaming_impl<C, false, true, false>(g);
+}
+
+template <typename C>
+__device__ inline void backward_kernel_v3_streaming_2ctaS(const globals<C>& g) {
+    backward_kernel_v3_streaming_impl<C, true, true, true>(g);
+}
+
+template <typename C>
+__device__ inline void backward_kernel_v3_streaming_2ctaS_replayonly(const globals<C>& g) {
+    backward_kernel_v3_streaming_impl<C, false, false, true>(g);
+}
+
+template <typename C>
+__device__ inline void backward_kernel_v3_streaming_2ctaSdupB(const globals_2ctaSdupB<C>& g) {
+    backward_kernel_v3_streaming_2ctaSdupB_impl<C, true, true>(g);
+}
+
+template <typename C>
+__device__ inline void backward_kernel_v3_streaming_2ctaSdupB_replayonly(const globals_2ctaSdupB<C>& g) {
+    backward_kernel_v3_streaming_2ctaSdupB_impl<C, false, false>(g);
 }
 
 } // namespace nvfp4_cce_backward_v3
