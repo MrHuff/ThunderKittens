@@ -45,34 +45,34 @@ def main() -> None:
     A = torch.randn(M, K, dtype=torch.bfloat16, device="cuda") / (K ** 0.25)
     B = torch.randn(N, K, dtype=torch.bfloat16, device="cuda") / (K ** 0.25)
 
-    D_local = torch.empty(M, N, dtype=torch.bfloat16, device="cuda")
-    D_fast = torch.empty(M, N, dtype=torch.bfloat16, device="cuda")
+    D_direct = torch.empty(M, N, dtype=torch.bfloat16, device="cuda")
+    D_prepared = torch.empty(M, N, dtype=torch.bfloat16, device="cuda")
     D_v5 = torch.empty(M, N, dtype=torch.bfloat16, device="cuda")
 
-    t_local_q = bench(lambda: local_q.tk_localcta_quantize_for_gemm(A, False, True))
-    t_fast_q = bench(lambda: local_q.tk_localcta_quantize_for_gemm_fast(A, False, True))
+    t_direct_q = bench(lambda: local_q.tk_localcta_quantize_for_gemm(A, False, True))
+    t_prepared_q = bench(lambda: local_q.tk_localcta_quantize_for_gemm_prepared(A, False, True))
     t_v5_q = bench(lambda: q_v5.tk_quantize_for_gemm(A, False, True))
 
-    A_local = local_q.tk_localcta_quantize_for_gemm(A, False, True)
-    B_local = local_q.tk_localcta_quantize_for_gemm(B, False, True)
-    A_fast = local_q.tk_localcta_quantize_for_gemm_fast(A, False, True)
-    B_fast = local_q.tk_localcta_quantize_for_gemm_fast(B, False, True)
+    A_direct = local_q.tk_localcta_quantize_for_gemm(A, False, True)
+    B_direct = local_q.tk_localcta_quantize_for_gemm(B, False, True)
+    A_prepared = local_q.tk_localcta_quantize_for_gemm_prepared(A, False, True)
+    B_prepared = local_q.tk_localcta_quantize_for_gemm_prepared(B, False, True)
     A_v5 = q_v5.tk_quantize_for_gemm(A, False, True)
     B_v5 = q_v5.tk_quantize_for_gemm(B, False, True)
 
-    t_local_deq = bench(lambda: local_q.tk_localcta_reconstruct_row(A_local[0], A_local[1], A_local[4]))
+    t_direct_deq = bench(lambda: local_q.tk_localcta_reconstruct_row(A_direct[0], A_direct[1], A_direct[4]))
     sg_grid_v5 = constant_chunk_grid(M, K, A_v5[4])
     t_v5_deq = bench(lambda: local_q.tk_localcta_reconstruct_row(A_v5[0], A_v5[1], sg_grid_v5))
 
-    t_local_gemm = bench(lambda: local_gemm.nvfp4_localcta_gemm(
-        A_local[0], A_local[1], A_local[4],
-        B_local[0], B_local[1], B_local[4],
-        D_local,
+    t_direct_gemm = bench(lambda: local_gemm.nvfp4_localcta_gemm(
+        A_direct[0], A_direct[1], A_direct[4],
+        B_direct[0], B_direct[1], B_direct[4],
+        D_direct,
     ))
-    t_fast_gemm = bench(lambda: local_gemm.nvfp4_localcta_fast_gemm(
-        A_fast[0], A_fast[6],
-        B_fast[0], B_fast[6],
-        D_fast,
+    t_prepared_gemm = bench(lambda: local_gemm.nvfp4_localcta_fast_gemm(
+        A_prepared[0], A_prepared[1],
+        B_prepared[0], B_prepared[1],
+        D_prepared,
     ))
     t_v5_gemm = bench(lambda: legacy_gemm.nvfp4_gemm(
         A_v5[0], A_v5[1], A_v5[4],
@@ -80,27 +80,27 @@ def main() -> None:
         D_v5,
     ))
 
-    def local_e2e():
+    def direct_e2e():
         Aq = local_q.tk_localcta_quantize_for_gemm(A, False, True)
         Bq = local_q.tk_localcta_quantize_for_gemm(B, False, True)
         local_gemm.nvfp4_localcta_gemm(
             Aq[0], Aq[1], Aq[4],
             Bq[0], Bq[1], Bq[4],
-            D_local,
+            D_direct,
         )
 
-    t_local_e2e = bench(local_e2e, warmup=2, iters=5)
+    t_direct_e2e = bench(direct_e2e, warmup=2, iters=5)
 
-    def local_fast_e2e():
-        Aq = local_q.tk_localcta_quantize_for_gemm_fast(A, False, True)
-        Bq = local_q.tk_localcta_quantize_for_gemm_fast(B, False, True)
+    def prepared_e2e():
+        Aq = local_q.tk_localcta_quantize_for_gemm_prepared(A, False, True)
+        Bq = local_q.tk_localcta_quantize_for_gemm_prepared(B, False, True)
         local_gemm.nvfp4_localcta_fast_gemm(
-            Aq[0], Aq[6],
-            Bq[0], Bq[6],
-            D_fast,
+            Aq[0], Aq[1],
+            Bq[0], Bq[1],
+            D_prepared,
         )
 
-    t_fast_e2e = bench(local_fast_e2e, warmup=2, iters=5)
+    t_prepared_e2e = bench(prepared_e2e, warmup=2, iters=5)
 
     def v5_e2e():
         Aq = q_v5.tk_quantize_for_gemm(A, False, True)
@@ -109,10 +109,10 @@ def main() -> None:
 
     t_v5_e2e = bench(v5_e2e, warmup=2, iters=5)
 
-    print(f"quant_only_ms localCTA_raw={t_local_q:.3f} localCTA_fast={t_fast_q:.3f} v5={t_v5_q:.3f}")
-    print(f"dequant_only_ms localCTA={t_local_deq:.3f} v5={t_v5_deq:.3f}")
-    print(f"gemm_only_ms localCTA_raw={t_local_gemm:.3f} localCTA_fast={t_fast_gemm:.3f} v5={t_v5_gemm:.3f}")
-    print(f"e2e_ms localCTA_raw={t_local_e2e:.3f} localCTA_fast={t_fast_e2e:.3f} v5={t_v5_e2e:.3f}")
+    print(f"quant_only_ms localcta_direct={t_direct_q:.3f} localcta_prepared={t_prepared_q:.3f} baseline_v5={t_v5_q:.3f}")
+    print(f"dequant_only_ms localcta_direct={t_direct_deq:.3f} baseline_v5={t_v5_deq:.3f}")
+    print(f"gemm_only_ms localcta_direct={t_direct_gemm:.3f} localcta_prepared={t_prepared_gemm:.3f} baseline_v5={t_v5_gemm:.3f}")
+    print(f"e2e_ms localcta_direct={t_direct_e2e:.3f} localcta_prepared={t_prepared_e2e:.3f} baseline_v5={t_v5_e2e:.3f}")
 
 
 if __name__ == "__main__":

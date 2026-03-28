@@ -30,16 +30,16 @@ def run_regular(M: int, N: int, K: int) -> None:
         D,
     )
     D_fast = torch.empty_like(D)
-    Aq_fast = local_q.tk_localcta_quantize_for_gemm_fast(A, False, True)
-    Bq_fast = local_q.tk_localcta_quantize_for_gemm_fast(B, False, True)
+    Aq_fast = local_q.tk_localcta_quantize_for_gemm_prepared(A, False, True)
+    Bq_fast = local_q.tk_localcta_quantize_for_gemm_prepared(B, False, True)
     local_gemm.nvfp4_localcta_fast_gemm(
-        Aq_fast[0], Aq_fast[6],
-        Bq_fast[0], Bq_fast[6],
+        Aq_fast[0], Aq_fast[1],
+        Bq_fast[0], Bq_fast[1],
         D_fast,
     )
     ref = torch.matmul(A, B.t()).to(torch.bfloat16)
-    stats("regular localCTA GEMM vs bf16", D, ref)
-    stats("regular localCTA fast GEMM vs bf16", D_fast, ref)
+    stats("regular localcta_direct GEMM vs bf16", D, ref)
+    stats("regular localcta_prepared GEMM vs bf16", D_fast, ref)
 
 
 def run_grouped(M: int, K: int, splits: list[int]) -> None:
@@ -55,16 +55,16 @@ def run_grouped(M: int, K: int, splits: list[int]) -> None:
         out,
     )
     out_fast = torch.empty_like(out)
-    Aq_fast = local_q.tk_localcta_quantize_for_gemm_fast(A, False, True)
-    Wq_fast = local_q.tk_localcta_group_quantize_for_gemm_fast(W, splits)
+    Aq_fast = local_q.tk_localcta_quantize_for_gemm_prepared(A, False, True)
+    Wq_fast = local_q.tk_localcta_group_quantize_for_gemm_prepared(W, splits)
     local_gemm.nvfp4_localcta_fast_grouped_gemm(
-        Aq_fast[0], Aq_fast[6],
-        Wq_fast[0], Wq_fast[8],
+        Aq_fast[0], Aq_fast[1],
+        Wq_fast[0], Wq_fast[1],
         out_fast,
     )
     ref = torch.matmul(A, W.t()).to(torch.bfloat16)
-    stats("grouped localCTA GEMM vs bf16", out, ref)
-    stats("grouped localCTA fast GEMM vs bf16", out_fast, ref)
+    stats("grouped localcta_direct GEMM vs bf16", out, ref)
+    stats("grouped localcta_prepared GEMM vs bf16", out_fast, ref)
 
 
 def run_batched(M: int, N: int, K: int, batches: int) -> None:
@@ -79,13 +79,13 @@ def run_batched(M: int, N: int, K: int, batches: int) -> None:
         A = torch.randn(M, K, dtype=torch.bfloat16, device="cuda") / (K ** 0.25)
         B = torch.randn(N, K, dtype=torch.bfloat16, device="cuda") / (K ** 0.25)
         Aq = local_q.tk_localcta_quantize_for_gemm(A, False, True)
-        Aq_fast = local_q.tk_localcta_quantize_for_gemm_fast(A, False, True)
+        Aq_fast = local_q.tk_localcta_quantize_for_gemm_prepared(A, False, True)
         Bq = local_q.tk_localcta_quantize_for_gemm(B, False, True)
-        Bq_fast = local_q.tk_localcta_quantize_for_gemm_fast(B, False, True)
+        Bq_fast = local_q.tk_localcta_quantize_for_gemm_prepared(B, False, True)
         A_list.append(Aq[0]); A_sc_list.append(Aq[1]); A_sg_list.append(Aq[4])
-        A_fast_list.append(Aq_fast[0]); A_sc_prepared_list.append(Aq_fast[6])
+        A_fast_list.append(Aq_fast[0]); A_sc_prepared_list.append(Aq_fast[1])
         B_list.append(Bq[0]); B_sc_list.append(Bq[1]); B_sg_list.append(Bq[4])
-        B_fast_list.append(Bq_fast[0]); B_sc_prepared_list.append(Bq_fast[6])
+        B_fast_list.append(Bq_fast[0]); B_sc_prepared_list.append(Bq_fast[1])
         D_list.append(torch.empty(M, N, dtype=torch.bfloat16, device="cuda"))
         D_fast_list.append(torch.empty(M, N, dtype=torch.bfloat16, device="cuda"))
         refs.append(torch.matmul(A, B.t()).to(torch.bfloat16))
@@ -101,9 +101,9 @@ def run_batched(M: int, N: int, K: int, batches: int) -> None:
         D_fast_list,
     )
     for i, (out, ref) in enumerate(zip(D_list, refs)):
-        stats(f"batched localCTA GEMM vs bf16 [{i}]", out, ref)
+        stats(f"batched localcta_direct GEMM vs bf16 [{i}]", out, ref)
     for i, (out, ref) in enumerate(zip(D_fast_list, refs)):
-        stats(f"batched localCTA fast GEMM vs bf16 [{i}]", out, ref)
+        stats(f"batched localcta_prepared GEMM vs bf16 [{i}]", out, ref)
 
 
 def run_batched_accum(M: int, N: int, K: int, batches: int) -> None:
@@ -116,13 +116,13 @@ def run_batched_accum(M: int, N: int, K: int, batches: int) -> None:
         A = torch.randn(M, K, dtype=torch.bfloat16, device="cuda") / (K ** 0.25)
         B = torch.randn(N, K, dtype=torch.bfloat16, device="cuda") / (K ** 0.25)
         Aq = local_q.tk_localcta_quantize_for_gemm(A, False, True)
-        Aq_fast = local_q.tk_localcta_quantize_for_gemm_fast(A, False, True)
+        Aq_fast = local_q.tk_localcta_quantize_for_gemm_prepared(A, False, True)
         Bq = local_q.tk_localcta_quantize_for_gemm(B, False, True)
-        Bq_fast = local_q.tk_localcta_quantize_for_gemm_fast(B, False, True)
+        Bq_fast = local_q.tk_localcta_quantize_for_gemm_prepared(B, False, True)
         A_list.append(Aq[0]); A_sc_list.append(Aq[1]); A_sg_list.append(Aq[4])
-        A_fast_list.append(Aq_fast[0]); A_sc_prepared_list.append(Aq_fast[6])
+        A_fast_list.append(Aq_fast[0]); A_sc_prepared_list.append(Aq_fast[1])
         B_list.append(Bq[0]); B_sc_list.append(Bq[1]); B_sg_list.append(Bq[4])
-        B_fast_list.append(Bq_fast[0]); B_sc_prepared_list.append(Bq_fast[6])
+        B_fast_list.append(Bq_fast[0]); B_sc_prepared_list.append(Bq_fast[1])
         ref.add_(torch.matmul(A, B.t()).to(torch.bfloat16))
 
     out = torch.empty(M, N, dtype=torch.bfloat16, device="cuda")
@@ -131,7 +131,7 @@ def run_batched_accum(M: int, N: int, K: int, batches: int) -> None:
         B_list, B_sc_list, B_sg_list,
         out,
     )
-    stats("batched_accum localCTA GEMM vs bf16", out, ref)
+    stats("batched_accum localcta_direct GEMM vs bf16", out, ref)
 
     out_fast = torch.empty(M, N, dtype=torch.bfloat16, device="cuda")
     local_gemm.nvfp4_localcta_fast_batched_accum_gemm(
@@ -139,7 +139,7 @@ def run_batched_accum(M: int, N: int, K: int, batches: int) -> None:
         B_fast_list, B_sc_prepared_list,
         out_fast,
     )
-    stats("batched_accum localCTA fast GEMM vs bf16", out_fast, ref)
+    stats("batched_accum localcta_prepared GEMM vs bf16", out_fast, ref)
 
 
 if __name__ == "__main__":
