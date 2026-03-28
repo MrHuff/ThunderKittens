@@ -486,6 +486,126 @@ static void launch_experimental_backward_v3_fp4_2ctaSdupB_replayonly(
 }
 
 template <typename C>
+static void launch_experimental_backward_v3_fp4_3wg(
+    const at::Tensor &A, const at::Tensor &A_sc, const at::Tensor &A_sc_global,
+    const at::Tensor &B, const at::Tensor &B_sc, const at::Tensor &B_sc_global,
+    at::Tensor &G_fp4_row, at::Tensor &G_sc_row, at::Tensor &G_sg_row,
+    at::Tensor &G_fp4_col, at::Tensor &G_sc_col,
+    const at::Tensor &lse, const at::Tensor &targets,
+    float grad_scale, int M, int N, float filter_eps = 0.0f,
+    bool encode_centric = false)
+{
+    using G = nvfp4_cce_backward_v3::globals_3wg<C>;
+    constexpr float kFp4Max = 6.0f;
+    constexpr float kE4M3Max = 448.0f;
+
+    TORCH_CHECK(filter_eps == 0.0f,
+                "NVFP4 experimental v3 3WG path does not support filter_eps yet.");
+    TORCH_CHECK(G_sg_row.is_cuda() && G_sg_row.numel() == 1,
+                "Phase 3 G_sg_row must be a CUDA tensor with one float element.");
+    const float g_sg = fmaxf(grad_scale / (kFp4Max * kE4M3Max), 1.0e-12f);
+    const auto stream = at::cuda::getCurrentCUDAStream();
+    auto err = cudaMemcpyAsync(
+        G_sg_row.data_ptr<float>(),
+        &g_sg,
+        sizeof(float),
+        cudaMemcpyHostToDevice,
+        stream.stream());
+    TORCH_CHECK(err == cudaSuccess,
+                "Failed to update NVFP4 experimental v3 3WG analytic G_sg_row: ",
+                cudaGetErrorString(err));
+
+    G g {
+        .A = kittens::py::tensor_to_gl<typename G::A_fp4x2_gl>(A),
+        .A_sc = kittens::py::tensor_to_gl<typename G::A_sc_gl, false>(
+            A_sc, 1,
+            A_sc.dim()==2 ? A_sc.size(0)/128 : A_sc.size(0),
+            A_sc.dim()==2 ? A_sc.size(1)/4 : A_sc.size(1), 256),
+        .A_sc_global = kittens::py::tensor_to_gl<typename G::A_sc_global_gl>(A_sc_global),
+        .B = kittens::py::tensor_to_gl<typename G::B_fp4x2_gl>(B),
+        .B_sc = kittens::py::tensor_to_gl<typename G::B_sc_gl, false>(
+            B_sc, 1,
+            B_sc.dim()==2 ? B_sc.size(0)/128 : B_sc.size(0),
+            B_sc.dim()==2 ? B_sc.size(1)/4 : B_sc.size(1), 256),
+        .B_sc_global = kittens::py::tensor_to_gl<typename G::B_sc_global_gl>(B_sc_global),
+        .G_fp4_row = kittens::py::tensor_to_gl<typename G::G_fp4_row_gl>(G_fp4_row),
+        .G_sc_row_ptr = reinterpret_cast<uint8_t*>(G_sc_row.data_ptr()),
+        .G_sc_row_kgroups = N / 64,
+        .G_sg_row = kittens::py::tensor_to_gl<typename G::G_sg_row_gl>(G_sg_row),
+        .G_fp4_col_ptr = reinterpret_cast<uint8_t*>(G_fp4_col.data_ptr()),
+        .G_sc_col_ptr = reinterpret_cast<uint8_t*>(G_sc_col.data_ptr()),
+        .G_sc_col_kgroups = M / 64,
+        .lse = lse.data_ptr<float>(),
+        .targets = targets.data_ptr<int64_t>(),
+        .grad_scale = grad_scale,
+        .filter_eps = filter_eps,
+        .M = M, .N = N,
+        .encode_centric = encode_centric
+    };
+    kittens::py::launch_kernel<C, G, nvfp4_cce_backward_v3::backward_kernel_v3_streaming_3wg<C>>(g);
+}
+
+template <typename C>
+static void launch_experimental_backward_v3_fp4_3wg_replayonly(
+    const at::Tensor &A, const at::Tensor &A_sc, const at::Tensor &A_sc_global,
+    const at::Tensor &B, const at::Tensor &B_sc, const at::Tensor &B_sc_global,
+    at::Tensor &G_fp4_row, at::Tensor &G_sc_row, at::Tensor &G_sg_row,
+    at::Tensor &G_fp4_col, at::Tensor &G_sc_col,
+    const at::Tensor &lse, const at::Tensor &targets,
+    float grad_scale, int M, int N, float filter_eps = 0.0f,
+    bool encode_centric = false)
+{
+    using G = nvfp4_cce_backward_v3::globals_3wg<C>;
+    constexpr float kFp4Max = 6.0f;
+    constexpr float kE4M3Max = 448.0f;
+
+    TORCH_CHECK(filter_eps == 0.0f,
+                "NVFP4 experimental v3 3WG replay-only path does not support filter_eps yet.");
+    TORCH_CHECK(G_sg_row.is_cuda() && G_sg_row.numel() == 1,
+                "Phase 3 G_sg_row must be a CUDA tensor with one float element.");
+    const float g_sg = fmaxf(grad_scale / (kFp4Max * kE4M3Max), 1.0e-12f);
+    const auto stream = at::cuda::getCurrentCUDAStream();
+    auto err = cudaMemcpyAsync(
+        G_sg_row.data_ptr<float>(),
+        &g_sg,
+        sizeof(float),
+        cudaMemcpyHostToDevice,
+        stream.stream());
+    TORCH_CHECK(err == cudaSuccess,
+                "Failed to update NVFP4 experimental v3 3WG replay-only analytic G_sg_row: ",
+                cudaGetErrorString(err));
+
+    G g {
+        .A = kittens::py::tensor_to_gl<typename G::A_fp4x2_gl>(A),
+        .A_sc = kittens::py::tensor_to_gl<typename G::A_sc_gl, false>(
+            A_sc, 1,
+            A_sc.dim()==2 ? A_sc.size(0)/128 : A_sc.size(0),
+            A_sc.dim()==2 ? A_sc.size(1)/4 : A_sc.size(1), 256),
+        .A_sc_global = kittens::py::tensor_to_gl<typename G::A_sc_global_gl>(A_sc_global),
+        .B = kittens::py::tensor_to_gl<typename G::B_fp4x2_gl>(B),
+        .B_sc = kittens::py::tensor_to_gl<typename G::B_sc_gl, false>(
+            B_sc, 1,
+            B_sc.dim()==2 ? B_sc.size(0)/128 : B_sc.size(0),
+            B_sc.dim()==2 ? B_sc.size(1)/4 : B_sc.size(1), 256),
+        .B_sc_global = kittens::py::tensor_to_gl<typename G::B_sc_global_gl>(B_sc_global),
+        .G_fp4_row = kittens::py::tensor_to_gl<typename G::G_fp4_row_gl>(G_fp4_row),
+        .G_sc_row_ptr = reinterpret_cast<uint8_t*>(G_sc_row.data_ptr()),
+        .G_sc_row_kgroups = N / 64,
+        .G_sg_row = kittens::py::tensor_to_gl<typename G::G_sg_row_gl>(G_sg_row),
+        .G_fp4_col_ptr = reinterpret_cast<uint8_t*>(G_fp4_col.data_ptr()),
+        .G_sc_col_ptr = reinterpret_cast<uint8_t*>(G_sc_col.data_ptr()),
+        .G_sc_col_kgroups = M / 64,
+        .lse = lse.data_ptr<float>(),
+        .targets = targets.data_ptr<int64_t>(),
+        .grad_scale = grad_scale,
+        .filter_eps = filter_eps,
+        .M = M, .N = N,
+        .encode_centric = encode_centric
+    };
+    kittens::py::launch_kernel<C, G, nvfp4_cce_backward_v3::backward_kernel_v3_streaming_3wg_replayonly<C>>(g);
+}
+
+template <typename C>
 static void launch_experimental_backward_v3_fp4_rowonly(
     const at::Tensor &A, const at::Tensor &A_sc, const at::Tensor &A_sc_global,
     const at::Tensor &B, const at::Tensor &B_sc, const at::Tensor &B_sc_global,
@@ -610,12 +730,21 @@ static void launch_experimental_backward_v3_fp4_colonly(
 // Config instantiations
 using bwd_v3_bf16_L4_SG8 = nvfp4_cce_backward_v3::config<4, 8, true, true>;
 using bwd_v3_fp4_L4_SG8  = nvfp4_cce_backward_v3::config<4, 8, false, true>;
+using bwd_v3_fp4_public_colwg_L4_SG8 = nvfp4_cce_backward_v3::experimental_config_colwg<4, 8, true>;
+using bwd_v3_exp3wg_fp4_L4_SG8 = nvfp4_cce_backward_v3::experimental_config_3wg<4, 8, true>;
+using bwd_v3_exp3wg_fp4_L5_SG8 = nvfp4_cce_backward_v3::experimental_config_3wg<5, 8, true>;
+using bwd_v3_exp3wg_fp4_L4_E2_SG8 = nvfp4_cce_backward_v3::experimental_config_3wg<4, 8, true, 2>;
+using bwd_v3_expcolwg_fp4_L4_SG8 = nvfp4_cce_backward_v3::experimental_config_colwg<4, 8, true>;
+using bwd_v3_exp4wg_fp4_L4_SG8 = nvfp4_cce_backward_v3::experimental_config_4wg<4, 8, true>;
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("backward_v3_bf16_L4_SG8", &launch_backward_v3_bf16<bwd_v3_bf16_L4_SG8>,
           "NVFP4 CCE backward v3 (BF16 output) L4 SG8");
-    m.def("backward_v3_fp4_L4_SG8", &launch_backward_v3_fp4<bwd_v3_fp4_L4_SG8>,
-          "NVFP4 CCE backward v3 (FP4 output) L4 SG8");
+    // Public FP4 v3 stays on CTA-local/per-16 micro-scale quantization with
+    // analytic G_sg_row, but now uses the consumer-row / quantizer-col split
+    // because it wins end-to-end over the old consumer-does-both path.
+    m.def("backward_v3_fp4_L4_SG8", &launch_experimental_backward_v3_fp4_3wg<bwd_v3_fp4_public_colwg_L4_SG8>,
+          "NVFP4 CCE backward v3 (FP4 output, consumer-row/col-WG) L4 SG8");
     m.def("experimental_backward_v3_fp4_L4_SG8", &launch_experimental_backward_v3_fp4<bwd_v3_fp4_L4_SG8>,
           "NVFP4 CCE backward v3 experimental (FP4 output) L4 SG8");
     m.def("experimental_backward_v3_fp4_replayonly_L4_SG8", &launch_experimental_backward_v3_fp4_replayonly<bwd_v3_fp4_L4_SG8>,
@@ -632,5 +761,25 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           "NVFP4 CCE backward v3 experimental 2CTA-S duplicate-B (FP4 output) L4 SG8");
     m.def("experimental_backward_v3_fp4_2ctaSdupB_replayonly_L4_SG8", &launch_experimental_backward_v3_fp4_2ctaSdupB_replayonly<bwd_v3_fp4_L4_SG8>,
           "NVFP4 CCE backward v3 experimental 2CTA-S duplicate-B replay-only (FP4 output) L4 SG8");
+    m.def("experimental_backward_v3_fp4_3wg_L4_SG8", &launch_experimental_backward_v3_fp4_3wg<bwd_v3_exp3wg_fp4_L4_SG8>,
+          "NVFP4 CCE backward v3 experimental 3WG (FP4 output) L4 SG8");
+    m.def("experimental_backward_v3_fp4_3wg_replayonly_L4_SG8", &launch_experimental_backward_v3_fp4_3wg_replayonly<bwd_v3_exp3wg_fp4_L4_SG8>,
+          "NVFP4 CCE backward v3 experimental 3WG replay-only (FP4 output) L4 SG8");
+    m.def("experimental_backward_v3_fp4_3wg_L5_SG8", &launch_experimental_backward_v3_fp4_3wg<bwd_v3_exp3wg_fp4_L5_SG8>,
+          "NVFP4 CCE backward v3 experimental 3WG (FP4 output) L5 SG8");
+    m.def("experimental_backward_v3_fp4_3wg_replayonly_L5_SG8", &launch_experimental_backward_v3_fp4_3wg_replayonly<bwd_v3_exp3wg_fp4_L5_SG8>,
+          "NVFP4 CCE backward v3 experimental 3WG replay-only (FP4 output) L5 SG8");
+    m.def("experimental_backward_v3_fp4_3wg_L4_E2_SG8", &launch_experimental_backward_v3_fp4_3wg<bwd_v3_exp3wg_fp4_L4_E2_SG8>,
+          "NVFP4 CCE backward v3 experimental 3WG (FP4 output) L4 E2 SG8");
+    m.def("experimental_backward_v3_fp4_3wg_replayonly_L4_E2_SG8", &launch_experimental_backward_v3_fp4_3wg_replayonly<bwd_v3_exp3wg_fp4_L4_E2_SG8>,
+          "NVFP4 CCE backward v3 experimental 3WG replay-only (FP4 output) L4 E2 SG8");
+    m.def("experimental_backward_v3_fp4_colwg_L4_SG8", &launch_experimental_backward_v3_fp4_3wg<bwd_v3_expcolwg_fp4_L4_SG8>,
+          "NVFP4 CCE backward v3 experimental consumer-row/col-WG (FP4 output) L4 SG8");
+    m.def("experimental_backward_v3_fp4_colwg_replayonly_L4_SG8", &launch_experimental_backward_v3_fp4_3wg_replayonly<bwd_v3_expcolwg_fp4_L4_SG8>,
+          "NVFP4 CCE backward v3 experimental consumer-row/col-WG replay-only (FP4 output) L4 SG8");
+    m.def("experimental_backward_v3_fp4_4wg_L4_SG8", &launch_experimental_backward_v3_fp4_3wg<bwd_v3_exp4wg_fp4_L4_SG8>,
+          "NVFP4 CCE backward v3 experimental 4WG (FP4 output) L4 SG8");
+    m.def("experimental_backward_v3_fp4_4wg_replayonly_L4_SG8", &launch_experimental_backward_v3_fp4_3wg_replayonly<bwd_v3_exp4wg_fp4_L4_SG8>,
+          "NVFP4 CCE backward v3 experimental 4WG replay-only (FP4 output) L4 SG8");
 }
 #endif
