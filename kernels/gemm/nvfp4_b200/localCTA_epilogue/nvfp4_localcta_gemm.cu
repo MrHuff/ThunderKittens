@@ -358,6 +358,25 @@ void check_batched_inputs(
     }
 }
 
+template <typename AList, typename BList>
+void check_batched_shape_compatibility(
+    const AList& A_list,
+    const BList& B_list,
+    const std::vector<at::Tensor>& D_list
+) {
+    const int64_t M = A_list[0].size(0);
+    const int64_t N = B_list[0].size(0);
+    const int64_t K_packed = A_list[0].size(1);
+    for (size_t i = 0; i < A_list.size(); ++i) {
+        TORCH_CHECK(A_list[i].size(0) == M, "all batched A tensors must share M");
+        TORCH_CHECK(B_list[i].size(0) == N, "all batched B tensors must share N");
+        TORCH_CHECK(A_list[i].size(1) == K_packed && B_list[i].size(1) == K_packed,
+                    "all batched tensors must share packed K");
+        TORCH_CHECK(D_list[i].size(0) == M && D_list[i].size(1) == N,
+                    "all batched outputs must share the same shape");
+    }
+}
+
 void check_fast_batched_inputs(
     const std::vector<at::Tensor>& A_list,
     const std::vector<at::Tensor>& A_sc_prepared_list,
@@ -487,12 +506,23 @@ void launch_fast_batched_gemm(
     const std::vector<at::Tensor>& B_sc_prepared_list,
     std::vector<at::Tensor>& D_list
 ) {
-    for (size_t i = 0; i < A_list.size(); ++i) {
-        launch_fast_regular_gemm(
-            A_list[i], A_sc_prepared_list[i],
-            B_list[i], B_sc_prepared_list[i],
-            D_list[i]);
+    const int spatial_tiles =
+        static_cast<int>((D_list[0].size(0) / localcta_fast_batched_config::Mb) *
+                         (D_list[0].size(1) / localcta_fast_batched_config::Nb));
+
+    // Keep the old per-batch path only for tiny launches that cannot form a full cluster.
+    if (spatial_tiles < localcta_fast_batched_config::CLUSTER_SIZE) {
+        for (size_t i = 0; i < A_list.size(); ++i) {
+            launch_fast_regular_gemm(
+                A_list[i], A_sc_prepared_list[i],
+                B_list[i], B_sc_prepared_list[i],
+                D_list[i]);
+        }
+        return;
     }
+
+    launch_fast_batched_gemm_with_config<localcta_fast_batched_config>(
+        A_list, A_sc_prepared_list, B_list, B_sc_prepared_list, D_list);
 }
 
 __global__ void sum_tensors_kernel(
@@ -643,6 +673,7 @@ void nvfp4_localcta_batched_gemm_entrypoint(
     for (int i = 0; i < n; ++i) {
         check_output_matrix(D_list[i], "D_list[i]", A_list[i].size(0), B_list[i].size(0));
     }
+    check_batched_shape_compatibility(A_list, B_list, D_list);
 
     launch_batched_gemm(
         A_list, A_sc_list, A_sg_chunks_list,
@@ -668,6 +699,7 @@ void nvfp4_localcta_fast_batched_gemm_entrypoint(
     for (int i = 0; i < n; ++i) {
         check_output_matrix(D_list[i], "D_list[i]", A_list[i].size(0), B_list[i].size(0));
     }
+    check_batched_shape_compatibility(A_list, B_list, D_list);
 
     launch_fast_batched_gemm(A_list, A_sc_prepared_list, B_list, B_sc_prepared_list, D_list);
 }
