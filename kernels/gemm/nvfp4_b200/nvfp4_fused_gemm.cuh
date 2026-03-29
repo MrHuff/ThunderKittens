@@ -132,6 +132,9 @@ struct globals {
     struct a_export_t {
         alignas(16) uint8_t data[C::ROW_SLICE * (C::Kb/2)];
     };
+    struct a_scale_export_t {
+        alignas(16) uint8_t data[sizeof(A_sc_tile)];
+    };
 
     __host__ inline dim3 grid() const {
         int d_cols = use_split_D ? (q_dim + k_dim + D_V.cols()) : D.cols();
@@ -139,10 +142,18 @@ struct globals {
     }
     __host__ inline dim3 block() const { return dim3(C::NUM_THREADS); }
     __host__ inline int dynamic_shared_memory() const {
+        constexpr int shared_a_transport_smem =
+            C::SHARE_A_ACROSS_CTAS
+                ? (sizeof(a_export_t) +
+                   sizeof(a_scale_export_t) +
+                   sizeof(a_export_t) * C::LOAD_PIPE_DEPTH +
+                   sizeof(a_scale_export_t) * C::LOAD_PIPE_DEPTH)
+                : 0;
         constexpr int _dynamic_shared_memory = sizeof(input_tiles_t)  * C::LOAD_PIPE_DEPTH + 1024 +
                                                sizeof(input_scales_t) * C::LOAD_PIPE_DEPTH + 1024 +
                                                sizeof(outputs_t) +
                                                sizeof(quant_buf_t) + 1024 +
+                                               shared_a_transport_smem +
                                                64; // running_amax SMEM + warp_max_buf
         static_assert(_dynamic_shared_memory <= MAX_SHARED_MEMORY - 1024);
         return _dynamic_shared_memory;
@@ -706,11 +717,15 @@ __device__ inline void kernel_shared_a_cross_cta(const globals<C> &g) {
     typename G::input_scales_t (&input_scales)[C::LOAD_PIPE_DEPTH] = sm_allocator.allocate<G::input_scales_t, C::LOAD_PIPE_DEPTH>();
     typename G::outputs_t       &output_tiles                      = sm_allocator.allocate<G::outputs_t>();
     typename G::quant_buf_t     &quant_buf                         = sm_allocator.allocate<G::quant_buf_t>();
+    typename G::a_export_t      &a_export_fp4                      = sm_allocator.allocate<typename G::a_export_t>();
+    typename G::a_scale_export_t &a_export_sc                     = sm_allocator.allocate<typename G::a_scale_export_t>();
+    typename G::a_export_t      (&a_recv_fp4)[C::LOAD_PIPE_DEPTH] =
+        sm_allocator.allocate<typename G::a_export_t, C::LOAD_PIPE_DEPTH>();
+    typename G::a_scale_export_t (&a_recv_sc)[C::LOAD_PIPE_DEPTH] =
+        sm_allocator.allocate<typename G::a_scale_export_t, C::LOAD_PIPE_DEPTH>();
 
     __shared__ float running_amax;
     __shared__ float warp_max_buf[4];
-    alignas(16) __shared__ uint8_t a_remote_fp4[C::LOAD_PIPE_DEPTH][C::ROW_SLICE * (C::Kb / 2)];
-    alignas(16) __shared__ uint8_t a_remote_sc[C::LOAD_PIPE_DEPTH][sizeof(typename G::A_sc_tile)];
 
     tensor_allocator<1, C::TMEM_NCTA, false> tm_allocator;
 
@@ -724,7 +739,8 @@ __device__ inline void kernel_shared_a_cross_cta(const globals<C> &g) {
     __shared__ semaphore outputs_finished;
     __shared__ semaphore bf16_sub_arrived[C::QUANT_SUB_TILES];
     __shared__ semaphore a_quant_done[C::LOAD_PIPE_DEPTH];
-    __shared__ semaphore a_remote_ready[C::LOAD_PIPE_DEPTH];
+    __shared__ semaphore a_payload_arrived[C::LOAD_PIPE_DEPTH];
+    __shared__ semaphore a_scale_arrived[C::LOAD_PIPE_DEPTH];
 
     if (threadIdx.x == 32) {
         init_semaphore(tmem_provisioned, 0, 1);
@@ -735,7 +751,8 @@ __device__ inline void kernel_shared_a_cross_cta(const globals<C> &g) {
             init_semaphore(inputs_finished[i], 0, 1);
             init_semaphore(a_stage_released[i], 0, C::CLUSTER_SIZE);
             init_semaphore(a_quant_done[i], 0, 1);
-            init_semaphore(a_remote_ready[i], 0, 1);
+            init_semaphore(a_payload_arrived[i], 0, 1);
+            init_semaphore(a_scale_arrived[i], 0, 1);
         }
         init_semaphore(outputs_arrived, 0, 1);
         init_semaphore(outputs_finished, 0, 1);
@@ -754,7 +771,7 @@ __device__ inline void kernel_shared_a_cross_cta(const globals<C> &g) {
         const bool is_leader = (local_tid == 0);
         constexpr int quant_sync_bar_id = 2;
         uint32_t release_phasebits = 0xFFFF0000;
-        uint32_t remote_ready_phasebits = 0xFFFF0000;
+        uint32_t payload_arrived_phasebits = 0;
         int iter_idx = 0;
 
         if constexpr (C::USE_PDL) {
@@ -799,30 +816,22 @@ __device__ inline void kernel_shared_a_cross_cta(const globals<C> &g) {
                         }
                         wait(bf16_sub_arrived[sub], bf16_sub_phase);
                         const uint32_t export_a_canonical_smem_base = static_cast<uint32_t>(
-                            __cvta_generic_to_shared(&a_remote_fp4[stage][0]));
-                        const uint32_t remote_a_scale_local_smem_base = static_cast<uint32_t>(
-                            __cvta_generic_to_shared(&a_remote_sc[stage][0]));
+                            __cvta_generic_to_shared(&a_export_fp4.data[0]));
                         if constexpr (C::USE_CTA_AMAX) {
                             quantize_subtile_cta_amax<G>(
                                 quant_buf, input_tiles[stage], input_scales[stage],
                                 sub, quant_sync_bar_id, &running_amax, warp_max_buf,
-                                export_a_canonical_smem_base,
-                                remote_a_scale_local_smem_base,
-                                1,
-                                false);
+                                export_a_canonical_smem_base);
                         } else {
                             quantize_subtile_constant<G>(
                                 quant_buf, input_tiles[stage], input_scales[stage], sub,
-                                export_a_canonical_smem_base,
-                                remote_a_scale_local_smem_base,
-                                1,
-                                false);
+                                export_a_canonical_smem_base);
                         }
                         warpgroup::sync(quant_sync_bar_id);
                     }
                     bf16_sub_phase ^= 1;
                     copy_shared_local_bytes(
-                        static_cast<uint32_t>(__cvta_generic_to_shared(&a_remote_sc[stage][0])),
+                        static_cast<uint32_t>(__cvta_generic_to_shared(&a_export_sc.data[0])),
                         static_cast<uint32_t>(__cvta_generic_to_shared(&input_scales[stage].A.data[0])),
                         sizeof(input_scales[stage].A),
                         local_tid,
@@ -834,18 +843,39 @@ __device__ inline void kernel_shared_a_cross_cta(const globals<C> &g) {
                     asm volatile("fence.proxy.async.shared::cluster;\n" ::: "memory");
 
                     if (is_leader) {
+                        const int target_cta = 1;
+                        tma::cluster::expect_bytes(
+                            a_payload_arrived[stage],
+                            sizeof(typename G::a_export_t),
+                            target_cta);
+                        tma::cluster::expect_bytes(
+                            a_scale_arrived[stage],
+                            sizeof(typename G::a_scale_export_t),
+                            target_cta);
+                        tma::cluster::store_async(
+                            reinterpret_cast<void*>(&a_recv_fp4[stage]),
+                            reinterpret_cast<void*>(&a_export_fp4),
+                            sizeof(typename G::a_export_t),
+                            target_cta,
+                            a_payload_arrived[stage]);
+                        tma::cluster::store_async(
+                            reinterpret_cast<void*>(&a_recv_sc[stage]),
+                            reinterpret_cast<void*>(&a_export_sc),
+                            sizeof(typename G::a_scale_export_t),
+                            target_cta,
+                            a_scale_arrived[stage]);
+                        tma::store_async_read_wait<0>();
                         arrive(a_quant_done[stage], 1);
-                        arrive_remote_cluster(a_remote_ready[stage], 1, 1);
                     }
                     if (cluster_id == 0 && block_idx == 0 && i == 0) {
                         if (g.debug_cta0_a_ptr != nullptr) {
                             dump_shared_raw_bytes(
-                                &a_remote_fp4[stage][0], g.debug_cta0_a_ptr,
+                                &a_export_fp4.data[0], g.debug_cta0_a_ptr,
                                 C::ROW_SLICE * (C::Kb/2), local_tid, 128);
                         }
                         if (g.debug_cta0_sc_ptr != nullptr) {
                             dump_shared_raw_bytes(
-                                &a_remote_sc[stage][0], g.debug_cta0_sc_ptr,
+                                &a_export_sc.data[0], g.debug_cta0_sc_ptr,
                                 sizeof(input_scales[stage].A), local_tid, 128);
                         }
                     }
@@ -856,33 +886,23 @@ __device__ inline void kernel_shared_a_cross_cta(const globals<C> &g) {
                     if (iter_idx >= C::LOAD_PIPE_DEPTH && is_leader) {
                         arrive_remote_cluster(a_stage_released[stage], 0, 1);
                     }
-                    wait(a_remote_ready[stage], get_phasebit<1>(remote_ready_phasebits, stage));
+                    wait(a_payload_arrived[stage], get_phasebit<0>(payload_arrived_phasebits, stage));
+                    wait(a_scale_arrived[stage], get_phasebit<0>(payload_arrived_phasebits, stage));
                     asm volatile("fence.proxy.async.shared::cluster;\n" ::: "memory");
-                    copy_shared_cluster_bytes(
-                        static_cast<uint32_t>(__cvta_generic_to_shared(&a_remote_sc[stage][0])),
-                        static_cast<uint32_t>(__cvta_generic_to_shared(&a_remote_sc[stage][0])),
-                        0,
-                        sizeof(input_scales[stage].A),
-                        local_tid,
-                        128);
+                    __threadfence_block();
+                    asm volatile("fence.proxy.async.shared::cta;\n" ::: "memory");
                     copy_shared_local_bytes(
                         static_cast<uint32_t>(__cvta_generic_to_shared(&input_scales[stage].A.data[0])),
-                        static_cast<uint32_t>(__cvta_generic_to_shared(&a_remote_sc[stage][0])),
+                        static_cast<uint32_t>(__cvta_generic_to_shared(&a_recv_sc[stage].data[0])),
                         sizeof(input_scales[stage].A),
                         local_tid,
                         128);
-                    copy_shared_cluster_bytes(
-                        static_cast<uint32_t>(__cvta_generic_to_shared(&a_remote_fp4[stage][0])),
-                        static_cast<uint32_t>(__cvta_generic_to_shared(&a_remote_fp4[stage][0])),
-                        0,
-                        C::ROW_SLICE * (C::Kb / 2),
-                        local_tid,
-                        128);
+                    warpgroup::sync(quant_sync_bar_id);
                     import_local_canonical_fp4_tile(
                         input_tiles[stage].A,
                         C::ROW_SLICE,
                         C::Kb / 2,
-                        static_cast<uint32_t>(__cvta_generic_to_shared(&a_remote_fp4[stage][0])),
+                        static_cast<uint32_t>(__cvta_generic_to_shared(&a_recv_fp4[stage].data[0])),
                         local_tid,
                         128);
 
@@ -890,12 +910,13 @@ __device__ inline void kernel_shared_a_cross_cta(const globals<C> &g) {
                     if (cluster_id == 0 && block_idx == 0 && i == 0) {
                         if (g.debug_cta1_a_ptr != nullptr) {
                             dump_shared_raw_bytes(
-                                &a_remote_fp4[stage][0], g.debug_cta1_a_ptr,
+                                &a_recv_fp4[stage].data[0],
+                                g.debug_cta1_a_ptr,
                                 C::ROW_SLICE * (C::Kb/2), local_tid, 128);
                         }
                         if (g.debug_cta1_sc_ptr != nullptr) {
                             dump_shared_raw_bytes(
-                                &a_remote_sc[stage][0], g.debug_cta1_sc_ptr,
+                                &a_recv_sc[stage].data[0], g.debug_cta1_sc_ptr,
                                 sizeof(input_scales[stage].A), local_tid, 128);
                         }
                     }
@@ -905,7 +926,7 @@ __device__ inline void kernel_shared_a_cross_cta(const globals<C> &g) {
                     if (is_leader) {
                         arrive(a_quant_done[stage], 1);
                     }
-                    update_phasebit<1>(remote_ready_phasebits, stage);
+                    update_phasebit<0>(payload_arrived_phasebits, stage);
                 }
 
                 update_phasebit<1>(phasebits, stage);
