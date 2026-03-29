@@ -95,10 +95,33 @@ These helped because they reduced live state and stage pressure.
   - mathematically valid
   - but it widens live output state and pushes register pressure back up
 
+- splitting `dC` into a 3-warpgroup "producer / math / epilogue" pipeline
+  - it was possible to make the sandbox correct
+  - but not to turn it into a compelling standalone kernel
+  - the extra handoff / scoreboard / codegen cost ate the intended overlap win
+
 - trying to rescue the old toxic `half_tt` `dC` output contract
 
 - treating this as a DRAM bandwidth problem
   - the profiler data does not support that
+
+## Current Practical Conclusion
+
+- the 3-warpgroup idea is at most mildly useful for `dE`
+  - decoupling tensor-core issue from softmax/quantize can still buy a small win there
+
+- the same idea does not look promising for standalone `dC`
+  - recompute + on-chip `G^T` staging is too narrow a reuse window
+  - widening the window just pushes state, synchronization, and codegen pressure back up
+
+- the best practical "experimental combo" shape is therefore:
+  - experimental `dE`
+  - public `dC`
+
+- if the goal is real end-to-end speedup, the serious path is back toward `v2` / `v3` style materialization
+  - write a bounded quantized intermediate once
+  - let the following GEMMs run with much lighter on-chip state
+  - spend effort on the materialization kernel and its epilogue economics, not on making `v5 dC` ever more elaborate
 
 ## Current Best Bounded Conclusion
 
