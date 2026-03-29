@@ -100,44 +100,111 @@ These helped because they reduced live state and stage pressure.
   - but not to turn it into a compelling standalone kernel
   - the extra handoff / scoreboard / codegen cost ate the intended overlap win
 
+- "hybrid" `v5`: keep phase 1 in FP4, but stage BF16 `G` / `G^T` on chip and run phase 3 in BF16
+  - this made the kernels exact across the main validation shapes:
+    - `dC`: `256x256x512`, `4096x256x512`, `256x256x8192`
+    - `dE`: `256x256x512`, `4096x256x512`
+    - combo: `4096x4096x32000`
+  - but it did not improve the economics
+  - on `4Kx4K->32K`, measured direct timings were:
+    - hybrid `dC`: `53.423 ms` vs public `dC`: `38.530 ms`
+    - hybrid `dE`: `68.419 ms` vs public `dE`: `60.604 ms`
+    - hybrid combo: `217.274 ms` vs public combo: `41.038 ms`
+    - shipped experimental combo (`exp dE + public dC`): `35.683 ms`
+  - so removing on-the-fly FP4 requantization was not enough
+  - the BF16 intermediate removed control-path ugliness, but the larger live BF16 scratch/state made the fused path even less attractive
+
 - trying to rescue the old toxic `half_tt` `dC` output contract
 
 - treating this as a DRAM bandwidth problem
   - the profiler data does not support that
 
+## What Finally Worked
+
+- a Triton-style one-pass exact combo kernel
+  - keep only the logits GEMM in FP4
+  - take dense BF16 `E` and `C` in natural row-major layout
+  - compute the softmax-gradient tile once
+  - immediately update both `dE` and `dC` from that same tile
+  - do not stage `G` / `G^T`
+  - do not split into separate replay-style `dE` / `dC` kernels
+  - do not use the owner-flipped phase-3 pipeline
+
+- this path is exact on the main validation set:
+  - `256x256x512`
+  - `4096x256x512`
+  - `256x256x8192`
+  - `4096x4096x32000`
+  - tiny `compute-sanitizer --tool memcheck` is clean
+
+- on `4Kx4K->32K`, current direct timings are:
+  - Triton-style exact combo: `20.48 ms`
+  - Triton `cce_exact` backward: `23.07 ms`
+  - Triton `cce` backward: `8.74 ms`
+  - public `nv-v5-combo`: `41.09 ms`
+  - shipped experimental combo (`exp dE + public dC`): `35.70 ms`
+
+- so the important new fact is:
+  - `v5` does not have to lose
+  - but it only starts to look viable when it copies the Triton backward schedule instead of the replay / owner-flipped schedule
+  - the win comes from computing the gradient tile once and consuming it twice, not from making the old split pipeline ever more elaborate
+
 ## Current Practical Conclusion
 
-- the 3-warpgroup idea is at most mildly useful for `dE`
-  - decoupling tensor-core issue from softmax/quantize can still buy a small win there
+- the replay-style `v5` family is still a dead end
+  - 3-warpgroup `dC` did not become a good kernel
+  - the BF16-intermediate hybrid did not become a good kernel
+  - owner-flipped split passes still pay too much replay / handoff / live-state tax
 
-- the same idea does not look promising for standalone `dC`
-  - recompute + on-chip `G^T` staging is too narrow a reuse window
-  - widening the window just pushes state, synchronization, and codegen pressure back up
+- the meaningful `v5` direction is now different:
+  - one-pass combo only
+  - Triton-style schedule
+  - FP4 only where it buys something directly, i.e. the logits GEMM
+  - immediate double-consumption of the BF16 gradient tile
 
-- the best practical "experimental combo" shape is therefore:
-  - experimental `dE`
-  - public `dC`
+- that means the practical comparison is no longer just `v5` vs `v3`
+  - `v3` is still the right answer if we want a materialized-intermediate design
+  - but a Triton-style one-pass `v5` combo is now a legitimate non-materialized alternative
 
-- if the goal is real end-to-end speedup, the serious path is back toward `v2` / `v3` style materialization
-  - write a bounded quantized intermediate once
-  - let the following GEMMs run with much lighter on-chip state
-  - spend effort on the materialization kernel and its epilogue economics, not on making `v5 dC` ever more elaborate
+- the current result is good but not complete
+  - it beats `cce_exact`
+  - it is still well behind filtered Triton `cce`
+  - so the remaining work, if any, should focus on this one-pass combo kernel only
 
 ## Current Best Bounded Conclusion
 
-On current Blackwell/TK resource economics, 1-pass FP4 without materialized `G` loses for one of two reasons:
+On current Blackwell/TK resource economics, replay-style 1-pass FP4 without materialized `G` loses for one of two reasons:
 
 - either reuse is too small, so `G` is recomputed/requantized too often
 - or reuse is widened, so enough state stays live that occupancy collapses and scoreboard stalls dominate
 
-That is why `v3` is still better:
+That is why the old split `v5` designs still lose.
 
-- compute `G` once
-- quantize it once
-- store quantized `G`
-- let later GEMMs run with much lighter on-chip state
+But the Triton-style one-pass result shows a narrower claim is more accurate:
 
-So the next serious work should prioritize `v3`, especially the fused FP4 epilogue/materialization kernel, while preserving the NVFP4 rule:
+- materializing `G` is not strictly required to beat `cce_exact`
+- what matters is computing the softmax-gradient tile once and consuming it twice with very little extra on-chip choreography
+
+So the two serious paths are now:
+
+- `v3` style:
+  - compute `G` once
+  - quantize it once
+  - store quantized `G`
+  - let later GEMMs run with much lighter on-chip state
+
+- Triton-style `v5` combo:
+  - recompute logits once
+  - form the BF16 grad tile once
+  - consume it immediately for both `dE` and `dC`
+  - avoid staged `G` / `G^T` and avoid separate replay passes
+
+So the next serious work should either:
+
+- prioritize `v3`, especially the fused FP4 epilogue/materialization kernel
+- or stay entirely on the Triton-style one-pass combo path
+
+and in either case preserve the NVFP4 rule:
 
 - CTA-local quantization
 - CTA-local `amax`
