@@ -193,8 +193,20 @@ Important limitations of the current version:
   - compile-only signal is encouraging relative to the quad-column path:
     - constant-scale: `96` bytes stack, `44` bytes spill stores / `56` bytes spill loads
     - CTA-amax: `48` bytes stack, `0` bytes spill stores / `0` bytes spill loads
-  - this backend is still debug-only and unvalidated at runtime in the current session because CUDA
-    device access is unavailable here
+  - the manual `ld.shared::cluster` receive path is now replaced by a DSMEM-style async transport:
+    - sender-side remote `expect_bytes(...)`
+    - async shared-cluster remote stores into CTA1-owned receive scratch
+    - CTA1 waits on a local completion semaphore before importing the canonical FP4 tile
+  - runtime bring-up on `256 x 512 x 256` now confirms that the backend launches and both CTAs produce
+    strongly correlated output tiles, but the transport is still not byte-exact:
+    - constant-scale dump mismatches remain (`A tile: 16354`, `A scales: 2039`)
+    - CTA-amax dump mismatches remain (`A tile: 8532`, `A scales: 2048`)
+    - constant-scale tile cosine matrix versus separate now has all four `128`-column tiles on-diagonal
+      at about `0.976-0.984`, so the path is no longer "dead right half", but a small number of
+      catastrophic outliers still make the full-output cosine only `0.694`
+    - CTA-amax also improved from the original dead-half failure mode, but still only reaches
+      about `0.705` cosine against the separate baseline
+  - public both-bf16 dispatch remains unchanged; this backend is still debug-only
 
 ## Current Validation
 
@@ -213,8 +225,10 @@ Important limitations of the current version:
   - `4096 x 4096 x 4096`
 - The quad-column same-CTA both-bf16 experiment currently has compile coverage only from this
   session; runtime validation is still pending on a GPU-enabled B200 host.
-- The cross-CTA shared-A both-bf16 experiment also currently has compile coverage only from this
-  session; runtime validation is pending on a GPU-enabled B200 host.
+- The cross-CTA shared-A both-bf16 experiment has now been rerun on:
+  - `python3 -u test_fused_gemm.py --both-bf16-shared-a-2cta 256 512 256`
+  It launches and produces sane tile structure, but it still fails the dump-level transport gate and
+  is not yet safe to promote.
 - The current fused dispatch is:
   - `N % 256 == 0 && N <= 2048`: dual-column prototype `config<128, *, *, 4, 2, false, USE_CTA_AMAX, 256, true, 2, 2>`
   - `N % 256 == 0 && N > 2048`: single-column wide-tile `config<256, 4, 8, 4, 2, false, USE_CTA_AMAX>`
@@ -222,8 +236,11 @@ Important limitations of the current version:
 - The dual-column constant-scale kernels currently compile with small but nonzero spills:
   `8` bytes spill stores / `12` bytes spill loads.
 - A cross-CTA shared-A prototype exists in-tree, but it is **not** currently dispatched. It still
-  miscomputes CTA1's imported A tile on `256 x 512 x 256` (left-half cosine `~0.988`, right-half
-  cosine `~0.56` against the separate baseline), so it is gated off until the DSMEM handoff is correct.
+  miscomputes the DSMEM-imported A/scales on `256 x 512 x 256`, even after replacing the original
+  manual cluster loads. The current debug run is no longer a "dead half" failure; instead, all four
+  `128`-column tiles are structurally correlated with the separate baseline, but dump mismatches and
+  a handful of extreme outliers still keep the full-output cosine low (`~0.694` constant,
+  `~0.705` CTA-amax). It stays gated off until that transport/scale mismatch is fully resolved.
 
 ## Current Measurements
 
@@ -345,3 +362,345 @@ the first cut, but it still does not beat separate `quantize + gemm`.
 So the next meaningful speed path is still structural reuse, not “just fuse more work into
 one CTA.” A winning both-bf16 design needs a 2D reuse schedule where quantized A and
 quantized B each feed multiple output tiles before being discarded.
+
+## Shared-A 2CTA Debug Update
+
+Latest isolated repro:
+
+```bash
+python3 -u test_fused_gemm.py --both-bf16-shared-a-2cta 256 512 256
+```
+
+Current state:
+
+- The catastrophic errors are still confined to the odd `128`-column tiles, which means the
+  remaining failure is still on the `cta_id == 1` path.
+- The diagonal tile cosines are high (`~0.98-0.99`), but a small number of CTA1 outputs are
+  catastrophically wrong:
+  - constant-scale outliers jump to values like `+-262144`
+  - CTA-amax outliers collapse toward `0`
+- The strongest recent experiments did **not** fix it:
+  - leader-only bulk DSMEM copies for A/scales instead of striped `st.async`
+  - adding `fence.proxy.async.shared::cluster`
+  - splitting the FP4-payload and scale-payload completion onto separate semaphores
+
+Useful interpretation:
+
+- The transport is still the leading suspect, but the newer outlier print shows the failure mode
+  more precisely than before:
+  - the bad coordinates live in tiles `1` and `3`, i.e. the CTA1-owned output tiles
+  - CTA0-owned tiles remain in the expected accuracy band
+- So the next highest-value debug move is to bypass shared-A on CTA1 temporarily
+  and let CTA1 quantize A locally. If that fixes the odd tiles immediately, the rest of the
+  CTA1 B/MMA/epilogue path is fine and the problem is purely the shared-A import path.
+
+### CTA1 Local-A Diagnostic Result
+
+That diagnostic is now implemented as a separate developer-only backend. On the same
+`256 x 512 x 256` repro:
+
+- CTA1-local-A makes the dump checks go fully bitwise-equal for both constant-scale and CTA-amax:
+  - A tile mismatches: `0`
+  - A scale mismatches: `0`
+- End-to-end numerics also snap back to the healthy both-bf16 baseline:
+  - constant-scale cosine vs separate: `0.9758429527`
+  - CTA-amax cosine vs separate: `0.9935339093`
+
+So the remaining bug is confirmed to be transport-only. CTA1's local B quantization, MMA,
+TMEM use, and epilogue are all fine when A import is removed from the equation.
+
+### Current Best Shared-A Transport Checkpoint
+
+The best stable shared-A receive experiment so far is:
+
+- CTA1 pulls the remote payload with `copy_shared_cluster_bytes_b8(...)`
+- then does a `warpgroup::sync(...)`
+- then copies scales into `input_scales` and imports the canonical FP4 bytes into the local swizzled A tile
+
+Observed result on the same repro:
+
+- Constant-scale dump mismatches improve a lot, but are not fixed:
+  - A tile mismatches: `2099`
+  - A scales mismatches: `2048`
+- Constant-scale no longer throws huge `+-262144` outliers or launch-fails.
+  The CTA1-owned output tiles now collapse cleanly to zero instead:
+  - tiles `1` and `3` have cosine `0.0000` vs separate
+  - full-output cosine is `0.6915594935`
+- CTA-amax remains partially live but still wrong:
+  - full-output cosine is `0.7048626542`
+
+One follow-up hybrid attempt (`b32` for scales, `b8` for FP4) regressed immediately back to
+an unspecified launch failure, so the all-`b8` receive with the added post-copy sync is the
+best current checkpoint.
+
+Practical conclusion:
+
+- The transport bug is now narrowed further:
+  - CTA1-local quantization proves the consumer path is good
+  - all-`b8` receive plus sync proves the raw CTA1 payload can be made much less corrupted
+  - but the received scale scratch is still effectively dead, which is why constant-scale
+    odd tiles zero out instead of matching the baseline
+- The next fix should focus specifically on why CTA1's copied A-scale scratch is not surviving
+  the receive path, rather than continuing to question the rest of the GEMM pipeline.
+
+## Dedicated-Producer 4WG Refactor
+
+Implemented a fresh single-CTA both-bf16 production backend with a real 4WG split:
+
+- `WG0`: dedicated producer for bf16 A/B TMA fetches
+- `WG1`: A quantizer only
+- `WG2`: B quantizer only
+- `WG3`: MMA plus epilogue/store
+
+This backend was implemented and benchmarked behind the existing public API shape band, but it
+is currently left **gated off** because it did not beat the older single-CTA ping-pong kernel.
+The public both-bf16 dispatcher is therefore still on the older 2-stage path.
+
+### What Changed
+
+- The new backend keeps the quantized stage ring (`LOAD_PIPE_DEPTH=3`) but moves raw A/B
+  fetch issuance out of the quantizer warpgroups.
+- Because a full raw bf16 stage ring does not fit in SMEM for this kernel shape, the producer
+  uses single raw A and B staging buffers and drives them independently with separate producer
+  warps inside `WG0`.
+- Epilogue/store moved from the old consumer warpgroup into `WG3` so `WG0` stays load-only.
+
+### Validation
+
+Build:
+
+```bash
+make -B -j1
+```
+
+Public runs:
+
+```bash
+python3 -u test_fused_gemm.py 256 256 256
+python3 -u test_fused_gemm.py 1024 1024 1024
+python3 -u test_fused_gemm.py 2048 2048 2048
+python3 -u test_fused_gemm.py 4096 4096 4096
+```
+
+Sanitizer smoke:
+
+```bash
+compute-sanitizer --tool memcheck python3 -u test_fused_gemm.py 256 256 256
+```
+
+Current result: all public paths still run, and the sanitizer smoke passed with `0` errors.
+The dedicated-producer measurements below were taken before the dispatcher was gated back to the
+older public both-bf16 path.
+
+### Benchmark Outcome
+
+The new 4WG backend is correct, but it does **not** beat separate `quantize + gemm`.
+It also does not beat the older both-bf16 ping-pong kernel on the large-shape band.
+
+Measured dedicated-producer both-bf16 timings:
+
+- `2048`: dedicated-producer const `0.128 ms`, CTA-amax `0.130 ms`
+- `4096`: dedicated-producer const `0.894 ms`, CTA-amax `0.929 ms`
+
+Reference baselines from the same runs:
+
+- `2048`: separate `0.029 ms`, A-only fused `0.049 ms`
+- `4096`: separate `0.060 ms`, A-only fused `0.345 ms`
+
+Compile-time signal for the new dedicated-producer both-bf16 config:
+
+- constant: `104` bytes spill stores / `208` bytes spill loads
+- CTA-amax: `272` bytes spill stores / `512` bytes spill loads
+
+So decoupling the fetch issue path from the quantizers helped a little structurally, but it
+did not change the main economics: the kernel is still dominated by on-the-fly quantization
+work with too little reuse per quantized operand tile.
+
+### Current Takeaway
+
+This refactor answers the utilization question more clearly:
+
+- the old both-bf16 kernel was indeed making quantizer warpgroups do double duty
+- separating producer from quantization is feasible and the implementation now exists in-tree
+- but overlap alone is not enough to win at `2048+`
+
+The next meaningful speed path is still structural reuse, not more local pipeline cleanup.
+To beat separate `quantize + gemm`, the both-bf16 design likely needs one or both of:
+
+- wider effective reuse of quantized A across more output columns
+- wider effective reuse of quantized B across more output rows
+
+The A-only fused path was left on the existing production backend in this round. The public
+both-bf16 dispatcher was also left on the older production backend after the dedicated-producer
+measurements came back slower.
+
+## Shared-B 2CTA Debug Split Results
+
+Current work is on the new internal shared-B `2CTA` backend only. Public dispatch is still
+unchanged.
+
+The most useful split results so far are:
+
+- `producer-only` passes for both constant and CTA-amax at `256 x 256 x 256`
+- `A-wait-only` passes for both constant and CTA-amax at `256 x 256 x 256`
+- `B-wait-only` passes for both constant and CTA-amax at `256 x 256 x 256`
+- `A-quant-only` passes at `256 x 256 x 128`, but hangs on the constant kernel at `256 x 256 x 256`
+- `B-quant-only` passes the constant kernel at `256 x 256 x 128`, then hangs on CTA-amax
+- `B-quant-only` hangs on the constant kernel at `256 x 256 x 256`
+- `A-stage1-quant-only` passes for both constant and CTA-amax at `256 x 256 x 256`
+- `B-stage1-quant-only` reaches CTA-amax launch at `256 x 256 x 256`, so the constant stage-1
+  pass completes there too
+- `A-quant-per-stage-only` still hangs on the constant kernel at `256 x 256 x 256`
+- `A-quant-then-wait-only` also hangs on the constant kernel at `256 x 256 x 256`
+
+Current interpretation:
+
+- the shared-B producer and raw-arrival semaphore contract is working
+- the second raw BF16 stage itself is readable; stage-1-only bring-up is clean
+- the constant-path `K=256` hang needs the **first quantize pass** to happen before the second-stage
+  progress breaks
+- giving transport-only quantization distinct destination slots per stage still does **not** fix
+  the hang, so the failure is not just reuse of `input_tiles[0]` / `input_scales[0]`
+- `A-quant-then-wait-only` hanging means the first A quantization pass is already poisoning the
+  second-stage wait path before the second quantization body even starts
+- the strongest current hypothesis is shared-memory corruption from the first quantization pass
+  clobbering stage-1 raw data or semaphore state
+- the B CTA-amax path still has a separate single-stage bug in its peer-amax / global-scale path
+
+The current highest-value next step is to verify what the first quantization pass corrupts in the
+shared-B transport-only backend, for example by dumping or checksumming stage-1 raw buffers and
+nearby semaphore storage before and after the first quantize iteration. Once the constant path is
+clean, come back to the separate B CTA-amax peer-amax exchange bug.
+
+## Shared-B 2CTA Current Checkpoint
+
+The shared-B `2CTA` debug backend advanced substantially after the earlier split work:
+
+- restoring the older cluster-MMA contract in the real kernel helped immediately:
+  - `a_quant_done` and `b_quant_done` are cluster-scoped again
+  - only `cta_id == 0 && warp_id == 0` issues `mm2_ABt` / `mma2_ABt`
+  - non-leader CTA uses `tma::cluster::arrive(..., 0, 1)` instead of running cluster MMA itself
+- with that fix, `256 x 256 x 256` full shared-B debug became numerically sane for both modes
+
+Measured `256 x 256 x 256` shared-B debug quality versus separate quantize+GEMM:
+
+- constant:
+  - full cosine `0.975947`
+  - quadrants all land around `0.975-0.976`
+- CTA-amax:
+  - full cosine `0.994232`
+  - quadrants land around `0.993-0.996`
+
+So the shared-B dataflow is now correct enough at the bring-up shape to be worth pushing on.
+
+### Shared-B Standalone Checkpoint
+
+The shared-B `2CTA` debug backend now has a standalone runner in the non-`TORCH_COMPILE`
+path of `nvfp4_b200_gemm.cu`, with a dedicated local build target:
+
+```bash
+make -B -j1 shared_b_debug_runner
+./nvfp4_b200_shared_b_debug.out --mode shared_b_const --m 1024 --n 1024 --k 1024
+./nvfp4_b200_shared_b_debug.out --mode shared_b_cta --m 1024 --n 1024 --k 1024
+```
+
+The crucial peer-amax fix was replacing the earlier async scalar hop with a direct remote
+shared-memory `b32` store plus explicit remote mbarrier arrival. The old failure signature
+was:
+
+- repeated WG2 `pre-peer`
+- no `post-peer`
+- `1024` CTA-amax hang in both transport-only and full shared-B debug modes
+
+Current standalone status:
+
+- `shared_b_const 256 256 256`: passes
+- `shared_b_cta 256 256 256`: passes
+- `shared_b_const 1024 1024 1024`: passes
+- `shared_b_cta 1024 1024 1024`: passes
+- `compute-sanitizer --tool memcheck ./nvfp4_b200_shared_b_debug.out --mode shared_b_cta --m 1024 --n 1024 --k 1024`: `0` errors
+- `shared_b_const 2048 2048 2048`: passes
+- `shared_b_cta 2048 2048 2048`: passes
+
+Representative standalone summaries:
+
+- `1024` constant:
+  - finite `1048576 / 1048576`
+  - checksum `58.5263`
+  - abs max `1.64844`
+- `1024` CTA-amax:
+  - finite `1048576 / 1048576`
+  - checksum `-100.787`
+  - abs max `1.64844`
+- `2048` constant:
+  - finite `4194304 / 4194304`
+  - checksum `-486.919`
+  - abs max `0.980469`
+- `2048` CTA-amax:
+  - finite `4194304 / 4194304`
+  - checksum `346.124`
+  - abs max `1.79688`
+
+One debug-only branch is still broken:
+
+- `shared_b_transport_cta 1024 1024 1024` still fails with `unspecified launch failure`
+
+That no longer blocks the main shared-B backend. The full shared-B CTA-amax kernel now runs
+through WG2 peer exchange, WG3 scale wait, and cluster MMA at `1024` and `2048`.
+
+### Python Validation Checkpoint
+
+After rebuilding the extension with the same peer-amax fix, the Python shared-B debug harness
+also completes cleanly again:
+
+```bash
+CUDA_VISIBLE_DEVICES=1 TK_SKIP_CUDA_PREFLIGHT=1 python3 -u test_fused_gemm.py --both-bf16-shared-b-2cta 1024 1024 1024
+CUDA_VISIBLE_DEVICES=1 TK_SKIP_CUDA_PREFLIGHT=1 python3 -u test_fused_gemm.py --both-bf16-shared-b-2cta 2048 2048 2048
+```
+
+`1024 x 1024 x 1024` versus separate quantize+GEMM:
+
+- shared-B constant:
+  - max diff `1.187500`
+  - mean diff `0.194954`
+  - cosine `0.9711900949`
+- shared-B CTA-amax:
+  - max diff `2.078125`
+  - mean diff `0.232026`
+  - cosine `0.9867668152`
+
+`2048 x 2048 x 2048` versus separate quantize+GEMM:
+
+- shared-B constant:
+  - max diff `1.203125`
+  - mean diff `0.183925`
+  - cosine `0.9736415148`
+- shared-B CTA-amax:
+  - max diff `2.578125`
+  - mean diff `0.305810`
+  - cosine `0.9868634939`
+
+At both shapes, the shared-B debug outputs match the current public both-bf16 path very closely.
+Public dispatch is still unchanged: the shared-B backend is debug-only until it is benchmarked
+against separate `quantize + gemm`.
+
+### Host Runtime Noise
+
+The Torch/CUDA host stack is still somewhat noisy on this machine:
+
+- fresh Python processes sometimes hit `cudaGetDeviceCount() -> Error 304`
+- `TK_SKIP_CUDA_PREFLIGHT=1` still helps avoid false negatives
+- stale GPU jobs can still poison new Torch sessions even when `nvidia-smi` looks fine
+
+Those are harness issues, not current kernel blockers.
+
+### Immediate Next Step
+
+The next work item is no longer deadlock debugging. The shared-B backend is now ready for
+performance comparison:
+
+1. add or reuse a timing path for the shared-B debug backend
+2. compare shared-B constant and CTA-amax against:
+   - separate quantize+GEMM
+   - current public both-bf16 backend
+3. only then decide whether to promote shared-B for `2048+`

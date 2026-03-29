@@ -54,6 +54,7 @@ NVCCFLAGS += -I${THUNDERKITTENS_ROOT}/include -I${THUNDERKITTENS_ROOT}/prototype
 NVCCFLAGS += -DNDEBUG # disable debug blocks
 NVCCFLAGS += -lineinfo # show line number with compute-sanitizer (does not affect perf, but binary gets larger)
 NVCCFLAGS += -ftemplate-backtrace-limit=0 # show full template trace
+NVCCFLAGS += $(EXTRA_NVCCFLAGS)
 
 # Python configuration (i.e., run with Python + PyTorch, but C++-side does not use the PyTorch API)
 ifeq ($(CONFIG),python)
