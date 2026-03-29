@@ -3,6 +3,9 @@
 #include "nvfp4_cce_backward_v5_dC.cuh"
 #include "nvfp4_cce_backward_v5_dE_superk4_experimental.cuh"
 #include "nvfp4_cce_backward_v5_dC_superk4_experimental.cuh"
+#include "nvfp4_cce_backward_v5_dE_fp4p1_bf16p3_experimental.cuh"
+#include "nvfp4_cce_backward_v5_dC_fp4p1_bf16p3_experimental.cuh"
+#include "nvfp4_cce_backward_v5_combo_tritonstyle_experimental.cuh"
 
 #ifndef TORCH_COMPILE
 int main() { return 0; }
@@ -60,6 +63,15 @@ using bwd_v5_dE_fp4_L4_SG8 = nvfp4_cce_backward_v5_dE::config<2, 8, true>;
 using bwd_v5_dC_fp4_L4_SG8 = nvfp4_cce_backward_v5_dC::config<2, 8, true>;
 using exp_bwd_v5_dE_fp4_L4_SG8 = nvfp4_cce_backward_v5_dE_superk4_experimental::config<2, 8, true>;
 using exp_bwd_v5_dC_fp4_L4_SG8 = nvfp4_cce_backward_v5_dC_superk4_experimental::config<2, 8, true>;
+using exp_bwd_v5_dE_fp4p1_bf16p3_L4_SG8 = nvfp4_cce_backward_v5_dE_fp4p1_bf16p3_experimental::config<2, 8, true>;
+using exp_bwd_v5_dC_fp4p1_bf16p3_L4_SG8 = nvfp4_cce_backward_v5_dC_fp4p1_bf16p3_experimental::config<2, 8, true>;
+using exp_bwd_v5_dE_fp4p1_bf16p3_L2_SG4 = nvfp4_cce_backward_v5_dE_fp4p1_bf16p3_experimental::config<2, 4, true>;
+using exp_bwd_v5_dC_fp4p1_bf16p3_L2_SG4 = nvfp4_cce_backward_v5_dC_fp4p1_bf16p3_experimental::config<2, 4, true>;
+using exp_bwd_v5_dE_fp4p1_bf16p3_L1_SG8 = nvfp4_cce_backward_v5_dE_fp4p1_bf16p3_experimental::config<1, 8, true>;
+using exp_bwd_v5_dC_fp4p1_bf16p3_L1_SG8 = nvfp4_cce_backward_v5_dC_fp4p1_bf16p3_experimental::config<1, 8, true>;
+using exp_bwd_v5_dE_fp4p1_bf16p3_L1_SG4 = nvfp4_cce_backward_v5_dE_fp4p1_bf16p3_experimental::config<1, 4, true>;
+using exp_bwd_v5_dC_fp4p1_bf16p3_L1_SG4 = nvfp4_cce_backward_v5_dC_fp4p1_bf16p3_experimental::config<1, 4, true>;
+using exp_bwd_v5_combo_fp4p1_tritonstyle_exact_L4_SG8 = nvfp4_cce_backward_v5_combo_tritonstyle_experimental::config<2, 8, true>;
 
 template <typename C>
 static void launch_experimental_backward_v5_dE(
@@ -101,6 +113,47 @@ static void launch_experimental_backward_v5_dE(
 }
 
 template <typename C>
+static void launch_experimental_backward_v5_dE_fp4p1_bf16p3(
+    const at::Tensor &A, const at::Tensor &A_sc, const at::Tensor &A_sc_global,
+    const at::Tensor &B, const at::Tensor &B_sc, const at::Tensor &B_sc_global,
+    const at::Tensor &C_col_bf16,
+    at::Tensor &dE_out, const at::Tensor &lse, const at::Tensor &targets,
+    float grad_scale, int M, int N, int K, float filter_eps = 0.0f)
+{
+    using G = nvfp4_cce_backward_v5_dE_fp4p1_bf16p3_experimental::globals<C>;
+
+    TORCH_CHECK(C_col_bf16.scalar_type() == at::kBFloat16,
+                "experimental_backward_v5_dE_fp4p1_bf16p3_L4_SG8 expects C_col_bf16 to have dtype bfloat16");
+    TORCH_CHECK(C_col_bf16.is_contiguous(),
+                "experimental_backward_v5_dE_fp4p1_bf16p3_L4_SG8 expects C_col_bf16 to be contiguous and pre-transposed into [K, N_pad]");
+
+    G g {
+        .A = kittens::py::tensor_to_gl<typename G::A_fp4x2_gl>(A),
+        .A_sc = kittens::py::tensor_to_gl<typename G::A_sc_gl, false>(
+            A_sc, 1,
+            A_sc.dim() == 2 ? A_sc.size(0) / 128 : A_sc.size(0),
+            A_sc.dim() == 2 ? A_sc.size(1) / 4 : A_sc.size(1), 256),
+        .A_sc_global = kittens::py::tensor_to_gl<typename G::A_sc_global_gl>(A_sc_global),
+        .B = kittens::py::tensor_to_gl<typename G::B_fp4x2_gl>(B),
+        .B_sc = kittens::py::tensor_to_gl<typename G::B_sc_gl, false>(
+            B_sc, 1,
+            B_sc.dim() == 2 ? B_sc.size(0) / 128 : B_sc.size(0),
+            B_sc.dim() == 2 ? B_sc.size(1) / 4 : B_sc.size(1), 256),
+        .B_sc_global = kittens::py::tensor_to_gl<typename G::B_sc_global_gl>(B_sc_global),
+        .C_col = kittens::py::tensor_to_gl<typename G::P3_B_fp4x2_gl>(C_col_bf16),
+        .dE_out = kittens::py::tensor_to_gl<typename G::Out_gl>(dE_out),
+        .lse = lse.data_ptr<float>(),
+        .targets = targets.data_ptr<int64_t>(),
+        .grad_scale = grad_scale,
+        .filter_eps = filter_eps,
+        .M = M,
+        .N = N,
+        .K = K,
+    };
+    kittens::py::launch_kernel<C, G, nvfp4_cce_backward_v5_dE_fp4p1_bf16p3_experimental::kernel<C>>(g);
+}
+
+template <typename C>
 static void launch_experimental_backward_v5_dC(
     const at::Tensor &A, const at::Tensor &A_sc, const at::Tensor &A_sc_global,
     const at::Tensor &B, const at::Tensor &B_sc, const at::Tensor &B_sc_global,
@@ -119,6 +172,97 @@ static void launch_experimental_backward_v5_dC(
         E_col, E_col_sc, E_col_sc_global,
         dC_out, lse, targets,
         grad_scale, M, N, K, filter_eps);
+}
+
+template <typename C>
+static void launch_experimental_backward_v5_dC_fp4p1_bf16p3(
+    const at::Tensor &A, const at::Tensor &A_sc, const at::Tensor &A_sc_global,
+    const at::Tensor &B, const at::Tensor &B_sc, const at::Tensor &B_sc_global,
+    const at::Tensor &E_col_bf16,
+    at::Tensor &dC_out, const at::Tensor &lse, const at::Tensor &targets,
+    float grad_scale, int M, int N, int K, float filter_eps = 0.0f)
+{
+    using G = nvfp4_cce_backward_v5_dC_fp4p1_bf16p3_experimental::globals<C>;
+
+    TORCH_CHECK(E_col_bf16.scalar_type() == at::kBFloat16,
+                "experimental_backward_v5_dC_fp4p1_bf16p3_L4_SG8 expects E_col_bf16 to have dtype bfloat16");
+    TORCH_CHECK(E_col_bf16.is_contiguous(),
+                "experimental_backward_v5_dC_fp4p1_bf16p3_L4_SG8 expects E_col_bf16 to be contiguous and pre-transposed into [K, M_pad]");
+
+    G g {
+        .A = kittens::py::tensor_to_gl<typename G::A_fp4x2_gl>(A),
+        .A_sc = kittens::py::tensor_to_gl<typename G::A_sc_gl, false>(
+            A_sc, 1,
+            A_sc.dim() == 2 ? A_sc.size(0) / 128 : A_sc.size(0),
+            A_sc.dim() == 2 ? A_sc.size(1) / 4 : A_sc.size(1), 256),
+        .A_sc_global = kittens::py::tensor_to_gl<typename G::A_sc_global_gl>(A_sc_global),
+        .B = kittens::py::tensor_to_gl<typename G::B_fp4x2_gl>(B),
+        .B_sc = kittens::py::tensor_to_gl<typename G::B_sc_gl, false>(
+            B_sc, 1,
+            B_sc.dim() == 2 ? B_sc.size(0) / 128 : B_sc.size(0),
+            B_sc.dim() == 2 ? B_sc.size(1) / 4 : B_sc.size(1), 256),
+        .B_sc_global = kittens::py::tensor_to_gl<typename G::B_sc_global_gl>(B_sc_global),
+        .E_col = kittens::py::tensor_to_gl<typename G::P3_B_fp4x2_gl>(E_col_bf16),
+        .dC_out = kittens::py::tensor_to_gl<typename G::Out_gl>(dC_out),
+        .lse = lse.data_ptr<float>(),
+        .targets = targets.data_ptr<int64_t>(),
+        .grad_scale = grad_scale,
+        .filter_eps = filter_eps,
+        .M = M,
+        .N = N,
+        .K = K,
+    };
+    kittens::py::launch_kernel<C, G, nvfp4_cce_backward_v5_dC_fp4p1_bf16p3_experimental::kernel<C>>(g);
+}
+
+template <typename C>
+static void launch_experimental_backward_v5_combo_fp4p1_tritonstyle_exact(
+    const at::Tensor &A, const at::Tensor &A_sc, const at::Tensor &A_sc_global,
+    const at::Tensor &B, const at::Tensor &B_sc, const at::Tensor &B_sc_global,
+    const at::Tensor &E_bf16, const at::Tensor &C_bf16,
+    at::Tensor &dE_out, at::Tensor &dC_out,
+    const at::Tensor &lse, const at::Tensor &targets,
+    float grad_scale, int M, int N, int K, float filter_eps = 0.0f)
+{
+    using G = nvfp4_cce_backward_v5_combo_tritonstyle_experimental::globals<C>;
+
+    TORCH_CHECK(filter_eps == 0.0f,
+                "experimental_backward_v5_combo_fp4p1_tritonstyle_exact_L4_SG8 currently only supports exact mode with filter_eps == 0");
+    TORCH_CHECK(E_bf16.scalar_type() == at::kBFloat16,
+                "experimental_backward_v5_combo_fp4p1_tritonstyle_exact_L4_SG8 expects E_bf16 to have dtype bfloat16");
+    TORCH_CHECK(C_bf16.scalar_type() == at::kBFloat16,
+                "experimental_backward_v5_combo_fp4p1_tritonstyle_exact_L4_SG8 expects C_bf16 to have dtype bfloat16");
+    TORCH_CHECK(E_bf16.is_contiguous(),
+                "experimental_backward_v5_combo_fp4p1_tritonstyle_exact_L4_SG8 expects E_bf16 to be contiguous in row-major [M_pad, K]");
+    TORCH_CHECK(C_bf16.is_contiguous(),
+                "experimental_backward_v5_combo_fp4p1_tritonstyle_exact_L4_SG8 expects C_bf16 to be contiguous in row-major [N_pad, K]");
+
+    G g {
+        .A = kittens::py::tensor_to_gl<typename G::A_fp4x2_gl>(A),
+        .A_sc = kittens::py::tensor_to_gl<typename G::A_sc_gl, false>(
+            A_sc, 1,
+            A_sc.dim() == 2 ? A_sc.size(0) / 128 : A_sc.size(0),
+            A_sc.dim() == 2 ? A_sc.size(1) / 4 : A_sc.size(1), 256),
+        .A_sc_global = kittens::py::tensor_to_gl<typename G::A_sc_global_gl>(A_sc_global),
+        .B = kittens::py::tensor_to_gl<typename G::B_fp4x2_gl>(B),
+        .B_sc = kittens::py::tensor_to_gl<typename G::B_sc_gl, false>(
+            B_sc, 1,
+            B_sc.dim() == 2 ? B_sc.size(0) / 128 : B_sc.size(0),
+            B_sc.dim() == 2 ? B_sc.size(1) / 4 : B_sc.size(1), 256),
+        .B_sc_global = kittens::py::tensor_to_gl<typename G::B_sc_global_gl>(B_sc_global),
+        .E_bf16 = kittens::py::tensor_to_gl<typename G::E_gl>(E_bf16),
+        .C_bf16 = kittens::py::tensor_to_gl<typename G::C_gl>(C_bf16),
+        .dE_out = kittens::py::tensor_to_gl<typename G::dE_gl>(dE_out),
+        .dC_out = kittens::py::tensor_to_gl<typename G::dC_gl>(dC_out),
+        .lse = lse.data_ptr<float>(),
+        .targets = targets.data_ptr<int64_t>(),
+        .grad_scale = grad_scale,
+        .filter_eps = filter_eps,
+        .M = M,
+        .N = N,
+        .K = K,
+    };
+    kittens::py::launch_kernel<C, G, nvfp4_cce_backward_v5_combo_tritonstyle_experimental::kernel<C>>(g);
 }
 
 template <typename C>
@@ -375,8 +519,26 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           "Developer-only isolated NVFP4 dC phase-3 mm2 probe L4 SG8");
     m.def("experimental_backward_v5_dE_fp4_L4_SG8", &launch_experimental_backward_v5_dE<exp_bwd_v5_dE_fp4_L4_SG8>,
           "Developer-only NVFP4 CCE v5 dE experimental sandbox");
+    m.def("experimental_backward_v5_dE_fp4p1_bf16p3_L4_SG8", &launch_experimental_backward_v5_dE_fp4p1_bf16p3<exp_bwd_v5_dE_fp4p1_bf16p3_L4_SG8>,
+          "Developer-only NVFP4 CCE v5 dE hybrid FP4 phase-1 + BF16 phase-3 path");
+    m.def("experimental_backward_v5_dE_fp4p1_bf16p3_L2_SG4", &launch_experimental_backward_v5_dE_fp4p1_bf16p3<exp_bwd_v5_dE_fp4p1_bf16p3_L2_SG4>,
+          "Developer-only NVFP4 CCE v5 dE hybrid FP4 phase-1 + BF16 phase-3 path");
+    m.def("experimental_backward_v5_dE_fp4p1_bf16p3_L1_SG8", &launch_experimental_backward_v5_dE_fp4p1_bf16p3<exp_bwd_v5_dE_fp4p1_bf16p3_L1_SG8>,
+          "Developer-only NVFP4 CCE v5 dE hybrid FP4 phase-1 + BF16 phase-3 path");
+    m.def("experimental_backward_v5_dE_fp4p1_bf16p3_L1_SG4", &launch_experimental_backward_v5_dE_fp4p1_bf16p3<exp_bwd_v5_dE_fp4p1_bf16p3_L1_SG4>,
+          "Developer-only NVFP4 CCE v5 dE hybrid FP4 phase-1 + BF16 phase-3 path");
     m.def("experimental_backward_v5_dC_fp4_L4_SG8", &launch_experimental_backward_v5_dC<exp_bwd_v5_dC_fp4_L4_SG8>,
           "Developer-only NVFP4 CCE v5 dC experimental sandbox");
+    m.def("experimental_backward_v5_dC_fp4p1_bf16p3_L4_SG8", &launch_experimental_backward_v5_dC_fp4p1_bf16p3<exp_bwd_v5_dC_fp4p1_bf16p3_L4_SG8>,
+          "Developer-only NVFP4 CCE v5 dC hybrid FP4 phase-1 + BF16 phase-3 path");
+    m.def("experimental_backward_v5_dC_fp4p1_bf16p3_L2_SG4", &launch_experimental_backward_v5_dC_fp4p1_bf16p3<exp_bwd_v5_dC_fp4p1_bf16p3_L2_SG4>,
+          "Developer-only NVFP4 CCE v5 dC hybrid FP4 phase-1 + BF16 phase-3 path");
+    m.def("experimental_backward_v5_dC_fp4p1_bf16p3_L1_SG8", &launch_experimental_backward_v5_dC_fp4p1_bf16p3<exp_bwd_v5_dC_fp4p1_bf16p3_L1_SG8>,
+          "Developer-only NVFP4 CCE v5 dC hybrid FP4 phase-1 + BF16 phase-3 path");
+    m.def("experimental_backward_v5_dC_fp4p1_bf16p3_L1_SG4", &launch_experimental_backward_v5_dC_fp4p1_bf16p3<exp_bwd_v5_dC_fp4p1_bf16p3_L1_SG4>,
+          "Developer-only NVFP4 CCE v5 dC hybrid FP4 phase-1 + BF16 phase-3 path");
+    m.def("experimental_backward_v5_combo_fp4p1_tritonstyle_exact_L4_SG8", &launch_experimental_backward_v5_combo_fp4p1_tritonstyle_exact<exp_bwd_v5_combo_fp4p1_tritonstyle_exact_L4_SG8>,
+          "Developer-only NVFP4 CCE v5 Triton-style exact combo path");
     m.def("debug_experimental_v5_dC_trace_fp4_L4_SG8", &launch_debug_experimental_backward_v5_dC_trace<exp_bwd_v5_dC_fp4_L4_SG8>,
           "Developer-only NVFP4 CCE v5 experimental dC bounded trace L4 SG8");
 }
