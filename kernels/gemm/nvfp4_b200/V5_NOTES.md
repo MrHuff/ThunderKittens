@@ -138,9 +138,10 @@ These helped because they reduced live state and stage pressure.
   - tiny `compute-sanitizer --tool memcheck` is clean
 
 - on `4Kx4K->32K`, current direct timings are:
-  - Triton-style exact combo: `20.48 ms`
-  - Triton `cce_exact` backward: `23.07 ms`
-  - Triton `cce` backward: `8.74 ms`
+  - Triton-style exact combo, `EPI_PIPE_DEPTH=1`: `19.680 ms`
+  - Triton-style filtered combo, `EPI_PIPE_DEPTH=2`, `filter_eps=2^-12`: `11.051 ms`
+  - Triton `cce_exact` backward: `20.940 ms`
+  - Triton `cce` backward: `6.600 ms`
   - public `nv-v5-combo`: `41.09 ms`
   - shipped experimental combo (`exp dE + public dC`): `35.70 ms`
 
@@ -148,6 +149,17 @@ These helped because they reduced live state and stage pressure.
   - `v5` does not have to lose
   - but it only starts to look viable when it copies the Triton backward schedule instead of the replay / owner-flipped schedule
   - the win comes from computing the gradient tile once and consuming it twice, not from making the old split pipeline ever more elaborate
+
+- the remaining bottleneck is now much clearer:
+  - only the logits GEMM is FP4
+  - after that, the kernel still has to pay for two BF16 back-half GEMMs, `dE += grad @ C` and `dC += E^T @ grad`
+  - those two updates, plus their overlapping reduction stores, are now the dominant cost
+  - this is why the Triton-style combo can beat `cce_exact`, but still does not catch filtered Triton `cce`
+
+- this also sharpens the conclusion on on-the-fly quantization:
+  - quantizing `G` / `G^T` on the fly is not just a minor tax
+  - it adds enough extra register state, shared-memory staging, scales, and requantization machinery that the replay-style kernels collapse under their own bookkeeping
+  - removing that machinery was necessary, but not sufficient; the remaining BF16 `dE` / `dC` updates still set the floor
 
 ## Current Practical Conclusion
 
@@ -170,6 +182,7 @@ These helped because they reduced live state and stage pressure.
   - it beats `cce_exact`
   - it is still well behind filtered Triton `cce`
   - so the remaining work, if any, should focus on this one-pass combo kernel only
+  - and specifically on reducing the cost of the two remaining BF16 back-half GEMMs and their output accumulation path
 
 ## Current Best Bounded Conclusion
 

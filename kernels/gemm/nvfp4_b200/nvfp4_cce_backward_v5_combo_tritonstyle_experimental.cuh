@@ -18,10 +18,11 @@
 
 namespace nvfp4_cce_backward_v5_combo_tritonstyle_experimental {
 
-template <int _LOAD_PIPE_DEPTH, int _SUPERGROUP_SIZE, bool _PINGPONG = true>
+template <int _LOAD_PIPE_DEPTH, int _SUPERGROUP_SIZE, bool _PINGPONG = true, int _EPI_PIPE_DEPTH = 4>
 struct config {
     static_assert(_LOAD_PIPE_DEPTH > 0 && _LOAD_PIPE_DEPTH <= 5);
     static_assert(_SUPERGROUP_SIZE > 0);
+    static_assert(_EPI_PIPE_DEPTH > 0);
 
     static constexpr int CLUSTER_SIZE = 1;
     static constexpr bool USE_PDL = false;
@@ -33,7 +34,7 @@ struct config {
     static constexpr int NUM_THREADS = NUM_WARPS * WARP_THREADS;
 
     static constexpr int LOAD_PIPE_DEPTH = _LOAD_PIPE_DEPTH;
-    static constexpr int EPI_PIPE_DEPTH = 4;
+    static constexpr int EPI_PIPE_DEPTH = _EPI_PIPE_DEPTH;
     static constexpr bool OVERLAP_EPI = false;
     static constexpr bool PINGPONG = _PINGPONG;
     static constexpr int SUPERGROUP_SIZE = _SUPERGROUP_SIZE;
@@ -43,9 +44,12 @@ struct config {
     static constexpr int LOCAL_N = Nb / 2;  // one-CTA legal half-block
     static constexpr int Kb = 256;          // logits reduction
     static constexpr int Nb_out = 128;      // K-tile for output updates
+    static_assert(LOCAL_N % EPI_PIPE_DEPTH == 0);
+    static_assert(Nb_out % EPI_PIPE_DEPTH == 0);
 
     static constexpr int B_SC_SIZE = Nb / 128;
     static constexpr int MMA_PER_TILE = Kb / 64;
+    static constexpr int STORE_PIPE_STAGES = (EPI_PIPE_DEPTH < 2 ? EPI_PIPE_DEPTH : 2);
 };
 
 template <typename C>
@@ -111,8 +115,8 @@ struct globals {
     };
     struct output_tiles_t {
         Grad_subtile logits;
-        dE_tile dE;
-        dC_tile dC;
+        dE_tile dE[C::STORE_PIPE_STAGES];
+        dC_tile dC[C::STORE_PIPE_STAGES];
     };
 
     __host__ inline dim3 grid() const {
@@ -180,6 +184,7 @@ __device__ inline void kernel(const globals<C> &g) {
     __shared__ semaphore e_tiles_arrived;
     __shared__ semaphore de_outputs_arrived;
     __shared__ semaphore dc_outputs_arrived;
+    __shared__ float filter_max_smem[WARPGROUP_WARPS];
     if (threadIdx.x == 32) {
         init_semaphore(tmem_provisioned, 0, 1);
         #pragma unroll
@@ -321,10 +326,6 @@ __device__ inline void kernel(const globals<C> &g) {
             static_cast<uint32_t>(__cvta_generic_to_shared(&grad_tiles.G_row.data[0]));
         const uint32_t logits_base =
             static_cast<uint32_t>(__cvta_generic_to_shared(&output_tiles.logits.data[0]));
-        const uint32_t dE_base =
-            static_cast<uint32_t>(__cvta_generic_to_shared(&output_tiles.dE.data[0]));
-        const uint32_t dC_base =
-            static_cast<uint32_t>(__cvta_generic_to_shared(&output_tiles.dC.data[0]));
         const int wg_thread = warpgroup::warpid() * WARP_THREADS + lane_id;
 
         int my_targets_x[logits_rt::height];
@@ -350,6 +351,7 @@ __device__ inline void kernel(const globals<C> &g) {
             auto &phase1_tm = (half == 0) ? phase1_tm_0 : phase1_tm_1;
             logits_rt D_pipe[2];
             logits_rt_bf D_bf;
+            float filter_local_max = 0.0f;
 
             warpgroup::load_async(
                 D_pipe[0],
@@ -442,6 +444,19 @@ __device__ inline void kernel(const globals<C> &g) {
                     }
                 }
 
+                if (g.filter_eps > 0.0f) {
+                    #pragma unroll
+                    for (int i = 0; i < logits_rt::height; ++i) {
+                        #pragma unroll
+                        for (int j = 0; j < logits_rt::width; ++j) {
+                            #pragma unroll
+                            for (int kk = 0; kk < 4; ++kk) {
+                                filter_local_max = fmaxf(filter_local_max, fabsf(D_fl.tiles[i][j].data[kk].x));
+                                filter_local_max = fmaxf(filter_local_max, fabsf(D_fl.tiles[i][j].data[kk].y));
+                            }
+                        }
+                    }
+                }
                 warp::mul(D_fl, D_fl, g.grad_scale);
                 warp::copy(D_bf, D_fl);
                 warpgroup::sync(1);
@@ -470,6 +485,28 @@ __device__ inline void kernel(const globals<C> &g) {
                 }
             }
 
+            bool half_is_filtered = false;
+            if (g.filter_eps > 0.0f) {
+                #pragma unroll
+                for (int offset = WARP_THREADS / 2; offset > 0; offset >>= 1) {
+                    filter_local_max = fmaxf(filter_local_max, __shfl_xor_sync(0xFFFFFFFF, filter_local_max, offset));
+                }
+                if (lane_id == 0) filter_max_smem[warpgroup::warpid()] = filter_local_max;
+                warpgroup::sync(1);
+
+                float global_max = 0.0f;
+                #pragma unroll
+                for (int w = 0; w < WARPGROUP_WARPS; ++w) {
+                    global_max = fmaxf(global_max, filter_max_smem[w]);
+                }
+                half_is_filtered = (global_max < g.filter_eps);
+                warpgroup::sync(1);
+            }
+
+            if (half_is_filtered) {
+                continue;
+            }
+
             warpgroup::sync(1);
             __threadfence_block();
             asm volatile("fence.proxy.async.shared::cta;\n" ::: "memory");
@@ -494,6 +531,7 @@ __device__ inline void kernel(const globals<C> &g) {
 
                 #pragma unroll
                 for (int epi = 0; epi < C::EPI_PIPE_DEPTH; ++epi) {
+                    const int smem_slot = epi % C::STORE_PIPE_STAGES;
                     de_rt D_reg_fl;
                     de_rt_bf D_reg_bf;
                     warpgroup::load_async(
@@ -502,17 +540,24 @@ __device__ inline void kernel(const globals<C> &g) {
                             0, epi * (C::Nb_out / C::EPI_PIPE_DEPTH)));
                     tensor_load_wait();
                     tensor_before_thread_sync();
+                    if constexpr (C::EPI_PIPE_DEPTH > C::STORE_PIPE_STAGES) {
+                        if (epi >= C::STORE_PIPE_STAGES) {
+                            warpgroup::tma::store_async_read_wait<C::STORE_PIPE_STAGES - 1>();
+                        }
+                    }
                     warpgroup::sync(1);
                     warp::copy(D_reg_bf, D_reg_fl);
-                    warpgroup::store(output_tiles.dE, D_reg_bf);
+                    warpgroup::store(output_tiles.dE[smem_slot], D_reg_bf);
                     warpgroup::sync(1);
                     warpgroup::tma::store_add_async(
-                        g.dE_out, output_tiles.dE,
+                        g.dE_out, output_tiles.dE[smem_slot],
                         {row_block_idx, k_block_idx * C::EPI_PIPE_DEPTH + epi});
-                    tma::store_async_read_wait();
                 }
                 warpgroup::sync(1);
                 tensor_after_thread_sync();
+                if constexpr (C::EPI_PIPE_DEPTH > C::STORE_PIPE_STAGES) {
+                    warpgroup::tma::store_async_read_wait<0>();
+                }
 
                 if (issue_leader) {
                     tma::load_async(phase3_tiles.E_rows, g.E_bf16, {row_block_idx, k_block_idx}, e_tiles_arrived);
@@ -533,6 +578,9 @@ __device__ inline void kernel(const globals<C> &g) {
 
                 #pragma unroll
                 for (int epi = 0; epi < C::EPI_PIPE_DEPTH; ++epi) {
+                    const int smem_slot = epi % C::STORE_PIPE_STAGES;
+                    const uint32_t dC_base =
+                        static_cast<uint32_t>(__cvta_generic_to_shared(&output_tiles.dC[smem_slot].data[0]));
                     logits_rt D_reg_fl;
                     logits_rt_bf D_reg_bf;
                     warpgroup::load_async(
@@ -541,6 +589,11 @@ __device__ inline void kernel(const globals<C> &g) {
                             0, epi * (C::LOCAL_N / C::EPI_PIPE_DEPTH)));
                     tensor_load_wait();
                     tensor_before_thread_sync();
+                    if constexpr (C::EPI_PIPE_DEPTH > C::STORE_PIPE_STAGES) {
+                        if (epi >= C::STORE_PIPE_STAGES) {
+                            warpgroup::tma::store_async_read_wait<C::STORE_PIPE_STAGES - 1>();
+                        }
+                    }
                     warpgroup::sync(1);
                     warp::copy(D_reg_bf, D_reg_fl);
                     warpgroup::store(output_tiles.logits, D_reg_bf);
@@ -557,12 +610,12 @@ __device__ inline void kernel(const globals<C> &g) {
                     warpgroup::sync(1);
 
                     warpgroup::tma::store_add_async(
-                        g.dC_out, output_tiles.dC,
+                        g.dC_out, output_tiles.dC[smem_slot],
                         {col_block_idx * (C::Nb / (C::LOCAL_N / C::EPI_PIPE_DEPTH)) +
                              half * (C::LOCAL_N / (C::LOCAL_N / C::EPI_PIPE_DEPTH)) + epi,
                          k_block_idx});
-                    tma::store_async_read_wait();
                 }
+                warpgroup::tma::store_async_read_wait<0>();
                 warpgroup::sync(1);
                 tensor_after_thread_sync();
             }

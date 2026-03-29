@@ -71,7 +71,14 @@ using exp_bwd_v5_dE_fp4p1_bf16p3_L1_SG8 = nvfp4_cce_backward_v5_dE_fp4p1_bf16p3_
 using exp_bwd_v5_dC_fp4p1_bf16p3_L1_SG8 = nvfp4_cce_backward_v5_dC_fp4p1_bf16p3_experimental::config<1, 8, true>;
 using exp_bwd_v5_dE_fp4p1_bf16p3_L1_SG4 = nvfp4_cce_backward_v5_dE_fp4p1_bf16p3_experimental::config<1, 4, true>;
 using exp_bwd_v5_dC_fp4p1_bf16p3_L1_SG4 = nvfp4_cce_backward_v5_dC_fp4p1_bf16p3_experimental::config<1, 4, true>;
-using exp_bwd_v5_combo_fp4p1_tritonstyle_exact_L4_SG8 = nvfp4_cce_backward_v5_combo_tritonstyle_experimental::config<2, 8, true>;
+using exp_bwd_v5_combo_fp4p1_tritonstyle_exact_L4_SG8 =
+    nvfp4_cce_backward_v5_combo_tritonstyle_experimental::config<2, 8, true, 4>;
+using exp_bwd_v5_combo_fp4p1_tritonstyle_exact_L4_SG8_E2 =
+    nvfp4_cce_backward_v5_combo_tritonstyle_experimental::config<2, 8, true, 2>;
+using exp_bwd_v5_combo_fp4p1_tritonstyle_exact_L4_SG8_E1 =
+    nvfp4_cce_backward_v5_combo_tritonstyle_experimental::config<2, 8, true, 1>;
+using exp_bwd_v5_combo_fp4p1_tritonstyle_exact_L1_SG8_E1 =
+    nvfp4_cce_backward_v5_combo_tritonstyle_experimental::config<1, 8, true, 1>;
 
 template <typename C>
 static void launch_experimental_backward_v5_dE(
@@ -226,8 +233,6 @@ static void launch_experimental_backward_v5_combo_fp4p1_tritonstyle_exact(
 {
     using G = nvfp4_cce_backward_v5_combo_tritonstyle_experimental::globals<C>;
 
-    TORCH_CHECK(filter_eps == 0.0f,
-                "experimental_backward_v5_combo_fp4p1_tritonstyle_exact_L4_SG8 currently only supports exact mode with filter_eps == 0");
     TORCH_CHECK(E_bf16.scalar_type() == at::kBFloat16,
                 "experimental_backward_v5_combo_fp4p1_tritonstyle_exact_L4_SG8 expects E_bf16 to have dtype bfloat16");
     TORCH_CHECK(C_bf16.scalar_type() == at::kBFloat16,
@@ -538,7 +543,13 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("experimental_backward_v5_dC_fp4p1_bf16p3_L1_SG4", &launch_experimental_backward_v5_dC_fp4p1_bf16p3<exp_bwd_v5_dC_fp4p1_bf16p3_L1_SG4>,
           "Developer-only NVFP4 CCE v5 dC hybrid FP4 phase-1 + BF16 phase-3 path");
     m.def("experimental_backward_v5_combo_fp4p1_tritonstyle_exact_L4_SG8", &launch_experimental_backward_v5_combo_fp4p1_tritonstyle_exact<exp_bwd_v5_combo_fp4p1_tritonstyle_exact_L4_SG8>,
-          "Developer-only NVFP4 CCE v5 Triton-style exact combo path");
+          "Developer-only NVFP4 CCE v5 Triton-style combo path");
+    m.def("experimental_backward_v5_combo_fp4p1_tritonstyle_exact_L4_SG8_E2", &launch_experimental_backward_v5_combo_fp4p1_tritonstyle_exact<exp_bwd_v5_combo_fp4p1_tritonstyle_exact_L4_SG8_E2>,
+          "Developer-only NVFP4 CCE v5 Triton-style combo path with EPI depth 2");
+    m.def("experimental_backward_v5_combo_fp4p1_tritonstyle_exact_L4_SG8_E1", &launch_experimental_backward_v5_combo_fp4p1_tritonstyle_exact<exp_bwd_v5_combo_fp4p1_tritonstyle_exact_L4_SG8_E1>,
+          "Developer-only NVFP4 CCE v5 Triton-style combo path with EPI depth 1");
+    m.def("experimental_backward_v5_combo_fp4p1_tritonstyle_exact_L1_SG8_E1", &launch_experimental_backward_v5_combo_fp4p1_tritonstyle_exact<exp_bwd_v5_combo_fp4p1_tritonstyle_exact_L1_SG8_E1>,
+          "Developer-only NVFP4 CCE v5 Triton-style combo path with load depth 1 and EPI depth 1");
     m.def("debug_experimental_v5_dC_trace_fp4_L4_SG8", &launch_debug_experimental_backward_v5_dC_trace<exp_bwd_v5_dC_fp4_L4_SG8>,
           "Developer-only NVFP4 CCE v5 experimental dC bounded trace L4 SG8");
 }
