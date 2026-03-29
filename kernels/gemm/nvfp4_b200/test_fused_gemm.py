@@ -225,8 +225,8 @@ DEBUG_A_SC_BYTES = 2048
 
 
 def check_diff(name: str, A: torch.Tensor, A_ref: torch.Tensor) -> None:
-    A = A.to(torch.float32)
-    A_ref = A_ref.to(torch.float32)
+    A = A.detach().float().cpu()
+    A_ref = A_ref.detach().float().cpu()
     max_diff = (A - A_ref).abs().max().item()
     mean_diff = (A - A_ref).abs().mean().item()
     cos_sim = torch.nn.functional.cosine_similarity(
@@ -249,8 +249,8 @@ def check_diff_quadrants(name: str, A: torch.Tensor, A_ref: torch.Tensor) -> Non
     ]
     print(f"  Quadrants for {name}:")
     for label, tile, tile_ref in quadrants:
-        tile = tile.to(torch.float32)
-        tile_ref = tile_ref.to(torch.float32)
+        tile = tile.detach().float().cpu()
+        tile_ref = tile_ref.detach().float().cpu()
         max_diff = (tile - tile_ref).abs().max().item()
         mean_diff = (tile - tile_ref).abs().mean().item()
         cos_sim = torch.nn.functional.cosine_similarity(
@@ -328,17 +328,17 @@ def both_bf16_shared_a_2cta_full_transport_backend_label() -> str:
 
 
 def compare_byte_dump(name: str, lhs: torch.Tensor, rhs: torch.Tensor) -> None:
-    equal = torch.equal(lhs, rhs)
-    diff = (lhs.to(torch.int16) - rhs.to(torch.int16)).abs()
+    lhs_cpu = lhs.detach().flatten().cpu()
+    rhs_cpu = rhs.detach().flatten().cpu()
+    equal = torch.equal(lhs_cpu, rhs_cpu)
+    diff = (lhs_cpu.to(torch.int16) - rhs_cpu.to(torch.int16)).abs()
     max_diff = diff.max().item()
-    mismatch_count = (lhs != rhs).sum().item()
+    mismatch_count = (lhs_cpu != rhs_cpu).sum().item()
     if mismatch_count:
-        lhs_flat = lhs.flatten()
-        rhs_flat = rhs.flatten()
-        first_mismatch = (lhs_flat != rhs_flat).nonzero()[0].item()
-        window_end = min(first_mismatch + 8, lhs_flat.numel())
-        lhs_window = lhs_flat[first_mismatch:window_end].tolist()
-        rhs_window = rhs_flat[first_mismatch:window_end].tolist()
+        first_mismatch = (lhs_cpu != rhs_cpu).nonzero()[0].item()
+        window_end = min(first_mismatch + 8, lhs_cpu.numel())
+        lhs_window = lhs_cpu[first_mismatch:window_end].tolist()
+        rhs_window = rhs_cpu[first_mismatch:window_end].tolist()
         print(
             f"  {name}: equal={equal}, mismatches={mismatch_count}, first mismatch={first_mismatch}, "
             f"max byte diff={max_diff}, lhs[{first_mismatch}:{window_end}]={lhs_window}, "

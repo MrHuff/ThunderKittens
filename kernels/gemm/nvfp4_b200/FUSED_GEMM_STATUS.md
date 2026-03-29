@@ -874,3 +874,142 @@ Even with that caveat, the broad conclusion is now clearer:
 - but **tile-local direct streaming still does not match separate `quantize + gemm`** on large
   square GEMMs
 - the missing ingredient is still wider-lifetime reuse of quantized strips, not more pipeline depth
+
+## 2026-03-29: A-only shared-A transport fixed, but backend still loses
+
+We revisited the older A-only cross-CTA shared-A debug backend in `nvfp4_fused_gemm.cuh` to see
+whether a structurally better one-sided reuse path could beat the current public A-only fused
+kernel.
+
+The important transport fix was:
+
+- the shared-A receiver semaphores (`a_payload_arrived` / `a_scale_arrived`) were waiting on the
+  wrong phase-bit half
+- the A-scale export path was also not matching the working shared-B contract
+- after switching those waits to the lower phase-bit half and making A-scale export follow the
+  same `local input_scales -> export scratch -> async cluster store` pattern as shared-B, direct
+  dump probes became exact for both constant-scale and CTA-amax
+
+Clean direct dump result at `256 x 512 x 256`:
+
+- constant dump: imported A payload exact, imported A scales exact
+- CTA-amax dump: imported A payload exact, imported A scales exact
+
+Direct end-to-end kernel result at `256 x 512 x 256`:
+
+- shared-A constant runs cleanly and matches separate with cosine about `0.9876`
+- shared-A CTA-amax runs cleanly and matches separate with cosine about `0.9966`
+
+Larger-shape follow-up:
+
+- `2048` shared-A constant now launches and stays finite
+- `2048` shared-A CTA-amax still hits `cudaErrorLaunchFailure`
+
+Constant-only timing comparison:
+
+- `2048`: separate `0.0299 ms`, public A-only fused `0.0500 ms`, shared-A debug constant `0.0656 ms`
+- `4096`: separate `0.0634 ms`, public A-only fused `0.3488 ms`, shared-A debug constant `0.4611 ms`
+
+So the shared-A transport bug is finally fixed, but the backend still does **not** improve the
+current public A-only fused path:
+
+- it is slower than the existing public A-only fused kernel at both `2048` and `4096`
+- CTA-amax is still not stable at `2048`
+- that makes the result more decisive, not less: even after transport is correct, this particular
+  cross-CTA shared-A backend does not overturn the broader conclusion that current tile-local
+  streaming designs are dominated by repeated quantization tax
+
+One last scheduling-only sweep was still worth trying after the transport fix:
+
+- disabling `USE_PDL` did not help; shared-A constant stayed at about `0.0657 ms` at `2048` and
+  about `0.4613 ms` at `4096`
+- increasing `SUPERGROUP_SIZE` from `4` to `8` and then `16` on the original PDL-enabled path
+  shaved a little constant-path time off the debug backend:
+  - `2048`: shared-A constant improved from about `0.0656 ms` to about `0.0642 ms`
+  - `4096`: shared-A constant improved from about `0.4611 ms` to about `0.4598 ms`
+- the public A-only fused kernel still remains clearly faster:
+  - `2048`: public A-only fused about `0.0485 ms`
+  - `4096`: public A-only fused about `0.3466 ms`
+- shared-A CTA-amax still fails at `2048` with `cudaErrorLaunchFailure`
+
+Interpretation:
+
+- there is a little row-group scheduling overhead to trim in the shared-A path
+- but the size of the win is only a few percent and does not materially change the ranking
+- that is strong evidence that the remaining gap is not a “hidden pipeline knob” problem
+- even after fixing transport and nudging scheduling, this shared-A backend still loses to the
+  simpler public A-only fused kernel, which is itself still behind separate `quantize + gemm`
+
+## 2026-03-29: Bottom Line on Streaming FP4 Into GEMM
+
+At this point the engineering conclusion is fairly clear for **pure dense square GEMMs** on the
+current B200 path:
+
+- streaming FP4 quantization directly into the GEMM hot loop is **feasible**
+- it is sometimes **usefully faster than a worse fused design**
+- but it is **not** competitive with separate `quantize + gemm` once shapes are large and reuse is
+  high
+
+Fresh end-to-end confirmation on the current tree:
+
+`2048 x 2048 x 2048`
+
+- separate `quantize + gemm`: `0.030 ms`
+- A-only fused (`A streamed / B pre-quantized`): `0.049 ms`
+- mirror hybrid (`A pre-quantized / B streamed`): `0.052 ms`
+- both-bf16 shared-B (`A streamed / B streamed`): `0.070 ms`
+
+`4096 x 4096 x 4096`
+
+- separate `quantize + gemm`: `0.061 ms`
+- A-only fused (`A streamed / B pre-quantized`): `0.348 ms`
+- mirror hybrid (`A pre-quantized / B streamed`): `0.353 ms`
+- both-bf16 shared-B (`A streamed / B streamed`): `0.547 ms`
+
+That gives a pretty consistent ranking:
+
+1. separate `quantize + gemm`
+2. one-sided streaming
+3. two-sided streaming
+
+The profile evidence explains why. The promoted shared-B path was:
+
+- not bandwidth-bound
+- not tensor-core-saturated
+- mostly **latency / eligibility limited**
+- running with very low eligible-warp count and high dependency waiting
+
+So deeper or cleaner pipelining can shave constants, but it cannot remove the core tax:
+
+- separate `quantize + gemm` quantizes each operand once and reuses the result globally
+- streaming fused kernels quantize in the hot loop and only reuse the result over a small local
+  output block
+- as `M` and `N` grow, that repeated-quantization tax dominates
+
+The one-sided controls are especially informative:
+
+- A-only fused and the mirror hybrid land in nearly the same performance band
+- that strongly suggests the problem is **not mainly which side is streamed**
+- the problem is the **block-local lifetime** of streamed quantized tiles on current hardware
+
+What this does **not** mean:
+
+- it does **not** mean “fusion is always bad”
+- it does **not** mean “streaming quantization can never win”
+
+What it *does* mean for this repo and hardware target is:
+
+- for standalone GEMM, current tile-local FP4 streaming is a poor economic trade versus
+  pre-quantization
+- fusion may still make sense when it removes additional memory traffic or kernels beyond the
+  quantize step itself
+- examples would be cases where the quantized tile is immediately consumed by more work than just
+  GEMM, or where fusion also absorbs a downstream reduction / normalization / pointwise stage
+
+That last point is still an inference, not something we proved here. We did **not** benchmark a
+full “quantize + GEMM + softmax” style fused pipeline in this work. So the validated statement is
+more specific:
+
+- on this hardware, for the GEMM-only workloads tested here, we could not pipeline our way around
+  the repeated-quantization tax
+- wider-lifetime reuse of quantized strips would be needed to change that conclusion materially

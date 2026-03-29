@@ -2179,7 +2179,7 @@ static inline void dispatch_fused_gemm_shared_a_debug(
     at::Tensor *debug_cta1_sc = nullptr
 ) {
     launch_fused_gemm_with_config<
-        nvfp4_fused_gemm::config<256, 2, 8, 4, 2, false, USE_CTA_AMAX, 128, true, 2, 1, 1, true>>(
+        nvfp4_fused_gemm::config<256, 2, 8, 16, 2, false, USE_CTA_AMAX, 128, true, 2, 1, 1, true>>(
             A_bf16, B, B_sc, B_sc_global, D,
             debug_cta0_a, debug_cta1_a, debug_cta0_sc, debug_cta1_sc);
 }
