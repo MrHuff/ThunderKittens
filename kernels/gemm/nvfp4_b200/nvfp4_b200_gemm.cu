@@ -1575,7 +1575,7 @@ static inline void dispatch_fused_gemm_both_bf16(
 }
 
 template <bool USE_CTA_AMAX>
-static inline void dispatch_fused_gemm_both_bf16_shared_b_2cta_debug(
+static inline void dispatch_fused_gemm_both_bf16_shared_b_2cta(
     const at::Tensor &A_bf16,
     const at::Tensor &B_bf16,
     at::Tensor &D
@@ -1584,6 +1584,15 @@ static inline void dispatch_fused_gemm_both_bf16_shared_b_2cta_debug(
         nvfp4_fused_gemm_both_bf16::config<
             USE_CTA_AMAX, 1, 2, 4, 2, 2, false, false, false, true, false, true, 128>>(
             A_bf16, B_bf16, D);
+}
+
+template <bool USE_CTA_AMAX>
+static inline void dispatch_fused_gemm_both_bf16_shared_b_2cta_debug(
+    const at::Tensor &A_bf16,
+    const at::Tensor &B_bf16,
+    at::Tensor &D
+) {
+    dispatch_fused_gemm_both_bf16_shared_b_2cta<USE_CTA_AMAX>(A_bf16, B_bf16, D);
 }
 
 template <bool USE_CTA_AMAX>
@@ -2038,7 +2047,15 @@ void nvfp4_fused_gemm_both_bf16_entrypoint(
     TORCH_CHECK(N % 128 == 0, "N must be a multiple of 128");
     TORCH_CHECK(K % 256 == 0, "K must be a multiple of 256");
 
-    dispatch_fused_gemm_both_bf16<false>(A_bf16, B_bf16, D);
+    const bool use_shared_b_2cta =
+        M >= 2048 && N >= 2048 &&
+        (M % 256 == 0) && (N % 256 == 0) && (K % 256 == 0);
+
+    if (use_shared_b_2cta) {
+        dispatch_fused_gemm_both_bf16_shared_b_2cta<false>(A_bf16, B_bf16, D);
+    } else {
+        dispatch_fused_gemm_both_bf16<false>(A_bf16, B_bf16, D);
+    }
 }
 
 void nvfp4_fused_gemm_both_bf16_cta_amax_entrypoint(
@@ -2062,7 +2079,15 @@ void nvfp4_fused_gemm_both_bf16_cta_amax_entrypoint(
     TORCH_CHECK(N % 128 == 0, "N must be a multiple of 128");
     TORCH_CHECK(K % 256 == 0, "K must be a multiple of 256");
 
-    dispatch_fused_gemm_both_bf16<true>(A_bf16, B_bf16, D);
+    const bool use_shared_b_2cta =
+        M >= 2048 && N >= 2048 &&
+        (M % 256 == 0) && (N % 256 == 0) && (K % 256 == 0);
+
+    if (use_shared_b_2cta) {
+        dispatch_fused_gemm_both_bf16_shared_b_2cta<true>(A_bf16, B_bf16, D);
+    } else {
+        dispatch_fused_gemm_both_bf16<true>(A_bf16, B_bf16, D);
+    }
 }
 
 void nvfp4_fused_gemm_both_bf16_shared_b_2cta_debug_entrypoint(

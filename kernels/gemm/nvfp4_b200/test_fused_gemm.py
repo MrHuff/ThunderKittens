@@ -263,7 +263,9 @@ def fused_backend_label(N: int) -> str:
     return "single-column fallback"
 
 
-def both_bf16_backend_label(N: int, K: int) -> str:
+def both_bf16_backend_label(M: int, N: int, K: int) -> str:
+    if M >= 2048 and N >= 2048 and M % 256 == 0 and N % 256 == 0 and K % 256 == 0:
+        return "shared-B 2CTA backend (Kb=128, cluster MMA)"
     return "single-CTA ping-pong (2-stage)"
 
 
@@ -390,7 +392,7 @@ def run_case(M: int, N: int, K: int) -> None:
     print(f"{'='*72}")
     print(f"  M={M}, N={N}, K={K}")
     print(f"  Fused backend: {fused_backend_label(N)}")
-    print(f"  Both-bf16 backend: {both_bf16_backend_label(N, K)}")
+    print(f"  Both-bf16 backend: {both_bf16_backend_label(M, N, K)}")
     print(f"{'='*72}")
 
     A_bf16 = torch.randn(M, K, dtype=torch.bfloat16, device="cuda") / K**0.25

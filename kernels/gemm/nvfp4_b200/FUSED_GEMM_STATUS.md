@@ -704,3 +704,59 @@ performance comparison:
    - separate quantize+GEMM
    - current public both-bf16 backend
 3. only then decide whether to promote shared-B for `2048+`
+
+## Shared-B Public Promotion Checkpoint
+
+The shared-B `2CTA` backend is now promoted into the public both-bf16 dispatcher for the
+large-shape band only:
+
+- `M >= 2048`
+- `N >= 2048`
+- `M % 256 == 0`
+- `N % 256 == 0`
+- `K % 256 == 0`
+
+Smaller shapes still use the older single-CTA ping-pong backend.
+
+Public benchmark results after promotion:
+
+`2048 x 2048 x 2048`
+
+- separate `quantize + gemm`: `0.029 ms`
+- public both-bf16 const: `0.070 ms`
+- public both-bf16 CTA-amax: `0.076 ms`
+
+This replaces the old public both-bf16 numbers at roughly:
+
+- const: `0.126 ms`
+- CTA-amax: `0.129 ms`
+
+So the promoted shared-B path improves public both-bf16 throughput by about `1.8x` at `2048`.
+
+`4096 x 4096 x 4096`
+
+- separate `quantize + gemm`: `0.063 ms`
+- public both-bf16 const: `1.073 ms`
+- public both-bf16 CTA-amax: `1.409 ms`
+
+On the same shape, the old public both-bf16 path was around:
+
+- const: `1.959 ms`
+- CTA-amax: `2.739 ms`
+
+So the promoted shared-B path also improves the public both-bf16 path materially at `4096`,
+but it still does **not** beat separate `quantize + gemm`.
+
+Numerically, the promoted public both-bf16 path remains sane after promotion:
+
+- `2048` const cosine vs separate: `0.9736415148`
+- `2048` CTA-amax cosine vs separate: `0.9866641760`
+- `4096` const cosine vs separate: `0.9742028713`
+- `4096` CTA-amax cosine vs separate: `0.9861819148`
+
+Important conclusion:
+
+- shared-B is the best current public both-bf16 fused path for large shapes
+- but the deeper structural conclusion did not change: this direct streaming design is still
+  slower than separate `quantize + gemm` at large square shapes because quantization reuse is
+  still tile-local rather than global
