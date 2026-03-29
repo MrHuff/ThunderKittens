@@ -27,7 +27,7 @@ using localcta_regular_smallk_config = nvfp4_localcta_gemm::config<256, 5, 8, 4,
 using localcta_regular_largek_config = nvfp4_localcta_gemm::config<256, 5, 8, 12, 2, false, 256, true, 2, 128>;
 using localcta_parity_config = nvfp4_localcta_gemm::config<256, 5, 8, 4, 2, false, 256, true, 2, 128>;
 using localcta_fast_smallk_config = nvfp4_gemm::config<256, 5, 8, 4, 2, false>;
-using localcta_fast_largek_config = nvfp4_gemm::config<256, 4, 8, 12, 2, false>;
+using localcta_fast_largek_config = nvfp4_gemm::config<256, 5, 8, 12, 2, false>;
 using localcta_fast_grouped_config = nvfp4_gemm::config<256, 5, 8, 4, 2, false>;
 using localcta_fast_batched_config = nvfp4_gemm::config<256, 5, 8, 4, 2, false>;
 
