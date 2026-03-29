@@ -43,7 +43,8 @@ template <
     bool _DEDICATED_PRODUCER = false,
     bool _CLUSTER_REUSE_2D = false,
     bool _SHARE_B_ACROSS_CTAS = false,
-    int _KB = 256>
+    int _KB = 256,
+    bool _PREQUANT_A = false>
 struct config {
     static_assert(_COL_TILES_PER_BLOCK == 1 || _COL_TILES_PER_BLOCK == 2 || _COL_TILES_PER_BLOCK == 4,
                   "Both-bf16 fused kernel supports 1, 2, or 4 column tiles per block");
@@ -65,6 +66,8 @@ struct config {
     static_assert(!_SHARE_B_ACROSS_CTAS ||
                       (_CLUSTER_SIZE == 2 && _COL_TILES_PER_BLOCK == 1 && _DEDICATED_PRODUCER && _KB == 128),
                   "Shared-B both-bf16 path expects a 2-CTA dedicated-producer backend with Kb=128");
+    static_assert(!_PREQUANT_A || _SHARE_B_ACROSS_CTAS,
+                  "Pre-quantized A mirror path currently reuses the shared-B 2CTA backend only");
     static constexpr bool USE_CTA_AMAX = _USE_CTA_AMAX;
     static constexpr int COL_TILES_PER_BLOCK = _COL_TILES_PER_BLOCK;
     static constexpr int CLUSTER_SIZE = _CLUSTER_SIZE;
@@ -74,6 +77,7 @@ struct config {
     static constexpr bool DEDICATED_PRODUCER = _DEDICATED_PRODUCER;
     static constexpr bool CLUSTER_REUSE_2D = _CLUSTER_REUSE_2D;
     static constexpr bool SHARE_B_ACROSS_CTAS = _SHARE_B_ACROSS_CTAS;
+    static constexpr bool PREQUANT_A = _PREQUANT_A;
     static constexpr int TMEM_NCTA =
         (SHARE_A_ACROSS_CTAS || CLUSTER_REUSE_2D) ? 1 : (SHARE_B_ACROSS_CTAS ? 2 : CLUSTER_SIZE);
 
@@ -110,10 +114,16 @@ struct globals {
 
     using A_bf16_gl = gl<bf16, 1, 1, -1, -1, A_bf16_tile>;
     using B_bf16_gl = gl<bf16, 1, 1, -1, -1, B_bf16_tile>;
+    using A_pre_fp4x2_gl = gl<fp4e2m1_2, 1, 1, -1, -1, A_fp4x2_tile>;
+    using A_pre_sc_gl = gl<half, 1, -1, -1, 256, A_sc_tile>;
+    using A_pre_sg_gl = gl<float, 1, 1, 1, 1>;
     using D_gl = gl<bf16, 1, 1, -1, -1, D_tile>;
 
     A_bf16_gl A_bf16;
     B_bf16_gl B_bf16;
+    A_pre_fp4x2_gl A_pre;
+    A_pre_sc_gl A_pre_sc;
+    A_pre_sg_gl A_pre_sg;
     D_gl D;
 
     struct input_tiles_t {
@@ -2723,7 +2733,12 @@ __device__ inline void kernel_shared_b_cross_cta(const globals<C> &g) {
     const bool a_quant_then_skip_wait_only = transport_only && g.debug_front_half_mode == 14;
 
     if (threadIdx.x == 0) {
-        g.A_bf16.template prefetch_tma<typename G::A_bf16_tile>();
+        if constexpr (C::PREQUANT_A) {
+            g.A_pre.template prefetch_tma<typename G::A_fp4x2_tile>();
+            g.A_pre_sc.template prefetch_tma<typename G::A_sc_tile>();
+        } else {
+            g.A_bf16.template prefetch_tma<typename G::A_bf16_tile>();
+        }
         g.B_bf16.template prefetch_tma<typename G::B_bf16_tile>();
         g.D.template prefetch_tma<typename G::D_tile>();
     }
@@ -2733,7 +2748,9 @@ __device__ inline void kernel_shared_b_cross_cta(const globals<C> &g) {
     const int row_block_idx = blockIdx.y * C::CLUSTER_SIZE + cta_id;
     const int col_block_idx = clusterIdx().x;
     const int local_b_col_tile_idx = clusterIdx().x * C::CLUSTER_SIZE + cta_id;
-    const int num_red_blocks = g.A_bf16.cols() / C::Kb;
+    const int num_red_blocks =
+        C::PREQUANT_A ? static_cast<int>((2 * g.A_pre.cols()) / C::Kb)
+                      : static_cast<int>(g.A_bf16.cols() / C::Kb);
 
     extern __shared__ int __shm[];
     tma_swizzle_allocator sm_allocator((int *)&__shm[0]);
@@ -2754,6 +2771,7 @@ __device__ inline void kernel_shared_b_cross_cta(const globals<C> &g) {
     __shared__ semaphore outputs_arrived;
     __shared__ semaphore outputs_finished;
     __shared__ semaphore a_raw_arrived[C::LOAD_PIPE_DEPTH];
+    __shared__ semaphore a_scale_arrived[C::LOAD_PIPE_DEPTH];
     __shared__ semaphore b_raw_arrived[C::LOAD_PIPE_DEPTH];
     __shared__ semaphore a_quant_done[C::LOAD_PIPE_DEPTH];
     __shared__ semaphore b_quant_done[C::LOAD_PIPE_DEPTH];
@@ -2774,6 +2792,7 @@ __device__ inline void kernel_shared_b_cross_cta(const globals<C> &g) {
         #pragma unroll
         for (int s = 0; s < C::LOAD_PIPE_DEPTH; ++s) {
             init_semaphore(a_raw_arrived[s], 0, 1);
+            init_semaphore(a_scale_arrived[s], 0, 1);
             init_semaphore(b_raw_arrived[s], 0, 1);
             init_semaphore(a_quant_done[s], 0, C::CLUSTER_SIZE);
             init_semaphore(b_quant_done[s], 0, C::CLUSTER_SIZE);
@@ -2822,12 +2841,27 @@ __device__ inline void kernel_shared_b_cross_cta(const globals<C> &g) {
                 if (!transport_only) {
                     wait(inputs_finished[stage], get_phasebit<1>(phasebits, stage));
                 }
-                tma::expect(a_raw_arrived[stage], raw_a[stage].bf16_tile);
-                tma::load_async(
-                    raw_a[stage].bf16_tile,
-                    g.A_bf16,
-                    {row_block_idx, red_block_idx},
-                    a_raw_arrived[stage]);
+                if constexpr (C::PREQUANT_A) {
+                    tma::expect(a_raw_arrived[stage], input_tiles[stage].A);
+                    tma::load_async(
+                        input_tiles[stage].A,
+                        g.A_pre,
+                        {row_block_idx, red_block_idx},
+                        a_raw_arrived[stage]);
+                    tma::expect(a_scale_arrived[stage], input_scales[stage].A);
+                    tma::load_async(
+                        input_scales[stage].A,
+                        g.A_pre_sc,
+                        {row_block_idx, red_block_idx, 0},
+                        a_scale_arrived[stage]);
+                } else {
+                    tma::expect(a_raw_arrived[stage], raw_a[stage].bf16_tile);
+                    tma::load_async(
+                        raw_a[stage].bf16_tile,
+                        g.A_bf16,
+                        {row_block_idx, red_block_idx},
+                        a_raw_arrived[stage]);
+                }
                 update_phasebit<1>(phasebits, stage);
                 stage = (stage + 1) % C::LOAD_PIPE_DEPTH;
             }
@@ -2862,7 +2896,7 @@ __device__ inline void kernel_shared_b_cross_cta(const globals<C> &g) {
         uint32_t raw_phasebits = 0;
 
         if constexpr (C::USE_CTA_AMAX) {
-            if (is_leader) {
+            if (is_leader && !C::PREQUANT_A) {
                 running_amax_a = 0.0f;
             }
             warpgroup::sync(a_quant_bar_id);
@@ -2875,6 +2909,9 @@ __device__ inline void kernel_shared_b_cross_cta(const globals<C> &g) {
             const bool skip_raw_wait = a_quant_then_skip_wait_only && red_block_idx > 0;
             if (!skip_raw_wait) {
                 wait(a_raw_arrived[stage], get_phasebit<0>(raw_phasebits, stage));
+                if constexpr (C::PREQUANT_A) {
+                    wait(a_scale_arrived[stage], get_phasebit<0>(raw_phasebits, stage));
+                }
             }
             const uint32_t quant_stage = (transport_only && !a_quant_per_stage_only) ? 0 : stage;
             if (a_debug_print_mode && cta_id == 0 && is_leader && red_block_idx == 0) {
@@ -2938,13 +2975,17 @@ __device__ inline void kernel_shared_b_cross_cta(const globals<C> &g) {
                 continue;
             }
 
-            if constexpr (C::USE_CTA_AMAX) {
-                quantize_operand_subtile_cta_amax(
-                    raw_a[stage], input_tiles[quant_stage].A, input_scales[quant_stage].A, 0,
-                    a_quant_bar_id, &running_amax_a, warp_max_buf_a);
+            if constexpr (C::PREQUANT_A) {
+                warpgroup::sync(a_quant_bar_id);
             } else {
-                quantize_operand_subtile_constant(
-                    raw_a[stage], input_tiles[quant_stage].A, input_scales[quant_stage].A, 0);
+                if constexpr (C::USE_CTA_AMAX) {
+                    quantize_operand_subtile_cta_amax(
+                        raw_a[stage], input_tiles[quant_stage].A, input_scales[quant_stage].A, 0,
+                        a_quant_bar_id, &running_amax_a, warp_max_buf_a);
+                } else {
+                    quantize_operand_subtile_constant(
+                        raw_a[stage], input_tiles[quant_stage].A, input_scales[quant_stage].A, 0);
+                }
             }
             if (a_debug_print_mode && cta_id == 0 && is_leader && red_block_idx == 0) {
                 const uint32_t *raw_a1_words =
@@ -3264,7 +3305,9 @@ __device__ inline void kernel_shared_b_cross_cta(const globals<C> &g) {
 
         wait(outputs_arrived, 0);
 
-        const float a_sg_dec = C::USE_CTA_AMAX ? running_amax_a / (6.0f * 448.0f) : SCALE_MAX_DEC;
+        const float a_sg_dec = C::PREQUANT_A
+                                   ? g.A_pre_sg[{0}]
+                                   : (C::USE_CTA_AMAX ? running_amax_a / (6.0f * 448.0f) : SCALE_MAX_DEC);
         const float b_sg_dec = C::USE_CTA_AMAX ? running_amax_b / (6.0f * 448.0f) : SCALE_MAX_DEC;
         auto out_tm = tm_allocator.template allocate<full_tt_fl<C::Nb>>(0);
 

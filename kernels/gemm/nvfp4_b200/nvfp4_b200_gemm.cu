@@ -30,6 +30,14 @@ __global__ void kernel_both_bf16_entrypoint(
     nvfp4_fused_gemm_both_bf16::kernel<C>(g);
 }
 
+template <bool SCALE_2D>
+__launch_bounds__(nvfp4_quantize::quantize_config::NUM_THREADS)
+__global__ void quantize_kernel_entrypoint(
+    const __grid_constant__ nvfp4_quantize::globals g
+) {
+    nvfp4_quantize::quantize_kernel<SCALE_2D>(g);
+}
+
 template <typename C>
 static inline void launch_both_bf16_standalone(
     const nvfp4_fused_gemm_both_bf16::globals<C> &g
@@ -59,6 +67,56 @@ static inline void launch_both_bf16_standalone(
     }
 }
 
+static inline void quantize_bf16_to_nvfp4_standalone(
+    __nv_bfloat16 *d_A_bf16,
+    int M,
+    int K,
+    __nv_fp4x2_e2m1 *d_A_fp4x2,
+    __nv_fp8_e4m3 *d_A_sc,
+    float *d_A_sg
+) {
+    using C = nvfp4_quantize::quantize_config;
+    using G = nvfp4_quantize::globals;
+
+    G g{
+        .A_bf16 = kittens::make_gl<typename G::A_bf16_gl>(
+            reinterpret_cast<uint64_t>(d_A_bf16), 1, 1, M, K),
+        .A_fp4x2 = kittens::make_gl<typename G::A_fp4x2_gl>(
+            reinterpret_cast<uint64_t>(d_A_fp4x2), 1, 1, M, K / 2),
+        .A_sc = kittens::make_gl<typename G::A_sc_gl>(
+            reinterpret_cast<uint64_t>(d_A_sc), 1, M / 128, K / 64, 256),
+        .A_sc_global = kittens::make_gl<typename G::A_sc_global_gl>(
+            reinterpret_cast<uint64_t>(d_A_sg), 1, 1, 1, 1),
+    };
+
+    cudaStream_t stream = 0;
+    nvfp4_quantize::zero_kernel<<<1, 1, 0, stream>>>(g);
+    nvfp4_quantize::absmax_kernel<<<
+        nvfp4_quantize::absmax_config::NUM_BLOCKS,
+        nvfp4_quantize::absmax_config::NUM_THREADS,
+        0,
+        stream>>>(g);
+    nvfp4_quantize::divide_kernel<<<1, 1, 0, stream>>>(g);
+
+    CUDACHECK(cudaFuncSetAttribute(
+        quantize_kernel_entrypoint<false>,
+        cudaFuncAttributeMaxDynamicSharedMemorySize,
+        g.dynamic_shared_memory()));
+    quantize_kernel_entrypoint<false><<<
+        g.grid(),
+        dim3(C::NUM_THREADS),
+        g.dynamic_shared_memory(),
+        stream>>>(g);
+
+    const int64_t sc_numel = static_cast<int64_t>(M / 128) * (K / 64) * 512;
+    const int threads = 256;
+    const int blocks = static_cast<int>(((sc_numel / 4) + threads - 1) / threads);
+    fp8_nan_fixup_kernel<<<blocks, threads, 0, stream>>>(
+        reinterpret_cast<uint8_t *>(d_A_sc), sc_numel);
+    CUDACHECK(cudaGetLastError());
+    CUDACHECK(cudaStreamSynchronize(stream));
+}
+
 #ifdef SHARED_B_DEBUG_STANDALONE
 
 struct SharedBDebugStandaloneOptions {
@@ -71,7 +129,8 @@ struct SharedBDebugStandaloneOptions {
 static inline void print_shared_b_debug_standalone_usage(const char *argv0) {
     std::cout
         << "Usage:\n"
-        << "  " << argv0 << " --mode {shared_b_const,shared_b_cta,shared_b_transport_const,shared_b_transport_cta}"
+        << "  " << argv0 << " --mode {shared_b_const,shared_b_cta,shared_b_transport_const,shared_b_transport_cta,"
+        << "prequant_a_shared_b_const,prequant_a_shared_b_cta}"
         << " [--m M] [--n N] [--k K]\n"
         << "  " << argv0 << " shared_b_const 256 256 256\n";
 }
@@ -179,6 +238,14 @@ static inline int run_shared_b_debug_standalone_once(
             reinterpret_cast<uint64_t>(d_A), 1, 1, opts.m, opts.k),
         .B_bf16 = kittens::make_gl<typename G::B_bf16_gl>(
             reinterpret_cast<uint64_t>(d_B), 1, 1, opts.n, opts.k),
+        // PREQUANT_A=false kernels still carry these descriptors in globals, so keep
+        // them structurally valid even though this path never dereferences them.
+        .A_pre = kittens::make_gl<typename G::A_pre_fp4x2_gl>(
+            reinterpret_cast<uint64_t>(d_A), 1, 1, opts.m, std::max(1, opts.k / 2)),
+        .A_pre_sc = kittens::make_gl<typename G::A_pre_sc_gl>(
+            reinterpret_cast<uint64_t>(d_A), 1, std::max(1, opts.m / 128), std::max(1, opts.k / 64), 256),
+        .A_pre_sg = kittens::make_gl<typename G::A_pre_sg_gl>(
+            reinterpret_cast<uint64_t>(d_A), 1, 1, 1, 1),
         .D = kittens::make_gl<typename G::D_gl>(
             reinterpret_cast<uint64_t>(d_D), 1, 1, opts.m, opts.n),
         .debug_cta0_a_ptr = nullptr,
@@ -219,6 +286,105 @@ static inline int run_shared_b_debug_standalone_once(
     cudaFree(d_A);
     cudaFree(d_B);
     cudaFree(d_D);
+    return 0;
+}
+
+template <bool USE_CTA_AMAX>
+static inline int run_prequant_a_shared_b_standalone_once(
+    const SharedBDebugStandaloneOptions &opts
+) {
+    using C = nvfp4_fused_gemm_both_bf16::config<
+        USE_CTA_AMAX, 1, 2, 4, 2, 2, false, false, false, true, false, true, 128, true>;
+    using G = nvfp4_fused_gemm_both_bf16::globals<C>;
+
+    if ((opts.m % 256) != 0 || (opts.n % 256) != 0 || (opts.k % 128) != 0) {
+        std::cerr << "Prequant-A shared-B standalone runner expects M/N multiples of 256 and K a multiple of 128.\n";
+        return 2;
+    }
+
+    __nv_bfloat16 *d_A = nullptr;
+    __nv_bfloat16 *d_B = nullptr;
+    __nv_bfloat16 *d_D = nullptr;
+    __nv_fp4x2_e2m1 *d_A_fp4x2 = nullptr;
+    __nv_fp8_e4m3 *d_A_sc = nullptr;
+    float *d_A_sg = nullptr;
+
+    const size_t a_count = static_cast<size_t>(opts.m) * opts.k;
+    const size_t b_count = static_cast<size_t>(opts.n) * opts.k;
+    const size_t d_count = static_cast<size_t>(opts.m) * opts.n;
+    const size_t a_fp4_count = static_cast<size_t>(opts.m) * (opts.k / 2);
+    const size_t a_sc_count = static_cast<size_t>(opts.m / 128) * (opts.k / 64) * 512;
+    const float init_bound = 1.0f / std::sqrt(std::sqrt(static_cast<float>(opts.k)));
+
+    CUDACHECK(cudaMalloc(&d_A, a_count * sizeof(__nv_bfloat16)));
+    CUDACHECK(cudaMalloc(&d_B, b_count * sizeof(__nv_bfloat16)));
+    CUDACHECK(cudaMalloc(&d_D, d_count * sizeof(__nv_bfloat16)));
+    CUDACHECK(cudaMalloc(&d_A_fp4x2, a_fp4_count * sizeof(__nv_fp4x2_e2m1)));
+    CUDACHECK(cudaMalloc(&d_A_sc, a_sc_count * sizeof(__nv_fp8_e4m3)));
+    CUDACHECK(cudaMalloc(&d_A_sg, sizeof(float)));
+
+    fill<__nv_bfloat16, FillMode::RANDOM>(d_A, a_count, 3024, -init_bound, init_bound);
+    fill<__nv_bfloat16, FillMode::RANDOM>(d_B, b_count, 3025, -init_bound, init_bound);
+    fill<__nv_bfloat16, FillMode::CONSTANT>(d_D, d_count, 0.0f);
+    CUDACHECK(cudaDeviceSynchronize());
+
+    quantize_bf16_to_nvfp4_standalone(d_A, opts.m, opts.k, d_A_fp4x2, d_A_sc, d_A_sg);
+
+    G g{
+        .A_bf16 = kittens::make_gl<typename G::A_bf16_gl>(
+            reinterpret_cast<uint64_t>(d_A), 1, 1, opts.m, opts.k),
+        .B_bf16 = kittens::make_gl<typename G::B_bf16_gl>(
+            reinterpret_cast<uint64_t>(d_B), 1, 1, opts.n, opts.k),
+        .A_pre = kittens::make_gl<typename G::A_pre_fp4x2_gl>(
+            reinterpret_cast<uint64_t>(d_A_fp4x2), 1, 1, opts.m, opts.k / 2),
+        .A_pre_sc = kittens::make_gl<typename G::A_pre_sc_gl>(
+            reinterpret_cast<uint64_t>(d_A_sc), 1, opts.m / 128, opts.k / 64, 256),
+        .A_pre_sg = kittens::make_gl<typename G::A_pre_sg_gl>(
+            reinterpret_cast<uint64_t>(d_A_sg), 1, 1, 1, 1),
+        .D = kittens::make_gl<typename G::D_gl>(
+            reinterpret_cast<uint64_t>(d_D), 1, 1, opts.m, opts.n),
+        .debug_cta0_a_ptr = nullptr,
+        .debug_cta1_a_ptr = nullptr,
+        .debug_cta0_sc_ptr = nullptr,
+        .debug_cta1_sc_ptr = nullptr,
+        .debug_a_stride = 0,
+        .debug_transport_only = false,
+        .debug_main_dump_only = false,
+        .debug_front_half_mode = 0,
+    };
+
+    std::cout << "Mode: " << opts.mode
+              << "  M=" << opts.m << " N=" << opts.n << " K=" << opts.k
+              << "  smem=" << g.dynamic_shared_memory() << " bytes"
+              << "  cluster=" << C::CLUSTER_SIZE
+              << "  threads=" << C::NUM_THREADS << "\n";
+
+    cudaGetLastError();
+    launch_both_bf16_standalone<C>(g);
+    const cudaError_t sync_err = cudaDeviceSynchronize();
+    if (sync_err != cudaSuccess) {
+        std::cerr << "Kernel failed: " << cudaGetErrorString(sync_err) << "\n";
+        cudaFree(d_A);
+        cudaFree(d_B);
+        cudaFree(d_D);
+        cudaFree(d_A_fp4x2);
+        cudaFree(d_A_sc);
+        cudaFree(d_A_sg);
+        return 1;
+    }
+
+    std::cout << "Kernel completed successfully.\n";
+    std::vector<__nv_bfloat16> h_D(d_count);
+    CUDACHECK(cudaMemcpy(
+        h_D.data(), d_D, d_count * sizeof(__nv_bfloat16), cudaMemcpyDeviceToHost));
+    print_bf16_buffer_summary(h_D);
+
+    cudaFree(d_A);
+    cudaFree(d_B);
+    cudaFree(d_D);
+    cudaFree(d_A_fp4x2);
+    cudaFree(d_A_sc);
+    cudaFree(d_A_sg);
     return 0;
 }
 
@@ -367,6 +533,10 @@ int main(int argc, char **argv) {
         return run_shared_b_debug_standalone_once<false>(opts, true);
     } else if (opts.mode == "shared_b_transport_cta") {
         return run_shared_b_debug_standalone_once<true>(opts, true);
+    } else if (opts.mode == "prequant_a_shared_b_const") {
+        return run_prequant_a_shared_b_standalone_once<false>(opts);
+    } else if (opts.mode == "prequant_a_shared_b_cta") {
+        return run_prequant_a_shared_b_standalone_once<true>(opts);
     }
 
     print_shared_b_debug_standalone_usage(argv[0]);
@@ -1496,9 +1666,18 @@ static inline void launch_fused_gemm_both_bf16_with_config(
     int debug_front_half_mode = 0
 ) {
     using G = nvfp4_fused_gemm_both_bf16::globals<C>;
+    const auto a_rows = static_cast<int>(A_bf16.size(0));
+    const auto k_cols = static_cast<int>(A_bf16.size(1));
     G g{
         .A_bf16 = kittens::py::tensor_to_gl<typename G::A_bf16_gl>(A_bf16),
         .B_bf16 = kittens::py::tensor_to_gl<typename G::B_bf16_gl>(B_bf16),
+        // PREQUANT_A=false kernels still materialize these TMA descriptors.
+        .A_pre = kittens::make_gl<typename G::A_pre_fp4x2_gl>(
+            reinterpret_cast<uint64_t>(A_bf16.data_ptr()), 1, 1, a_rows, std::max(1, k_cols / 2)),
+        .A_pre_sc = kittens::make_gl<typename G::A_pre_sc_gl>(
+            reinterpret_cast<uint64_t>(A_bf16.data_ptr()), 1, std::max(1, a_rows / 128), std::max(1, k_cols / 64), 256),
+        .A_pre_sg = kittens::make_gl<typename G::A_pre_sg_gl>(
+            reinterpret_cast<uint64_t>(A_bf16.data_ptr()), 1, 1, 1, 1),
         .D = kittens::py::tensor_to_gl<typename G::D_gl>(D),
         .debug_cta0_a_ptr = debug_cta0_a ? reinterpret_cast<uint8_t*>(debug_cta0_a->data_ptr()) : nullptr,
         .debug_cta1_a_ptr = debug_cta1_a ? reinterpret_cast<uint8_t*>(debug_cta1_a->data_ptr()) : nullptr,
@@ -1509,6 +1688,40 @@ static inline void launch_fused_gemm_both_bf16_with_config(
         .debug_transport_only = debug_transport_only,
         .debug_main_dump_only = debug_main_dump_only,
         .debug_front_half_mode = debug_front_half_mode,
+    };
+    kittens::py::launch_kernel<C, G, nvfp4_fused_gemm_both_bf16::kernel<C>>(g);
+}
+
+template <typename C>
+static inline void launch_fused_gemm_prequant_a_bf16_with_config(
+    const at::Tensor &A_fp4x2,
+    const at::Tensor &A_sc,
+    const at::Tensor &A_sg,
+    const at::Tensor &B_bf16,
+    at::Tensor &D
+) {
+    using G = nvfp4_fused_gemm_both_bf16::globals<C>;
+    G g{
+        .A_bf16 = kittens::make_gl<typename G::A_bf16_gl>(
+            reinterpret_cast<uint64_t>(B_bf16.data_ptr()), 1, 1, D.size(0), B_bf16.size(1)),
+        .B_bf16 = kittens::py::tensor_to_gl<typename G::B_bf16_gl>(B_bf16),
+        .A_pre = kittens::py::tensor_to_gl<typename G::A_pre_fp4x2_gl>(A_fp4x2),
+        .A_pre_sc = kittens::py::tensor_to_gl<typename G::A_pre_sc_gl, false>(
+            A_sc,
+            1,
+            A_sc.dim() == 2 ? A_sc.size(0) / 128 : A_sc.size(0),
+            A_sc.dim() == 2 ? A_sc.size(1) / 4 : A_sc.size(1),
+            256),
+        .A_pre_sg = kittens::py::tensor_to_gl<typename G::A_pre_sg_gl>(A_sg),
+        .D = kittens::py::tensor_to_gl<typename G::D_gl>(D),
+        .debug_cta0_a_ptr = nullptr,
+        .debug_cta1_a_ptr = nullptr,
+        .debug_cta0_sc_ptr = nullptr,
+        .debug_cta1_sc_ptr = nullptr,
+        .debug_a_stride = 0,
+        .debug_transport_only = false,
+        .debug_main_dump_only = false,
+        .debug_front_half_mode = 0,
     };
     kittens::py::launch_kernel<C, G, nvfp4_fused_gemm_both_bf16::kernel<C>>(g);
 }
@@ -1593,6 +1806,20 @@ static inline void dispatch_fused_gemm_both_bf16_shared_b_2cta_debug(
     at::Tensor &D
 ) {
     dispatch_fused_gemm_both_bf16_shared_b_2cta<USE_CTA_AMAX>(A_bf16, B_bf16, D);
+}
+
+template <bool USE_CTA_AMAX>
+static inline void dispatch_fused_gemm_prequant_a_shared_b_2cta_debug(
+    const at::Tensor &A_fp4x2,
+    const at::Tensor &A_sc,
+    const at::Tensor &A_sg,
+    const at::Tensor &B_bf16,
+    at::Tensor &D
+) {
+    launch_fused_gemm_prequant_a_bf16_with_config<
+        nvfp4_fused_gemm_both_bf16::config<
+            USE_CTA_AMAX, 1, 2, 4, 2, 2, false, false, false, true, false, true, 128, true>>(
+                A_fp4x2, A_sc, A_sg, B_bf16, D);
 }
 
 template <bool USE_CTA_AMAX>
@@ -2124,6 +2351,54 @@ void nvfp4_fused_gemm_both_bf16_cta_amax_shared_b_2cta_debug_entrypoint(
     TORCH_CHECK(A_bf16.size(0) % 256 == 0 && B_bf16.size(0) % 256 == 0 && A_bf16.size(1) % 128 == 0,
                 "shared-B 2CTA debug path requires M/N multiples of 256 and K multiple of 128");
     dispatch_fused_gemm_both_bf16_shared_b_2cta_debug<true>(A_bf16, B_bf16, D);
+}
+
+void nvfp4_fused_gemm_prequant_a_shared_b_2cta_debug_entrypoint(
+    const at::Tensor &A_fp4x2,
+    const at::Tensor &A_sc,
+    const at::Tensor &A_sg,
+    const at::Tensor &B_bf16,
+    at::Tensor &D
+) {
+    TORCH_CHECK(A_fp4x2.is_cuda() && A_sc.is_cuda() && A_sg.is_cuda() && B_bf16.is_cuda() && D.is_cuda(),
+                "all tensors must be CUDA");
+    TORCH_CHECK(A_fp4x2.dtype() == at::kFloat4_e2m1fn_x2, "A_fp4x2 must be fp4x2");
+    TORCH_CHECK(A_sc.dtype() == at::kFloat8_e4m3fn, "A_sc must be float8_e4m3fn");
+    TORCH_CHECK(A_sg.dtype() == at::kFloat, "A_sg must be float32");
+    TORCH_CHECK(B_bf16.dtype() == at::kBFloat16, "B_bf16 must be bfloat16");
+    TORCH_CHECK(D.dtype() == at::kBFloat16, "D must be bfloat16");
+    TORCH_CHECK(A_fp4x2.dim() == 2 && A_sc.dim() == 3 && A_sg.numel() == 1 && B_bf16.dim() == 2 && D.dim() == 2,
+                "A_fp4x2/B_bf16/D must be 2D, A_sc must be 3D, and A_sg must have one element");
+    TORCH_CHECK(B_bf16.size(1) == A_fp4x2.size(1) * 2, "A and B inner dimensions must match");
+    TORCH_CHECK(A_fp4x2.size(0) == D.size(0), "D rows must match A rows");
+    TORCH_CHECK(B_bf16.size(0) == D.size(1), "D cols must match B rows");
+    TORCH_CHECK(A_fp4x2.size(0) % 256 == 0 && B_bf16.size(0) % 256 == 0 && B_bf16.size(1) % 128 == 0,
+                "prequant-A shared-B 2CTA debug path requires M/N multiples of 256 and K multiple of 128");
+    dispatch_fused_gemm_prequant_a_shared_b_2cta_debug<false>(A_fp4x2, A_sc, A_sg, B_bf16, D);
+}
+
+void nvfp4_fused_gemm_prequant_a_cta_amax_shared_b_2cta_debug_entrypoint(
+    const at::Tensor &A_fp4x2,
+    const at::Tensor &A_sc,
+    const at::Tensor &A_sg,
+    const at::Tensor &B_bf16,
+    at::Tensor &D
+) {
+    TORCH_CHECK(A_fp4x2.is_cuda() && A_sc.is_cuda() && A_sg.is_cuda() && B_bf16.is_cuda() && D.is_cuda(),
+                "all tensors must be CUDA");
+    TORCH_CHECK(A_fp4x2.dtype() == at::kFloat4_e2m1fn_x2, "A_fp4x2 must be fp4x2");
+    TORCH_CHECK(A_sc.dtype() == at::kFloat8_e4m3fn, "A_sc must be float8_e4m3fn");
+    TORCH_CHECK(A_sg.dtype() == at::kFloat, "A_sg must be float32");
+    TORCH_CHECK(B_bf16.dtype() == at::kBFloat16, "B_bf16 must be bfloat16");
+    TORCH_CHECK(D.dtype() == at::kBFloat16, "D must be bfloat16");
+    TORCH_CHECK(A_fp4x2.dim() == 2 && A_sc.dim() == 3 && A_sg.numel() == 1 && B_bf16.dim() == 2 && D.dim() == 2,
+                "A_fp4x2/B_bf16/D must be 2D, A_sc must be 3D, and A_sg must have one element");
+    TORCH_CHECK(B_bf16.size(1) == A_fp4x2.size(1) * 2, "A and B inner dimensions must match");
+    TORCH_CHECK(A_fp4x2.size(0) == D.size(0), "D rows must match A rows");
+    TORCH_CHECK(B_bf16.size(0) == D.size(1), "D cols must match B rows");
+    TORCH_CHECK(A_fp4x2.size(0) % 256 == 0 && B_bf16.size(0) % 256 == 0 && B_bf16.size(1) % 128 == 0,
+                "prequant-A shared-B 2CTA debug path requires M/N multiples of 256 and K multiple of 128");
+    dispatch_fused_gemm_prequant_a_shared_b_2cta_debug<true>(A_fp4x2, A_sc, A_sg, B_bf16, D);
 }
 
 void nvfp4_fused_gemm_both_bf16_shared_b_2cta_transport_only_debug_entrypoint(
@@ -3420,6 +3695,14 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           "Developer-only both-bf16 fused GEMM: 2CTA shared-B experiment (CTA amax)",
           pybind11::arg("A_bf16"), pybind11::arg("B_bf16"),
           pybind11::arg("D"));
+    m.def("nvfp4_fused_gemm_prequant_a_shared_b_2cta_debug", &nvfp4_fused_gemm_prequant_a_shared_b_2cta_debug_entrypoint,
+          "Developer-only mirror hybrid fused GEMM: pre-quantized A with streamed shared-B backend (constant scale)",
+          pybind11::arg("A_fp4x2"), pybind11::arg("A_sc"), pybind11::arg("A_sg"),
+          pybind11::arg("B_bf16"), pybind11::arg("D"));
+    m.def("nvfp4_fused_gemm_prequant_a_cta_amax_shared_b_2cta_debug", &nvfp4_fused_gemm_prequant_a_cta_amax_shared_b_2cta_debug_entrypoint,
+          "Developer-only mirror hybrid fused GEMM: pre-quantized A with streamed shared-B backend (CTA amax on B)",
+          pybind11::arg("A_fp4x2"), pybind11::arg("A_sc"), pybind11::arg("A_sg"),
+          pybind11::arg("B_bf16"), pybind11::arg("D"));
     m.def("nvfp4_fused_gemm_both_bf16_shared_b_2cta_transport_only_debug", &nvfp4_fused_gemm_both_bf16_shared_b_2cta_transport_only_debug_entrypoint,
           "Developer-only both-bf16 fused GEMM: 2CTA shared-B front-half bring-up (constant scale)",
           pybind11::arg("A_bf16"), pybind11::arg("B_bf16"),

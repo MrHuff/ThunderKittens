@@ -760,3 +760,117 @@ Important conclusion:
 - but the deeper structural conclusion did not change: this direct streaming design is still
   slower than separate `quantize + gemm` at large square shapes because quantization reuse is
   still tile-local rather than global
+
+### Why More Pipelining Probably Will Not Fix It
+
+Nsight Compute on the promoted shared-B constant backend at `2048 x 2048 x 2048`:
+
+```bash
+ncu --target-processes all \
+    --section SpeedOfLight \
+    --section SchedulerStats \
+    --section WarpStateStats \
+    --section Occupancy \
+    ./nvfp4_b200_shared_b_debug.out --mode shared_b_const --m 2048 --n 2048 --k 2048
+```
+
+Key counters from that run:
+
+- compute throughput: about `28.1%`
+- memory throughput: about `20.5%`
+- DRAM throughput: about `1.66%`
+- active warps per scheduler: about `3.36`
+- eligible warps per scheduler: about `0.42`
+- cycles with no eligible warp: about `63.8%`
+- achieved occupancy: about `20.8%`
+- theoretical occupancy: `25%`
+- top Nsight guidance: about `4.1` cycles of L1TEX scoreboard dependency, about `44.3%` of
+  the issue gap
+
+Interpretation:
+
+- the promoted shared-B kernel is not bandwidth-bound
+- it is also not tensor-core-saturated
+- it is mostly latency/eligibility-limited: too few eligible warps, too much dependency waiting,
+  and only one cluster resident because the kernel is already large in threads, registers, and SMEM
+
+That means more overlap can still improve constants a bit, but it does **not** change the main
+economic problem: the kernel still re-quantizes A and B for each `256 x 256` output block instead
+of reusing those quantized strips globally the way separate `quantize + gemm` does.
+
+We also tried one last low-risk tuning sweep on the shared-B backend:
+
+- `LOAD_PIPE_DEPTH=1` instead of `2`
+- `NUM_D_TILES=1` instead of `2`
+
+Observed outcome:
+
+- `LOAD_PIPE_DEPTH=1` improved the shared-B constant path at `2048` by only about `1%`
+- the same `LOAD_PIPE_DEPTH=1` variant became unstable or incorrect at `4096`
+- `NUM_D_TILES=1` was slower at `2048`
+
+So the straightforward pipe-depth / output-buffer knobs do not rescue the large-shape case.
+The most likely remaining path to actually beat separate `quantize + gemm` would need much
+larger-lifetime reuse of quantized strips, not just deeper or cleaner single-block streaming.
+
+### Mirror Hybrid Control: A Pre-Quantized, B Streamed
+
+The existing production A-only fused kernel already serves as the first hybrid control:
+
+- **A streamed / B pre-quantized**: public `nvfp4_fused_gemm`
+
+To complete the feasibility picture, we added a debug-only mirror hybrid on top of the shared-B
+`2CTA` backend:
+
+- **A pre-quantized / B streamed**: debug-only `prequant_a_shared_b_*`
+
+That mirror path now:
+
+- builds in both the extension and the standalone runner
+- runs cleanly at `256` and `1024` in standalone constant and CTA-amax modes
+- passes standalone memcheck at `1024` CTA-amax
+- runs through the Python harness at `256`, `1024`, `2048`, and `4096`
+
+What this control was meant to tell us:
+
+- if **A pre-quantized / B streamed** got close to separate, then B streaming would look like the
+  better direction
+- if it still lost badly, then the conclusion would be stronger: current hardware is mainly losing
+  on block-local streaming itself, not just on which operand gets streamed
+
+Observed Python comparison against separate `quantize + gemm`:
+
+`2048 x 2048 x 2048`
+
+- separate `quantize + gemm`: `0.028 ms`, cosine `0.9909662008` vs bf16 ref
+- A-only fused const (`A streamed / B pre-quantized`): `0.048 ms`, cosine `0.9870330691` vs separate
+- mirror hybrid const (`A pre-quantized / B streamed`): `0.051 ms`, cosine `0.6620744467` vs separate
+- shared-B both-bf16 const (`A streamed / B streamed`): `0.069 ms`, cosine `0.9736415148` vs separate
+
+`4096 x 4096 x 4096`
+
+- separate `quantize + gemm`: `0.060 ms`, cosine `0.9909696579` vs bf16 ref
+- A-only fused const (`A streamed / B pre-quantized`): `0.609 ms`, cosine `0.9869642258` vs separate
+- mirror hybrid const (`A pre-quantized / B streamed`): `0.609 ms`, cosine `0.6624910831` vs separate
+- shared-B both-bf16 const (`A streamed / B streamed`): `1.064 ms`, cosine `0.9742028713` vs separate
+
+Interpretation:
+
+- performance-wise, the mirror hybrid lands in essentially the same band as the existing A-only
+  fused path, especially at `4096`
+- that is the useful new lesson: **streaming exactly one operand is materially cheaper than
+  streaming both operands**, but still far slower than separate `quantize + gemm` at large square
+  shapes
+- the mirror hybrid's numerics are currently **not** trustworthy; cosine stays near `0.66` across
+  shapes, which strongly suggests a remaining pre-quantized-A staging/layout bug in this debug path
+  rather than a meaningful algorithmic accuracy limit
+- because of that, the mirror path should be treated as a feasibility/control experiment only, not
+  as a candidate backend
+
+Even with that caveat, the broad conclusion is now clearer:
+
+- on current hardware, **one-sided streaming is feasible** and lands in the same rough performance
+  band regardless of which side pays the streaming tax
+- but **tile-local direct streaming still does not match separate `quantize + gemm`** on large
+  square GEMMs
+- the missing ingredient is still wider-lifetime reuse of quantized strips, not more pipeline depth

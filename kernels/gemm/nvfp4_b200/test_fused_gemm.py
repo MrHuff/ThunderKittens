@@ -83,6 +83,8 @@ def load_ext() -> None:
     global nvfp4_fused_gemm_both_bf16, nvfp4_fused_gemm_both_bf16_cta_amax
     global nvfp4_fused_gemm_both_bf16_shared_b_2cta_debug
     global nvfp4_fused_gemm_both_bf16_cta_amax_shared_b_2cta_debug
+    global nvfp4_fused_gemm_prequant_a_shared_b_2cta_debug
+    global nvfp4_fused_gemm_prequant_a_cta_amax_shared_b_2cta_debug
     global nvfp4_fused_gemm_both_bf16_shared_b_2cta_transport_only_debug
     global nvfp4_fused_gemm_both_bf16_shared_b_2cta_producer_only_debug
     global nvfp4_fused_gemm_both_bf16_shared_b_2cta_a_only_debug
@@ -148,6 +150,8 @@ def load_ext() -> None:
                     nvfp4_fused_gemm_both_bf16, nvfp4_fused_gemm_both_bf16_cta_amax,
                     nvfp4_fused_gemm_both_bf16_shared_b_2cta_debug,
                     nvfp4_fused_gemm_both_bf16_cta_amax_shared_b_2cta_debug,
+                    nvfp4_fused_gemm_prequant_a_shared_b_2cta_debug,
+                    nvfp4_fused_gemm_prequant_a_cta_amax_shared_b_2cta_debug,
                     nvfp4_fused_gemm_both_bf16_shared_b_2cta_transport_only_debug,
                     nvfp4_fused_gemm_both_bf16_shared_b_2cta_producer_only_debug,
                     nvfp4_fused_gemm_both_bf16_shared_b_2cta_a_only_debug,
@@ -275,6 +279,12 @@ def both_bf16_shared_b_2cta_backend_label(M: int, N: int, K: int) -> str:
     return "unsupported"
 
 
+def prequant_a_shared_b_backend_label(M: int, N: int, K: int) -> str:
+    if M % 256 == 0 and N % 256 == 0 and K % 128 == 0:
+        return "mirror hybrid: A pre-quantized, B streamed on shared-B 2CTA backend"
+    return "unsupported"
+
+
 def both_bf16_quadcol_backend_label(N: int, K: int) -> str:
     if N % 512 == 0:
         return "same-CTA quad-column A-reuse debug backend (1-stage, 1-epi)"
@@ -393,6 +403,7 @@ def run_case(M: int, N: int, K: int) -> None:
     print(f"  M={M}, N={N}, K={K}")
     print(f"  Fused backend: {fused_backend_label(N)}")
     print(f"  Both-bf16 backend: {both_bf16_backend_label(M, N, K)}")
+    print(f"  Mirror hybrid: {prequant_a_shared_b_backend_label(M, N, K)}")
     print(f"{'='*72}")
 
     A_bf16 = torch.randn(M, K, dtype=torch.bfloat16, device="cuda") / K**0.25
@@ -447,6 +458,30 @@ def run_case(M: int, N: int, K: int) -> None:
     print(f"\n[4] Fused both-bf16 (CTA amax) vs separate:")
     check_diff("fused_both_cta vs sep", D_both_cta, D_separate)
 
+    mirror_supported = (M % 256 == 0) and (N % 256 == 0) and (K % 128 == 0)
+    D_mirror_const = None
+    D_mirror_cta = None
+    if mirror_supported:
+        D_mirror_const = torch.zeros(M, N, dtype=torch.bfloat16, device="cuda")
+        nvfp4_fused_gemm_prequant_a_shared_b_2cta_debug(
+            A_fp4x2, A_sc, A_sc_global, B_bf16, D_mirror_const)
+        torch.cuda.synchronize()
+        print(f"\n[5] Mirror hybrid (A prequant, B streamed, constant) vs bf16 ref:")
+        check_diff("mirror_const vs ref", D_mirror_const, D_ref)
+        print(f"\n[5] Mirror hybrid (A prequant, B streamed, constant) vs separate:")
+        check_diff("mirror_const vs sep", D_mirror_const, D_separate)
+
+        D_mirror_cta = torch.zeros(M, N, dtype=torch.bfloat16, device="cuda")
+        nvfp4_fused_gemm_prequant_a_cta_amax_shared_b_2cta_debug(
+            A_fp4x2, A_sc, A_sc_global, B_bf16, D_mirror_cta)
+        torch.cuda.synchronize()
+        print(f"\n[6] Mirror hybrid (A prequant, B streamed, CTA amax) vs bf16 ref:")
+        check_diff("mirror_cta vs ref", D_mirror_cta, D_ref)
+        print(f"\n[6] Mirror hybrid (A prequant, B streamed, CTA amax) vs separate:")
+        check_diff("mirror_cta vs sep", D_mirror_cta, D_separate)
+    else:
+        print("\n[5] Mirror hybrid skipped: requires M/N multiples of 256 and K multiple of 128.")
+
     NUM_WARMUPS = 5
     NUM_ITERS = 10
     start = torch.cuda.Event(enable_timing=True)
@@ -483,6 +518,13 @@ def run_case(M: int, N: int, K: int) -> None:
           "Both-bf16 fused (const)   ")
     bench(lambda: nvfp4_fused_gemm_both_bf16_cta_amax(A_bf16, B_bf16, D_both_cta),
           "Both-bf16 fused (CTA)     ")
+    if mirror_supported:
+        bench(lambda: nvfp4_fused_gemm_prequant_a_shared_b_2cta_debug(
+                  A_fp4x2, A_sc, A_sc_global, B_bf16, D_mirror_const),
+              "Mirror hybrid (const)    ")
+        bench(lambda: nvfp4_fused_gemm_prequant_a_cta_amax_shared_b_2cta_debug(
+                  A_fp4x2, A_sc, A_sc_global, B_bf16, D_mirror_cta),
+              "Mirror hybrid (CTA)      ")
     print(f"{'='*72}")
 
 
