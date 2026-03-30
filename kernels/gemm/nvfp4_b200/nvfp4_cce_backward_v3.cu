@@ -1077,6 +1077,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           "NVFP4 CCE backward v3 experimental public col-WG BF16-pair-cache col quantization (FP4 output) L4 SG8");
     m.def("experimental_backward_v3_fp4_colwg_colpair_L4_SG8", &launch_experimental_backward_v3_fp4_3wg<bwd_v3_fp4_public_colwg_colpair_L4_SG8>,
           "NVFP4 CCE backward v3 experimental public col-WG transposed col-pair mailbox + packed col store (FP4 output) L4 SG8");
+    m.def("experimental_backward_v3_fp4_colwg_colpair_rowonly_L4_SG8", &launch_experimental_backward_v3_fp4_3wg_rowonly<bwd_v3_fp4_public_colwg_colpair_L4_SG8>,
+          "NVFP4 CCE backward v3 experimental public col-WG colpair row-only (FP4 output) L4 SG8");
+    m.def("experimental_backward_v3_fp4_colwg_colpair_colonly_L4_SG8", &launch_experimental_backward_v3_fp4_3wg_colonly<bwd_v3_fp4_public_colwg_colpair_L4_SG8>,
+          "NVFP4 CCE backward v3 experimental public col-WG colpair col-only (FP4 output) L4 SG8");
     m.def("experimental_backward_v3_fp4_col2wg_L4_SG8", &launch_experimental_backward_v3_fp4_3wg<bwd_v3_expcol2wg_fp4_L4_SG8>,
           "NVFP4 CCE backward v3 experimental consumer-row/two-col-WG (FP4 output) L4 SG8");
     m.def("experimental_backward_v3_fp4_col2wg_replayonly_L4_SG8", &launch_experimental_backward_v3_fp4_3wg_replayonly<bwd_v3_expcol2wg_fp4_L4_SG8>,
