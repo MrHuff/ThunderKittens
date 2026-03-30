@@ -723,6 +723,16 @@ __device__ __forceinline__ uint16_t bf16_bits(bf16 value) {
     return *reinterpret_cast<uint16_t*>(&value);
 }
 
+__device__ __forceinline__ bf16_2 bf16x2_from_bits(uint32_t bits) {
+    bf16_2 value;
+    *reinterpret_cast<uint32_t*>(&value) = bits;
+    return value;
+}
+
+__device__ __forceinline__ uint32_t bf16x2_bits(bf16_2 value) {
+    return *reinterpret_cast<uint32_t*>(&value);
+}
+
 __device__ __forceinline__ void store_global_u64(uint8_t* dst, uint64_t value) {
     *reinterpret_cast<uint64_t*>(dst) = value;
 }
@@ -2826,24 +2836,20 @@ __device__ inline void backward_kernel_v3_streaming_3wg_impl(const globals_3wg<C
                                         const bf16_2 vals0 = D_bf.tiles[i][group16].data[row_half];
                                         const bf16_2 vals1 = D_bf.tiles[i][group16].data[row_half + 2];
                                         const int peer_lane = ((lane_row ^ 1) << 2) | lane_pair;
-                                        const uint16_t v00_peer_bits =
-                                            static_cast<uint16_t>(__shfl_sync(0xffffffff, static_cast<uint32_t>(bf16_bits(vals0.x)), peer_lane));
-                                        const uint16_t v01_peer_bits =
-                                            static_cast<uint16_t>(__shfl_sync(0xffffffff, static_cast<uint32_t>(bf16_bits(vals0.y)), peer_lane));
-                                        const uint16_t v10_peer_bits =
-                                            static_cast<uint16_t>(__shfl_sync(0xffffffff, static_cast<uint32_t>(bf16_bits(vals1.x)), peer_lane));
-                                        const uint16_t v11_peer_bits =
-                                            static_cast<uint16_t>(__shfl_sync(0xffffffff, static_cast<uint32_t>(bf16_bits(vals1.y)), peer_lane));
+                                        const bf16_2 vals0_peer =
+                                            bf16x2_from_bits(__shfl_sync(0xffffffff, bf16x2_bits(vals0), peer_lane));
+                                        const bf16_2 vals1_peer =
+                                            bf16x2_from_bits(__shfl_sync(0xffffffff, bf16x2_bits(vals1), peer_lane));
                                         if ((lane_row & 1) == 0) {
                                             const int col_base = group16 * 16 + lane_pair * 2;
                                             col_pair_stage[bf_stage].pairs[row16_block][col_base + 0][pair_slot] =
-                                                bf16_2{vals0.x, bf16_from_bits(v00_peer_bits)};
+                                                bf16_2{vals0.x, vals0_peer.x};
                                             col_pair_stage[bf_stage].pairs[row16_block][col_base + 1][pair_slot] =
-                                                bf16_2{vals0.y, bf16_from_bits(v01_peer_bits)};
+                                                bf16_2{vals0.y, vals0_peer.y};
                                             col_pair_stage[bf_stage].pairs[row16_block][col_base + 8 + 0][pair_slot] =
-                                                bf16_2{vals1.x, bf16_from_bits(v10_peer_bits)};
+                                                bf16_2{vals1.x, vals1_peer.x};
                                             col_pair_stage[bf_stage].pairs[row16_block][col_base + 8 + 1][pair_slot] =
-                                                bf16_2{vals1.y, bf16_from_bits(v11_peer_bits)};
+                                                bf16_2{vals1.y, vals1_peer.y};
                                         }
                                     }
                                 }
@@ -2961,9 +2967,10 @@ __device__ inline void backward_kernel_v3_streaming_3wg_impl(const globals_3wg<C
                         }
                         if constexpr (DO_COL) {
                             warpgroup::sync(1);
+                            __threadfence_block();
+                            asm volatile("fence.proxy.async.shared::cta;\n" ::: "memory");
+                            warpgroup::sync(1);
                             if (warpgroup::warpid() == 0 && warp::laneid() == 0) {
-                                __threadfence_block();
-                                asm volatile("fence.proxy.async.shared::cta;\n" ::: "memory");
                                 arrive(slice_col_ready[bf_stage]);
                             }
                             update_phasebit<1>(slice_col_recycle_phasebits, bf_stage);
