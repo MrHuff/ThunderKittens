@@ -16,6 +16,7 @@
 #include "pyutils/torchutils.cuh"
 #include "nvfp4_localcta_kernel.cuh"
 #include "nvfp4_localcta_batched_kernel.cuh"
+#include "../nvfp4_accum_gemm.cuh"
 #include "../nvfp4_gemm.cuh"
 #include "../nvfp4_batched_gemm.cuh"
 
@@ -525,6 +526,90 @@ void launch_fast_batched_gemm(
         A_list, A_sc_prepared_list, B_list, B_sc_prepared_list, D_list);
 }
 
+template <typename C>
+void launch_fast_batched_accum_gemm_with_config(
+    const std::vector<at::Tensor>& A_list,
+    const std::vector<at::Tensor>& A_sc_prepared_list,
+    const std::vector<at::Tensor>& B_list,
+    const std::vector<at::Tensor>& B_sc_prepared_list,
+    at::Tensor& D_out
+) {
+    using G = nvfp4_accum_gemm::globals<C>;
+    G g_host;
+    memset(&g_host, 0, sizeof(G));
+
+    const int n = static_cast<int>(A_list.size());
+    const int64_t M = D_out.size(0);
+    const int64_t N_out = D_out.size(1);
+    auto one = get_unit_scale_tensor(A_list[0]);
+    const float* one_ptr = one.data_ptr<float>();
+
+    g_host.num_batches = n;
+    g_host.num_row_blocks = static_cast<int>(M / C::Mb);
+    g_host.num_col_blocks = static_cast<int>(N_out / C::Nb);
+    g_host.num_red_blocks = static_cast<int>((2 * A_list[0].size(1)) / C::Kb);
+    const int num_tiles = g_host.num_row_blocks * 2 * g_host.num_col_blocks;
+
+    static thread_local std::vector<at::Tensor> tile_done_cache;
+    const int device_index = A_list[0].get_device();
+    if (device_index >= static_cast<int>(tile_done_cache.size())) {
+        tile_done_cache.resize(device_index + 1);
+    }
+    auto& tile_done_buf = tile_done_cache[device_index];
+    if (!tile_done_buf.defined() || tile_done_buf.numel() < num_tiles) {
+        tile_done_buf = torch::zeros({num_tiles}, torch::dtype(torch::kInt32).device(A_list[0].device()));
+    } else {
+        tile_done_buf.narrow(0, 0, num_tiles).zero_();
+    }
+    g_host.tile_done = tile_done_buf.data_ptr<int>();
+
+    for (int i = 0; i < n; ++i) {
+        auto a_gl = kittens::py::tensor_to_gl<typename G::A_fp4x2_gl>(A_list[i]);
+        auto a_sc_gl = kittens::py::tensor_to_gl<typename G::A_sc_gl, false>(
+            A_sc_prepared_list[i], 1,
+            A_sc_prepared_list[i].dim() == 2 ? A_sc_prepared_list[i].size(0) / 128 : A_sc_prepared_list[i].size(0),
+            A_sc_prepared_list[i].dim() == 2 ? A_sc_prepared_list[i].size(1) / 4 : A_sc_prepared_list[i].size(1),
+            256);
+        auto b_gl = kittens::py::tensor_to_gl<typename G::B_fp4x2_gl>(B_list[i]);
+        auto b_sc_gl = kittens::py::tensor_to_gl<typename G::B_sc_gl, false>(
+            B_sc_prepared_list[i], 1,
+            B_sc_prepared_list[i].dim() == 2 ? B_sc_prepared_list[i].size(0) / 128 : B_sc_prepared_list[i].size(0),
+            B_sc_prepared_list[i].dim() == 2 ? B_sc_prepared_list[i].size(1) / 4 : B_sc_prepared_list[i].size(1),
+            256);
+
+        memcpy(&g_host.A_tma[i], &a_gl.tma_descs.tma_desc, sizeof(CUtensorMap));
+        memcpy(&g_host.A_sc_tma[i], &a_sc_gl.tma_descs.tma_desc, sizeof(CUtensorMap));
+        memcpy(&g_host.B_tma[i], &b_gl.tma_descs.tma_desc, sizeof(CUtensorMap));
+        memcpy(&g_host.B_sc_tma[i], &b_sc_gl.tma_descs.tma_desc, sizeof(CUtensorMap));
+
+        g_host.A_sg[i] = one_ptr;
+        g_host.B_sg[i] = one_ptr;
+    }
+
+    auto d_gl = kittens::py::tensor_to_gl<typename G::D_gl>(D_out);
+    memcpy(&g_host.D_tma, &d_gl.tma_descs.tma_desc, sizeof(CUtensorMap));
+
+    kittens::py::launch_kernel<C, G, nvfp4_accum_gemm::kernel<C>>(g_host);
+}
+
+void launch_fast_batched_accum_gemm(
+    const std::vector<at::Tensor>& A_list,
+    const std::vector<at::Tensor>& A_sc_prepared_list,
+    const std::vector<at::Tensor>& B_list,
+    const std::vector<at::Tensor>& B_sc_prepared_list,
+    at::Tensor& D_out
+) {
+    if (A_list.size() == 1) {
+        launch_fast_regular_gemm(
+            A_list[0], A_sc_prepared_list[0],
+            B_list[0], B_sc_prepared_list[0],
+            D_out);
+        return;
+    }
+    launch_fast_batched_accum_gemm_with_config<localcta_fast_batched_config>(
+        A_list, A_sc_prepared_list, B_list, B_sc_prepared_list, D_out);
+}
+
 __global__ void sum_tensors_kernel(
     const __nv_bfloat16* __restrict__ A,
     const __nv_bfloat16* __restrict__ B,
@@ -781,48 +866,8 @@ void nvfp4_localcta_fast_batched_accum_gemm_entrypoint(
     TORCH_CHECK(n <= 4, "num_batches must be 1..4");
     check_output_matrix(D_out, "D_out", A_list[0].size(0), B_list[0].size(0));
 
-    if (n == 1) {
-        launch_fast_regular_gemm(A_list[0], A_sc_prepared_list[0], B_list[0], B_sc_prepared_list[0], D_out);
-        return;
-    }
-
-    std::vector<at::Tensor> D_list;
-    D_list.reserve(n);
-    for (int i = 0; i < n; ++i) {
-        D_list.push_back(at::empty_like(D_out));
-    }
-
-    launch_fast_batched_gemm(A_list, A_sc_prepared_list, B_list, B_sc_prepared_list, D_list);
-
-    const int64_t numel = D_out.numel();
-    const int threads = 256;
-    const int blocks = static_cast<int>((numel + threads - 1) / threads);
-    auto stream = at::cuda::getCurrentCUDAStream();
-
-    if (n == 2) {
-        sum_tensors_kernel<<<blocks, threads, 0, stream>>>(
-            reinterpret_cast<const __nv_bfloat16*>(D_list[0].data_ptr()),
-            reinterpret_cast<const __nv_bfloat16*>(D_list[1].data_ptr()),
-            reinterpret_cast<__nv_bfloat16*>(D_out.data_ptr()),
-            numel);
-    } else if (n == 3) {
-        sum3_tensors_kernel<<<blocks, threads, 0, stream>>>(
-            reinterpret_cast<const __nv_bfloat16*>(D_list[0].data_ptr()),
-            reinterpret_cast<const __nv_bfloat16*>(D_list[1].data_ptr()),
-            reinterpret_cast<const __nv_bfloat16*>(D_list[2].data_ptr()),
-            reinterpret_cast<__nv_bfloat16*>(D_out.data_ptr()),
-            numel);
-    } else {
-        sum4_tensors_kernel<<<blocks, threads, 0, stream>>>(
-            reinterpret_cast<const __nv_bfloat16*>(D_list[0].data_ptr()),
-            reinterpret_cast<const __nv_bfloat16*>(D_list[1].data_ptr()),
-            reinterpret_cast<const __nv_bfloat16*>(D_list[2].data_ptr()),
-            reinterpret_cast<const __nv_bfloat16*>(D_list[3].data_ptr()),
-            reinterpret_cast<__nv_bfloat16*>(D_out.data_ptr()),
-            numel);
-    }
-
-    CUDACHECK(cudaGetLastError());
+    launch_fast_batched_accum_gemm(
+        A_list, A_sc_prepared_list, B_list, B_sc_prepared_list, D_out);
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
