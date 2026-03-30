@@ -586,6 +586,50 @@ struct experimental_config_colwg_colpair {
     static constexpr bool ROW_QUANT_FROM_REGS = false;
 };
 
+template <int _LOAD_PIPE_DEPTH, int _SUPERGROUP_SIZE, bool _PINGPONG = true, int _EPI_PIPE_DEPTH = 4>
+struct experimental_config_colwg_colpair_rowregs {
+    static_assert(_LOAD_PIPE_DEPTH > 0 && _LOAD_PIPE_DEPTH <= 5);
+    static_assert(_SUPERGROUP_SIZE > 0);
+    static_assert(_EPI_PIPE_DEPTH > 0 && (128 % _EPI_PIPE_DEPTH) == 0);
+
+    static constexpr int CLUSTER_SIZE = 2;
+    static constexpr bool USE_PDL = true;
+
+    static constexpr int CONSUMER_WARPGROUPS = 1;
+    static constexpr int QUANTIZER_WARPGROUPS = 1;
+    static constexpr int ROW_QUANTIZER_WARPGROUPS = 0;
+    static constexpr int COL_QUANTIZER_WARPGROUPS = 0;
+    static constexpr int PRODUCER_WARPGROUPS = 1;
+    static constexpr int NUM_WARPGROUPS = CONSUMER_WARPGROUPS + QUANTIZER_WARPGROUPS + PRODUCER_WARPGROUPS;
+    static constexpr int NUM_WARPS = NUM_WARPGROUPS * WARPGROUP_WARPS;
+    static constexpr int NUM_THREADS = NUM_WARPS * WARP_THREADS;
+
+    static constexpr int LOAD_PIPE_DEPTH = _LOAD_PIPE_DEPTH;
+    static constexpr int EPI_PIPE_DEPTH = _EPI_PIPE_DEPTH;
+    static constexpr bool OVERLAP_EPI = false;
+    static constexpr bool PINGPONG = _PINGPONG;
+
+    static constexpr int SUPERGROUP_SIZE = _SUPERGROUP_SIZE;
+    static constexpr int Mb = 256;
+    static constexpr int Nb = 128;
+    static constexpr int Kb = 256;
+    static constexpr int B_SC_SIZE = Nb/128;
+    static constexpr int MMA_PER_TILE = Kb/64;
+
+    static constexpr int BF16_STAGE_COUNT = 2;
+    static constexpr int NUM_D_TILES = BF16_STAGE_COUNT;
+    static constexpr bool USE_BF16_ACCUM = false;
+    static constexpr bool CONSUMER_DO_ROW = true;
+    static constexpr bool COL_HELPERS_USE_ALL_QUANTIZER_WGS = false;
+    static constexpr bool USE_COL_PLAIN_STAGE = false;
+    static constexpr bool EARLY_COL_READY = false;
+    static constexpr bool CACHE_COL_VALUES = false;
+    static constexpr bool CACHE_COL_VALUES_BF16 = false;
+    static constexpr bool CACHE_COL_VALUES_BF16_PAIRS = false;
+    static constexpr bool FAST_ALIGNED_QUANT = false;
+    static constexpr bool ROW_QUANT_FROM_REGS = true;
+};
+
 template <typename C>
 struct config_traits_3wg {
     static constexpr bool USE_COL_PAIR_STAGE = false;
@@ -594,6 +638,12 @@ struct config_traits_3wg {
 
 template <int _LOAD_PIPE_DEPTH, int _SUPERGROUP_SIZE, bool _PINGPONG, int _EPI_PIPE_DEPTH>
 struct config_traits_3wg<experimental_config_colwg_colpair<_LOAD_PIPE_DEPTH, _SUPERGROUP_SIZE, _PINGPONG, _EPI_PIPE_DEPTH>> {
+    static constexpr bool USE_COL_PAIR_STAGE = true;
+    static constexpr bool PACK_COL_FP4_U64 = true;
+};
+
+template <int _LOAD_PIPE_DEPTH, int _SUPERGROUP_SIZE, bool _PINGPONG, int _EPI_PIPE_DEPTH>
+struct config_traits_3wg<experimental_config_colwg_colpair_rowregs<_LOAD_PIPE_DEPTH, _SUPERGROUP_SIZE, _PINGPONG, _EPI_PIPE_DEPTH>> {
     static constexpr bool USE_COL_PAIR_STAGE = true;
     static constexpr bool PACK_COL_FP4_U64 = true;
 };
@@ -2834,61 +2884,46 @@ __device__ inline void backward_kernel_v3_streaming_3wg_impl(const globals_3wg<C
                         const int lane_pair = lane_id % 4;
                         const int local_warp_row_base = warpgroup::warpid() * (C::Mb / 8);
 
-                        if constexpr (DO_COL) {
+                        if constexpr (C::ROW_QUANT_FROM_REGS) {
                             #pragma unroll
                             for (int i = 0; i < subtile_rt_bf::height; ++i) {
                                 const int row16_block = (local_warp_row_base + i * 16) / 16;
                                 #pragma unroll
                                 for (int row_half = 0; row_half < 2; ++row_half) {
+                                    const int local_row = local_warp_row_base + i * 16 + row_half * 8 + lane_row;
+                                    const int global_row = tile_row_base + local_row;
                                     const int pair_slot = row_half * 4 + lane_row / 2;
+                                    const bool writer_lane = (lane_row & 1) == 0;
+                                    const int peer_lane = ((lane_row ^ 1) << 2) | lane_pair;
                                     #pragma unroll
                                     for (int group16 = 0; group16 < SUBTILE_COLS / 16; ++group16) {
-                                        const int peer_lane = ((lane_row ^ 1) << 2) | lane_pair;
-                                        const bool writer_lane = (lane_row & 1) == 0;
+                                        const bf16_2 vals0 = D_bf.tiles[i][group16].data[row_half];
+                                        const bf16_2 vals1 = D_bf.tiles[i][group16].data[row_half + 2];
                                         const int col_base = group16 * 16 + lane_pair * 2;
                                         const int col_pair_base = col_base / 2;
-                                        const uint32_t vals0_bits =
-                                            bf16x2_bits(D_bf.tiles[i][group16].data[row_half]);
-                                        const uint32_t vals0_peer_bits =
-                                            __shfl_sync(0xffffffff, vals0_bits, peer_lane);
-                                        if (writer_lane) {
-                                            store_bf16x2_pair_bits(
-                                                &col_pair_stage[bf_stage].pairs[row16_block][col_pair_base + 0][pair_slot][0],
-                                                (vals0_bits & 0x0000ffffu) | (vals0_peer_bits << 16),
-                                                (vals0_bits >> 16) | (vals0_peer_bits & 0xffff0000u));
-                                        }
-                                        const uint32_t vals1_bits =
-                                            bf16x2_bits(D_bf.tiles[i][group16].data[row_half + 2]);
-                                        const uint32_t vals1_peer_bits =
-                                            __shfl_sync(0xffffffff, vals1_bits, peer_lane);
-                                        if (writer_lane) {
-                                            store_bf16x2_pair_bits(
-                                                &col_pair_stage[bf_stage].pairs[row16_block][col_pair_base + 4][pair_slot][0],
-                                                (vals1_bits & 0x0000ffffu) | (vals1_peer_bits << 16),
-                                                (vals1_bits >> 16) | (vals1_peer_bits & 0xffff0000u));
-                                        }
-                                    }
-                                }
-                            }
-                        }
 
-                        if constexpr (DO_ROW && !C::ROW_QUANT_FROM_REGS) {
-                            warpgroup::store(bf16_epi_stage[bf_stage].D, D_bf);
-                            warpgroup::sync(1);
-                        }
+                                        if constexpr (DO_COL) {
+                                            const uint32_t vals0_bits = bf16x2_bits(vals0);
+                                            const uint32_t vals0_peer_bits =
+                                                __shfl_sync(0xffffffff, vals0_bits, peer_lane);
+                                            if (writer_lane) {
+                                                store_bf16x2_pair_bits(
+                                                    &col_pair_stage[bf_stage].pairs[row16_block][col_pair_base + 0][pair_slot][0],
+                                                    (vals0_bits & 0x0000ffffu) | (vals0_peer_bits << 16),
+                                                    (vals0_bits >> 16) | (vals0_peer_bits & 0xffff0000u));
+                                            }
+                                            const uint32_t vals1_bits = bf16x2_bits(vals1);
+                                            const uint32_t vals1_peer_bits =
+                                                __shfl_sync(0xffffffff, vals1_bits, peer_lane);
+                                            if (writer_lane) {
+                                                store_bf16x2_pair_bits(
+                                                    &col_pair_stage[bf_stage].pairs[row16_block][col_pair_base + 4][pair_slot][0],
+                                                    (vals1_bits & 0x0000ffffu) | (vals1_peer_bits << 16),
+                                                    (vals1_bits >> 16) | (vals1_peer_bits & 0xffff0000u));
+                                            }
+                                        }
 
-                        if constexpr (DO_ROW) {
-                            if constexpr (C::ROW_QUANT_FROM_REGS) {
-                                #pragma unroll
-                                for (int i = 0; i < subtile_rt_bf::height; ++i) {
-                                    #pragma unroll
-                                    for (int row_half = 0; row_half < 2; ++row_half) {
-                                        const int local_row = local_warp_row_base + i * 16 + row_half * 8 + lane_row;
-                                        const int global_row = tile_row_base + local_row;
-                                        #pragma unroll
-                                        for (int group16 = 0; group16 < SUBTILE_COLS / 16; ++group16) {
-                                            const bf16_2 vals0 = D_bf.tiles[i][group16].data[row_half];
-                                            const bf16_2 vals1 = D_bf.tiles[i][group16].data[row_half + 2];
+                                        if constexpr (DO_ROW) {
                                             const float v00 = __bfloat162float(vals0.x);
                                             const float v01 = __bfloat162float(vals0.y);
                                             const float v10 = __bfloat162float(vals1.x);
@@ -2929,7 +2964,50 @@ __device__ inline void backward_kernel_v3_streaming_3wg_impl(const globals_3wg<C
                                         }
                                     }
                                 }
-                            } else {
+                            }
+                        } else {
+                            if constexpr (DO_COL) {
+                                #pragma unroll
+                                for (int i = 0; i < subtile_rt_bf::height; ++i) {
+                                    const int row16_block = (local_warp_row_base + i * 16) / 16;
+                                    #pragma unroll
+                                    for (int row_half = 0; row_half < 2; ++row_half) {
+                                        const int pair_slot = row_half * 4 + lane_row / 2;
+                                        #pragma unroll
+                                        for (int group16 = 0; group16 < SUBTILE_COLS / 16; ++group16) {
+                                            const int peer_lane = ((lane_row ^ 1) << 2) | lane_pair;
+                                            const bool writer_lane = (lane_row & 1) == 0;
+                                            const int col_base = group16 * 16 + lane_pair * 2;
+                                            const int col_pair_base = col_base / 2;
+                                            const uint32_t vals0_bits =
+                                                bf16x2_bits(D_bf.tiles[i][group16].data[row_half]);
+                                            const uint32_t vals0_peer_bits =
+                                                __shfl_sync(0xffffffff, vals0_bits, peer_lane);
+                                            if (writer_lane) {
+                                                store_bf16x2_pair_bits(
+                                                    &col_pair_stage[bf_stage].pairs[row16_block][col_pair_base + 0][pair_slot][0],
+                                                    (vals0_bits & 0x0000ffffu) | (vals0_peer_bits << 16),
+                                                    (vals0_bits >> 16) | (vals0_peer_bits & 0xffff0000u));
+                                            }
+                                            const uint32_t vals1_bits =
+                                                bf16x2_bits(D_bf.tiles[i][group16].data[row_half + 2]);
+                                            const uint32_t vals1_peer_bits =
+                                                __shfl_sync(0xffffffff, vals1_bits, peer_lane);
+                                            if (writer_lane) {
+                                                store_bf16x2_pair_bits(
+                                                    &col_pair_stage[bf_stage].pairs[row16_block][col_pair_base + 4][pair_slot][0],
+                                                    (vals1_bits & 0x0000ffffu) | (vals1_peer_bits << 16),
+                                                    (vals1_bits >> 16) | (vals1_peer_bits & 0xffff0000u));
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+
+                            if constexpr (DO_ROW) {
+                                warpgroup::store(bf16_epi_stage[bf_stage].D, D_bf);
+                                warpgroup::sync(1);
+
                                 const uint32_t d_base = static_cast<uint32_t>(
                                     __cvta_generic_to_shared(&bf16_epi_stage[bf_stage].D.data[0]));
                                 const int quant_row = threadIdx.x;
