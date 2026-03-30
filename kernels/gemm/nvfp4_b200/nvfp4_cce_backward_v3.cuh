@@ -1329,7 +1329,7 @@ struct globals_3wg {
         bf16_2 pairs[C::Mb/32][C::Nb/C::EPI_PIPE_DEPTH/2][8][2];
     };
     struct alignas(16) row_pair_stage_t {
-        bf16_2 pairs[C::Mb/2][C::Nb/C::EPI_PIPE_DEPTH/16][8];
+        bf16_2 pairs[C::Mb/2][C::Nb/C::EPI_PIPE_DEPTH/16][4][2];
     };
     struct col_mailbox_stage_t {
         D_helper_tile D[COL_HELPER_SLOTS];
@@ -3623,8 +3623,9 @@ __device__ inline void backward_kernel_v3_streaming_3wg_impl(const globals_3wg<C
                                             if constexpr (G::USE_ROW_PAIR_STAGE && DO_ROW) {
                                                 const int local_row =
                                                     local_warp_row_base + i * 16 + row_half * 8 + lane_row;
-                                                row_pair_stage[bf_stage].pairs[local_row][group16][lane_pair] = vals0;
-                                                row_pair_stage[bf_stage].pairs[local_row][group16][lane_pair + 4] = vals1;
+                                                store_bf16x2_pair_bits(
+                                                    &row_pair_stage[bf_stage].pairs[local_row][group16][lane_pair][0],
+                                                    vals0_bits, vals1_bits);
                                             }
                                         }
                                     }
@@ -3639,10 +3640,10 @@ __device__ inline void backward_kernel_v3_streaming_3wg_impl(const globals_3wg<C
                                         const int local_row = local_warp_row_base + i * 16 + row_half * 8 + lane_row;
                                         #pragma unroll
                                         for (int group16 = 0; group16 < SUBTILE_COLS / 16; ++group16) {
-                                            row_pair_stage[bf_stage].pairs[local_row][group16][lane_pair] =
-                                                D_bf.tiles[i][group16].data[row_half];
-                                            row_pair_stage[bf_stage].pairs[local_row][group16][lane_pair + 4] =
-                                                D_bf.tiles[i][group16].data[row_half + 2];
+                                            store_bf16x2_pair_bits(
+                                                &row_pair_stage[bf_stage].pairs[local_row][group16][lane_pair][0],
+                                                bf16x2_bits(D_bf.tiles[i][group16].data[row_half]),
+                                                bf16x2_bits(D_bf.tiles[i][group16].data[row_half + 2]));
                                         }
                                     }
                                 }
@@ -3682,15 +3683,32 @@ __device__ inline void backward_kernel_v3_streaming_3wg_impl(const globals_3wg<C
                                         bf16_2 vals[8];
                                         float amax = 0.0f;
                                         #pragma unroll
-                                        for (int pair = 0; pair < 8; ++pair) {
+                                        for (int pair = 0; pair < 4; ++pair) {
                                             if constexpr (G::USE_ROW_PAIR_STAGE) {
-                                                vals[pair] = row_pair_stage[bf_stage].pairs[quant_row][group16][pair];
+                                                const uint64_t pair_bits =
+                                                    *reinterpret_cast<const uint64_t*>(
+                                                        &row_pair_stage[bf_stage].pairs[quant_row][group16][pair][0]);
+                                                vals[pair] = bf16x2_from_bits(static_cast<uint32_t>(pair_bits));
+                                                vals[pair + 4] = bf16x2_from_bits(static_cast<uint32_t>(pair_bits >> 32));
+                                                amax = fmaxf(amax, fabsf(__bfloat162float(vals[pair].x)));
+                                                amax = fmaxf(amax, fabsf(__bfloat162float(vals[pair].y)));
+                                                amax = fmaxf(amax, fabsf(__bfloat162float(vals[pair + 4].x)));
+                                                amax = fmaxf(amax, fabsf(__bfloat162float(vals[pair + 4].y)));
                                             } else {
                                                 const int col = group16 * 16 + pair * 2;
                                                 move<bf16_2>::lds(vals[pair], G::D_tile::idx(d_base, {quant_row, col}));
+                                                amax = fmaxf(amax, fabsf(__bfloat162float(vals[pair].x)));
+                                                amax = fmaxf(amax, fabsf(__bfloat162float(vals[pair].y)));
                                             }
-                                            amax = fmaxf(amax, fabsf(__bfloat162float(vals[pair].x)));
-                                            amax = fmaxf(amax, fabsf(__bfloat162float(vals[pair].y)));
+                                        }
+                                        if constexpr (!G::USE_ROW_PAIR_STAGE) {
+                                            #pragma unroll
+                                            for (int pair = 4; pair < 8; ++pair) {
+                                                const int col = group16 * 16 + pair * 2;
+                                                move<bf16_2>::lds(vals[pair], G::D_tile::idx(d_base, {quant_row, col}));
+                                                amax = fmaxf(amax, fabsf(__bfloat162float(vals[pair].x)));
+                                                amax = fmaxf(amax, fabsf(__bfloat162float(vals[pair].y)));
+                                            }
                                         }
 
                                         const float scale = amax * (1.0f / FP4_MAX);
@@ -3699,13 +3717,27 @@ __device__ inline void backward_kernel_v3_streaming_3wg_impl(const globals_3wg<C
                                         if (row_in_bounds) {
                                             const int global_col_16 = col_start + group16 * 16;
                                             const int fp4x2_col_base = global_col_16 / 2;
-                                            #pragma unroll
-                                            for (int pair = 0; pair < 8; ++pair) {
-                                                row_fp4_ptr[global_row * row_fp4_stride + fp4x2_col_base + pair] =
-                                                    quantize_fp4_pair(
+                                            if constexpr (G::USE_ROW_PAIR_STAGE) {
+                                                uint64_t packed_fp4 = 0;
+                                                #pragma unroll
+                                                for (int pair = 0; pair < 8; ++pair) {
+                                                    packed_fp4 |= static_cast<uint64_t>(quantize_fp4_pair(
                                                         __bfloat162float(vals[pair].x),
                                                         __bfloat162float(vals[pair].y),
-                                                        rcp_scale);
+                                                        rcp_scale)) << (pair * 8);
+                                                }
+                                                store_global_u64(
+                                                    &row_fp4_ptr[global_row * row_fp4_stride + fp4x2_col_base],
+                                                    packed_fp4);
+                                            } else {
+                                                #pragma unroll
+                                                for (int pair = 0; pair < 8; ++pair) {
+                                                    row_fp4_ptr[global_row * row_fp4_stride + fp4x2_col_base + pair] =
+                                                        quantize_fp4_pair(
+                                                            __bfloat162float(vals[pair].x),
+                                                            __bfloat162float(vals[pair].y),
+                                                            rcp_scale);
+                                                }
                                             }
 
                                             float stored_scale = scale * g_sg_rcp;
