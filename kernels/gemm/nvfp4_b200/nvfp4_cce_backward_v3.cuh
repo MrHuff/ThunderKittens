@@ -721,6 +721,7 @@ struct experimental_config_colwg_colpair_rowregs_overlap {
 template <typename C>
 struct config_traits_3wg {
     static constexpr bool USE_COL_PAIR_STAGE = false;
+    static constexpr bool USE_ROW_PAIR_STAGE = false;
     static constexpr bool PACK_COL_FP4_U64 = false;
     static constexpr bool ROW_QUANT_ROWLEADER = false;
     static constexpr bool ROW_QUANT_ROWDUAL = false;
@@ -729,6 +730,7 @@ struct config_traits_3wg {
 template <int _LOAD_PIPE_DEPTH, int _SUPERGROUP_SIZE, bool _PINGPONG, int _EPI_PIPE_DEPTH>
 struct config_traits_3wg<experimental_config_colwg_colpair<_LOAD_PIPE_DEPTH, _SUPERGROUP_SIZE, _PINGPONG, _EPI_PIPE_DEPTH>> {
     static constexpr bool USE_COL_PAIR_STAGE = true;
+    static constexpr bool USE_ROW_PAIR_STAGE = false;
     static constexpr bool PACK_COL_FP4_U64 = true;
     static constexpr bool ROW_QUANT_ROWLEADER = false;
     static constexpr bool ROW_QUANT_ROWDUAL = false;
@@ -737,6 +739,60 @@ struct config_traits_3wg<experimental_config_colwg_colpair<_LOAD_PIPE_DEPTH, _SU
 template <int _LOAD_PIPE_DEPTH, int _SUPERGROUP_SIZE, bool _PINGPONG, int _EPI_PIPE_DEPTH>
 struct config_traits_3wg<experimental_config_colwg_colpair_overlap<_LOAD_PIPE_DEPTH, _SUPERGROUP_SIZE, _PINGPONG, _EPI_PIPE_DEPTH>> {
     static constexpr bool USE_COL_PAIR_STAGE = true;
+    static constexpr bool USE_ROW_PAIR_STAGE = false;
+    static constexpr bool PACK_COL_FP4_U64 = true;
+    static constexpr bool ROW_QUANT_ROWLEADER = false;
+    static constexpr bool ROW_QUANT_ROWDUAL = false;
+};
+
+template <int _LOAD_PIPE_DEPTH, int _SUPERGROUP_SIZE, bool _PINGPONG = true, int _EPI_PIPE_DEPTH = 4>
+struct experimental_config_colwg_colpair_rowpair_overlap {
+    static_assert(_LOAD_PIPE_DEPTH > 0 && _LOAD_PIPE_DEPTH <= 5);
+    static_assert(_SUPERGROUP_SIZE > 0);
+    static_assert(_EPI_PIPE_DEPTH > 0 && (128 % _EPI_PIPE_DEPTH) == 0);
+
+    static constexpr int CLUSTER_SIZE = 2;
+    static constexpr bool USE_PDL = true;
+
+    static constexpr int CONSUMER_WARPGROUPS = 1;
+    static constexpr int QUANTIZER_WARPGROUPS = 1;
+    static constexpr int ROW_QUANTIZER_WARPGROUPS = 0;
+    static constexpr int COL_QUANTIZER_WARPGROUPS = 0;
+    static constexpr int PRODUCER_WARPGROUPS = 1;
+    static constexpr int NUM_WARPGROUPS = CONSUMER_WARPGROUPS + QUANTIZER_WARPGROUPS + PRODUCER_WARPGROUPS;
+    static constexpr int NUM_WARPS = NUM_WARPGROUPS * WARPGROUP_WARPS;
+    static constexpr int NUM_THREADS = NUM_WARPS * WARP_THREADS;
+
+    static constexpr int LOAD_PIPE_DEPTH = _LOAD_PIPE_DEPTH;
+    static constexpr int EPI_PIPE_DEPTH = _EPI_PIPE_DEPTH;
+    static constexpr bool OVERLAP_EPI = false;
+    static constexpr bool PINGPONG = _PINGPONG;
+
+    static constexpr int SUPERGROUP_SIZE = _SUPERGROUP_SIZE;
+    static constexpr int Mb = 256;
+    static constexpr int Nb = 128;
+    static constexpr int Kb = 256;
+    static constexpr int B_SC_SIZE = Nb/128;
+    static constexpr int MMA_PER_TILE = Kb/64;
+
+    static constexpr int BF16_STAGE_COUNT = 2;
+    static constexpr int NUM_D_TILES = BF16_STAGE_COUNT;
+    static constexpr bool USE_BF16_ACCUM = false;
+    static constexpr bool CONSUMER_DO_ROW = true;
+    static constexpr bool COL_HELPERS_USE_ALL_QUANTIZER_WGS = false;
+    static constexpr bool USE_COL_PLAIN_STAGE = false;
+    static constexpr bool EARLY_COL_READY = true;
+    static constexpr bool CACHE_COL_VALUES = false;
+    static constexpr bool CACHE_COL_VALUES_BF16 = false;
+    static constexpr bool CACHE_COL_VALUES_BF16_PAIRS = false;
+    static constexpr bool FAST_ALIGNED_QUANT = false;
+    static constexpr bool ROW_QUANT_FROM_REGS = false;
+};
+
+template <int _LOAD_PIPE_DEPTH, int _SUPERGROUP_SIZE, bool _PINGPONG, int _EPI_PIPE_DEPTH>
+struct config_traits_3wg<experimental_config_colwg_colpair_rowpair_overlap<_LOAD_PIPE_DEPTH, _SUPERGROUP_SIZE, _PINGPONG, _EPI_PIPE_DEPTH>> {
+    static constexpr bool USE_COL_PAIR_STAGE = true;
+    static constexpr bool USE_ROW_PAIR_STAGE = true;
     static constexpr bool PACK_COL_FP4_U64 = true;
     static constexpr bool ROW_QUANT_ROWLEADER = false;
     static constexpr bool ROW_QUANT_ROWDUAL = false;
@@ -745,6 +801,7 @@ struct config_traits_3wg<experimental_config_colwg_colpair_overlap<_LOAD_PIPE_DE
 template <int _LOAD_PIPE_DEPTH, int _SUPERGROUP_SIZE, bool _PINGPONG, int _EPI_PIPE_DEPTH>
 struct config_traits_3wg<experimental_config_colwg_colpair_rowregs<_LOAD_PIPE_DEPTH, _SUPERGROUP_SIZE, _PINGPONG, _EPI_PIPE_DEPTH>> {
     static constexpr bool USE_COL_PAIR_STAGE = true;
+    static constexpr bool USE_ROW_PAIR_STAGE = false;
     static constexpr bool PACK_COL_FP4_U64 = true;
     static constexpr bool ROW_QUANT_ROWLEADER = false;
     static constexpr bool ROW_QUANT_ROWDUAL = false;
@@ -753,6 +810,7 @@ struct config_traits_3wg<experimental_config_colwg_colpair_rowregs<_LOAD_PIPE_DE
 template <int _LOAD_PIPE_DEPTH, int _SUPERGROUP_SIZE, bool _PINGPONG, int _EPI_PIPE_DEPTH>
 struct config_traits_3wg<experimental_config_colwg_colpair_rowregs_overlap<_LOAD_PIPE_DEPTH, _SUPERGROUP_SIZE, _PINGPONG, _EPI_PIPE_DEPTH>> {
     static constexpr bool USE_COL_PAIR_STAGE = true;
+    static constexpr bool USE_ROW_PAIR_STAGE = false;
     static constexpr bool PACK_COL_FP4_U64 = true;
     static constexpr bool ROW_QUANT_ROWLEADER = false;
     static constexpr bool ROW_QUANT_ROWDUAL = false;
@@ -805,6 +863,7 @@ struct experimental_config_colwg_colpair_rowleader {
 template <int _LOAD_PIPE_DEPTH, int _SUPERGROUP_SIZE, bool _PINGPONG, int _EPI_PIPE_DEPTH>
 struct config_traits_3wg<experimental_config_colwg_colpair_rowleader<_LOAD_PIPE_DEPTH, _SUPERGROUP_SIZE, _PINGPONG, _EPI_PIPE_DEPTH>> {
     static constexpr bool USE_COL_PAIR_STAGE = true;
+    static constexpr bool USE_ROW_PAIR_STAGE = false;
     static constexpr bool PACK_COL_FP4_U64 = true;
     static constexpr bool ROW_QUANT_ROWLEADER = true;
     static constexpr bool ROW_QUANT_ROWDUAL = false;
@@ -857,6 +916,7 @@ struct experimental_config_colwg_colpair_rowdual {
 template <int _LOAD_PIPE_DEPTH, int _SUPERGROUP_SIZE, bool _PINGPONG, int _EPI_PIPE_DEPTH>
 struct config_traits_3wg<experimental_config_colwg_colpair_rowdual<_LOAD_PIPE_DEPTH, _SUPERGROUP_SIZE, _PINGPONG, _EPI_PIPE_DEPTH>> {
     static constexpr bool USE_COL_PAIR_STAGE = true;
+    static constexpr bool USE_ROW_PAIR_STAGE = false;
     static constexpr bool PACK_COL_FP4_U64 = true;
     static constexpr bool ROW_QUANT_ROWLEADER = false;
     static constexpr bool ROW_QUANT_ROWDUAL = true;
@@ -1207,6 +1267,7 @@ struct globals_3wg {
     static constexpr bool USE_COL_HELPER_MAILBOX = (C::COL_QUANTIZER_WARPGROUPS > 1);
     static constexpr bool USE_COL_PLAIN_STAGE = C::USE_COL_PLAIN_STAGE;
     static constexpr bool USE_COL_PAIR_STAGE = config_traits_3wg<C>::USE_COL_PAIR_STAGE;
+    static constexpr bool USE_ROW_PAIR_STAGE = config_traits_3wg<C>::USE_ROW_PAIR_STAGE;
     static constexpr bool PACK_COL_FP4_U64 = config_traits_3wg<C>::PACK_COL_FP4_U64;
     static constexpr bool ROW_QUANT_ROWLEADER = config_traits_3wg<C>::ROW_QUANT_ROWLEADER;
     static constexpr bool ROW_QUANT_ROWDUAL = config_traits_3wg<C>::ROW_QUANT_ROWDUAL;
@@ -1267,6 +1328,9 @@ struct globals_3wg {
     struct alignas(16) col_pair_stage_t {
         bf16_2 pairs[C::Mb/32][C::Nb/C::EPI_PIPE_DEPTH/2][8][2];
     };
+    struct alignas(16) row_pair_stage_t {
+        bf16_2 pairs[C::Mb/2][C::Nb/C::EPI_PIPE_DEPTH/16][8];
+    };
     struct col_mailbox_stage_t {
         D_helper_tile D[COL_HELPER_SLOTS];
     };
@@ -1290,6 +1354,7 @@ struct globals_3wg {
             sizeof(bf16_stage_t) * C::BF16_STAGE_COUNT + 1024 +
             (USE_COL_PLAIN_STAGE ? (sizeof(col_plain_stage_t) * C::BF16_STAGE_COUNT + 1024) : 0) +
             (USE_COL_PAIR_STAGE ? (sizeof(col_pair_stage_t) * C::BF16_STAGE_COUNT + 1024) : 0) +
+            (USE_ROW_PAIR_STAGE ? (sizeof(row_pair_stage_t) * C::BF16_STAGE_COUNT + 1024) : 0) +
             (USE_COL_HELPER_MAILBOX ? (sizeof(col_mailbox_stage_t) * C::BF16_STAGE_COUNT + 1024) : 0);
         static_assert(_dynamic_shared_memory <= MAX_SHARED_MEMORY - 1024);
         return _dynamic_shared_memory;
@@ -2812,6 +2877,12 @@ __device__ inline void backward_kernel_v3_streaming_3wg_impl(const globals_3wg<C
             sm_allocator.template allocate<typename G::col_pair_stage_t, C::BF16_STAGE_COUNT>();
         col_pair_stage = &col_pair_stage_ref[0];
     }
+    typename G::row_pair_stage_t *row_pair_stage = nullptr;
+    if constexpr (G::USE_ROW_PAIR_STAGE) {
+        auto &row_pair_stage_ref =
+            sm_allocator.template allocate<typename G::row_pair_stage_t, C::BF16_STAGE_COUNT>();
+        row_pair_stage = &row_pair_stage_ref[0];
+    }
 
     tensor_allocator<1, C::CLUSTER_SIZE, false> tm_allocator;
 
@@ -3527,8 +3598,11 @@ __device__ inline void backward_kernel_v3_streaming_3wg_impl(const globals_3wg<C
                                             const bool writer_lane = (lane_row & 1) == 0;
                                             const int col_base = group16 * 16 + lane_pair * 2;
                                             const int col_pair_base = col_base / 2;
-                                            const uint32_t vals0_bits =
-                                                bf16x2_bits(D_bf.tiles[i][group16].data[row_half]);
+                                            const bf16_2 vals0 =
+                                                D_bf.tiles[i][group16].data[row_half];
+                                            const bf16_2 vals1 =
+                                                D_bf.tiles[i][group16].data[row_half + 2];
+                                            const uint32_t vals0_bits = bf16x2_bits(vals0);
                                             const uint32_t vals0_peer_bits =
                                                 __shfl_sync(0xffffffff, vals0_bits, peer_lane);
                                             if (writer_lane) {
@@ -3537,8 +3611,7 @@ __device__ inline void backward_kernel_v3_streaming_3wg_impl(const globals_3wg<C
                                                     (vals0_bits & 0x0000ffffu) | (vals0_peer_bits << 16),
                                                     (vals0_bits >> 16) | (vals0_peer_bits & 0xffff0000u));
                                             }
-                                            const uint32_t vals1_bits =
-                                                bf16x2_bits(D_bf.tiles[i][group16].data[row_half + 2]);
+                                            const uint32_t vals1_bits = bf16x2_bits(vals1);
                                             const uint32_t vals1_peer_bits =
                                                 __shfl_sync(0xffffffff, vals1_bits, peer_lane);
                                             if (writer_lane) {
@@ -3547,6 +3620,29 @@ __device__ inline void backward_kernel_v3_streaming_3wg_impl(const globals_3wg<C
                                                     (vals1_bits & 0x0000ffffu) | (vals1_peer_bits << 16),
                                                     (vals1_bits >> 16) | (vals1_peer_bits & 0xffff0000u));
                                             }
+                                            if constexpr (G::USE_ROW_PAIR_STAGE && DO_ROW) {
+                                                const int local_row =
+                                                    local_warp_row_base + i * 16 + row_half * 8 + lane_row;
+                                                row_pair_stage[bf_stage].pairs[local_row][group16][lane_pair] = vals0;
+                                                row_pair_stage[bf_stage].pairs[local_row][group16][lane_pair + 4] = vals1;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+
+                            if constexpr (G::USE_ROW_PAIR_STAGE && DO_ROW && !DO_COL) {
+                                #pragma unroll
+                                for (int i = 0; i < subtile_rt_bf::height; ++i) {
+                                    #pragma unroll
+                                    for (int row_half = 0; row_half < 2; ++row_half) {
+                                        const int local_row = local_warp_row_base + i * 16 + row_half * 8 + lane_row;
+                                        #pragma unroll
+                                        for (int group16 = 0; group16 < SUBTILE_COLS / 16; ++group16) {
+                                            row_pair_stage[bf_stage].pairs[local_row][group16][lane_pair] =
+                                                D_bf.tiles[i][group16].data[row_half];
+                                            row_pair_stage[bf_stage].pairs[local_row][group16][lane_pair + 4] =
+                                                D_bf.tiles[i][group16].data[row_half + 2];
                                         }
                                     }
                                 }
@@ -3564,10 +3660,14 @@ __device__ inline void backward_kernel_v3_streaming_3wg_impl(const globals_3wg<C
                             }
 
                             if constexpr (DO_ROW) {
-                                warpgroup::store(bf16_epi_stage[bf_stage].D, D_bf);
-                                warpgroup::sync(1);
+                                if constexpr (G::USE_ROW_PAIR_STAGE) {
+                                    warpgroup::sync(1);
+                                } else {
+                                    warpgroup::store(bf16_epi_stage[bf_stage].D, D_bf);
+                                    warpgroup::sync(1);
+                                }
 
-                                const uint32_t d_base = static_cast<uint32_t>(
+                                const uint32_t d_base = G::USE_ROW_PAIR_STAGE ? 0u : static_cast<uint32_t>(
                                     __cvta_generic_to_shared(&bf16_epi_stage[bf_stage].D.data[0]));
                                 const int quant_row = threadIdx.x;
                                 if (quant_row < C::Mb / 2) {
@@ -3583,8 +3683,12 @@ __device__ inline void backward_kernel_v3_streaming_3wg_impl(const globals_3wg<C
                                         float amax = 0.0f;
                                         #pragma unroll
                                         for (int pair = 0; pair < 8; ++pair) {
-                                            const int col = group16 * 16 + pair * 2;
-                                            move<bf16_2>::lds(vals[pair], G::D_tile::idx(d_base, {quant_row, col}));
+                                            if constexpr (G::USE_ROW_PAIR_STAGE) {
+                                                vals[pair] = row_pair_stage[bf_stage].pairs[quant_row][group16][pair];
+                                            } else {
+                                                const int col = group16 * 16 + pair * 2;
+                                                move<bf16_2>::lds(vals[pair], G::D_tile::idx(d_base, {quant_row, col}));
+                                            }
                                             amax = fmaxf(amax, fabsf(__bfloat162float(vals[pair].x)));
                                             amax = fmaxf(amax, fabsf(__bfloat162float(vals[pair].y)));
                                         }
