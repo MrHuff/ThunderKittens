@@ -321,6 +321,7 @@ void nvfp4_grouped_gemm_entrypoint(
             .D_V = use_split_D ? kittens::py::tensor_to_gl<typename G::D_gl>(D_V_opt.value()) : kittens::py::tensor_to_gl<typename G::D_gl>(D),
             .q_dim = use_split_D ? static_cast<int>(D.size(1)) : 0,
             .k_dim = use_split_D ? static_cast<int>(D_K_opt.value().size(1)) : 0,
+            .v_dim = use_split_D ? static_cast<int>(D_V_opt.value().size(1)) : 0,
             .use_split_D = use_split_D,
             .b_sg_per_tile = B_sg_per_tile.data_ptr<float>(),
             .silu_dim = silu_dim
@@ -342,6 +343,7 @@ void nvfp4_grouped_gemm_entrypoint(
             .D_V = use_split_D ? kittens::py::tensor_to_gl<typename G::D_gl>(D_V_opt.value()) : kittens::py::tensor_to_gl<typename G::D_gl>(D),
             .q_dim = use_split_D ? static_cast<int>(D.size(1)) : 0,
             .k_dim = use_split_D ? static_cast<int>(D_K_opt.value().size(1)) : 0,
+            .v_dim = use_split_D ? static_cast<int>(D_V_opt.value().size(1)) : 0,
             .use_split_D = use_split_D,
             .b_sg_per_tile = B_sg_per_tile.data_ptr<float>(),
             .silu_dim = silu_dim
@@ -391,6 +393,7 @@ void nvfp4_grouped_gemm_nopdl_entrypoint(
         .D_V = use_split_D ? kittens::py::tensor_to_gl<typename G::D_gl>(D_V_opt.value()) : kittens::py::tensor_to_gl<typename G::D_gl>(D),
         .q_dim = use_split_D ? static_cast<int>(D.size(1)) : 0,
         .k_dim = use_split_D ? static_cast<int>(D_K_opt.value().size(1)) : 0,
+        .v_dim = use_split_D ? static_cast<int>(D_V_opt.value().size(1)) : 0,
         .use_split_D = use_split_D,
         .b_sg_per_tile = B_sg_per_tile.data_ptr<float>(),
         .silu_dim = silu_dim
