@@ -983,7 +983,7 @@ static void launch_experimental_backward_v3_fp4_col2pass(
 // Config instantiations
 using bwd_v3_bf16_L4_SG8 = nvfp4_cce_backward_v3::config<4, 8, true, true>;
 using bwd_v3_fp4_L4_SG8  = nvfp4_cce_backward_v3::config<4, 8, false, true>;
-using bwd_v3_fp4_public_colwg_L4_SG8 = nvfp4_cce_backward_v3::experimental_config_colwg<4, 8, true>;
+using bwd_v3_fp4_public_colwg_L4_SG8 = nvfp4_cce_backward_v3::experimental_config_colwg_colpair<4, 8, true>;
 using bwd_v3_fp4_public_colwg_rowregs_L4_SG8 = nvfp4_cce_backward_v3::experimental_config_colwg_rowregs<4, 8, true>;
 using bwd_v3_fp4_public_colwg_rowregs_s3_L4_SG8 = nvfp4_cce_backward_v3::experimental_config_colwg_rowregs_s3<4, 8, true>;
 using bwd_v3_fp4_public_colwg_rowregs_s4_L4_SG8 = nvfp4_cce_backward_v3::experimental_config_colwg_rowregs_s4<4, 8, true>;
@@ -1005,8 +1005,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("backward_v3_bf16_L4_SG8", &launch_backward_v3_bf16<bwd_v3_bf16_L4_SG8>,
           "NVFP4 CCE backward v3 (BF16 output) L4 SG8");
     // Public FP4 v3 stays on CTA-local/per-16 micro-scale quantization with
-    // analytic G_sg_row, but now uses the consumer-row / quantizer-col split
-    // because it wins end-to-end over the old consumer-does-both path.
+    // analytic G_sg_row, and now uses the TE-inspired colpair mailbox variant
+    // of the consumer-row / quantizer-col split because it is the current
+    // strongest fused candidate.
     m.def("backward_v3_fp4_L4_SG8", &launch_experimental_backward_v3_fp4_3wg<bwd_v3_fp4_public_colwg_L4_SG8>,
           "NVFP4 CCE backward v3 (FP4 output, consumer-row/col-WG) L4 SG8");
     m.def("experimental_backward_v3_fp4_L4_SG8", &launch_experimental_backward_v3_fp4<bwd_v3_fp4_L4_SG8>,
