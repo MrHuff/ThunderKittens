@@ -62,7 +62,7 @@ def prepared_quant_mode(M: int, K: int) -> str:
     blocks_x = K // 128
     macro_tiles_y = (blocks_y + 1) // 2
     total_macro_tiles = blocks_x * macro_tiles_y
-    if total_macro_tiles <= 1024:
+    if total_macro_tiles > 0 and (blocks_x <= 16 or total_macro_tiles <= 1152):
         return "prepared_2cta_tuned"
     return "prepared_1cta_tuned"
 
