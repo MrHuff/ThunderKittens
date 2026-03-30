@@ -606,6 +606,12 @@ void launch_fast_batched_accum_gemm(
             D_out);
         return;
     }
+    const int64_t reduction_k = A_list[0].size(1) * 2;
+    if (A_list.size() == 2 && reduction_k >= 4096) {
+        launch_fast_batched_accum_gemm_with_config<localcta_fast_largek_config>(
+            A_list, A_sc_prepared_list, B_list, B_sc_prepared_list, D_out);
+        return;
+    }
     launch_fast_batched_accum_gemm_with_config<localcta_fast_batched_config>(
         A_list, A_sc_prepared_list, B_list, B_sc_prepared_list, D_out);
 }
