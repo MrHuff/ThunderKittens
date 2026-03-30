@@ -733,6 +733,14 @@ __device__ __forceinline__ uint32_t bf16x2_bits(bf16_2 value) {
     return *reinterpret_cast<uint32_t*>(&value);
 }
 
+__device__ __forceinline__ void store_bf16x2_bits(bf16_2 &dst, uint32_t bits) {
+    *reinterpret_cast<uint32_t*>(&dst) = bits;
+}
+
+__device__ __forceinline__ void store_bf16x2_pair_bits(bf16_2 *dst, uint32_t bits0, uint32_t bits1) {
+    *reinterpret_cast<uint64_t*>(dst) = static_cast<uint64_t>(bits0) | (static_cast<uint64_t>(bits1) << 32);
+}
+
 __device__ __forceinline__ void store_global_u64(uint8_t* dst, uint64_t value) {
     *reinterpret_cast<uint64_t*>(dst) = value;
 }
@@ -991,7 +999,7 @@ struct globals_3wg {
         D_helper_tile D;
     };
     struct alignas(16) col_pair_stage_t {
-        bf16_2 pairs[C::Mb/32][C::Nb/C::EPI_PIPE_DEPTH][8];
+        bf16_2 pairs[C::Mb/32][C::Nb/C::EPI_PIPE_DEPTH/2][8][2];
     };
     struct col_mailbox_stage_t {
         D_helper_tile D[COL_HELPER_SLOTS];
@@ -2737,80 +2745,82 @@ __device__ inline void backward_kernel_v3_streaming_3wg_impl(const globals_3wg<C
                     }
                 }
 
-                subtile_rt D_fl;
                 subtile_rt_bf D_bf;
-                warpgroup::load_async(D_fl, accum.template subtile<full_tt_fl<SUBTILE_COLS>>(0, SUBTILE_COLS * epi));
-                tensor_load_wait();
-                tensor_before_thread_sync();
-                warpgroup::sync(1);
-
-                warp::mul(D_fl, D_fl, global_scale);
                 const int col_start = col_block_idx * C::Nb + epi * SUBTILE_COLS;
+                {
+                    subtile_rt D_fl;
+                    warpgroup::load_async(D_fl, accum.template subtile<full_tt_fl<SUBTILE_COLS>>(0, SUBTILE_COLS * epi));
+                    tensor_load_wait();
+                    tensor_before_thread_sync();
+                    warpgroup::sync(1);
 
-                #pragma unroll
-                for (int i = 0; i < subtile_rt::height; ++i) {
-                    const float lse_x = my_lse_x[i];
-                    const float lse_y = my_lse_y[i];
+                    warp::mul(D_fl, D_fl, global_scale);
+
                     #pragma unroll
-                    for (int j = 0; j < subtile_rt::width; ++j) {
+                    for (int i = 0; i < subtile_rt::height; ++i) {
+                        const float lse_x = my_lse_x[i];
+                        const float lse_y = my_lse_y[i];
                         #pragma unroll
-                        for (int k = 0; k < 4; ++k) {
-                            const float lse_val = (k % 2 == 0) ? lse_x : lse_y;
-                            D_fl.tiles[i][j].data[k].x = __expf(D_fl.tiles[i][j].data[k].x - lse_val);
-                            D_fl.tiles[i][j].data[k].y = __expf(D_fl.tiles[i][j].data[k].y - lse_val);
-                        }
-                    }
-                }
-                #pragma unroll
-                for (int i = 0; i < subtile_rt::height; ++i) {
-                    const int tgt_x = my_targets_x[i];
-                    if (tgt_x >= col_start && tgt_x < col_start + SUBTILE_COLS) {
-                        const int local_col = tgt_x - col_start;
-                        const int j_idx = local_col / 16;
-                        const int within_tile = local_col % 16;
-                        const int k_half = within_tile / 8;
-                        const int pair_pos = (within_tile % 8) / 2;
-                        if ((lane_id % 4) == pair_pos) {
-                            const int k_idx = k_half * 2;
-                            if ((local_col & 1) == 0) D_fl.tiles[i][j_idx].data[k_idx].x -= 1.0f;
-                            else                      D_fl.tiles[i][j_idx].data[k_idx].y -= 1.0f;
-                        }
-                    }
-                    const int tgt_y = my_targets_y[i];
-                    if (tgt_y >= col_start && tgt_y < col_start + SUBTILE_COLS) {
-                        const int local_col = tgt_y - col_start;
-                        const int j_idx = local_col / 16;
-                        const int within_tile = local_col % 16;
-                        const int k_half = within_tile / 8;
-                        const int pair_pos = (within_tile % 8) / 2;
-                        if ((lane_id % 4) == pair_pos) {
-                            const int k_idx = k_half * 2 + 1;
-                            if ((local_col & 1) == 0) D_fl.tiles[i][j_idx].data[k_idx].x -= 1.0f;
-                            else                      D_fl.tiles[i][j_idx].data[k_idx].y -= 1.0f;
-                        }
-                    }
-                }
-                #pragma unroll
-                for (int i = 0; i < subtile_rt::height; ++i) {
-                    const int global_row_x = warp_row_base + i * 16 + lane_id / 4;
-                    const int global_row_y = warp_row_base + i * 16 + 8 + lane_id / 4;
-                    #pragma unroll
-                    for (int j = 0; j < subtile_rt::width; ++j) {
-                        #pragma unroll
-                        for (int k = 0; k < 4; ++k) {
-                            if (k % 2 == 0 && global_row_x >= g.M) {
-                                D_fl.tiles[i][j].data[k].x = 0.0f;
-                                D_fl.tiles[i][j].data[k].y = 0.0f;
-                            }
-                            if (k % 2 == 1 && global_row_y >= g.M) {
-                                D_fl.tiles[i][j].data[k].x = 0.0f;
-                                D_fl.tiles[i][j].data[k].y = 0.0f;
+                        for (int j = 0; j < subtile_rt::width; ++j) {
+                            #pragma unroll
+                            for (int k = 0; k < 4; ++k) {
+                                const float lse_val = (k % 2 == 0) ? lse_x : lse_y;
+                                D_fl.tiles[i][j].data[k].x = __expf(D_fl.tiles[i][j].data[k].x - lse_val);
+                                D_fl.tiles[i][j].data[k].y = __expf(D_fl.tiles[i][j].data[k].y - lse_val);
                             }
                         }
                     }
+                    #pragma unroll
+                    for (int i = 0; i < subtile_rt::height; ++i) {
+                        const int tgt_x = my_targets_x[i];
+                        if (tgt_x >= col_start && tgt_x < col_start + SUBTILE_COLS) {
+                            const int local_col = tgt_x - col_start;
+                            const int j_idx = local_col / 16;
+                            const int within_tile = local_col % 16;
+                            const int k_half = within_tile / 8;
+                            const int pair_pos = (within_tile % 8) / 2;
+                            if ((lane_id % 4) == pair_pos) {
+                                const int k_idx = k_half * 2;
+                                if ((local_col & 1) == 0) D_fl.tiles[i][j_idx].data[k_idx].x -= 1.0f;
+                                else                      D_fl.tiles[i][j_idx].data[k_idx].y -= 1.0f;
+                            }
+                        }
+                        const int tgt_y = my_targets_y[i];
+                        if (tgt_y >= col_start && tgt_y < col_start + SUBTILE_COLS) {
+                            const int local_col = tgt_y - col_start;
+                            const int j_idx = local_col / 16;
+                            const int within_tile = local_col % 16;
+                            const int k_half = within_tile / 8;
+                            const int pair_pos = (within_tile % 8) / 2;
+                            if ((lane_id % 4) == pair_pos) {
+                                const int k_idx = k_half * 2 + 1;
+                                if ((local_col & 1) == 0) D_fl.tiles[i][j_idx].data[k_idx].x -= 1.0f;
+                                else                      D_fl.tiles[i][j_idx].data[k_idx].y -= 1.0f;
+                            }
+                        }
+                    }
+                    #pragma unroll
+                    for (int i = 0; i < subtile_rt::height; ++i) {
+                        const int global_row_x = warp_row_base + i * 16 + lane_id / 4;
+                        const int global_row_y = warp_row_base + i * 16 + 8 + lane_id / 4;
+                        #pragma unroll
+                        for (int j = 0; j < subtile_rt::width; ++j) {
+                            #pragma unroll
+                            for (int k = 0; k < 4; ++k) {
+                                if (k % 2 == 0 && global_row_x >= g.M) {
+                                    D_fl.tiles[i][j].data[k].x = 0.0f;
+                                    D_fl.tiles[i][j].data[k].y = 0.0f;
+                                }
+                                if (k % 2 == 1 && global_row_y >= g.M) {
+                                    D_fl.tiles[i][j].data[k].x = 0.0f;
+                                    D_fl.tiles[i][j].data[k].y = 0.0f;
+                                }
+                            }
+                        }
+                    }
+                    warp::mul(D_fl, D_fl, g.grad_scale);
+                    warp::copy(D_bf, D_fl);
                 }
-                warp::mul(D_fl, D_fl, g.grad_scale);
-                warp::copy(D_bf, D_fl);
 
                 if (epi == C::EPI_PIPE_DEPTH - 1) {
                     warpgroup::tma::cluster::arrive(outputs_finished, 0, 1);
@@ -2833,23 +2843,29 @@ __device__ inline void backward_kernel_v3_streaming_3wg_impl(const globals_3wg<C
                                     const int pair_slot = row_half * 4 + lane_row / 2;
                                     #pragma unroll
                                     for (int group16 = 0; group16 < SUBTILE_COLS / 16; ++group16) {
-                                        const bf16_2 vals0 = D_bf.tiles[i][group16].data[row_half];
-                                        const bf16_2 vals1 = D_bf.tiles[i][group16].data[row_half + 2];
                                         const int peer_lane = ((lane_row ^ 1) << 2) | lane_pair;
-                                        const bf16_2 vals0_peer =
-                                            bf16x2_from_bits(__shfl_sync(0xffffffff, bf16x2_bits(vals0), peer_lane));
-                                        const bf16_2 vals1_peer =
-                                            bf16x2_from_bits(__shfl_sync(0xffffffff, bf16x2_bits(vals1), peer_lane));
-                                        if ((lane_row & 1) == 0) {
-                                            const int col_base = group16 * 16 + lane_pair * 2;
-                                            col_pair_stage[bf_stage].pairs[row16_block][col_base + 0][pair_slot] =
-                                                bf16_2{vals0.x, vals0_peer.x};
-                                            col_pair_stage[bf_stage].pairs[row16_block][col_base + 1][pair_slot] =
-                                                bf16_2{vals0.y, vals0_peer.y};
-                                            col_pair_stage[bf_stage].pairs[row16_block][col_base + 8 + 0][pair_slot] =
-                                                bf16_2{vals1.x, vals1_peer.x};
-                                            col_pair_stage[bf_stage].pairs[row16_block][col_base + 8 + 1][pair_slot] =
-                                                bf16_2{vals1.y, vals1_peer.y};
+                                        const bool writer_lane = (lane_row & 1) == 0;
+                                        const int col_base = group16 * 16 + lane_pair * 2;
+                                        const int col_pair_base = col_base / 2;
+                                        const uint32_t vals0_bits =
+                                            bf16x2_bits(D_bf.tiles[i][group16].data[row_half]);
+                                        const uint32_t vals0_peer_bits =
+                                            __shfl_sync(0xffffffff, vals0_bits, peer_lane);
+                                        if (writer_lane) {
+                                            store_bf16x2_pair_bits(
+                                                &col_pair_stage[bf_stage].pairs[row16_block][col_pair_base + 0][pair_slot][0],
+                                                (vals0_bits & 0x0000ffffu) | (vals0_peer_bits << 16),
+                                                (vals0_bits >> 16) | (vals0_peer_bits & 0xffff0000u));
+                                        }
+                                        const uint32_t vals1_bits =
+                                            bf16x2_bits(D_bf.tiles[i][group16].data[row_half + 2]);
+                                        const uint32_t vals1_peer_bits =
+                                            __shfl_sync(0xffffffff, vals1_bits, peer_lane);
+                                        if (writer_lane) {
+                                            store_bf16x2_pair_bits(
+                                                &col_pair_stage[bf_stage].pairs[row16_block][col_pair_base + 4][pair_slot][0],
+                                                (vals1_bits & 0x0000ffffu) | (vals1_peer_bits << 16),
+                                                (vals1_bits >> 16) | (vals1_peer_bits & 0xffff0000u));
                                         }
                                     }
                                 }
@@ -3373,11 +3389,13 @@ __device__ inline void backward_kernel_v3_streaming_3wg_impl(const globals_3wg<C
                                     const int chunk = depth * col_sc_kgroups + m_kgroup;
                                     const int byte_idx = sr * 16 + rr * 4 + m_16_in_64;
                                     if constexpr (G::USE_COL_PAIR_STAGE) {
+                                        const int col_pair_idx = col_in_epi / 2;
+                                        const int col_pair_lane = col_in_epi % 2;
                                         bf16_2 cached_pairs[8];
                                         float col_amax = 0.0f;
                                         #pragma unroll
                                         for (int pair = 0; pair < 8; ++pair) {
-                                            cached_pairs[pair] = col_pair_stage[bf_stage].pairs[row16_block][col_in_epi][pair];
+                                            cached_pairs[pair] = col_pair_stage[bf_stage].pairs[row16_block][col_pair_idx][pair][col_pair_lane];
                                             const float v0 = __bfloat162float(cached_pairs[pair].x);
                                             const float v1 = (global_row_base + pair * 2 + 1 < g.M) ? __bfloat162float(cached_pairs[pair].y) : 0.0f;
                                             col_amax = fmaxf(col_amax, fabsf(v0));
