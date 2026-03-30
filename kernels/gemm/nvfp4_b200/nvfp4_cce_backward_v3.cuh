@@ -587,6 +587,50 @@ struct experimental_config_colwg_colpair {
 };
 
 template <int _LOAD_PIPE_DEPTH, int _SUPERGROUP_SIZE, bool _PINGPONG = true, int _EPI_PIPE_DEPTH = 4>
+struct experimental_config_colwg_colpair_overlap {
+    static_assert(_LOAD_PIPE_DEPTH > 0 && _LOAD_PIPE_DEPTH <= 5);
+    static_assert(_SUPERGROUP_SIZE > 0);
+    static_assert(_EPI_PIPE_DEPTH > 0 && (128 % _EPI_PIPE_DEPTH) == 0);
+
+    static constexpr int CLUSTER_SIZE = 2;
+    static constexpr bool USE_PDL = true;
+
+    static constexpr int CONSUMER_WARPGROUPS = 1;
+    static constexpr int QUANTIZER_WARPGROUPS = 1;
+    static constexpr int ROW_QUANTIZER_WARPGROUPS = 0;
+    static constexpr int COL_QUANTIZER_WARPGROUPS = 0;
+    static constexpr int PRODUCER_WARPGROUPS = 1;
+    static constexpr int NUM_WARPGROUPS = CONSUMER_WARPGROUPS + QUANTIZER_WARPGROUPS + PRODUCER_WARPGROUPS;
+    static constexpr int NUM_WARPS = NUM_WARPGROUPS * WARPGROUP_WARPS;
+    static constexpr int NUM_THREADS = NUM_WARPS * WARP_THREADS;
+
+    static constexpr int LOAD_PIPE_DEPTH = _LOAD_PIPE_DEPTH;
+    static constexpr int EPI_PIPE_DEPTH = _EPI_PIPE_DEPTH;
+    static constexpr bool OVERLAP_EPI = false;
+    static constexpr bool PINGPONG = _PINGPONG;
+
+    static constexpr int SUPERGROUP_SIZE = _SUPERGROUP_SIZE;
+    static constexpr int Mb = 256;
+    static constexpr int Nb = 128;
+    static constexpr int Kb = 256;
+    static constexpr int B_SC_SIZE = Nb/128;
+    static constexpr int MMA_PER_TILE = Kb/64;
+
+    static constexpr int BF16_STAGE_COUNT = 2;
+    static constexpr int NUM_D_TILES = BF16_STAGE_COUNT;
+    static constexpr bool USE_BF16_ACCUM = false;
+    static constexpr bool CONSUMER_DO_ROW = true;
+    static constexpr bool COL_HELPERS_USE_ALL_QUANTIZER_WGS = false;
+    static constexpr bool USE_COL_PLAIN_STAGE = false;
+    static constexpr bool EARLY_COL_READY = true;
+    static constexpr bool CACHE_COL_VALUES = false;
+    static constexpr bool CACHE_COL_VALUES_BF16 = false;
+    static constexpr bool CACHE_COL_VALUES_BF16_PAIRS = false;
+    static constexpr bool FAST_ALIGNED_QUANT = false;
+    static constexpr bool ROW_QUANT_FROM_REGS = false;
+};
+
+template <int _LOAD_PIPE_DEPTH, int _SUPERGROUP_SIZE, bool _PINGPONG = true, int _EPI_PIPE_DEPTH = 4>
 struct experimental_config_colwg_colpair_rowregs {
     static_assert(_LOAD_PIPE_DEPTH > 0 && _LOAD_PIPE_DEPTH <= 5);
     static_assert(_SUPERGROUP_SIZE > 0);
@@ -630,22 +674,192 @@ struct experimental_config_colwg_colpair_rowregs {
     static constexpr bool ROW_QUANT_FROM_REGS = true;
 };
 
+template <int _LOAD_PIPE_DEPTH, int _SUPERGROUP_SIZE, bool _PINGPONG = true, int _EPI_PIPE_DEPTH = 4>
+struct experimental_config_colwg_colpair_rowregs_overlap {
+    static_assert(_LOAD_PIPE_DEPTH > 0 && _LOAD_PIPE_DEPTH <= 5);
+    static_assert(_SUPERGROUP_SIZE > 0);
+    static_assert(_EPI_PIPE_DEPTH > 0 && (128 % _EPI_PIPE_DEPTH) == 0);
+
+    static constexpr int CLUSTER_SIZE = 2;
+    static constexpr bool USE_PDL = true;
+
+    static constexpr int CONSUMER_WARPGROUPS = 1;
+    static constexpr int QUANTIZER_WARPGROUPS = 1;
+    static constexpr int ROW_QUANTIZER_WARPGROUPS = 0;
+    static constexpr int COL_QUANTIZER_WARPGROUPS = 0;
+    static constexpr int PRODUCER_WARPGROUPS = 1;
+    static constexpr int NUM_WARPGROUPS = CONSUMER_WARPGROUPS + QUANTIZER_WARPGROUPS + PRODUCER_WARPGROUPS;
+    static constexpr int NUM_WARPS = NUM_WARPGROUPS * WARPGROUP_WARPS;
+    static constexpr int NUM_THREADS = NUM_WARPS * WARP_THREADS;
+
+    static constexpr int LOAD_PIPE_DEPTH = _LOAD_PIPE_DEPTH;
+    static constexpr int EPI_PIPE_DEPTH = _EPI_PIPE_DEPTH;
+    static constexpr bool OVERLAP_EPI = false;
+    static constexpr bool PINGPONG = _PINGPONG;
+
+    static constexpr int SUPERGROUP_SIZE = _SUPERGROUP_SIZE;
+    static constexpr int Mb = 256;
+    static constexpr int Nb = 128;
+    static constexpr int Kb = 256;
+    static constexpr int B_SC_SIZE = Nb/128;
+    static constexpr int MMA_PER_TILE = Kb/64;
+
+    static constexpr int BF16_STAGE_COUNT = 2;
+    static constexpr int NUM_D_TILES = BF16_STAGE_COUNT;
+    static constexpr bool USE_BF16_ACCUM = false;
+    static constexpr bool CONSUMER_DO_ROW = true;
+    static constexpr bool COL_HELPERS_USE_ALL_QUANTIZER_WGS = false;
+    static constexpr bool USE_COL_PLAIN_STAGE = false;
+    static constexpr bool EARLY_COL_READY = true;
+    static constexpr bool CACHE_COL_VALUES = false;
+    static constexpr bool CACHE_COL_VALUES_BF16 = false;
+    static constexpr bool CACHE_COL_VALUES_BF16_PAIRS = false;
+    static constexpr bool FAST_ALIGNED_QUANT = false;
+    static constexpr bool ROW_QUANT_FROM_REGS = true;
+};
+
 template <typename C>
 struct config_traits_3wg {
     static constexpr bool USE_COL_PAIR_STAGE = false;
     static constexpr bool PACK_COL_FP4_U64 = false;
+    static constexpr bool ROW_QUANT_ROWLEADER = false;
+    static constexpr bool ROW_QUANT_ROWDUAL = false;
 };
 
 template <int _LOAD_PIPE_DEPTH, int _SUPERGROUP_SIZE, bool _PINGPONG, int _EPI_PIPE_DEPTH>
 struct config_traits_3wg<experimental_config_colwg_colpair<_LOAD_PIPE_DEPTH, _SUPERGROUP_SIZE, _PINGPONG, _EPI_PIPE_DEPTH>> {
     static constexpr bool USE_COL_PAIR_STAGE = true;
     static constexpr bool PACK_COL_FP4_U64 = true;
+    static constexpr bool ROW_QUANT_ROWLEADER = false;
+    static constexpr bool ROW_QUANT_ROWDUAL = false;
+};
+
+template <int _LOAD_PIPE_DEPTH, int _SUPERGROUP_SIZE, bool _PINGPONG, int _EPI_PIPE_DEPTH>
+struct config_traits_3wg<experimental_config_colwg_colpair_overlap<_LOAD_PIPE_DEPTH, _SUPERGROUP_SIZE, _PINGPONG, _EPI_PIPE_DEPTH>> {
+    static constexpr bool USE_COL_PAIR_STAGE = true;
+    static constexpr bool PACK_COL_FP4_U64 = true;
+    static constexpr bool ROW_QUANT_ROWLEADER = false;
+    static constexpr bool ROW_QUANT_ROWDUAL = false;
 };
 
 template <int _LOAD_PIPE_DEPTH, int _SUPERGROUP_SIZE, bool _PINGPONG, int _EPI_PIPE_DEPTH>
 struct config_traits_3wg<experimental_config_colwg_colpair_rowregs<_LOAD_PIPE_DEPTH, _SUPERGROUP_SIZE, _PINGPONG, _EPI_PIPE_DEPTH>> {
     static constexpr bool USE_COL_PAIR_STAGE = true;
     static constexpr bool PACK_COL_FP4_U64 = true;
+    static constexpr bool ROW_QUANT_ROWLEADER = false;
+    static constexpr bool ROW_QUANT_ROWDUAL = false;
+};
+
+template <int _LOAD_PIPE_DEPTH, int _SUPERGROUP_SIZE, bool _PINGPONG, int _EPI_PIPE_DEPTH>
+struct config_traits_3wg<experimental_config_colwg_colpair_rowregs_overlap<_LOAD_PIPE_DEPTH, _SUPERGROUP_SIZE, _PINGPONG, _EPI_PIPE_DEPTH>> {
+    static constexpr bool USE_COL_PAIR_STAGE = true;
+    static constexpr bool PACK_COL_FP4_U64 = true;
+    static constexpr bool ROW_QUANT_ROWLEADER = false;
+    static constexpr bool ROW_QUANT_ROWDUAL = false;
+};
+
+template <int _LOAD_PIPE_DEPTH, int _SUPERGROUP_SIZE, bool _PINGPONG = true, int _EPI_PIPE_DEPTH = 4>
+struct experimental_config_colwg_colpair_rowleader {
+    static_assert(_LOAD_PIPE_DEPTH > 0 && _LOAD_PIPE_DEPTH <= 5);
+    static_assert(_SUPERGROUP_SIZE > 0);
+    static_assert(_EPI_PIPE_DEPTH > 0 && (128 % _EPI_PIPE_DEPTH) == 0);
+
+    static constexpr int CLUSTER_SIZE = 2;
+    static constexpr bool USE_PDL = true;
+
+    static constexpr int CONSUMER_WARPGROUPS = 1;
+    static constexpr int QUANTIZER_WARPGROUPS = 1;
+    static constexpr int ROW_QUANTIZER_WARPGROUPS = 0;
+    static constexpr int COL_QUANTIZER_WARPGROUPS = 0;
+    static constexpr int PRODUCER_WARPGROUPS = 1;
+    static constexpr int NUM_WARPGROUPS = CONSUMER_WARPGROUPS + QUANTIZER_WARPGROUPS + PRODUCER_WARPGROUPS;
+    static constexpr int NUM_WARPS = NUM_WARPGROUPS * WARPGROUP_WARPS;
+    static constexpr int NUM_THREADS = NUM_WARPS * WARP_THREADS;
+
+    static constexpr int LOAD_PIPE_DEPTH = _LOAD_PIPE_DEPTH;
+    static constexpr int EPI_PIPE_DEPTH = _EPI_PIPE_DEPTH;
+    static constexpr bool OVERLAP_EPI = false;
+    static constexpr bool PINGPONG = _PINGPONG;
+
+    static constexpr int SUPERGROUP_SIZE = _SUPERGROUP_SIZE;
+    static constexpr int Mb = 256;
+    static constexpr int Nb = 128;
+    static constexpr int Kb = 256;
+    static constexpr int B_SC_SIZE = Nb/128;
+    static constexpr int MMA_PER_TILE = Kb/64;
+
+    static constexpr int BF16_STAGE_COUNT = 2;
+    static constexpr int NUM_D_TILES = BF16_STAGE_COUNT;
+    static constexpr bool USE_BF16_ACCUM = false;
+    static constexpr bool CONSUMER_DO_ROW = true;
+    static constexpr bool COL_HELPERS_USE_ALL_QUANTIZER_WGS = false;
+    static constexpr bool USE_COL_PLAIN_STAGE = false;
+    static constexpr bool EARLY_COL_READY = false;
+    static constexpr bool CACHE_COL_VALUES = false;
+    static constexpr bool CACHE_COL_VALUES_BF16 = false;
+    static constexpr bool CACHE_COL_VALUES_BF16_PAIRS = false;
+    static constexpr bool FAST_ALIGNED_QUANT = false;
+    static constexpr bool ROW_QUANT_FROM_REGS = true;
+};
+
+template <int _LOAD_PIPE_DEPTH, int _SUPERGROUP_SIZE, bool _PINGPONG, int _EPI_PIPE_DEPTH>
+struct config_traits_3wg<experimental_config_colwg_colpair_rowleader<_LOAD_PIPE_DEPTH, _SUPERGROUP_SIZE, _PINGPONG, _EPI_PIPE_DEPTH>> {
+    static constexpr bool USE_COL_PAIR_STAGE = true;
+    static constexpr bool PACK_COL_FP4_U64 = true;
+    static constexpr bool ROW_QUANT_ROWLEADER = true;
+    static constexpr bool ROW_QUANT_ROWDUAL = false;
+};
+
+template <int _LOAD_PIPE_DEPTH, int _SUPERGROUP_SIZE, bool _PINGPONG = true, int _EPI_PIPE_DEPTH = 4>
+struct experimental_config_colwg_colpair_rowdual {
+    static_assert(_LOAD_PIPE_DEPTH > 0 && _LOAD_PIPE_DEPTH <= 5);
+    static_assert(_SUPERGROUP_SIZE > 0);
+    static_assert(_EPI_PIPE_DEPTH > 0 && (128 % _EPI_PIPE_DEPTH) == 0);
+
+    static constexpr int CLUSTER_SIZE = 2;
+    static constexpr bool USE_PDL = true;
+
+    static constexpr int CONSUMER_WARPGROUPS = 1;
+    static constexpr int QUANTIZER_WARPGROUPS = 1;
+    static constexpr int ROW_QUANTIZER_WARPGROUPS = 0;
+    static constexpr int COL_QUANTIZER_WARPGROUPS = 0;
+    static constexpr int PRODUCER_WARPGROUPS = 1;
+    static constexpr int NUM_WARPGROUPS = CONSUMER_WARPGROUPS + QUANTIZER_WARPGROUPS + PRODUCER_WARPGROUPS;
+    static constexpr int NUM_WARPS = NUM_WARPGROUPS * WARPGROUP_WARPS;
+    static constexpr int NUM_THREADS = NUM_WARPS * WARP_THREADS;
+
+    static constexpr int LOAD_PIPE_DEPTH = _LOAD_PIPE_DEPTH;
+    static constexpr int EPI_PIPE_DEPTH = _EPI_PIPE_DEPTH;
+    static constexpr bool OVERLAP_EPI = false;
+    static constexpr bool PINGPONG = _PINGPONG;
+
+    static constexpr int SUPERGROUP_SIZE = _SUPERGROUP_SIZE;
+    static constexpr int Mb = 256;
+    static constexpr int Nb = 128;
+    static constexpr int Kb = 256;
+    static constexpr int B_SC_SIZE = Nb/128;
+    static constexpr int MMA_PER_TILE = Kb/64;
+
+    static constexpr int BF16_STAGE_COUNT = 2;
+    static constexpr int NUM_D_TILES = BF16_STAGE_COUNT;
+    static constexpr bool USE_BF16_ACCUM = false;
+    static constexpr bool CONSUMER_DO_ROW = true;
+    static constexpr bool COL_HELPERS_USE_ALL_QUANTIZER_WGS = false;
+    static constexpr bool USE_COL_PLAIN_STAGE = false;
+    static constexpr bool EARLY_COL_READY = false;
+    static constexpr bool CACHE_COL_VALUES = false;
+    static constexpr bool CACHE_COL_VALUES_BF16 = false;
+    static constexpr bool CACHE_COL_VALUES_BF16_PAIRS = false;
+    static constexpr bool FAST_ALIGNED_QUANT = false;
+    static constexpr bool ROW_QUANT_FROM_REGS = true;
+};
+
+template <int _LOAD_PIPE_DEPTH, int _SUPERGROUP_SIZE, bool _PINGPONG, int _EPI_PIPE_DEPTH>
+struct config_traits_3wg<experimental_config_colwg_colpair_rowdual<_LOAD_PIPE_DEPTH, _SUPERGROUP_SIZE, _PINGPONG, _EPI_PIPE_DEPTH>> {
+    static constexpr bool USE_COL_PAIR_STAGE = true;
+    static constexpr bool PACK_COL_FP4_U64 = true;
+    static constexpr bool ROW_QUANT_ROWLEADER = false;
+    static constexpr bool ROW_QUANT_ROWDUAL = true;
 };
 
 template <int _LOAD_PIPE_DEPTH, int _SUPERGROUP_SIZE, bool _PINGPONG = true, int _EPI_PIPE_DEPTH = 4>
@@ -994,6 +1208,8 @@ struct globals_3wg {
     static constexpr bool USE_COL_PLAIN_STAGE = C::USE_COL_PLAIN_STAGE;
     static constexpr bool USE_COL_PAIR_STAGE = config_traits_3wg<C>::USE_COL_PAIR_STAGE;
     static constexpr bool PACK_COL_FP4_U64 = config_traits_3wg<C>::PACK_COL_FP4_U64;
+    static constexpr bool ROW_QUANT_ROWLEADER = config_traits_3wg<C>::ROW_QUANT_ROWLEADER;
+    static constexpr bool ROW_QUANT_ROWDUAL = config_traits_3wg<C>::ROW_QUANT_ROWDUAL;
     using A_fp4x2_tile = st_fp4e2m1_2<C::Mb/2, C::Kb/2>;
     using A_sc_tile    = st_hf<4, 256, false>;
     using B_fp4x2_tile = st_fp4e2m1_2<C::Nb/2, C::Kb/2>;
@@ -1835,6 +2051,7 @@ __device__ inline void backward_kernel_v3_streaming_impl(const globals<C>& g) {
 
             const int tile_row_base = row_block_idx * C::Mb + cta_id * (C::Mb / 2);
             const int warp_row_base = tile_row_base + warpgroup::warpid() * (C::Mb / 8);
+            const bool full_tile_rows = tile_row_base + (C::Mb / 2) <= g.M;
 
             int my_targets_x[subtile_rt::height];
             int my_targets_y[subtile_rt::height];
@@ -2288,6 +2505,7 @@ __device__ inline void backward_kernel_v3_streaming_2ctaSdupB_impl(const globals
 
             const int tile_row_base = row_block_idx * C::Mb + cta_id * (C::Mb / 2);
             const int warp_row_base = tile_row_base + warpgroup::warpid() * (C::Mb / 8);
+            const bool full_tile_rows = tile_row_base + (C::Mb / 2) <= g.M;
 
             int my_targets_x[subtile_rt::height];
             int my_targets_y[subtile_rt::height];
@@ -2765,6 +2983,7 @@ __device__ inline void backward_kernel_v3_streaming_3wg_impl(const globals_3wg<C
 
             const int tile_row_base = row_block_idx * C::Mb + cta_id * (C::Mb / 2);
             const int warp_row_base = tile_row_base + warpgroup::warpid() * (C::Mb / 8);
+            const bool full_tile_rows = tile_row_base + (C::Mb / 2) <= g.M;
 
             int my_targets_x[subtile_rt::height];
             int my_targets_y[subtile_rt::height];
@@ -2884,7 +3103,221 @@ __device__ inline void backward_kernel_v3_streaming_3wg_impl(const globals_3wg<C
                         const int lane_pair = lane_id % 4;
                         const int local_warp_row_base = warpgroup::warpid() * (C::Mb / 8);
 
-                        if constexpr (C::ROW_QUANT_FROM_REGS) {
+                        if constexpr (C::ROW_QUANT_FROM_REGS && C::EARLY_COL_READY) {
+                            if constexpr (DO_COL) {
+                                #pragma unroll
+                                for (int i = 0; i < subtile_rt_bf::height; ++i) {
+                                    const int row16_block = (local_warp_row_base + i * 16) / 16;
+                                    #pragma unroll
+                                    for (int row_half = 0; row_half < 2; ++row_half) {
+                                        const int pair_slot = row_half * 4 + lane_row / 2;
+                                        const bool writer_lane = (lane_row & 1) == 0;
+                                        const int peer_lane = ((lane_row ^ 1) << 2) | lane_pair;
+                                        #pragma unroll
+                                        for (int group16 = 0; group16 < SUBTILE_COLS / 16; ++group16) {
+                                            const bf16_2 vals0 = D_bf.tiles[i][group16].data[row_half];
+                                            const bf16_2 vals1 = D_bf.tiles[i][group16].data[row_half + 2];
+                                            const int col_base = group16 * 16 + lane_pair * 2;
+                                            const int col_pair_base = col_base / 2;
+                                            const uint32_t vals0_bits = bf16x2_bits(vals0);
+                                            const uint32_t vals0_peer_bits =
+                                                __shfl_sync(0xffffffff, vals0_bits, peer_lane);
+                                            if (writer_lane) {
+                                                store_bf16x2_pair_bits(
+                                                    &col_pair_stage[bf_stage].pairs[row16_block][col_pair_base + 0][pair_slot][0],
+                                                    (vals0_bits & 0x0000ffffu) | (vals0_peer_bits << 16),
+                                                    (vals0_bits >> 16) | (vals0_peer_bits & 0xffff0000u));
+                                            }
+                                            const uint32_t vals1_bits = bf16x2_bits(vals1);
+                                            const uint32_t vals1_peer_bits =
+                                                __shfl_sync(0xffffffff, vals1_bits, peer_lane);
+                                            if (writer_lane) {
+                                                store_bf16x2_pair_bits(
+                                                    &col_pair_stage[bf_stage].pairs[row16_block][col_pair_base + 4][pair_slot][0],
+                                                    (vals1_bits & 0x0000ffffu) | (vals1_peer_bits << 16),
+                                                    (vals1_bits >> 16) | (vals1_peer_bits & 0xffff0000u));
+                                            }
+                                        }
+                                    }
+                                }
+                                warpgroup::sync(1);
+                                __threadfence_block();
+                                asm volatile("fence.proxy.async.shared::cta;\n" ::: "memory");
+                                warpgroup::sync(1);
+                                if (warpgroup::warpid() == 0 && warp::laneid() == 0) {
+                                    arrive(slice_col_ready[bf_stage]);
+                                }
+                                update_phasebit<1>(slice_col_recycle_phasebits, bf_stage);
+                            }
+
+                            if constexpr (DO_ROW) {
+                                #pragma unroll
+                                for (int i = 0; i < subtile_rt_bf::height; ++i) {
+                                    #pragma unroll
+                                    for (int row_half = 0; row_half < 2; ++row_half) {
+                                        const int local_row = local_warp_row_base + i * 16 + row_half * 8 + lane_row;
+                                        const int global_row = tile_row_base + local_row;
+                                        #pragma unroll
+                                        for (int group16 = 0; group16 < SUBTILE_COLS / 16; ++group16) {
+                                            const bf16_2 vals0 = D_bf.tiles[i][group16].data[row_half];
+                                            const bf16_2 vals1 = D_bf.tiles[i][group16].data[row_half + 2];
+                                            if constexpr (G::ROW_QUANT_ROWLEADER) {
+                                                const uint32_t vals0_bits = bf16x2_bits(vals0);
+                                                const uint32_t vals1_bits = bf16x2_bits(vals1);
+                                                const int row_lane_base = lane_row << 2;
+                                                uint32_t gathered_vals0[4];
+                                                uint32_t gathered_vals1[4];
+                                                #pragma unroll
+                                                for (int src_pair = 0; src_pair < 4; ++src_pair) {
+                                                    gathered_vals0[src_pair] =
+                                                        __shfl_sync(0xffffffff, vals0_bits, row_lane_base + src_pair);
+                                                    gathered_vals1[src_pair] =
+                                                        __shfl_sync(0xffffffff, vals1_bits, row_lane_base + src_pair);
+                                                }
+                                                if (lane_pair == 0 && global_row < g.M) {
+                                                    float amax = 0.0f;
+                                                    #pragma unroll
+                                                    for (int src_pair = 0; src_pair < 4; ++src_pair) {
+                                                        const bf16_2 gathered0 = bf16x2_from_bits(gathered_vals0[src_pair]);
+                                                        const bf16_2 gathered1 = bf16x2_from_bits(gathered_vals1[src_pair]);
+                                                        amax = fmaxf(amax, fabsf(__bfloat162float(gathered0.x)));
+                                                        amax = fmaxf(amax, fabsf(__bfloat162float(gathered0.y)));
+                                                        amax = fmaxf(amax, fabsf(__bfloat162float(gathered1.x)));
+                                                        amax = fmaxf(amax, fabsf(__bfloat162float(gathered1.y)));
+                                                    }
+
+                                                    const float scale = amax * (1.0f / FP4_MAX);
+                                                    const float rcp_scale = (amax > 0.0f) ? (FP4_MAX / amax) : 0.0f;
+                                                    const int global_col_16 = col_start + group16 * 16;
+                                                    const int fp4x2_col_base = global_col_16 / 2;
+                                                    #pragma unroll
+                                                    for (int src_pair = 0; src_pair < 4; ++src_pair) {
+                                                        const bf16_2 gathered0 = bf16x2_from_bits(gathered_vals0[src_pair]);
+                                                        const bf16_2 gathered1 = bf16x2_from_bits(gathered_vals1[src_pair]);
+                                                        row_fp4_ptr[global_row * row_fp4_stride + fp4x2_col_base + src_pair] =
+                                                            quantize_fp4_pair(
+                                                                __bfloat162float(gathered0.x),
+                                                                __bfloat162float(gathered0.y),
+                                                                rcp_scale);
+                                                        row_fp4_ptr[global_row * row_fp4_stride + fp4x2_col_base + 4 + src_pair] =
+                                                            quantize_fp4_pair(
+                                                                __bfloat162float(gathered1.x),
+                                                                __bfloat162float(gathered1.y),
+                                                                rcp_scale);
+                                                    }
+
+                                                    float stored_scale = scale * g_sg_rcp;
+                                                    if (encode_centric) {
+                                                        stored_scale = fminf(rcp_scale * g_sg, E4M3_MAX);
+                                                    }
+                                                    const __nv_fp8_e4m3 sc = __nv_fp8_e4m3(stored_scale);
+                                                    const int kgroup = global_col_16 / 64;
+                                                    const int col_16_in_64 = (global_col_16 / 16) % 4;
+                                                    const int depth = global_row / 128;
+                                                    const int sr = global_row % 32;
+                                                    const int rr = (global_row / 32) % 4;
+                                                    const int chunk = depth * row_sc_kgroups + kgroup;
+                                                    const int byte_idx = sr * 16 + rr * 4 + col_16_in_64;
+                                                    row_sc_ptr[chunk * 512 + byte_idx] =
+                                                        *reinterpret_cast<const uint8_t*>(&sc);
+                                                }
+                                            } else if constexpr (G::ROW_QUANT_ROWDUAL) {
+                                                const uint32_t vals0_bits = bf16x2_bits(vals0);
+                                                const uint32_t vals1_bits = bf16x2_bits(vals1);
+                                                const int row_lane_base = lane_row << 2;
+                                                const uint32_t owner_bits = ((lane_pair & 1) == 0) ? vals0_bits : vals1_bits;
+                                                uint32_t gathered_bits[4];
+                                                float half_amax = 0.0f;
+                                                #pragma unroll
+                                                for (int src_pair = 0; src_pair < 4; ++src_pair) {
+                                                    const uint32_t bits =
+                                                        __shfl_sync(0xffffffff, owner_bits, row_lane_base + src_pair);
+                                                    gathered_bits[src_pair] = bits;
+                                                    const bf16_2 gathered = bf16x2_from_bits(bits);
+                                                    half_amax = fmaxf(half_amax, fabsf(__bfloat162float(gathered.x)));
+                                                    half_amax = fmaxf(half_amax, fabsf(__bfloat162float(gathered.y)));
+                                                }
+
+                                                if (global_row < g.M && lane_pair < 2) {
+                                                    const float other_half_amax =
+                                                        __shfl_sync(0xffffffff, half_amax, row_lane_base + (lane_pair ^ 1));
+                                                    const float amax = fmaxf(half_amax, other_half_amax);
+                                                    const float scale = amax * (1.0f / FP4_MAX);
+                                                    const float rcp_scale = (amax > 0.0f) ? (FP4_MAX / amax) : 0.0f;
+                                                    const int global_col_16 = col_start + group16 * 16;
+                                                    const int fp4x2_col_base = global_col_16 / 2 + lane_pair * 4;
+                                                    #pragma unroll
+                                                    for (int src_pair = 0; src_pair < 4; ++src_pair) {
+                                                        const bf16_2 gathered = bf16x2_from_bits(gathered_bits[src_pair]);
+                                                        row_fp4_ptr[global_row * row_fp4_stride + fp4x2_col_base + src_pair] =
+                                                            quantize_fp4_pair(
+                                                                __bfloat162float(gathered.x),
+                                                                __bfloat162float(gathered.y),
+                                                                rcp_scale);
+                                                    }
+
+                                                    if (lane_pair == 0) {
+                                                        float stored_scale = scale * g_sg_rcp;
+                                                        if (encode_centric) {
+                                                            stored_scale = fminf(rcp_scale * g_sg, E4M3_MAX);
+                                                        }
+                                                        const __nv_fp8_e4m3 sc = __nv_fp8_e4m3(stored_scale);
+                                                        const int kgroup = global_col_16 / 64;
+                                                        const int col_16_in_64 = (global_col_16 / 16) % 4;
+                                                        const int depth = global_row / 128;
+                                                        const int sr = global_row % 32;
+                                                        const int rr = (global_row / 32) % 4;
+                                                        const int chunk = depth * row_sc_kgroups + kgroup;
+                                                        const int byte_idx = sr * 16 + rr * 4 + col_16_in_64;
+                                                        row_sc_ptr[chunk * 512 + byte_idx] =
+                                                            *reinterpret_cast<const uint8_t*>(&sc);
+                                                    }
+                                                }
+                                            } else {
+                                                const float v00 = __bfloat162float(vals0.x);
+                                                const float v01 = __bfloat162float(vals0.y);
+                                                const float v10 = __bfloat162float(vals1.x);
+                                                const float v11 = __bfloat162float(vals1.y);
+                                                const int depth = global_row / 128;
+                                                const int sr = global_row % 32;
+                                                const int rr = (global_row / 32) % 4;
+                                                const int row_chunk_base = depth * row_sc_kgroups;
+
+                                                if (full_tile_rows || global_row < g.M) {
+                                                    float amax = fmaxf(fmaxf(fabsf(v00), fabsf(v01)),
+                                                                       fmaxf(fabsf(v10), fabsf(v11)));
+                                                    amax = fmaxf(amax, __shfl_xor_sync(0xffffffff, amax, 1, 4));
+                                                    amax = fmaxf(amax, __shfl_xor_sync(0xffffffff, amax, 2, 4));
+
+                                                    const float scale = amax * (1.0f / FP4_MAX);
+                                                    const float rcp_scale = (amax > 0.0f) ? (FP4_MAX / amax) : 0.0f;
+                                                    const int global_col_16 = col_start + group16 * 16;
+                                                    const int fp4x2_col_base = global_col_16 / 2;
+                                                    row_fp4_ptr[global_row * row_fp4_stride + fp4x2_col_base + lane_pair] =
+                                                        quantize_fp4_pair(v00, v01, rcp_scale);
+                                                    row_fp4_ptr[global_row * row_fp4_stride + fp4x2_col_base + 4 + lane_pair] =
+                                                        quantize_fp4_pair(v10, v11, rcp_scale);
+
+                                                    if (lane_pair == 0) {
+                                                        float stored_scale = scale * g_sg_rcp;
+                                                        if (encode_centric) {
+                                                            stored_scale = fminf(rcp_scale * g_sg, E4M3_MAX);
+                                                        }
+                                                        const __nv_fp8_e4m3 sc = __nv_fp8_e4m3(stored_scale);
+                                                        const int kgroup = global_col_16 / 64;
+                                                        const int col_16_in_64 = (global_col_16 / 16) % 4;
+                                                        const int chunk = row_chunk_base + kgroup;
+                                                        const int byte_idx = sr * 16 + rr * 4 + col_16_in_64;
+                                                        row_sc_ptr[chunk * 512 + byte_idx] =
+                                                            *reinterpret_cast<const uint8_t*>(&sc);
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        } else if constexpr (C::ROW_QUANT_FROM_REGS) {
                             #pragma unroll
                             for (int i = 0; i < subtile_rt_bf::height; ++i) {
                                 const int row16_block = (local_warp_row_base + i * 16) / 16;
@@ -2924,27 +3357,51 @@ __device__ inline void backward_kernel_v3_streaming_3wg_impl(const globals_3wg<C
                                         }
 
                                         if constexpr (DO_ROW) {
-                                            const float v00 = __bfloat162float(vals0.x);
-                                            const float v01 = __bfloat162float(vals0.y);
-                                            const float v10 = __bfloat162float(vals1.x);
-                                            const float v11 = __bfloat162float(vals1.y);
+                                            if constexpr (G::ROW_QUANT_ROWLEADER) {
+                                                const uint32_t vals0_bits = bf16x2_bits(vals0);
+                                                const uint32_t vals1_bits = bf16x2_bits(vals1);
+                                                const int row_lane_base = lane_row << 2;
+                                                uint32_t gathered_vals0[4];
+                                                uint32_t gathered_vals1[4];
+                                                #pragma unroll
+                                                for (int src_pair = 0; src_pair < 4; ++src_pair) {
+                                                    gathered_vals0[src_pair] =
+                                                        __shfl_sync(0xffffffff, vals0_bits, row_lane_base + src_pair);
+                                                    gathered_vals1[src_pair] =
+                                                        __shfl_sync(0xffffffff, vals1_bits, row_lane_base + src_pair);
+                                                }
+                                                if (lane_pair == 0 && global_row < g.M) {
+                                                    float amax = 0.0f;
+                                                    #pragma unroll
+                                                    for (int src_pair = 0; src_pair < 4; ++src_pair) {
+                                                        const bf16_2 gathered0 = bf16x2_from_bits(gathered_vals0[src_pair]);
+                                                        const bf16_2 gathered1 = bf16x2_from_bits(gathered_vals1[src_pair]);
+                                                        amax = fmaxf(amax, fabsf(__bfloat162float(gathered0.x)));
+                                                        amax = fmaxf(amax, fabsf(__bfloat162float(gathered0.y)));
+                                                        amax = fmaxf(amax, fabsf(__bfloat162float(gathered1.x)));
+                                                        amax = fmaxf(amax, fabsf(__bfloat162float(gathered1.y)));
+                                                    }
 
-                                            if (global_row < g.M) {
-                                                float amax = fmaxf(fmaxf(fabsf(v00), fabsf(v01)),
-                                                                   fmaxf(fabsf(v10), fabsf(v11)));
-                                                amax = fmaxf(amax, __shfl_xor_sync(0xffffffff, amax, 1, 4));
-                                                amax = fmaxf(amax, __shfl_xor_sync(0xffffffff, amax, 2, 4));
+                                                    const float scale = amax * (1.0f / FP4_MAX);
+                                                    const float rcp_scale = (amax > 0.0f) ? (FP4_MAX / amax) : 0.0f;
+                                                    const int global_col_16 = col_start + group16 * 16;
+                                                    const int fp4x2_col_base = global_col_16 / 2;
+                                                    #pragma unroll
+                                                    for (int src_pair = 0; src_pair < 4; ++src_pair) {
+                                                        const bf16_2 gathered0 = bf16x2_from_bits(gathered_vals0[src_pair]);
+                                                        const bf16_2 gathered1 = bf16x2_from_bits(gathered_vals1[src_pair]);
+                                                        row_fp4_ptr[global_row * row_fp4_stride + fp4x2_col_base + src_pair] =
+                                                            quantize_fp4_pair(
+                                                                __bfloat162float(gathered0.x),
+                                                                __bfloat162float(gathered0.y),
+                                                                rcp_scale);
+                                                        row_fp4_ptr[global_row * row_fp4_stride + fp4x2_col_base + 4 + src_pair] =
+                                                            quantize_fp4_pair(
+                                                                __bfloat162float(gathered1.x),
+                                                                __bfloat162float(gathered1.y),
+                                                                rcp_scale);
+                                                    }
 
-                                                const float scale = amax * (1.0f / FP4_MAX);
-                                                const float rcp_scale = (amax > 0.0f) ? (FP4_MAX / amax) : 0.0f;
-                                                const int global_col_16 = col_start + group16 * 16;
-                                                const int fp4x2_col_base = global_col_16 / 2;
-                                                row_fp4_ptr[global_row * row_fp4_stride + fp4x2_col_base + lane_pair] =
-                                                    quantize_fp4_pair(v00, v01, rcp_scale);
-                                                row_fp4_ptr[global_row * row_fp4_stride + fp4x2_col_base + 4 + lane_pair] =
-                                                    quantize_fp4_pair(v10, v11, rcp_scale);
-
-                                                if (lane_pair == 0) {
                                                     float stored_scale = scale * g_sg_rcp;
                                                     if (encode_centric) {
                                                         stored_scale = fminf(rcp_scale * g_sg, E4M3_MAX);
@@ -2959,6 +3416,97 @@ __device__ inline void backward_kernel_v3_streaming_3wg_impl(const globals_3wg<C
                                                     const int byte_idx = sr * 16 + rr * 4 + col_16_in_64;
                                                     row_sc_ptr[chunk * 512 + byte_idx] =
                                                         *reinterpret_cast<const uint8_t*>(&sc);
+                                                }
+                                            } else if constexpr (G::ROW_QUANT_ROWDUAL) {
+                                                const uint32_t vals0_bits = bf16x2_bits(vals0);
+                                                const uint32_t vals1_bits = bf16x2_bits(vals1);
+                                                const int row_lane_base = lane_row << 2;
+                                                const uint32_t owner_bits = ((lane_pair & 1) == 0) ? vals0_bits : vals1_bits;
+                                                uint32_t gathered_bits[4];
+                                                float half_amax = 0.0f;
+                                                #pragma unroll
+                                                for (int src_pair = 0; src_pair < 4; ++src_pair) {
+                                                    const uint32_t bits =
+                                                        __shfl_sync(0xffffffff, owner_bits, row_lane_base + src_pair);
+                                                    gathered_bits[src_pair] = bits;
+                                                    const bf16_2 gathered = bf16x2_from_bits(bits);
+                                                    half_amax = fmaxf(half_amax, fabsf(__bfloat162float(gathered.x)));
+                                                    half_amax = fmaxf(half_amax, fabsf(__bfloat162float(gathered.y)));
+                                                }
+
+                                                if (global_row < g.M && lane_pair < 2) {
+                                                    const float other_half_amax =
+                                                        __shfl_sync(0xffffffff, half_amax, row_lane_base + (lane_pair ^ 1));
+                                                    const float amax = fmaxf(half_amax, other_half_amax);
+                                                    const float scale = amax * (1.0f / FP4_MAX);
+                                                    const float rcp_scale = (amax > 0.0f) ? (FP4_MAX / amax) : 0.0f;
+                                                    const int global_col_16 = col_start + group16 * 16;
+                                                    const int fp4x2_col_base = global_col_16 / 2 + lane_pair * 4;
+                                                    #pragma unroll
+                                                    for (int src_pair = 0; src_pair < 4; ++src_pair) {
+                                                        const bf16_2 gathered = bf16x2_from_bits(gathered_bits[src_pair]);
+                                                        row_fp4_ptr[global_row * row_fp4_stride + fp4x2_col_base + src_pair] =
+                                                            quantize_fp4_pair(
+                                                                __bfloat162float(gathered.x),
+                                                                __bfloat162float(gathered.y),
+                                                                rcp_scale);
+                                                    }
+
+                                                    if (lane_pair == 0) {
+                                                        float stored_scale = scale * g_sg_rcp;
+                                                        if (encode_centric) {
+                                                            stored_scale = fminf(rcp_scale * g_sg, E4M3_MAX);
+                                                        }
+                                                        const __nv_fp8_e4m3 sc = __nv_fp8_e4m3(stored_scale);
+                                                        const int kgroup = global_col_16 / 64;
+                                                        const int col_16_in_64 = (global_col_16 / 16) % 4;
+                                                        const int depth = global_row / 128;
+                                                        const int sr = global_row % 32;
+                                                        const int rr = (global_row / 32) % 4;
+                                                        const int chunk = depth * row_sc_kgroups + kgroup;
+                                                        const int byte_idx = sr * 16 + rr * 4 + col_16_in_64;
+                                                        row_sc_ptr[chunk * 512 + byte_idx] =
+                                                            *reinterpret_cast<const uint8_t*>(&sc);
+                                                    }
+                                                }
+                                            } else {
+                                                const float v00 = __bfloat162float(vals0.x);
+                                                const float v01 = __bfloat162float(vals0.y);
+                                                const float v10 = __bfloat162float(vals1.x);
+                                                const float v11 = __bfloat162float(vals1.y);
+                                                const int depth = global_row / 128;
+                                                const int sr = global_row % 32;
+                                                const int rr = (global_row / 32) % 4;
+                                                const int row_chunk_base = depth * row_sc_kgroups;
+
+                                                if (full_tile_rows || global_row < g.M) {
+                                                    float amax = fmaxf(fmaxf(fabsf(v00), fabsf(v01)),
+                                                                       fmaxf(fabsf(v10), fabsf(v11)));
+                                                    amax = fmaxf(amax, __shfl_xor_sync(0xffffffff, amax, 1, 4));
+                                                    amax = fmaxf(amax, __shfl_xor_sync(0xffffffff, amax, 2, 4));
+
+                                                    const float scale = amax * (1.0f / FP4_MAX);
+                                                    const float rcp_scale = (amax > 0.0f) ? (FP4_MAX / amax) : 0.0f;
+                                                    const int global_col_16 = col_start + group16 * 16;
+                                                    const int fp4x2_col_base = global_col_16 / 2;
+                                                    row_fp4_ptr[global_row * row_fp4_stride + fp4x2_col_base + lane_pair] =
+                                                        quantize_fp4_pair(v00, v01, rcp_scale);
+                                                    row_fp4_ptr[global_row * row_fp4_stride + fp4x2_col_base + 4 + lane_pair] =
+                                                        quantize_fp4_pair(v10, v11, rcp_scale);
+
+                                                    if (lane_pair == 0) {
+                                                        float stored_scale = scale * g_sg_rcp;
+                                                        if (encode_centric) {
+                                                            stored_scale = fminf(rcp_scale * g_sg, E4M3_MAX);
+                                                        }
+                                                        const __nv_fp8_e4m3 sc = __nv_fp8_e4m3(stored_scale);
+                                                        const int kgroup = global_col_16 / 64;
+                                                        const int col_16_in_64 = (global_col_16 / 16) % 4;
+                                                        const int chunk = row_chunk_base + kgroup;
+                                                        const int byte_idx = sr * 16 + rr * 4 + col_16_in_64;
+                                                        row_sc_ptr[chunk * 512 + byte_idx] =
+                                                            *reinterpret_cast<const uint8_t*>(&sc);
+                                                    }
                                                 }
                                             }
                                         }
@@ -3004,6 +3552,17 @@ __device__ inline void backward_kernel_v3_streaming_3wg_impl(const globals_3wg<C
                                 }
                             }
 
+                            if constexpr (DO_COL && C::EARLY_COL_READY) {
+                                warpgroup::sync(1);
+                                __threadfence_block();
+                                asm volatile("fence.proxy.async.shared::cta;\n" ::: "memory");
+                                warpgroup::sync(1);
+                                if (warpgroup::warpid() == 0 && warp::laneid() == 0) {
+                                    arrive(slice_col_ready[bf_stage]);
+                                }
+                                update_phasebit<1>(slice_col_recycle_phasebits, bf_stage);
+                            }
+
                             if constexpr (DO_ROW) {
                                 warpgroup::store(bf16_epi_stage[bf_stage].D, D_bf);
                                 warpgroup::sync(1);
@@ -3013,6 +3572,11 @@ __device__ inline void backward_kernel_v3_streaming_3wg_impl(const globals_3wg<C
                                 const int quant_row = threadIdx.x;
                                 if (quant_row < C::Mb / 2) {
                                     const int global_row = tile_row_base + quant_row;
+                                    const int depth = global_row / 128;
+                                    const int sr = global_row % 32;
+                                    const int rr = (global_row / 32) % 4;
+                                    const int row_chunk_base = depth * row_sc_kgroups;
+                                    const bool row_in_bounds = full_tile_rows || global_row < g.M;
                                     #pragma unroll
                                     for (int group16 = 0; group16 < SUBTILE_COLS / 16; ++group16) {
                                         bf16_2 vals[8];
@@ -3028,15 +3592,16 @@ __device__ inline void backward_kernel_v3_streaming_3wg_impl(const globals_3wg<C
                                         const float scale = amax * (1.0f / FP4_MAX);
                                         const float rcp_scale = (amax > 0.0f) ? (FP4_MAX / amax) : 0.0f;
 
-                                        if (global_row < g.M) {
+                                        if (row_in_bounds) {
+                                            const int global_col_16 = col_start + group16 * 16;
+                                            const int fp4x2_col_base = global_col_16 / 2;
                                             #pragma unroll
                                             for (int pair = 0; pair < 8; ++pair) {
-                                                const uint8_t fp4_pair = quantize_fp4_pair(
-                                                    __bfloat162float(vals[pair].x),
-                                                    __bfloat162float(vals[pair].y),
-                                                    rcp_scale);
-                                                const int fp4x2_col = (col_start + group16 * 16 + pair * 2) / 2;
-                                                row_fp4_ptr[global_row * row_fp4_stride + fp4x2_col] = fp4_pair;
+                                                row_fp4_ptr[global_row * row_fp4_stride + fp4x2_col_base + pair] =
+                                                    quantize_fp4_pair(
+                                                        __bfloat162float(vals[pair].x),
+                                                        __bfloat162float(vals[pair].y),
+                                                        rcp_scale);
                                             }
 
                                             float stored_scale = scale * g_sg_rcp;
@@ -3044,13 +3609,9 @@ __device__ inline void backward_kernel_v3_streaming_3wg_impl(const globals_3wg<C
                                                 stored_scale = fminf(rcp_scale * g_sg, E4M3_MAX);
                                             }
                                             const __nv_fp8_e4m3 sc = __nv_fp8_e4m3(stored_scale);
-                                            const int global_col_16 = col_start + group16 * 16;
                                             const int kgroup = global_col_16 / 64;
                                             const int col_16_in_64 = (global_col_16 / 16) % 4;
-                                            const int depth = global_row / 128;
-                                            const int sr = global_row % 32;
-                                            const int rr = (global_row / 32) % 4;
-                                            const int chunk = depth * row_sc_kgroups + kgroup;
+                                            const int chunk = row_chunk_base + kgroup;
                                             const int byte_idx = sr * 16 + rr * 4 + col_16_in_64;
                                             row_sc_ptr[chunk * 512 + byte_idx] =
                                                 *reinterpret_cast<const uint8_t*>(&sc);
@@ -3059,7 +3620,7 @@ __device__ inline void backward_kernel_v3_streaming_3wg_impl(const globals_3wg<C
                                 }
                             }
                         }
-                        if constexpr (DO_COL) {
+                        if constexpr (DO_COL && !C::EARLY_COL_READY) {
                             warpgroup::sync(1);
                             __threadfence_block();
                             asm volatile("fence.proxy.async.shared::cta;\n" ::: "memory");
@@ -3101,7 +3662,7 @@ __device__ inline void backward_kernel_v3_streaming_3wg_impl(const globals_3wg<C
                                     for (int row_half = 0; row_half < 2; ++row_half) {
                                         const int local_row = local_warp_row_base + i * 16 + row_half * 8 + lane_row;
                                         const int global_row = tile_row_base + local_row;
-                                        if (global_row < g.M) {
+                                        if (full_tile_rows || global_row < g.M) {
                                             #pragma unroll
                                             for (int group16 = 0; group16 < SUBTILE_COLS / 16; ++group16) {
                                                 const bf16_2 vals0 = D_bf.tiles[i][group16].data[row_half];
@@ -3110,6 +3671,10 @@ __device__ inline void backward_kernel_v3_streaming_3wg_impl(const globals_3wg<C
                                                 const float v01 = __bfloat162float(vals0.y);
                                                 const float v10 = __bfloat162float(vals1.x);
                                                 const float v11 = __bfloat162float(vals1.y);
+                                                const int depth = global_row / 128;
+                                                const int sr = global_row % 32;
+                                                const int rr = (global_row / 32) % 4;
+                                                const int row_chunk_base = depth * row_sc_kgroups;
                                                 float amax = fmaxf(fmaxf(fabsf(v00), fabsf(v01)),
                                                                    fmaxf(fabsf(v10), fabsf(v11)));
                                                 amax = fmaxf(amax, __shfl_xor_sync(0xffffffff, amax, 1, 4));
@@ -3132,10 +3697,7 @@ __device__ inline void backward_kernel_v3_streaming_3wg_impl(const globals_3wg<C
                                                     const __nv_fp8_e4m3 sc = __nv_fp8_e4m3(stored_scale);
                                                     const int kgroup = global_col_16 / 64;
                                                     const int col_16_in_64 = (global_col_16 / 16) % 4;
-                                                    const int depth = global_row / 128;
-                                                    const int sr = global_row % 32;
-                                                    const int rr = (global_row / 32) % 4;
-                                                    const int chunk = depth * row_sc_kgroups + kgroup;
+                                                    const int chunk = row_chunk_base + kgroup;
                                                     const int byte_idx = sr * 16 + rr * 4 + col_16_in_64;
                                                     row_sc_ptr[chunk * 512 + byte_idx] =
                                                         *reinterpret_cast<const uint8_t*>(&sc);
@@ -3293,6 +3855,7 @@ __device__ inline void backward_kernel_v3_streaming_3wg_impl(const globals_3wg<C
             int row_block_idx = supergroup_idx * C::SUPERGROUP_SIZE + row_within_supergroup;
             int col_block_idx = idx_within_supergroup / rows_in_supergroup;
             const int tile_row_base = row_block_idx * C::Mb + cta_id * (C::Mb / 2);
+            const bool full_tile_rows = tile_row_base + (C::Mb / 2) <= g.M;
 
             #pragma unroll
             for (int epi = 0; epi < C::EPI_PIPE_DEPTH; ++epi) {
