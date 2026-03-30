@@ -302,7 +302,7 @@ void nvfp4_grouped_gemm_entrypoint(
     if (!dummy_bsg.defined()) {
         dummy_bsg = at::zeros({1}, at::dtype(at::kFloat).device(at::kCUDA));
     }
-    bool use_split_D = (D_K_opt.has_value() && D_V_opt.has_value());
+    bool use_split_D = D_K_opt.has_value();
 
     int K = B.size(1) * 2;
     if (K <= 2048) {
@@ -318,10 +318,12 @@ void nvfp4_grouped_gemm_entrypoint(
             .B_sc_global = kittens::py::tensor_to_gl<typename G::B_sc_global_gl>(dummy_bsg),
             .D = kittens::py::tensor_to_gl<typename G::D_gl>(D),
             .D_K = use_split_D ? kittens::py::tensor_to_gl<typename G::D_gl>(D_K_opt.value()) : kittens::py::tensor_to_gl<typename G::D_gl>(D),
-            .D_V = use_split_D ? kittens::py::tensor_to_gl<typename G::D_gl>(D_V_opt.value()) : kittens::py::tensor_to_gl<typename G::D_gl>(D),
+            .D_V = D_V_opt.has_value() ? kittens::py::tensor_to_gl<typename G::D_gl>(D_V_opt.value())
+                                       : (use_split_D ? kittens::py::tensor_to_gl<typename G::D_gl>(D_K_opt.value())
+                                                      : kittens::py::tensor_to_gl<typename G::D_gl>(D)),
             .q_dim = use_split_D ? static_cast<int>(D.size(1)) : 0,
             .k_dim = use_split_D ? static_cast<int>(D_K_opt.value().size(1)) : 0,
-            .v_dim = use_split_D ? static_cast<int>(D_V_opt.value().size(1)) : 0,
+            .v_dim = D_V_opt.has_value() ? static_cast<int>(D_V_opt.value().size(1)) : 0,
             .use_split_D = use_split_D,
             .b_sg_per_tile = B_sg_per_tile.data_ptr<float>(),
             .silu_dim = silu_dim
@@ -340,10 +342,12 @@ void nvfp4_grouped_gemm_entrypoint(
             .B_sc_global = kittens::py::tensor_to_gl<typename G::B_sc_global_gl>(dummy_bsg),
             .D = kittens::py::tensor_to_gl<typename G::D_gl>(D),
             .D_K = use_split_D ? kittens::py::tensor_to_gl<typename G::D_gl>(D_K_opt.value()) : kittens::py::tensor_to_gl<typename G::D_gl>(D),
-            .D_V = use_split_D ? kittens::py::tensor_to_gl<typename G::D_gl>(D_V_opt.value()) : kittens::py::tensor_to_gl<typename G::D_gl>(D),
+            .D_V = D_V_opt.has_value() ? kittens::py::tensor_to_gl<typename G::D_gl>(D_V_opt.value())
+                                       : (use_split_D ? kittens::py::tensor_to_gl<typename G::D_gl>(D_K_opt.value())
+                                                      : kittens::py::tensor_to_gl<typename G::D_gl>(D)),
             .q_dim = use_split_D ? static_cast<int>(D.size(1)) : 0,
             .k_dim = use_split_D ? static_cast<int>(D_K_opt.value().size(1)) : 0,
-            .v_dim = use_split_D ? static_cast<int>(D_V_opt.value().size(1)) : 0,
+            .v_dim = D_V_opt.has_value() ? static_cast<int>(D_V_opt.value().size(1)) : 0,
             .use_split_D = use_split_D,
             .b_sg_per_tile = B_sg_per_tile.data_ptr<float>(),
             .silu_dim = silu_dim
@@ -375,7 +379,7 @@ void nvfp4_grouped_gemm_nopdl_entrypoint(
     if (!dummy_bsg.defined()) {
         dummy_bsg = at::zeros({1}, at::dtype(at::kFloat).device(at::kCUDA));
     }
-    bool use_split_D = (D_K_opt.has_value() && D_V_opt.has_value());
+    bool use_split_D = D_K_opt.has_value();
 
     // USE_PDL=false, CLUSTER_SIZE=2 (default) — safe for multi-stream
     // USE_PDL=false (8th arg), CLUSTER_SIZE=2 (9th arg — kernel requires cluster pairs)
@@ -390,10 +394,12 @@ void nvfp4_grouped_gemm_nopdl_entrypoint(
         .B_sc_global = kittens::py::tensor_to_gl<typename G::B_sc_global_gl>(dummy_bsg),
         .D = kittens::py::tensor_to_gl<typename G::D_gl>(D),
         .D_K = use_split_D ? kittens::py::tensor_to_gl<typename G::D_gl>(D_K_opt.value()) : kittens::py::tensor_to_gl<typename G::D_gl>(D),
-        .D_V = use_split_D ? kittens::py::tensor_to_gl<typename G::D_gl>(D_V_opt.value()) : kittens::py::tensor_to_gl<typename G::D_gl>(D),
+        .D_V = D_V_opt.has_value() ? kittens::py::tensor_to_gl<typename G::D_gl>(D_V_opt.value())
+                                   : (use_split_D ? kittens::py::tensor_to_gl<typename G::D_gl>(D_K_opt.value())
+                                                  : kittens::py::tensor_to_gl<typename G::D_gl>(D)),
         .q_dim = use_split_D ? static_cast<int>(D.size(1)) : 0,
         .k_dim = use_split_D ? static_cast<int>(D_K_opt.value().size(1)) : 0,
-        .v_dim = use_split_D ? static_cast<int>(D_V_opt.value().size(1)) : 0,
+        .v_dim = D_V_opt.has_value() ? static_cast<int>(D_V_opt.value().size(1)) : 0,
         .use_split_D = use_split_D,
         .b_sg_per_tile = B_sg_per_tile.data_ptr<float>(),
         .silu_dim = silu_dim
