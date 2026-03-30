@@ -1,15 +1,16 @@
 """
 Apples-to-apples localCTA benchmark.
 
-Both paths run the same fast GEMM kernel. The only difference is how the
-prepared FP8 block scales are produced:
+All curves stay within the localCTA quantization/GEMM family:
 
-1. Optimized localCTA quant:
-   tk_localcta_quantize_for_gemm_prepared_launch(...)
-2. Persistent 1CTA localCTA quant:
-   tk_localcta_quantize_for_gemm_fast_launch(...)
-3. Forced 2CTA prepared localCTA quant:
-   tk_localcta2_quantize_for_gemm_prepared_launch(...)
+1. Separate direct localCTA:
+   tk_localcta_quantize_for_gemm_launch(...) + nvfp4_localcta_gemm(...)
+2. Optimized separate prepared localCTA:
+   tk_localcta_quantize_for_gemm_prepared_launch(...) + nvfp4_localcta_fast_gemm(...)
+3. Persistent 1CTA localCTA quant:
+   tk_localcta_quantize_for_gemm_fast_launch(...) + nvfp4_localcta_fast_gemm(...)
+4. Forced 2CTA prepared localCTA:
+   tk_localcta2_quantize_for_gemm_prepared_launch(...) + nvfp4_localcta_fast_gemm(...)
 
 The benchmark uses preallocated outputs so we time kernel work rather than
 Python/Torch allocation overhead.
@@ -73,6 +74,12 @@ def alloc_prepared_outputs(M: int, K: int):
     )
 
 
+def alloc_direct_outputs(M: int, K: int):
+    return local_q.tk_localcta_quantize_for_gemm_alloc(
+        M, K, False, torch.device("cuda")
+    )
+
+
 def alloc_persistent_outputs(M: int, K: int):
     return local_q.tk_localcta_quantize_for_gemm_fast_alloc(
         M, K, False, torch.device("cuda")
@@ -87,6 +94,20 @@ def alloc_forced_2cta_outputs(M: int, K: int):
 
 def launch_prepared_quant(x: torch.Tensor, outputs) -> None:
     local_q.tk_localcta_quantize_for_gemm_prepared_launch(
+        x,
+        False,
+        True,
+        outputs[0],
+        outputs[1],
+        outputs[2],
+        outputs[3],
+        outputs[4],
+        outputs[5],
+    )
+
+
+def launch_direct_quant(x: torch.Tensor, outputs) -> None:
+    local_q.tk_localcta_quantize_for_gemm_launch(
         x,
         False,
         True,
@@ -133,16 +154,22 @@ def run_fast_gemm(A_fp4, A_sc_prepared, B_fp4, B_sc_prepared, D) -> None:
     local_gemm.nvfp4_localcta_fast_gemm(A_fp4, A_sc_prepared, B_fp4, B_sc_prepared, D)
 
 
+def run_direct_gemm(A_fp4, A_sc, A_sg, B_fp4, B_sc, B_sg, D) -> None:
+    local_gemm.nvfp4_localcta_gemm(A_fp4, A_sc, A_sg, B_fp4, B_sc, B_sg, D)
+
+
 def run_case(M: int, N: int, K: int) -> None:
     print(f"\n{'=' * 72}")
     print(f"  M={M}, N={N}, K={K}")
     print(f"{'=' * 72}")
     print(f"    Optimized quant mode:  {prepared_quant_mode(M, K)}")
-    print("    Comparison curves: optimized_auto_prepared, persistent_1cta_fast, forced_2cta_prepared")
+    print("    Comparison curves: separate_direct_localcta, optimized_auto_prepared, persistent_1cta_fast, forced_2cta_prepared")
 
     A = torch.randn(M, K, dtype=torch.bfloat16, device="cuda") / (K ** 0.25)
     B = torch.randn(N, K, dtype=torch.bfloat16, device="cuda") / (K ** 0.25)
 
+    A_direct = alloc_direct_outputs(M, K)
+    B_direct = alloc_direct_outputs(N, K)
     A_opt = alloc_prepared_outputs(M, K)
     B_opt = alloc_prepared_outputs(N, K)
     A_pers = alloc_persistent_outputs(M, K)
@@ -150,12 +177,17 @@ def run_case(M: int, N: int, K: int) -> None:
     A_forced2 = alloc_forced_2cta_outputs(M, K)
     B_forced2 = alloc_forced_2cta_outputs(N, K)
 
+    D_direct = torch.empty(M, N, dtype=torch.bfloat16, device="cuda")
     D_opt = torch.empty(M, N, dtype=torch.bfloat16, device="cuda")
     D_pers = torch.empty_like(D_opt)
     D_forced2 = torch.empty_like(D_opt)
 
     # The raw+prepared 2CTA fast path shares a cluster amax, so we exclude it
     # from this benchmark and compare against the numerically valid prepared-only 2CTA path.
+
+    def direct_quant() -> None:
+        launch_direct_quant(A, A_direct)
+        launch_direct_quant(B, B_direct)
 
     def opt_quant() -> None:
         launch_prepared_quant(A, A_opt)
@@ -169,6 +201,9 @@ def run_case(M: int, N: int, K: int) -> None:
         launch_forced_2cta_quant(A, A_forced2)
         launch_forced_2cta_quant(B, B_forced2)
 
+    def direct_gemm() -> None:
+        run_direct_gemm(A_direct[0], A_direct[1], A_direct[4], B_direct[0], B_direct[1], B_direct[4], D_direct)
+
     def opt_gemm() -> None:
         run_fast_gemm(A_opt[0], A_opt[1], B_opt[0], B_opt[1], D_opt)
 
@@ -177,6 +212,11 @@ def run_case(M: int, N: int, K: int) -> None:
 
     def forced2_gemm() -> None:
         run_fast_gemm(A_forced2[0], A_forced2[1], B_forced2[0], B_forced2[1], D_forced2)
+
+    def direct_e2e() -> None:
+        launch_direct_quant(A, A_direct)
+        launch_direct_quant(B, B_direct)
+        run_direct_gemm(A_direct[0], A_direct[1], A_direct[4], B_direct[0], B_direct[1], B_direct[4], D_direct)
 
     def opt_e2e() -> None:
         launch_prepared_quant(A, A_opt)
@@ -193,31 +233,41 @@ def run_case(M: int, N: int, K: int) -> None:
         launch_forced_2cta_quant(B, B_forced2)
         run_fast_gemm(A_forced2[0], A_forced2[1], B_forced2[0], B_forced2[1], D_forced2)
 
+    ms_direct_q = bench(direct_quant)
     ms_opt_q = bench(opt_quant)
     ms_pers_q = bench(pers_quant)
     ms_forced2_q = bench(forced2_quant)
 
+    direct_quant()
     opt_quant()
     pers_quant()
     forced2_quant()
 
+    ms_direct_g = bench(direct_gemm)
     ms_opt_g = bench(opt_gemm)
     ms_pers_g = bench(pers_gemm)
     ms_forced2_g = bench(forced2_gemm)
+    ms_direct = bench(direct_e2e)
     ms_opt = bench(opt_e2e)
     ms_pers = bench(pers_e2e)
     ms_forced2 = bench(forced2_e2e)
 
+    direct_e2e()
     opt_e2e()
     pers_e2e()
     forced2_e2e()
     torch.cuda.synchronize()
 
     flops = 2.0 * M * N * K
+    direct_tflops = flops / (ms_direct * 1e-3) / 1e12
     opt_tflops = flops / (ms_opt * 1e-3) / 1e12
     pers_tflops = flops / (ms_pers * 1e-3) / 1e12
     forced2_tflops = flops / (ms_forced2 * 1e-3) / 1e12
 
+    cosine_direct = torch.nn.functional.cosine_similarity(
+        D_direct.flatten().float().unsqueeze(0),
+        D_pers.flatten().float().unsqueeze(0),
+    ).item()
     cosine = torch.nn.functional.cosine_similarity(
         D_opt.flatten().float().unsqueeze(0),
         D_pers.flatten().float().unsqueeze(0),
@@ -226,9 +276,14 @@ def run_case(M: int, N: int, K: int) -> None:
         D_opt.flatten().float().unsqueeze(0),
         D_forced2.flatten().float().unsqueeze(0),
     ).item()
+    max_abs_direct = (D_direct.float() - D_pers.float()).abs().max().item()
     max_abs = (D_opt.float() - D_pers.float()).abs().max().item()
     max_abs_forced2 = (D_opt.float() - D_forced2.float()).abs().max().item()
 
+    print(
+        f"    localCTA direct:      {ms_direct:.4f} ms  ({direct_tflops:.0f} TFLOPs)"
+        f"  [Q={ms_direct_q:.4f} G={ms_direct_g:.4f}]"
+    )
     print(
         f"    localCTA optimized:   {ms_opt:.4f} ms  ({opt_tflops:.0f} TFLOPs)"
         f"  [Q={ms_opt_q:.4f} G={ms_opt_g:.4f}]"
@@ -241,6 +296,18 @@ def run_case(M: int, N: int, K: int) -> None:
         f"    localCTA forced-2cta: {ms_forced2:.4f} ms  ({forced2_tflops:.0f} TFLOPs)"
         f"  [Q={ms_forced2_q:.4f} G={ms_forced2_g:.4f}]"
     )
+
+    delta_direct = ms_direct - ms_pers
+    if delta_direct > 0:
+        print(
+            f"    -> persistent_1cta_fast beats separate_direct_localcta by {delta_direct:.4f} ms "
+            f"({delta_direct / ms_direct * 100:.1f}%)"
+        )
+    else:
+        print(
+            f"    -> separate_direct_localcta beats persistent_1cta_fast by {-delta_direct:.4f} ms "
+            f"({-delta_direct / ms_pers * 100:.1f}%)"
+        )
 
     best_persistent_label = "persistent_1cta_fast"
     best_persistent_ms = ms_pers
@@ -270,8 +337,10 @@ def run_case(M: int, N: int, K: int) -> None:
             f"    -> persistent_1cta_fast beats forced_2cta_prepared by {-delta_forced2:.4f} ms "
             f"({-delta_forced2 / ms_forced2 * 100:.1f}%)"
         )
+    print(f"    Cos(direct vs pers1): {cosine_direct:.6f}")
     print(f"    Cos(opt vs pers1): {cosine:.6f}")
     print(f"    Cos(opt vs forced2): {cosine_forced2:.6f}")
+    print(f"    MaxAbs(direct vs pers1): {max_abs_direct:.6f}")
     print(f"    MaxAbs(opt vs pers1): {max_abs:.6f}")
     print(f"    MaxAbs(opt vs forced2): {max_abs_forced2:.6f}")
 
@@ -286,9 +355,6 @@ def run_suite(title: str, cases) -> None:
 
 
 def main() -> None:
-    if not torch.cuda.is_available():
-        raise RuntimeError("CUDA unavailable")
-
     if len(sys.argv) == 4:
         run_case(int(sys.argv[1]), int(sys.argv[2]), int(sys.argv[3]))
         return
