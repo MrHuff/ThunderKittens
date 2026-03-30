@@ -7,6 +7,7 @@
 #include "nvfp4_batched_accum_gemm.cuh"
 #include "nvfp4_accum_gemm.cuh"
 #include "nvfp4_fused_gemm.cuh"
+#include "nvfp4_persistent_gemm.cuh"
 #include <optional>
 
 #ifndef TORCH_COMPILE
@@ -1400,6 +1401,75 @@ void nvfp4_fused_gemm_cta_amax_entrypoint(
     dispatch_fused_gemm<true>(A_bf16, B, B_sc, B_sc_global, D);
 }
 
+// ================================================================
+// Persistent Quantize→GEMM: single kernel launch.
+// Quantizes A (and optionally B) to FP4 in HBM, then runs GEMM.
+// Uses constant SCALE_MAX (no amax scan).
+// ================================================================
+template <typename KC>
+static __cluster_dims__(KC::CLUSTER_SIZE) __launch_bounds__(KC::NUM_THREADS)
+__global__ void persistent_gemm_entry(const __grid_constant__ nvfp4_persistent_gemm::globals<KC> g) {
+    nvfp4_persistent_gemm::kernel<KC>(g);
+}
+
+void nvfp4_persistent_gemm_entrypoint(
+    const at::Tensor &A_bf16,       // [M, K] bf16
+    const at::Tensor &B_bf16,       // [N, K] bf16
+    at::Tensor &D                   // [M, N] bf16 output
+) {
+    int M = A_bf16.size(0);
+    int K = A_bf16.size(1);
+    int N = B_bf16.size(0);
+
+    TORCH_CHECK(A_bf16.dtype() == at::kBFloat16, "A must be bf16");
+    TORCH_CHECK(B_bf16.dtype() == at::kBFloat16, "B must be bf16");
+    TORCH_CHECK(M % 256 == 0, "M must be multiple of 256");
+    TORCH_CHECK(K % 256 == 0, "K must be multiple of 256");
+    TORCH_CHECK(N % 256 == 0, "N must be multiple of 256");
+
+    constexpr float SCALE_MAX_DEC = 65504.0f / (6.0f * 448.0f);
+
+    // Allocate FP4 scratch buffers in HBM
+    auto A_fp4 = at::empty({M, K/2}, at::TensorOptions().dtype(at::kFloat4_e2m1fn_x2).device(A_bf16.device()));
+    auto A_sc  = at::empty({M/128, K/64, 512}, at::TensorOptions().dtype(at::kFloat8_e4m3fn).device(A_bf16.device()));
+    auto A_sg  = at::full({1}, SCALE_MAX_DEC, at::TensorOptions().dtype(at::kFloat).device(A_bf16.device()));
+    auto B_fp4 = at::empty({N, K/2}, at::TensorOptions().dtype(at::kFloat4_e2m1fn_x2).device(A_bf16.device()));
+    auto B_sc  = at::empty({N/128, K/64, 512}, at::TensorOptions().dtype(at::kFloat8_e4m3fn).device(A_bf16.device()));
+    auto B_sg  = at::full({1}, SCALE_MAX_DEC, at::TensorOptions().dtype(at::kFloat).device(A_bf16.device()));
+
+    // Grid barrier counter
+    auto barrier = at::zeros({1}, at::TensorOptions().dtype(at::kInt).device(A_bf16.device()));
+
+    using C = nvfp4_persistent_gemm::config<256, 5, 8, 4, 2, false>;
+    using G = nvfp4_persistent_gemm::globals<C>;
+
+    G g {
+        // Phase 1: quantize
+        .A_bf16  = kittens::py::tensor_to_gl<typename G::Q_bf16_gl>(A_bf16),
+        .A_q_fp4 = kittens::py::tensor_to_gl<typename G::Q_fp4_gl>(A_fp4),
+        .A_q_sc  = kittens::py::tensor_to_gl<typename G::Q_sc_gl, false>(A_sc, 1, M/128, K/64, 256),
+        .B_bf16  = kittens::py::tensor_to_gl<typename G::Q_bf16_gl>(B_bf16),
+        .B_q_fp4 = kittens::py::tensor_to_gl<typename G::Q_fp4_gl>(B_fp4),
+        .B_q_sc  = kittens::py::tensor_to_gl<typename G::Q_sc_gl, false>(B_sc, 1, N/128, K/64, 256),
+        .quantize_b = true,
+        // Phase 2: GEMM (same HBM data)
+        .A       = kittens::py::tensor_to_gl<typename G::A_fp4x2_gl>(A_fp4),
+        .A_sc    = kittens::py::tensor_to_gl<typename G::A_sc_gl, false>(A_sc, 1, M/128, K/64, 256),
+        .A_sc_global = kittens::py::tensor_to_gl<typename G::A_sc_global_gl>(A_sg),
+        .B       = kittens::py::tensor_to_gl<typename G::B_fp4x2_gl>(B_fp4),
+        .B_sc    = kittens::py::tensor_to_gl<typename G::B_sc_gl, false>(B_sc, 1, N/128, K/64, 256),
+        .B_sc_global = kittens::py::tensor_to_gl<typename G::B_sc_global_gl>(B_sg),
+        .D       = kittens::py::tensor_to_gl<typename G::D_gl>(D),
+        .barrier = barrier.data_ptr<int>(),
+    };
+
+    auto stream = at::cuda::getCurrentCUDAStream();
+    auto smem = g.dynamic_shared_memory();
+    cudaFuncSetAttribute(persistent_gemm_entry<C>, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
+    LaunchConfig<true, false> lc(g.grid(), g.block(), smem, (cudaStream_t)stream, C::CLUSTER_SIZE);
+    cudaLaunchKernelEx(lc, persistent_gemm_entry<C>, g);
+}
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("nvfp4_gemm", &nvfp4_gemm_entrypoint);
     m.def("nvfp4_gemm_nopdl", &nvfp4_gemm_nopdl_entrypoint,
@@ -1467,6 +1537,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           "Fused Quantize+GEMM: CTA-level amax pre-scan (better accuracy)",
           pybind11::arg("A_bf16"), pybind11::arg("B"),
           pybind11::arg("B_sc"), pybind11::arg("B_sc_global"),
+          pybind11::arg("D"));
+    m.def("nvfp4_persistent_gemm", &nvfp4_persistent_gemm_entrypoint,
+          "Persistent Quantize->GEMM: quantize A+B to HBM then GEMM, single kernel",
+          pybind11::arg("A_bf16"), pybind11::arg("B_bf16"),
           pybind11::arg("D"));
 
     // Fused TE→TK GEMM: takes raw TE NVFP4 tensors + dimensions.
