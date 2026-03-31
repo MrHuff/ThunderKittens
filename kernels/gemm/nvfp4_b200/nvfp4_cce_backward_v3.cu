@@ -997,6 +997,8 @@ using bwd_v3_fp4_public_colwg_colpair_L4_SG8 = nvfp4_cce_backward_v3::experiment
 using bwd_v3_fp4_public_colwg_colpair_overlap_L4_SG8 = nvfp4_cce_backward_v3::experimental_config_colwg_colpair_overlap<4, 8, true>;
 using bwd_v3_fp4_public_colwg_colpair_rowpair_overlap_L4_SG8 = nvfp4_cce_backward_v3::experimental_config_colwg_colpair_rowpair_overlap<4, 8, true>;
 using bwd_v3_fp4_public_colwg_colpair_rowpair_rowrecord_overlap_L4_SG8 = nvfp4_cce_backward_v3::experimental_config_colwg_colpair_rowpair_rowrecord_overlap<4, 8, true>;
+using bwd_v3_fp4_public_colwg_colpair_rowpair_lanepairrecord_overlap_L4_SG8 = nvfp4_cce_backward_v3::experimental_config_colwg_colpair_rowpair_lanepairrecord_overlap<4, 8, true>;
+using bwd_v3_fp4_public_colwg_colpair_rowpair_rowrecord_rcp_overlap_L4_SG8 = nvfp4_cce_backward_v3::experimental_config_colwg_colpair_rowpair_rowrecord_rcp_overlap<4, 8, true>;
 using bwd_v3_fp4_public_colwg_colpair_rowfromcol_overlap_L4_SG8 = nvfp4_cce_backward_v3::experimental_config_colwg_colpair_rowfromcol_overlap<4, 8, true>;
 using bwd_v3_fp4_public_colwg_colpair_rowregs_L4_SG8 = nvfp4_cce_backward_v3::experimental_config_colwg_colpair_rowregs<4, 8, true>;
 using bwd_v3_fp4_public_colwg_colpair_rowregs_overlap_L4_SG8 = nvfp4_cce_backward_v3::experimental_config_colwg_colpair_rowregs_overlap<4, 8, true>;
@@ -1104,6 +1106,18 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           "NVFP4 CCE backward v3 experimental public col-WG colpair+rowpair rowrecord row-only (FP4 output) L4 SG8");
     m.def("experimental_backward_v3_fp4_colwg_colpair_rowpair_rowrecord_overlap_colonly_L4_SG8", &launch_experimental_backward_v3_fp4_3wg_colonly<bwd_v3_fp4_public_colwg_colpair_rowpair_rowrecord_overlap_L4_SG8>,
           "NVFP4 CCE backward v3 experimental public col-WG colpair+rowpair rowrecord col-only (FP4 output) L4 SG8");
+    m.def("experimental_backward_v3_fp4_colwg_colpair_rowpair_lanepairrecord_overlap_L4_SG8", &launch_experimental_backward_v3_fp4_3wg<bwd_v3_fp4_public_colwg_colpair_rowpair_lanepairrecord_overlap_L4_SG8>,
+          "NVFP4 CCE backward v3 experimental public col-WG colpair+rowpair lane-pair-record row-stage layout (FP4 output) L4 SG8");
+    m.def("experimental_backward_v3_fp4_colwg_colpair_rowpair_lanepairrecord_overlap_rowonly_L4_SG8", &launch_experimental_backward_v3_fp4_3wg_rowonly<bwd_v3_fp4_public_colwg_colpair_rowpair_lanepairrecord_overlap_L4_SG8>,
+          "NVFP4 CCE backward v3 experimental public col-WG colpair+rowpair lane-pair-record row-only (FP4 output) L4 SG8");
+    m.def("experimental_backward_v3_fp4_colwg_colpair_rowpair_lanepairrecord_overlap_colonly_L4_SG8", &launch_experimental_backward_v3_fp4_3wg_colonly<bwd_v3_fp4_public_colwg_colpair_rowpair_lanepairrecord_overlap_L4_SG8>,
+          "NVFP4 CCE backward v3 experimental public col-WG colpair+rowpair lane-pair-record col-only (FP4 output) L4 SG8");
+    m.def("experimental_backward_v3_fp4_colwg_colpair_rowpair_rowrecord_rcp_overlap_L4_SG8", &launch_experimental_backward_v3_fp4_3wg<bwd_v3_fp4_public_colwg_colpair_rowpair_rowrecord_rcp_overlap_L4_SG8>,
+          "NVFP4 CCE backward v3 experimental public col-WG colpair+rowpair rowrecord producer-precomputed row rcp (FP4 output) L4 SG8");
+    m.def("experimental_backward_v3_fp4_colwg_colpair_rowpair_rowrecord_rcp_overlap_rowonly_L4_SG8", &launch_experimental_backward_v3_fp4_3wg_rowonly<bwd_v3_fp4_public_colwg_colpair_rowpair_rowrecord_rcp_overlap_L4_SG8>,
+          "NVFP4 CCE backward v3 experimental public col-WG colpair+rowpair rowrecord+rowrcp row-only (FP4 output) L4 SG8");
+    m.def("experimental_backward_v3_fp4_colwg_colpair_rowpair_rowrecord_rcp_overlap_colonly_L4_SG8", &launch_experimental_backward_v3_fp4_3wg_colonly<bwd_v3_fp4_public_colwg_colpair_rowpair_rowrecord_rcp_overlap_L4_SG8>,
+          "NVFP4 CCE backward v3 experimental public col-WG colpair+rowpair rowrecord+rowrcp col-only (FP4 output) L4 SG8");
     m.def("experimental_backward_v3_fp4_colwg_colpair_rowfromcol_overlap_L4_SG8", &launch_experimental_backward_v3_fp4_3wg<bwd_v3_fp4_public_colwg_colpair_rowfromcol_overlap_L4_SG8>,
           "NVFP4 CCE backward v3 experimental public col-WG colpair single-stage row-from-col overlap (FP4 output) L4 SG8");
     m.def("experimental_backward_v3_fp4_colwg_colpair_rowfromcol_overlap_rowonly_L4_SG8", &launch_experimental_backward_v3_fp4_3wg_rowonly<bwd_v3_fp4_public_colwg_colpair_rowfromcol_overlap_L4_SG8>,
