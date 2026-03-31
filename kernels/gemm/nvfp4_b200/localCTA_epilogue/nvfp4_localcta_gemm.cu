@@ -332,6 +332,13 @@ void launch_fast_grouped_gemm(
     std::optional<at::Tensor> D_V_opt,
     int silu_dim
 ) {
+    const bool use_split_D = D_K_opt.has_value();
+    const int64_t reduction_k = A.size(1) * 2;
+    if (!use_split_D && reduction_k > 2048) {
+        launch_fast_grouped_gemm_with_config<localcta_fast_largek_config>(
+            A, A_sc_prepared, B, B_sc_prepared, D, D_K_opt, D_V_opt, silu_dim);
+        return;
+    }
     launch_fast_grouped_gemm_with_config<localcta_fast_grouped_config>(
         A, A_sc_prepared, B, B_sc_prepared, D, D_K_opt, D_V_opt, silu_dim);
 }
