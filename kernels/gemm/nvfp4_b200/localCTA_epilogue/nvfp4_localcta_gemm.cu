@@ -19,6 +19,7 @@
 #include "../nvfp4_accum_gemm.cuh"
 #include "../nvfp4_gemm.cuh"
 #include "../nvfp4_batched_gemm.cuh"
+#include "../nvfp4_split3_accum_gemm.cuh"
 
 namespace {
 
@@ -33,6 +34,12 @@ using localcta_fast_grouped_config = nvfp4_gemm::config<256, 5, 8, 4, 2, false>;
 using localcta_fast_batched_config = nvfp4_gemm::config<256, 5, 8, 4, 2, false>;
 using localcta_fast_split2_dgrad_config = nvfp4_gemm::config<256, 5, 8, 12, 2, false>;
 using localcta_fast_split3_dgrad_config = nvfp4_gemm::config<256, 5, 8, 12, 2, false>;
+using localcta_onepass_cfg0 = nvfp4_gemm::config<128, 5, 4, 12, 2, true, 256, false, 1>;
+using localcta_onepass_cfg1 = nvfp4_gemm::config<128, 5, 4, 12, 2, true, 256, false, 2>;
+using localcta_onepass_cfg2 = nvfp4_gemm::config<256, 5, 8, 4, 2, false, 256, false, 1>;
+using localcta_onepass_cfg3 = nvfp4_gemm::config<256, 5, 8, 4, 2, false, 256, false, 2>;
+using localcta_onepass_cfg4 = nvfp4_gemm::config<256, 5, 8, 12, 2, false, 256, false, 1>;
+using localcta_onepass_cfg5 = nvfp4_gemm::config<256, 5, 8, 12, 2, false, 256, false, 2>;
 
 __global__ void sum3_tensors_kernel(
     const __nv_bfloat16* __restrict__ A,
@@ -866,6 +873,146 @@ void launch_fast_batched_gemm_strided_with_config(
     kittens::py::launch_kernel<C, G, nvfp4_batched_gemm::kernel<C>>(g_host);
 }
 
+template <typename C>
+void launch_fast_split3_dgrad_gemm_strided_onepass_with_config(
+    const at::Tensor& A_full,
+    const std::vector<at::Tensor>& A_sc_prepared_list,
+    const std::vector<int64_t>& A_col_offsets,
+    const std::vector<int64_t>& A_col_widths,
+    const std::vector<at::Tensor>& B_list,
+    const std::vector<at::Tensor>& B_sc_prepared_list,
+    at::Tensor& D_out
+) {
+    using G = nvfp4_split3_accum_gemm::globals<C>;
+    G g_host;
+    memset(&g_host, 0, sizeof(G));
+
+    TORCH_CHECK(A_sc_prepared_list.size() == 3, "one-pass split3 dgrad expects 3 A scale batches");
+    TORCH_CHECK(B_list.size() == 3, "one-pass split3 dgrad expects 3 B batches");
+    TORCH_CHECK(B_sc_prepared_list.size() == 3, "one-pass split3 dgrad expects 3 B scale batches");
+    TORCH_CHECK(A_col_offsets.size() == 3, "one-pass split3 dgrad expects 3 A offsets");
+    TORCH_CHECK(A_col_widths.size() == 3, "one-pass split3 dgrad expects 3 A widths");
+
+    const int64_t M = D_out.size(0);
+    const int64_t N_out = D_out.size(1);
+    const int64_t K_total_fp4 = A_full.size(1);
+    const uint8_t* a_base = reinterpret_cast<const uint8_t*>(A_full.data_ptr());
+    const int64_t a_full_row_stride = K_total_fp4;
+
+    g_host.num_row_blocks = static_cast<int>(M / C::Mb);
+    g_host.num_col_blocks = static_cast<int>(N_out / C::Nb);
+
+    for (int i = 0; i < 3; ++i) {
+        constexpr int64_t swizzle_elements = 128;
+        const int64_t fp4_cols = A_col_widths[i];
+        const int64_t fp4_offset = A_col_offsets[i];
+        const void* data_ptr = a_base + fp4_offset;
+
+        TORCH_CHECK(fp4_cols > 0, "A_col_widths must be positive");
+        TORCH_CHECK((2 * fp4_cols) % C::Kb == 0,
+                    "one-pass split3 dgrad expects reduction widths aligned to Kb=", C::Kb);
+        g_host.num_red_blocks[i] = static_cast<int>((2 * fp4_cols) / C::Kb);
+
+        uint64_t gmem_shape[5] = {
+            static_cast<uint64_t>(swizzle_elements),
+            static_cast<uint64_t>(M),
+            static_cast<uint64_t>((fp4_cols + swizzle_elements - 1) / swizzle_elements),
+            1, 1
+        };
+        uint64_t gmem_stride[4] = {
+            static_cast<uint64_t>(a_full_row_stride),
+            128,
+            static_cast<uint64_t>(M * a_full_row_stride),
+            static_cast<uint64_t>(M * a_full_row_stride)
+        };
+        uint32_t smem_shape[5] = {
+            static_cast<uint32_t>(swizzle_elements),
+            static_cast<uint32_t>(C::Mb / 2),
+            1, 1, 1
+        };
+        uint32_t smem_stride[5] = {1, 1, 1, 1, 1};
+
+        CUresult result = cuTensorMapEncodeTiled(
+            &g_host.A_tma[i],
+            CU_TENSOR_MAP_DATA_TYPE_UINT8,
+            5,
+            const_cast<void*>(data_ptr),
+            gmem_shape,
+            gmem_stride,
+            smem_shape,
+            smem_stride,
+            CU_TENSOR_MAP_INTERLEAVE_NONE,
+            CU_TENSOR_MAP_SWIZZLE_128B,
+            CU_TENSOR_MAP_L2_PROMOTION_NONE,
+            CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE
+        );
+        TORCH_CHECK(result == CUDA_SUCCESS,
+                    "One-pass split3 localCTA A TMA creation failed for batch ", i);
+
+        auto a_sc_gl = kittens::py::tensor_to_gl<typename G::A_sc_gl, false>(
+            A_sc_prepared_list[i], 1,
+            A_sc_prepared_list[i].dim() == 2 ? A_sc_prepared_list[i].size(0) / 128 : A_sc_prepared_list[i].size(0),
+            A_sc_prepared_list[i].dim() == 2 ? A_sc_prepared_list[i].size(1) / 4 : A_sc_prepared_list[i].size(1),
+            256);
+        auto b_gl = kittens::py::tensor_to_gl<typename G::B_fp4x2_gl>(B_list[i]);
+        auto b_sc_gl = kittens::py::tensor_to_gl<typename G::B_sc_gl, false>(
+            B_sc_prepared_list[i], 1,
+            B_sc_prepared_list[i].dim() == 2 ? B_sc_prepared_list[i].size(0) / 128 : B_sc_prepared_list[i].size(0),
+            B_sc_prepared_list[i].dim() == 2 ? B_sc_prepared_list[i].size(1) / 4 : B_sc_prepared_list[i].size(1),
+            256);
+
+        memcpy(&g_host.A_sc_tma[i], &a_sc_gl.tma_descs.tma_desc, sizeof(CUtensorMap));
+        memcpy(&g_host.B_tma[i], &b_gl.tma_descs.tma_desc, sizeof(CUtensorMap));
+        memcpy(&g_host.B_sc_tma[i], &b_sc_gl.tma_descs.tma_desc, sizeof(CUtensorMap));
+    }
+
+    auto d_gl = kittens::py::tensor_to_gl<typename G::D_gl>(D_out);
+    memcpy(&g_host.D_tma, &d_gl.tma_descs.tma_desc, sizeof(CUtensorMap));
+
+    kittens::py::launch_kernel<C, G, nvfp4_split3_accum_gemm::kernel<C>>(g_host);
+}
+
+void launch_fast_split3_dgrad_gemm_strided_onepass(
+    const at::Tensor& A_full,
+    const std::vector<at::Tensor>& A_sc_prepared_list,
+    const std::vector<int64_t>& A_col_offsets,
+    const std::vector<int64_t>& A_col_widths,
+    const std::vector<at::Tensor>& B_list,
+    const std::vector<at::Tensor>& B_sc_prepared_list,
+    at::Tensor& D_out,
+    int config_idx
+) {
+    int resolved_idx = config_idx;
+    if (resolved_idx < 0) {
+        resolved_idx = 5;
+    }
+    switch (resolved_idx) {
+        case 0:
+            TORCH_CHECK(false, "one-pass split3 config_idx=0 is not legal with CLUSTER_SIZE=1 on this kernel");
+            break;
+        case 1:
+            launch_fast_split3_dgrad_gemm_strided_onepass_with_config<localcta_onepass_cfg1>(
+                A_full, A_sc_prepared_list, A_col_offsets, A_col_widths, B_list, B_sc_prepared_list, D_out);
+            break;
+        case 2:
+            TORCH_CHECK(false, "one-pass split3 config_idx=2 is not legal with CLUSTER_SIZE=1 on this kernel");
+            break;
+        case 3:
+            launch_fast_split3_dgrad_gemm_strided_onepass_with_config<localcta_onepass_cfg3>(
+                A_full, A_sc_prepared_list, A_col_offsets, A_col_widths, B_list, B_sc_prepared_list, D_out);
+            break;
+        case 4:
+            TORCH_CHECK(false, "one-pass split3 config_idx=4 is not legal with CLUSTER_SIZE=1 on this kernel");
+            break;
+        case 5:
+            launch_fast_split3_dgrad_gemm_strided_onepass_with_config<localcta_onepass_cfg5>(
+                A_full, A_sc_prepared_list, A_col_offsets, A_col_widths, B_list, B_sc_prepared_list, D_out);
+            break;
+        default:
+            TORCH_CHECK(false, "Unknown one-pass split3 config_idx=", resolved_idx);
+    }
+}
+
 void launch_fast_batched_accum_gemm(
     const std::vector<at::Tensor>& A_list,
     const std::vector<at::Tensor>& A_sc_prepared_list,
@@ -1405,6 +1552,28 @@ void nvfp4_localcta_fast_split3_dgrad_strided_sum_gemm_entrypoint(
         B_list, B_sc_prepared_list, D_out);
 }
 
+void nvfp4_localcta_fast_split3_dgrad_strided_onepass_gemm_entrypoint(
+    const at::Tensor& A_full,
+    const std::vector<at::Tensor>& A_sc_prepared_list,
+    const std::vector<int64_t>& A_col_offsets,
+    const std::vector<int64_t>& A_col_widths,
+    const std::vector<at::Tensor>& B_list,
+    const std::vector<at::Tensor>& B_sc_prepared_list,
+    at::Tensor& D_out,
+    int64_t config_idx
+) {
+    check_fast_batched_strided_inputs(
+        A_full, A_sc_prepared_list,
+        A_col_offsets, A_col_widths,
+        B_list, B_sc_prepared_list);
+    TORCH_CHECK(A_sc_prepared_list.size() == 3, "split3 one-pass dgrad expects exactly 3 A batches");
+    TORCH_CHECK(B_list.size() == 3, "split3 one-pass dgrad expects exactly 3 B batches");
+    check_output_matrix(D_out, "D_out", A_full.size(0), B_list[0].size(0));
+    launch_fast_split3_dgrad_gemm_strided_onepass(
+        A_full, A_sc_prepared_list, A_col_offsets, A_col_widths,
+        B_list, B_sc_prepared_list, D_out, static_cast<int>(config_idx));
+}
+
 void nvfp4_localcta_fast_split2_dgrad_strided_sum_gemm_entrypoint(
     const at::Tensor& A_full,
     const std::vector<at::Tensor>& A_sc_prepared_list,
@@ -1616,6 +1785,13 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           pybind11::arg("A_col_offsets"), pybind11::arg("A_col_widths"),
           pybind11::arg("B_list"),
           pybind11::arg("B_sc_prepared_list"), pybind11::arg("D_out"));
+    m.def("nvfp4_localcta_fast_split3_dgrad_strided_onepass_gemm",
+          &nvfp4_localcta_fast_split3_dgrad_strided_onepass_gemm_entrypoint,
+          pybind11::arg("A_full"), pybind11::arg("A_sc_prepared_list"),
+          pybind11::arg("A_col_offsets"), pybind11::arg("A_col_widths"),
+          pybind11::arg("B_list"),
+          pybind11::arg("B_sc_prepared_list"), pybind11::arg("D_out"),
+          pybind11::arg("config_idx") = -1);
     m.def("nvfp4_localcta_fast_split2_dgrad_strided_sum_gemm",
           &nvfp4_localcta_fast_split2_dgrad_strided_sum_gemm_entrypoint,
           pybind11::arg("A_full"), pybind11::arg("A_sc_prepared_list"),
