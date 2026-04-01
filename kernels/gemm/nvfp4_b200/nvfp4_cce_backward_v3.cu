@@ -1034,7 +1034,7 @@ static void launch_backward_v3_fp4_public_dispatch_L4_SG8(
     bool encode_centric = false)
 {
     launch_experimental_backward_v3_fp4_3wg<
-        bwd_v3_fp4_public_colwg_colpairpad_rowpair_lanepairrecord_rowsync_dualfloatcache_row16ready_overlap_L4_SG8>(
+        bwd_v3_fp4_public_colwg_colpair_rowpair_rowrecord_rowsync_dualfloatcache_overlap_L4_SG8>(
         A, A_sc, A_sc_global,
         B, B_sc, B_sc_global,
         G_fp4_row, G_sc_row, G_sg_row,
