@@ -31,7 +31,23 @@ using localcta_fast_smallk_config = nvfp4_gemm::config<256, 5, 8, 4, 2, false>;
 using localcta_fast_largek_config = nvfp4_gemm::config<256, 5, 8, 12, 2, false>;
 using localcta_fast_grouped_config = nvfp4_gemm::config<256, 5, 8, 4, 2, false>;
 using localcta_fast_batched_config = nvfp4_gemm::config<256, 5, 8, 4, 2, false>;
+using localcta_fast_split2_dgrad_config = nvfp4_gemm::config<256, 5, 8, 12, 2, false>;
 using localcta_fast_split3_dgrad_config = nvfp4_gemm::config<256, 5, 8, 12, 2, false>;
+
+__global__ void sum3_tensors_kernel(
+    const __nv_bfloat16* __restrict__ A,
+    const __nv_bfloat16* __restrict__ B,
+    const __nv_bfloat16* __restrict__ C,
+    __nv_bfloat16* __restrict__ out,
+    int64_t numel
+);
+
+__global__ void sum_tensors_kernel(
+    const __nv_bfloat16* __restrict__ A,
+    const __nv_bfloat16* __restrict__ B,
+    __nv_bfloat16* __restrict__ out,
+    int64_t numel
+);
 
 void check_fp4_matrix(const at::Tensor& t, const char* name) {
     TORCH_CHECK(t.is_cuda(), name, " must be CUDA");
@@ -754,6 +770,102 @@ void launch_fast_batched_accum_gemm_strided_with_config(
     kittens::py::launch_kernel<C, G, nvfp4_accum_gemm::kernel<C>>(g_host);
 }
 
+template <typename C>
+void launch_fast_batched_gemm_strided_with_config(
+    const at::Tensor& A_full,
+    const std::vector<at::Tensor>& A_sc_prepared_list,
+    const std::vector<at::Tensor>& B_list,
+    const std::vector<at::Tensor>& B_sc_prepared_list,
+    const std::vector<int64_t>& A_col_offsets,
+    const std::vector<int64_t>& A_col_widths,
+    std::vector<at::Tensor>& D_list
+) {
+    using G = nvfp4_batched_gemm::globals<C>;
+    G g_host;
+    memset(&g_host, 0, sizeof(G));
+
+    const int n = static_cast<int>(A_sc_prepared_list.size());
+    const int64_t M = D_list[0].size(0);
+    const int64_t N_out = D_list[0].size(1);
+    const int64_t K_total_fp4 = A_full.size(1);
+    auto one = get_unit_scale_tensor(A_full);
+    const float* one_ptr = one.data_ptr<float>();
+
+    g_host.num_batches = n;
+    g_host.num_row_blocks = static_cast<int>(M / C::Mb);
+    g_host.num_col_blocks = static_cast<int>(N_out / C::Nb);
+    g_host.num_red_blocks = static_cast<int>((2 * A_col_widths[0]) / C::Kb);
+
+    const uint8_t* a_base = reinterpret_cast<const uint8_t*>(A_full.data_ptr());
+    const int64_t a_full_row_stride = K_total_fp4;
+
+    for (int i = 0; i < n; ++i) {
+        constexpr int64_t swizzle_elements = 128;
+        const int64_t fp4_cols = A_col_widths[i];
+        const int64_t fp4_offset = A_col_offsets[i];
+        const void* data_ptr = a_base + fp4_offset;
+
+        uint64_t gmem_shape[5] = {
+            static_cast<uint64_t>(swizzle_elements),
+            static_cast<uint64_t>(M),
+            static_cast<uint64_t>((fp4_cols + swizzle_elements - 1) / swizzle_elements),
+            1, 1
+        };
+        uint64_t gmem_stride[4] = {
+            static_cast<uint64_t>(a_full_row_stride),
+            128,
+            static_cast<uint64_t>(M * a_full_row_stride),
+            static_cast<uint64_t>(M * a_full_row_stride)
+        };
+        uint32_t smem_shape[5] = {
+            static_cast<uint32_t>(swizzle_elements),
+            static_cast<uint32_t>(C::Mb / 2),
+            1, 1, 1
+        };
+        uint32_t smem_stride[5] = {1, 1, 1, 1, 1};
+
+        CUresult result = cuTensorMapEncodeTiled(
+            &g_host.A_tma[i],
+            CU_TENSOR_MAP_DATA_TYPE_UINT8,
+            5,
+            const_cast<void*>(data_ptr),
+            gmem_shape,
+            gmem_stride,
+            smem_shape,
+            smem_stride,
+            CU_TENSOR_MAP_INTERLEAVE_NONE,
+            CU_TENSOR_MAP_SWIZZLE_128B,
+            CU_TENSOR_MAP_L2_PROMOTION_NONE,
+            CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE
+        );
+        TORCH_CHECK(result == CUDA_SUCCESS,
+                    "Strided localCTA A TMA creation failed for batch ", i);
+
+        auto a_sc_gl = kittens::py::tensor_to_gl<typename G::A_sc_gl, false>(
+            A_sc_prepared_list[i], 1,
+            A_sc_prepared_list[i].dim() == 2 ? A_sc_prepared_list[i].size(0) / 128 : A_sc_prepared_list[i].size(0),
+            A_sc_prepared_list[i].dim() == 2 ? A_sc_prepared_list[i].size(1) / 4 : A_sc_prepared_list[i].size(1),
+            256);
+        auto b_gl = kittens::py::tensor_to_gl<typename G::B_fp4x2_gl>(B_list[i]);
+        auto b_sc_gl = kittens::py::tensor_to_gl<typename G::B_sc_gl, false>(
+            B_sc_prepared_list[i], 1,
+            B_sc_prepared_list[i].dim() == 2 ? B_sc_prepared_list[i].size(0) / 128 : B_sc_prepared_list[i].size(0),
+            B_sc_prepared_list[i].dim() == 2 ? B_sc_prepared_list[i].size(1) / 4 : B_sc_prepared_list[i].size(1),
+            256);
+        auto d_gl = kittens::py::tensor_to_gl<typename G::D_gl>(D_list[i]);
+
+        memcpy(&g_host.A_sc_tma[i], &a_sc_gl.tma_descs.tma_desc, sizeof(CUtensorMap));
+        memcpy(&g_host.B_tma[i], &b_gl.tma_descs.tma_desc, sizeof(CUtensorMap));
+        memcpy(&g_host.B_sc_tma[i], &b_sc_gl.tma_descs.tma_desc, sizeof(CUtensorMap));
+        memcpy(&g_host.D_tma[i], &d_gl.tma_descs.tma_desc, sizeof(CUtensorMap));
+
+        g_host.A_sg[i] = one_ptr;
+        g_host.B_sg[i] = one_ptr;
+    }
+
+    kittens::py::launch_kernel<C, G, nvfp4_batched_gemm::kernel<C>>(g_host);
+}
+
 void launch_fast_batched_accum_gemm(
     const std::vector<at::Tensor>& A_list,
     const std::vector<at::Tensor>& A_sc_prepared_list,
@@ -819,6 +931,113 @@ void launch_fast_split3_dgrad_gemm_strided(
     launch_fast_batched_accum_gemm_strided_with_config<localcta_fast_batched_config>(
         A_full, A_sc_prepared_list, B_list, B_sc_prepared_list,
         A_col_offsets, A_col_widths, D_out);
+}
+
+void launch_fast_split3_dgrad_gemm_strided_sum(
+    const at::Tensor& A_full,
+    const std::vector<at::Tensor>& A_sc_prepared_list,
+    const std::vector<int64_t>& A_col_offsets,
+    const std::vector<int64_t>& A_col_widths,
+    const std::vector<at::Tensor>& B_list,
+    const std::vector<at::Tensor>& B_sc_prepared_list,
+    at::Tensor& D_out
+) {
+    TORCH_CHECK(A_sc_prepared_list.size() == 3, "split3 strided dgrad expects 3 A scale batches");
+    TORCH_CHECK(B_list.size() == 3, "split3 strided dgrad expects 3 B batches");
+
+    std::vector<at::Tensor> D_list;
+    D_list.reserve(3);
+    for (int i = 0; i < 3; ++i) {
+        D_list.push_back(at::empty_like(D_out));
+    }
+
+    const int64_t max_reduction_k =
+        2 * (*std::max_element(A_col_widths.begin(), A_col_widths.end()));
+    if (max_reduction_k >= 2048) {
+        launch_fast_batched_gemm_strided_with_config<localcta_fast_split3_dgrad_config>(
+            A_full, A_sc_prepared_list, B_list, B_sc_prepared_list,
+            A_col_offsets, A_col_widths, D_list);
+    } else {
+        launch_fast_batched_gemm_strided_with_config<localcta_fast_batched_config>(
+            A_full, A_sc_prepared_list, B_list, B_sc_prepared_list,
+            A_col_offsets, A_col_widths, D_list);
+    }
+
+    const int64_t numel = D_out.numel();
+    const int threads = 256;
+    const int blocks = static_cast<int>((numel + threads - 1) / threads);
+    auto stream = at::cuda::getCurrentCUDAStream();
+    sum3_tensors_kernel<<<blocks, threads, 0, stream>>>(
+        reinterpret_cast<const __nv_bfloat16*>(D_list[0].data_ptr()),
+        reinterpret_cast<const __nv_bfloat16*>(D_list[1].data_ptr()),
+        reinterpret_cast<const __nv_bfloat16*>(D_list[2].data_ptr()),
+        reinterpret_cast<__nv_bfloat16*>(D_out.data_ptr()),
+        numel);
+    CUDACHECK(cudaGetLastError());
+}
+
+void launch_fast_split2_dgrad_gemm_strided_sum(
+    const at::Tensor& A_full,
+    const std::vector<at::Tensor>& A_sc_prepared_list,
+    const std::vector<int64_t>& A_col_offsets,
+    const std::vector<int64_t>& A_col_widths,
+    const std::vector<at::Tensor>& B_list,
+    const std::vector<at::Tensor>& B_sc_prepared_list,
+    at::Tensor& D_out
+) {
+    TORCH_CHECK(A_sc_prepared_list.size() == 2, "split2 strided dgrad expects 2 A scale batches");
+    TORCH_CHECK(B_list.size() == 2, "split2 strided dgrad expects 2 B batches");
+
+    std::vector<at::Tensor> D_list;
+    D_list.reserve(2);
+    for (int i = 0; i < 2; ++i) {
+        D_list.push_back(at::empty_like(D_out));
+    }
+
+    const int64_t max_reduction_k =
+        2 * (*std::max_element(A_col_widths.begin(), A_col_widths.end()));
+    if (max_reduction_k >= 2048) {
+        launch_fast_batched_gemm_strided_with_config<localcta_fast_split2_dgrad_config>(
+            A_full, A_sc_prepared_list, B_list, B_sc_prepared_list,
+            A_col_offsets, A_col_widths, D_list);
+    } else {
+        launch_fast_batched_gemm_strided_with_config<localcta_fast_batched_config>(
+            A_full, A_sc_prepared_list, B_list, B_sc_prepared_list,
+            A_col_offsets, A_col_widths, D_list);
+    }
+
+    const int64_t numel = D_out.numel();
+    const int threads = 256;
+    const int blocks = static_cast<int>((numel + threads - 1) / threads);
+    auto stream = at::cuda::getCurrentCUDAStream();
+    sum_tensors_kernel<<<blocks, threads, 0, stream>>>(
+        reinterpret_cast<const __nv_bfloat16*>(D_list[0].data_ptr()),
+        reinterpret_cast<const __nv_bfloat16*>(D_list[1].data_ptr()),
+        reinterpret_cast<__nv_bfloat16*>(D_out.data_ptr()),
+        numel);
+    CUDACHECK(cudaGetLastError());
+}
+
+void launch_fast_batched_gemm_strided(
+    const at::Tensor& A_full,
+    const std::vector<at::Tensor>& A_sc_prepared_list,
+    const std::vector<int64_t>& A_col_offsets,
+    const std::vector<int64_t>& A_col_widths,
+    const std::vector<at::Tensor>& B_list,
+    const std::vector<at::Tensor>& B_sc_prepared_list,
+    std::vector<at::Tensor>& D_list
+) {
+    const int64_t max_reduction_k =
+        2 * (*std::max_element(A_col_widths.begin(), A_col_widths.end()));
+    if (max_reduction_k >= 2048) {
+        launch_fast_batched_gemm_strided_with_config<localcta_fast_split3_dgrad_config>(
+            A_full, A_sc_prepared_list, B_list, B_sc_prepared_list,
+            A_col_offsets, A_col_widths, D_list);
+        return;
+    }
+    launch_fast_batched_gemm_strided_with_config<localcta_fast_batched_config>(
+        A_full, A_sc_prepared_list, B_list, B_sc_prepared_list,
+        A_col_offsets, A_col_widths, D_list);
 }
 
 __global__ void sum_tensors_kernel(
@@ -1000,6 +1219,54 @@ void nvfp4_localcta_fast_batched_gemm_entrypoint(
     launch_fast_batched_gemm(A_list, A_sc_prepared_list, B_list, B_sc_prepared_list, D_list);
 }
 
+void nvfp4_localcta_fast_batched_gemm_strided_entrypoint(
+    const at::Tensor& A_full,
+    const std::vector<at::Tensor>& A_sc_prepared_list,
+    const std::vector<at::Tensor>& A_sg_chunks_list,
+    const std::vector<int64_t>& A_col_offsets,
+    const std::vector<int64_t>& A_col_widths,
+    const std::vector<at::Tensor>& B_list,
+    const std::vector<at::Tensor>& B_sc_prepared_list,
+    const std::vector<at::Tensor>& B_sg_chunks_list,
+    std::vector<at::Tensor>& D_list
+) {
+    (void)A_sg_chunks_list;
+    (void)B_sg_chunks_list;
+    check_fast_batched_strided_inputs(
+        A_full, A_sc_prepared_list,
+        A_col_offsets, A_col_widths,
+        B_list, B_sc_prepared_list);
+
+    const int n = static_cast<int>(A_sc_prepared_list.size());
+    TORCH_CHECK(n <= nvfp4_batched_gemm::MAX_BATCHES,
+                "num_batches must be 1..", nvfp4_batched_gemm::MAX_BATCHES);
+    TORCH_CHECK(n == static_cast<int>(D_list.size()),
+                "D_list length must match number of batches");
+    for (int i = 0; i < n; ++i) {
+        check_output_matrix(D_list[i], "D_list[i]", A_full.size(0), B_list[i].size(0));
+    }
+    launch_fast_batched_gemm_strided(
+        A_full, A_sc_prepared_list, A_col_offsets, A_col_widths,
+        B_list, B_sc_prepared_list, D_list);
+}
+
+void nvfp4_localcta_fast_batched_gemm_strided_nopdl_entrypoint(
+    const at::Tensor& A_full,
+    const std::vector<at::Tensor>& A_sc_prepared_list,
+    const std::vector<at::Tensor>& A_sg_chunks_list,
+    const std::vector<int64_t>& A_col_offsets,
+    const std::vector<int64_t>& A_col_widths,
+    const std::vector<at::Tensor>& B_list,
+    const std::vector<at::Tensor>& B_sc_prepared_list,
+    const std::vector<at::Tensor>& B_sg_chunks_list,
+    std::vector<at::Tensor>& D_list
+) {
+    nvfp4_localcta_fast_batched_gemm_strided_entrypoint(
+        A_full, A_sc_prepared_list, A_sg_chunks_list,
+        A_col_offsets, A_col_widths,
+        B_list, B_sc_prepared_list, B_sg_chunks_list, D_list);
+}
+
 void nvfp4_localcta_batched_accum_gemm_entrypoint(
     const std::vector<at::Tensor>& A_list,
     const std::vector<at::Tensor>& A_sc_list,
@@ -1117,6 +1384,171 @@ void nvfp4_localcta_fast_split3_dgrad_strided_gemm_entrypoint(
         B_list, B_sc_prepared_list, D_out);
 }
 
+void nvfp4_localcta_fast_split3_dgrad_strided_sum_gemm_entrypoint(
+    const at::Tensor& A_full,
+    const std::vector<at::Tensor>& A_sc_prepared_list,
+    const std::vector<int64_t>& A_col_offsets,
+    const std::vector<int64_t>& A_col_widths,
+    const std::vector<at::Tensor>& B_list,
+    const std::vector<at::Tensor>& B_sc_prepared_list,
+    at::Tensor& D_out
+) {
+    check_fast_batched_strided_inputs(
+        A_full, A_sc_prepared_list,
+        A_col_offsets, A_col_widths,
+        B_list, B_sc_prepared_list);
+    TORCH_CHECK(A_sc_prepared_list.size() == 3, "split3 strided dgrad expects exactly 3 A batches");
+    TORCH_CHECK(B_list.size() == 3, "split3 strided dgrad expects exactly 3 B batches");
+    check_output_matrix(D_out, "D_out", A_full.size(0), B_list[0].size(0));
+    launch_fast_split3_dgrad_gemm_strided_sum(
+        A_full, A_sc_prepared_list, A_col_offsets, A_col_widths,
+        B_list, B_sc_prepared_list, D_out);
+}
+
+void nvfp4_localcta_fast_split2_dgrad_strided_sum_gemm_entrypoint(
+    const at::Tensor& A_full,
+    const std::vector<at::Tensor>& A_sc_prepared_list,
+    const std::vector<int64_t>& A_col_offsets,
+    const std::vector<int64_t>& A_col_widths,
+    const std::vector<at::Tensor>& B_list,
+    const std::vector<at::Tensor>& B_sc_prepared_list,
+    at::Tensor& D_out
+) {
+    check_fast_batched_strided_inputs(
+        A_full, A_sc_prepared_list,
+        A_col_offsets, A_col_widths,
+        B_list, B_sc_prepared_list);
+    TORCH_CHECK(A_sc_prepared_list.size() == 2, "split2 strided dgrad expects exactly 2 A batches");
+    TORCH_CHECK(B_list.size() == 2, "split2 strided dgrad expects exactly 2 B batches");
+    check_output_matrix(D_out, "D_out", A_full.size(0), B_list[0].size(0));
+    launch_fast_split2_dgrad_gemm_strided_sum(
+        A_full, A_sc_prepared_list, A_col_offsets, A_col_widths,
+        B_list, B_sc_prepared_list, D_out);
+}
+
+void nvfp4_localcta_split_dgrad_sum_entrypoint(
+    const at::Tensor& A_fp4_cat,
+    const at::Tensor& A_sc_cat,
+    const std::vector<at::Tensor>& A_sg_list,
+    const std::vector<at::Tensor>& B_fp4_list,
+    const std::vector<at::Tensor>& B_sc_list,
+    const at::Tensor& B_sg_cat,
+    const std::vector<int64_t>& split_dims,
+    at::Tensor& D_out
+) {
+    (void)A_sg_list;
+    (void)B_sg_cat;
+    check_fp4_matrix(A_fp4_cat, "A_fp4_cat");
+    TORCH_CHECK(A_sc_cat.is_cuda() && A_sc_cat.is_contiguous(), "A_sc_cat must be contiguous CUDA tensor");
+    TORCH_CHECK(A_sc_cat.scalar_type() == at::kFloat8_e4m3fn, "A_sc_cat must be fp8 e4m3");
+    TORCH_CHECK(A_sc_cat.dim() == 3, "A_sc_cat must be 3D");
+    const int n_splits = static_cast<int>(split_dims.size());
+    TORCH_CHECK(n_splits >= 2 && n_splits <= 3, "split_dgrad_sum supports 2 or 3 splits");
+    TORCH_CHECK(n_splits == static_cast<int>(B_fp4_list.size()), "B_fp4_list size mismatch");
+    TORCH_CHECK(n_splits == static_cast<int>(B_sc_list.size()), "B_sc_list size mismatch");
+
+    std::vector<at::Tensor> A_sc_list;
+    std::vector<int64_t> A_col_offsets;
+    std::vector<int64_t> A_col_widths;
+    A_sc_list.reserve(n_splits);
+    A_col_offsets.reserve(n_splits);
+    A_col_widths.reserve(n_splits);
+
+    int64_t sc_offset = 0;
+    int64_t fp4_offset = 0;
+    for (int i = 0; i < n_splits; ++i) {
+        const int64_t n_i = split_dims[i];
+        TORCH_CHECK(n_i % 128 == 0, "split dims must be multiples of 128");
+        A_sc_list.push_back(A_sc_cat.narrow(1, sc_offset, n_i / 64));
+        A_col_offsets.push_back(fp4_offset);
+        A_col_widths.push_back(n_i / 2);
+        sc_offset += n_i / 64;
+        fp4_offset += n_i / 2;
+    }
+
+    std::vector<at::Tensor> D_list;
+    D_list.reserve(n_splits);
+    for (int i = 0; i < n_splits; ++i) {
+        D_list.push_back(at::empty_like(D_out));
+    }
+
+    launch_fast_batched_gemm_strided(
+        A_fp4_cat, A_sc_list, A_col_offsets, A_col_widths,
+        B_fp4_list, B_sc_list, D_list);
+
+    const int64_t numel = D_out.numel();
+    const int threads = 256;
+    const int blocks = static_cast<int>((numel + threads - 1) / threads);
+    auto stream = at::cuda::getCurrentCUDAStream();
+    if (n_splits == 2) {
+        sum_tensors_kernel<<<blocks, threads, 0, stream>>>(
+            reinterpret_cast<const __nv_bfloat16*>(D_list[0].data_ptr()),
+            reinterpret_cast<const __nv_bfloat16*>(D_list[1].data_ptr()),
+            reinterpret_cast<__nv_bfloat16*>(D_out.data_ptr()),
+            numel);
+    } else {
+        sum3_tensors_kernel<<<blocks, threads, 0, stream>>>(
+            reinterpret_cast<const __nv_bfloat16*>(D_list[0].data_ptr()),
+            reinterpret_cast<const __nv_bfloat16*>(D_list[1].data_ptr()),
+            reinterpret_cast<const __nv_bfloat16*>(D_list[2].data_ptr()),
+            reinterpret_cast<__nv_bfloat16*>(D_out.data_ptr()),
+            numel);
+    }
+    CUDACHECK(cudaGetLastError());
+}
+
+void sum2_bf16_entrypoint(
+    const at::Tensor& A,
+    const at::Tensor& B,
+    at::Tensor& D_out
+) {
+    check_output_matrix(D_out, "D_out", A.size(0), A.size(1));
+    TORCH_CHECK(B.is_cuda() && B.is_contiguous() && B.scalar_type() == at::kBFloat16,
+                "B must be contiguous CUDA bf16");
+    TORCH_CHECK(A.is_cuda() && A.is_contiguous() && A.scalar_type() == at::kBFloat16,
+                "A must be contiguous CUDA bf16");
+    TORCH_CHECK(A.sizes() == B.sizes() && A.sizes() == D_out.sizes(),
+                "sum2_bf16 inputs must have identical shapes");
+    const int64_t numel = D_out.numel();
+    const int threads = 256;
+    const int blocks = static_cast<int>((numel + threads - 1) / threads);
+    auto stream = at::cuda::getCurrentCUDAStream();
+    sum_tensors_kernel<<<blocks, threads, 0, stream>>>(
+        reinterpret_cast<const __nv_bfloat16*>(A.data_ptr()),
+        reinterpret_cast<const __nv_bfloat16*>(B.data_ptr()),
+        reinterpret_cast<__nv_bfloat16*>(D_out.data_ptr()),
+        numel);
+    CUDACHECK(cudaGetLastError());
+}
+
+void sum3_bf16_entrypoint(
+    const at::Tensor& A,
+    const at::Tensor& B,
+    const at::Tensor& C,
+    at::Tensor& D_out
+) {
+    check_output_matrix(D_out, "D_out", A.size(0), A.size(1));
+    TORCH_CHECK(A.is_cuda() && A.is_contiguous() && A.scalar_type() == at::kBFloat16,
+                "A must be contiguous CUDA bf16");
+    TORCH_CHECK(B.is_cuda() && B.is_contiguous() && B.scalar_type() == at::kBFloat16,
+                "B must be contiguous CUDA bf16");
+    TORCH_CHECK(C.is_cuda() && C.is_contiguous() && C.scalar_type() == at::kBFloat16,
+                "C must be contiguous CUDA bf16");
+    TORCH_CHECK(A.sizes() == B.sizes() && A.sizes() == C.sizes() && A.sizes() == D_out.sizes(),
+                "sum3_bf16 inputs must have identical shapes");
+    const int64_t numel = D_out.numel();
+    const int threads = 256;
+    const int blocks = static_cast<int>((numel + threads - 1) / threads);
+    auto stream = at::cuda::getCurrentCUDAStream();
+    sum3_tensors_kernel<<<blocks, threads, 0, stream>>>(
+        reinterpret_cast<const __nv_bfloat16*>(A.data_ptr()),
+        reinterpret_cast<const __nv_bfloat16*>(B.data_ptr()),
+        reinterpret_cast<const __nv_bfloat16*>(C.data_ptr()),
+        reinterpret_cast<__nv_bfloat16*>(D_out.data_ptr()),
+        numel);
+    CUDACHECK(cudaGetLastError());
+}
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("nvfp4_localcta_gemm", &nvfp4_localcta_gemm_entrypoint,
           pybind11::arg("A"), pybind11::arg("A_sc"), pybind11::arg("A_sg_chunks"),
@@ -1145,6 +1577,20 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           pybind11::arg("A_list"), pybind11::arg("A_sc_prepared_list"),
           pybind11::arg("B_list"), pybind11::arg("B_sc_prepared_list"),
           pybind11::arg("D_list"));
+    m.def("nvfp4_localcta_fast_batched_gemm_strided",
+          &nvfp4_localcta_fast_batched_gemm_strided_entrypoint,
+          pybind11::arg("A_full"), pybind11::arg("A_sc_prepared_list"),
+          pybind11::arg("A_sg_chunks_list"), pybind11::arg("A_col_offsets"),
+          pybind11::arg("A_col_widths"), pybind11::arg("B_list"),
+          pybind11::arg("B_sc_prepared_list"), pybind11::arg("B_sg_chunks_list"),
+          pybind11::arg("D_list"));
+    m.def("nvfp4_localcta_fast_batched_gemm_strided_nopdl",
+          &nvfp4_localcta_fast_batched_gemm_strided_nopdl_entrypoint,
+          pybind11::arg("A_full"), pybind11::arg("A_sc_prepared_list"),
+          pybind11::arg("A_sg_chunks_list"), pybind11::arg("A_col_offsets"),
+          pybind11::arg("A_col_widths"), pybind11::arg("B_list"),
+          pybind11::arg("B_sc_prepared_list"), pybind11::arg("B_sg_chunks_list"),
+          pybind11::arg("D_list"));
     m.def("nvfp4_localcta_batched_accum_gemm", &nvfp4_localcta_batched_accum_gemm_entrypoint,
           pybind11::arg("A_list"), pybind11::arg("A_sc_list"),
           pybind11::arg("A_sg_chunks_list"), pybind11::arg("B_list"),
@@ -1164,4 +1610,27 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           pybind11::arg("A_col_offsets"), pybind11::arg("A_col_widths"),
           pybind11::arg("B_list"),
           pybind11::arg("B_sc_prepared_list"), pybind11::arg("D_out"));
+    m.def("nvfp4_localcta_fast_split3_dgrad_strided_sum_gemm",
+          &nvfp4_localcta_fast_split3_dgrad_strided_sum_gemm_entrypoint,
+          pybind11::arg("A_full"), pybind11::arg("A_sc_prepared_list"),
+          pybind11::arg("A_col_offsets"), pybind11::arg("A_col_widths"),
+          pybind11::arg("B_list"),
+          pybind11::arg("B_sc_prepared_list"), pybind11::arg("D_out"));
+    m.def("nvfp4_localcta_fast_split2_dgrad_strided_sum_gemm",
+          &nvfp4_localcta_fast_split2_dgrad_strided_sum_gemm_entrypoint,
+          pybind11::arg("A_full"), pybind11::arg("A_sc_prepared_list"),
+          pybind11::arg("A_col_offsets"), pybind11::arg("A_col_widths"),
+          pybind11::arg("B_list"),
+          pybind11::arg("B_sc_prepared_list"), pybind11::arg("D_out"));
+    m.def("nvfp4_localcta_split_dgrad_sum",
+          &nvfp4_localcta_split_dgrad_sum_entrypoint,
+          pybind11::arg("A_fp4_cat"), pybind11::arg("A_sc_cat"),
+          pybind11::arg("A_sg_list"), pybind11::arg("B_fp4_list"),
+          pybind11::arg("B_sc_list"), pybind11::arg("B_sg_cat"),
+          pybind11::arg("split_dims"), pybind11::arg("D_out"));
+    m.def("sum2_bf16", &sum2_bf16_entrypoint,
+          pybind11::arg("A"), pybind11::arg("B"), pybind11::arg("D_out"));
+    m.def("sum3_bf16", &sum3_bf16_entrypoint,
+          pybind11::arg("A"), pybind11::arg("B"), pybind11::arg("C"),
+          pybind11::arg("D_out"));
 }
