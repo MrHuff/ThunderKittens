@@ -1002,6 +1002,7 @@ using bwd_v3_fp4_public_colwg_colpair_rowpair_rowslotrecord_rowsync_overlap_L4_S
 using bwd_v3_fp4_public_colwg_colpair_rowpair_rowrecord_rowsync_rcp_overlap_L4_SG8 = nvfp4_cce_backward_v3::experimental_config_colwg_colpair_rowpair_rowrecord_rowsync_rcp_overlap<4, 8, true>;
 using bwd_v3_fp4_public_colwg_colpair_rowpair_rowrecord_rowsync_floatcache_overlap_L4_SG8 = nvfp4_cce_backward_v3::experimental_config_colwg_colpair_rowpair_rowrecord_rowsync_floatcache_overlap<4, 8, true>;
 using bwd_v3_fp4_public_colwg_colpair_rowpair_rowrecord_rowsync_dualfloatcache_overlap_L4_SG8 = nvfp4_cce_backward_v3::experimental_config_colwg_colpair_rowpair_rowrecord_rowsync_dualfloatcache_overlap<4, 8, true>;
+using bwd_v3_fp4_public_colwg_colpair_rowpair_rowrecord_rowsync_dualfloatcache_row16ready_overlap_L4_SG8 = nvfp4_cce_backward_v3::experimental_config_colwg_colpair_rowpair_rowrecord_rowsync_dualfloatcache_row16ready_overlap<4, 8, true>;
 using bwd_v3_fp4_public_colwg_colpair_rowpair_rowrecord_rowsync_row16ready_overlap_L4_SG8 = nvfp4_cce_backward_v3::experimental_config_colwg_colpair_rowpair_rowrecord_rowsync_row16ready_overlap<4, 8, true>;
 using bwd_v3_fp4_public_colwg_colpair_rowpair_lanepairrecord_overlap_L4_SG8 = nvfp4_cce_backward_v3::experimental_config_colwg_colpair_rowpair_lanepairrecord_overlap<4, 8, true>;
 using bwd_v3_fp4_public_colwg_colpair_rowpair_rowrecord_rcp_overlap_L4_SG8 = nvfp4_cce_backward_v3::experimental_config_colwg_colpair_rowpair_rowrecord_rcp_overlap<4, 8, true>;
@@ -1017,6 +1018,39 @@ using bwd_v3_expcolwg_fp4_L4_SG8 = nvfp4_cce_backward_v3::experimental_config_co
 using bwd_v3_expcol2wg_fp4_L4_SG8 = nvfp4_cce_backward_v3::experimental_config_col2wg<4, 8, true>;
 using bwd_v3_exp4wg_fp4_L4_SG8 = nvfp4_cce_backward_v3::experimental_config_4wg<4, 8, true>;
 
+static void launch_backward_v3_fp4_public_dispatch_L4_SG8(
+    const at::Tensor &A, const at::Tensor &A_sc, const at::Tensor &A_sc_global,
+    const at::Tensor &B, const at::Tensor &B_sc, const at::Tensor &B_sc_global,
+    at::Tensor &G_fp4_row, at::Tensor &G_sc_row, at::Tensor &G_sg_row,
+    at::Tensor &G_fp4_col, at::Tensor &G_sc_col,
+    const at::Tensor &lse, const at::Tensor &targets,
+    float grad_scale, int M, int N, float filter_eps = 0.0f,
+    bool encode_centric = false)
+{
+    // The row16-ready overlap variant is a small but consistent win on the
+    // 32K-class shapes we ship today, while 128K still slightly prefers the
+    // simpler dual-float-cache baseline.
+    if (N <= 32768) {
+        launch_experimental_backward_v3_fp4_3wg<
+            bwd_v3_fp4_public_colwg_colpair_rowpair_rowrecord_rowsync_dualfloatcache_row16ready_overlap_L4_SG8>(
+            A, A_sc, A_sc_global,
+            B, B_sc, B_sc_global,
+            G_fp4_row, G_sc_row, G_sg_row,
+            G_fp4_col, G_sc_col,
+            lse, targets,
+            grad_scale, M, N, filter_eps, encode_centric);
+    } else {
+        launch_experimental_backward_v3_fp4_3wg<
+            bwd_v3_fp4_public_colwg_L4_SG8>(
+            A, A_sc, A_sc_global,
+            B, B_sc, B_sc_global,
+            G_fp4_row, G_sc_row, G_sg_row,
+            G_fp4_col, G_sc_col,
+            lse, targets,
+            grad_scale, M, N, filter_eps, encode_centric);
+    }
+}
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("backward_v3_bf16_L4_SG8", &launch_backward_v3_bf16<bwd_v3_bf16_L4_SG8>,
           "NVFP4 CCE backward v3 (BF16 output) L4 SG8");
@@ -1024,7 +1058,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     // analytic G_sg_row, and now uses the TE-inspired colpair mailbox variant
     // of the consumer-row / quantizer-col split because it is the current
     // strongest fused candidate.
-    m.def("backward_v3_fp4_L4_SG8", &launch_experimental_backward_v3_fp4_3wg<bwd_v3_fp4_public_colwg_L4_SG8>,
+    m.def("backward_v3_fp4_L4_SG8", &launch_backward_v3_fp4_public_dispatch_L4_SG8,
           "NVFP4 CCE backward v3 (FP4 output, consumer-row/col-WG) L4 SG8");
     m.def("experimental_backward_v3_fp4_L4_SG8", &launch_experimental_backward_v3_fp4<bwd_v3_fp4_L4_SG8>,
           "NVFP4 CCE backward v3 experimental (FP4 output) L4 SG8");
@@ -1142,6 +1176,12 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           "NVFP4 CCE backward v3 experimental public col-WG colpair+rowpair rowrecord dual float-cache row-only (FP4 output) L4 SG8");
     m.def("experimental_backward_v3_fp4_colwg_colpair_rowpair_rowrecord_rowsync_dualfloatcache_overlap_colonly_L4_SG8", &launch_experimental_backward_v3_fp4_3wg_colonly<bwd_v3_fp4_public_colwg_colpair_rowpair_rowrecord_rowsync_dualfloatcache_overlap_L4_SG8>,
           "NVFP4 CCE backward v3 experimental public col-WG colpair+rowpair rowrecord dual float-cache col-only (FP4 output) L4 SG8");
+    m.def("experimental_backward_v3_fp4_colwg_colpair_rowpair_rowrecord_rowsync_dualfloatcache_row16ready_overlap_L4_SG8", &launch_experimental_backward_v3_fp4_3wg<bwd_v3_fp4_public_colwg_colpair_rowpair_rowrecord_rowsync_dualfloatcache_row16ready_overlap_L4_SG8>,
+          "NVFP4 CCE backward v3 experimental public col-WG colpair+rowpair rowrecord dual float-cache row16-ready overlap (FP4 output) L4 SG8");
+    m.def("experimental_backward_v3_fp4_colwg_colpair_rowpair_rowrecord_rowsync_dualfloatcache_row16ready_overlap_rowonly_L4_SG8", &launch_experimental_backward_v3_fp4_3wg_rowonly<bwd_v3_fp4_public_colwg_colpair_rowpair_rowrecord_rowsync_dualfloatcache_row16ready_overlap_L4_SG8>,
+          "NVFP4 CCE backward v3 experimental public col-WG colpair+rowpair rowrecord dual float-cache row16-ready row-only (FP4 output) L4 SG8");
+    m.def("experimental_backward_v3_fp4_colwg_colpair_rowpair_rowrecord_rowsync_dualfloatcache_row16ready_overlap_colonly_L4_SG8", &launch_experimental_backward_v3_fp4_3wg_colonly<bwd_v3_fp4_public_colwg_colpair_rowpair_rowrecord_rowsync_dualfloatcache_row16ready_overlap_L4_SG8>,
+          "NVFP4 CCE backward v3 experimental public col-WG colpair+rowpair rowrecord dual float-cache row16-ready col-only (FP4 output) L4 SG8");
     m.def("experimental_backward_v3_fp4_colwg_colpair_rowpair_rowrecord_rowsync_row16ready_overlap_L4_SG8", &launch_experimental_backward_v3_fp4_3wg<bwd_v3_fp4_public_colwg_colpair_rowpair_rowrecord_rowsync_row16ready_overlap_L4_SG8>,
           "NVFP4 CCE backward v3 experimental public col-WG colpair+rowpair rowrecord row16-granular col-ready overlap (FP4 output) L4 SG8");
     m.def("experimental_backward_v3_fp4_colwg_colpair_rowpair_rowrecord_rowsync_row16ready_overlap_rowonly_L4_SG8", &launch_experimental_backward_v3_fp4_3wg_rowonly<bwd_v3_fp4_public_colwg_colpair_rowpair_rowrecord_rowsync_row16ready_overlap_L4_SG8>,
