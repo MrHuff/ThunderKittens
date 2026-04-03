@@ -8,6 +8,7 @@
 #include <cuda_runtime.h>
 
 #include <algorithm>
+#include <cstdint>
 #include <cstring>
 #include <optional>
 #include <tuple>
@@ -72,6 +73,67 @@ void check_scale_tensor(const at::Tensor& t, const char* name, int64_t rows, int
     TORCH_CHECK(t.size(0) == rows / 128, name, " first dim mismatch");
     TORCH_CHECK(t.size(1) == cols / 64, name, " second dim mismatch");
     TORCH_CHECK(t.size(2) == kScaleBytesPerTile, name, " third dim must be 512");
+}
+
+void check_scale_tensor_tma_compatible(const at::Tensor& t, const char* name, int64_t rows, int64_t cols) {
+    TORCH_CHECK(t.is_cuda(), name, " must be CUDA");
+    TORCH_CHECK(t.dim() == 3, name, " must be 3D");
+    TORCH_CHECK(t.scalar_type() == at::kFloat8_e4m3fn, name, " must be fp8 e4m3");
+    TORCH_CHECK(t.size(0) == rows / 128, name, " first dim mismatch");
+    TORCH_CHECK(t.size(1) == cols / 64, name, " second dim mismatch");
+    TORCH_CHECK(t.size(2) == kScaleBytesPerTile, name, " third dim must be 512");
+    TORCH_CHECK(t.stride(2) == 1, name, " last dim must be contiguous");
+    TORCH_CHECK(t.stride(1) == kScaleBytesPerTile,
+                name, " second-dim stride must equal 512 bytes");
+    TORCH_CHECK(t.stride(0) >= t.size(1) * kScaleBytesPerTile,
+                name, " leading stride is too small for a prepared-scale view");
+    const auto data_ptr = reinterpret_cast<uintptr_t>(t.data_ptr());
+    TORCH_CHECK((data_ptr & 0xF) == 0, name, " data pointer must be 16-byte aligned");
+    TORCH_CHECK((t.stride(1) % 16) == 0, name, " second-dim stride must be 16-byte aligned");
+    TORCH_CHECK((t.stride(0) % 16) == 0, name, " leading stride must be 16-byte aligned");
+}
+
+template <typename ST>
+void encode_prepared_scale_tensor_map(CUtensorMap* desc, const at::Tensor& t, const char* name) {
+    static_assert(std::is_same_v<typename ST::dtype, kittens::half>,
+                  "prepared scale TMA helper assumes half logical elements");
+    static_assert(!ST::swizzle, "prepared scale TMA helper only supports non-swizzled tiles");
+    check_scale_tensor_tma_compatible(t, name, t.size(0) * 128, t.size(1) * 64);
+
+    constexpr uint64_t logical_cols = kScaleBytesPerTile / sizeof(typename ST::dtype);
+    uint64_t gmem_shape[4] = {
+        logical_cols,
+        static_cast<uint64_t>(t.size(1)),
+        static_cast<uint64_t>(t.size(0)),
+        1,
+    };
+    uint64_t gmem_stride[3] = {
+        static_cast<uint64_t>(t.stride(1)),
+        static_cast<uint64_t>(t.stride(0)),
+        static_cast<uint64_t>(t.size(0) * t.stride(0)),
+    };
+    uint32_t smem_shape[4] = {
+        static_cast<uint32_t>(ST::cols),
+        static_cast<uint32_t>(ST::rows),
+        1, 1,
+    };
+    uint32_t smem_stride[4] = {1, 1, 1, 1};
+
+    CUresult result = cuTensorMapEncodeTiled(
+        desc,
+        CU_TENSOR_MAP_DATA_TYPE_FLOAT16,
+        4,
+        t.data_ptr(),
+        gmem_shape,
+        gmem_stride,
+        smem_shape,
+        smem_stride,
+        CU_TENSOR_MAP_INTERLEAVE_NONE,
+        CU_TENSOR_MAP_SWIZZLE_NONE,
+        CU_TENSOR_MAP_L2_PROMOTION_NONE,
+        CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE
+    );
+    TORCH_CHECK(result == CUDA_SUCCESS, name, " TMA creation failed");
 }
 
 void check_chunk_grid(const at::Tensor& t, const char* name, int64_t rows, int64_t cols) {
@@ -468,6 +530,47 @@ void check_fast_batched_strided_inputs(
     }
 }
 
+void check_fast_batched_strided_inputs_allow_a_sc_views(
+    const at::Tensor& A_full,
+    const std::vector<at::Tensor>& A_sc_prepared_list,
+    const std::vector<int64_t>& A_col_offsets,
+    const std::vector<int64_t>& A_col_widths,
+    const std::vector<at::Tensor>& B_list,
+    const std::vector<at::Tensor>& B_sc_prepared_list
+) {
+    check_fp4_matrix(A_full, "A_full");
+    TORCH_CHECK(A_full.size(0) % 128 == 0, "A_full M must be a multiple of 128");
+    TORCH_CHECK((A_full.size(1) * 2) % 128 == 0, "A_full K must be a multiple of 128");
+
+    const int n = static_cast<int>(A_sc_prepared_list.size());
+    TORCH_CHECK(n > 0, "strided batched accum requires at least one batch");
+    TORCH_CHECK(n == static_cast<int>(A_col_offsets.size()) &&
+                n == static_cast<int>(A_col_widths.size()) &&
+                n == static_cast<int>(B_list.size()) &&
+                n == static_cast<int>(B_sc_prepared_list.size()),
+                "all strided batched accum inputs must have the same length");
+
+    for (int i = 0; i < n; ++i) {
+        TORCH_CHECK(A_col_offsets[i] >= 0, "A_col_offsets must be non-negative");
+        TORCH_CHECK(A_col_widths[i] > 0, "A_col_widths must be positive");
+        TORCH_CHECK(A_col_offsets[i] + A_col_widths[i] <= A_full.size(1),
+                    "A_full slice exceeds packed width");
+        TORCH_CHECK((A_col_widths[i] * 2) % 128 == 0,
+                    "split widths must be multiples of 128");
+        check_scale_tensor_tma_compatible(A_sc_prepared_list[i], "A_sc_prepared_list[i]",
+                                          A_full.size(0), A_col_widths[i] * 2);
+        check_fp4_matrix(B_list[i], "B_list[i]");
+        TORCH_CHECK(B_list[i].size(1) == A_col_widths[i],
+                    "B_list packed K must match A_col_widths");
+        TORCH_CHECK(B_list[i].size(0) % 128 == 0,
+                    "B_list rows must be multiples of 128");
+        check_scale_tensor(B_sc_prepared_list[i], "B_sc_prepared_list[i]",
+                           B_list[i].size(0), B_list[i].size(1) * 2);
+        kittens::py::device_check(
+            A_full, A_sc_prepared_list[i], B_list[i], B_sc_prepared_list[i]);
+    }
+}
+
 template <typename C>
 void launch_batched_gemm_with_config(
     const std::vector<at::Tensor>& A_list,
@@ -752,11 +855,6 @@ void launch_fast_batched_accum_gemm_strided_with_config(
         TORCH_CHECK(result == CUDA_SUCCESS,
                     "Strided localCTA A TMA creation failed for batch ", i);
 
-        auto a_sc_gl = kittens::py::tensor_to_gl<typename G::A_sc_gl, false>(
-            A_sc_prepared_list[i], 1,
-            A_sc_prepared_list[i].dim() == 2 ? A_sc_prepared_list[i].size(0) / 128 : A_sc_prepared_list[i].size(0),
-            A_sc_prepared_list[i].dim() == 2 ? A_sc_prepared_list[i].size(1) / 4 : A_sc_prepared_list[i].size(1),
-            256);
         auto b_gl = kittens::py::tensor_to_gl<typename G::B_fp4x2_gl>(B_list[i]);
         auto b_sc_gl = kittens::py::tensor_to_gl<typename G::B_sc_gl, false>(
             B_sc_prepared_list[i], 1,
@@ -764,7 +862,8 @@ void launch_fast_batched_accum_gemm_strided_with_config(
             B_sc_prepared_list[i].dim() == 2 ? B_sc_prepared_list[i].size(1) / 4 : B_sc_prepared_list[i].size(1),
             256);
 
-        memcpy(&g_host.A_sc_tma[i], &a_sc_gl.tma_descs.tma_desc, sizeof(CUtensorMap));
+        encode_prepared_scale_tensor_map<typename G::A_sc_tile>(
+            &g_host.A_sc_tma[i], A_sc_prepared_list[i], "A_sc_prepared_list[i]");
         memcpy(&g_host.B_tma[i], &b_gl.tma_descs.tma_desc, sizeof(CUtensorMap));
         memcpy(&g_host.B_sc_tma[i], &b_sc_gl.tma_descs.tma_desc, sizeof(CUtensorMap));
 
@@ -950,11 +1049,6 @@ void launch_fast_split3_dgrad_gemm_strided_onepass_with_config(
         TORCH_CHECK(result == CUDA_SUCCESS,
                     "One-pass split3 localCTA A TMA creation failed for batch ", i);
 
-        auto a_sc_gl = kittens::py::tensor_to_gl<typename G::A_sc_gl, false>(
-            A_sc_prepared_list[i], 1,
-            A_sc_prepared_list[i].dim() == 2 ? A_sc_prepared_list[i].size(0) / 128 : A_sc_prepared_list[i].size(0),
-            A_sc_prepared_list[i].dim() == 2 ? A_sc_prepared_list[i].size(1) / 4 : A_sc_prepared_list[i].size(1),
-            256);
         auto b_gl = kittens::py::tensor_to_gl<typename G::B_fp4x2_gl>(B_list[i]);
         auto b_sc_gl = kittens::py::tensor_to_gl<typename G::B_sc_gl, false>(
             B_sc_prepared_list[i], 1,
@@ -962,7 +1056,8 @@ void launch_fast_split3_dgrad_gemm_strided_onepass_with_config(
             B_sc_prepared_list[i].dim() == 2 ? B_sc_prepared_list[i].size(1) / 4 : B_sc_prepared_list[i].size(1),
             256);
 
-        memcpy(&g_host.A_sc_tma[i], &a_sc_gl.tma_descs.tma_desc, sizeof(CUtensorMap));
+        encode_prepared_scale_tensor_map<typename G::A_sc_tile>(
+            &g_host.A_sc_tma[i], A_sc_prepared_list[i], "A_sc_prepared_list[i]");
         memcpy(&g_host.B_tma[i], &b_gl.tma_descs.tma_desc, sizeof(CUtensorMap));
         memcpy(&g_host.B_sc_tma[i], &b_sc_gl.tma_descs.tma_desc, sizeof(CUtensorMap));
     }
@@ -1049,11 +1144,6 @@ void launch_fast_split2_dgrad_gemm_strided_onepass_with_config(
         TORCH_CHECK(result == CUDA_SUCCESS,
                     "One-pass split2 localCTA A TMA creation failed for batch ", i);
 
-        auto a_sc_gl = kittens::py::tensor_to_gl<typename G::A_sc_gl, false>(
-            A_sc_prepared_list[i], 1,
-            A_sc_prepared_list[i].dim() == 2 ? A_sc_prepared_list[i].size(0) / 128 : A_sc_prepared_list[i].size(0),
-            A_sc_prepared_list[i].dim() == 2 ? A_sc_prepared_list[i].size(1) / 4 : A_sc_prepared_list[i].size(1),
-            256);
         auto b_gl = kittens::py::tensor_to_gl<typename G::B_fp4x2_gl>(B_list[i]);
         auto b_sc_gl = kittens::py::tensor_to_gl<typename G::B_sc_gl, false>(
             B_sc_prepared_list[i], 1,
@@ -1061,7 +1151,8 @@ void launch_fast_split2_dgrad_gemm_strided_onepass_with_config(
             B_sc_prepared_list[i].dim() == 2 ? B_sc_prepared_list[i].size(1) / 4 : B_sc_prepared_list[i].size(1),
             256);
 
-        memcpy(&g_host.A_sc_tma[i], &a_sc_gl.tma_descs.tma_desc, sizeof(CUtensorMap));
+        encode_prepared_scale_tensor_map<typename G::A_sc_tile>(
+            &g_host.A_sc_tma[i], A_sc_prepared_list[i], "A_sc_prepared_list[i]");
         memcpy(&g_host.B_tma[i], &b_gl.tma_descs.tma_desc, sizeof(CUtensorMap));
         memcpy(&g_host.B_sc_tma[i], &b_sc_gl.tma_descs.tma_desc, sizeof(CUtensorMap));
     }
@@ -1826,7 +1917,7 @@ void nvfp4_localcta_fast_split2_dgrad_strided_sum_gemm_entrypoint(
     const std::vector<at::Tensor>& B_sc_prepared_list,
     at::Tensor& D_out
 ) {
-    check_fast_batched_strided_inputs(
+    check_fast_batched_strided_inputs_allow_a_sc_views(
         A_full, A_sc_prepared_list,
         A_col_offsets, A_col_widths,
         B_list, B_sc_prepared_list);
@@ -1848,7 +1939,7 @@ void nvfp4_localcta_fast_split2_dgrad_strided_onepass_gemm_entrypoint(
     at::Tensor& D_out,
     int64_t config_idx
 ) {
-    check_fast_batched_strided_inputs(
+    check_fast_batched_strided_inputs_allow_a_sc_views(
         A_full, A_sc_prepared_list,
         A_col_offsets, A_col_widths,
         B_list, B_sc_prepared_list);
