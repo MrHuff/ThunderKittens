@@ -402,6 +402,25 @@ for (int i = 0; i < EPI_PIPE_DEPTH; i++) {
 - **Epilogue pipelining:** Without it, the store-back is a serial bottleneck — load full 128×256 from TMEM, store to SMEM, then store to GMEM. With pipelining, the store to GMEM for slice `i` overlaps with the SMEM write of slice `i+1`.
 - The epilogue is a bigger deal than it seems — for 128×256 bf16, that's 64KB of store traffic that can now overlap.
 
+> [!IMPORTANT]
+> **Why the epilogue MUST go TMEM → Regs → SMEM → GMEM (no shortcuts)**
+>
+> These are three physically separate hardware units with **no direct connections** between non-adjacent stages:
+>
+> ```
+> ┌──────────┐  tcgen05.ld   ┌──────────┐  st.shared   ┌──────────┐  cp.async.bulk  ┌──────────┐
+> │   TMEM   │──────────────→│   Regs   │─────────────→│   SMEM   │────────────────→│   GMEM   │
+> │(tensor   │               │(register │               │(shared   │                 │  (HBM)   │
+> │ memory)  │               │  file)   │               │ memory)  │                 │          │
+> └──────────┘               └──────────┘               └──────────┘                 └──────────┘
+> ```
+>
+> - **TMEM → Regs:** `tcgen05.ld` — the ONLY instruction that reads from tensor memory
+> - **Regs → SMEM:** `st.shared` — threads write their registers to shared memory
+> - **SMEM → GMEM:** `cp.async.bulk` (TMA store) — the DMA engine only reads from SMEM, not registers
+>
+> There is no `TMEM → GMEM` path, no `TMEM → SMEM` path, and no `Regs → GMEM via TMA` path in hardware. The 3-hop route is forced by the silicon. This is why epilogue optimization (sub-tiling, overlapping stores) matters — you're stuck doing 3 data movements no matter what.
+
 ---
 
 ## Level 09 — 2-CTA Cluster + Warpgroup Parallelism → ~1285 TFLOPS
