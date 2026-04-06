@@ -188,7 +188,7 @@ static void launch_nvfp4_gemm_bridge_overlap_combo(
             cudaEventRecord(side_done_event, side_stream.stream());
         }
         auto G_sc_row_fp8 = G_sc_row.view(at::kFloat8_e4m3fn);
-        launch_nvfp4_gemm_bridge_nopdl(
+        launch_nvfp4_gemm_bridge(
             G_fp4_row, G_sc_row_fp8, G_sg_row,
             C_col, C_col_sc, C_col_sc_global,
             dE_out);
@@ -204,7 +204,7 @@ static void launch_nvfp4_gemm_bridge_overlap_combo(
         }
         auto G_fp4_col_fp4x2 = G_fp4_col.view(at::kFloat4_e2m1fn_x2);
         auto G_sc_col_fp8 = G_sc_col.view(at::kFloat8_e4m3fn);
-        launch_nvfp4_gemm_bridge_nopdl(
+        launch_nvfp4_gemm_bridge(
             G_fp4_col_fp4x2, G_sc_col_fp8, G_sg_row,
             E_col, E_col_sc, E_col_sc_global,
             dC_out);
