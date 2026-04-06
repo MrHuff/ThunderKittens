@@ -11,6 +11,84 @@ using exp_bwd_v6_combo_publicv3_fp4_L4_SG8 =
     nvfp4_cce_backward_v3::experimental_config_colwg_colpairpad_rowpair_lanepairrecord_rowsync_dualfloatcache_rowhwfp4_row16ready_overlap_combo_storeadd<4, 8, true, 4>;
 using exp_bwd_v6_combo_publicv3_fp4_5wg_L4_SG8 =
     nvfp4_cce_backward_v3::experimental_config_colwg_colpairpad_rowpair_lanepairrecord_rowsync_dualfloatcache_rowhwfp4_row16ready_overlap_combo_storeadd_5wg<4, 8, true, 4>;
+using pub_bwd_v3_fp4_frontend_L4_SG8 =
+    nvfp4_cce_backward_v3::experimental_config_colwg_colpairpad_rowpair_lanepairrecord_rowsync_dualfloatcache_rowhwfp4_row16ready_overlap<4, 8, true>;
+
+template <typename C>
+static void launch_public_v3_fp4_frontend_for_bridge(
+    const at::Tensor &A, const at::Tensor &A_sc, const at::Tensor &A_sc_global,
+    const at::Tensor &B, const at::Tensor &B_sc, const at::Tensor &B_sc_global,
+    const at::Tensor &C_col, const at::Tensor &C_col_sc, const at::Tensor &C_col_sc_global,
+    const at::Tensor &E_col, const at::Tensor &E_col_sc, const at::Tensor &E_col_sc_global,
+    at::Tensor &dE_out, at::Tensor &dC_out,
+    at::Tensor &G_fp4_row, at::Tensor &G_sc_row, at::Tensor &G_sg_row,
+    at::Tensor &G_fp4_col, at::Tensor &G_sc_col,
+    const at::Tensor &lse, const at::Tensor &targets,
+    float grad_scale, int M, int N, float filter_eps = 0.0f,
+    bool encode_centric = false)
+{
+    using G = nvfp4_cce_backward_v3::globals_3wg<C>;
+    constexpr float kFp4Max = 6.0f;
+    constexpr float kE4M3Max = 448.0f;
+
+    TORCH_CHECK(filter_eps == 0.0f,
+                "v6 public-v3 bridge frontend does not support filter_eps yet.");
+    TORCH_CHECK(G_sg_row.is_cuda() && G_sg_row.numel() == 1,
+                "v6 public-v3 bridge frontend expects G_sg_row to be a CUDA tensor with one float element.");
+
+    const float g_sg = fmaxf(grad_scale / (kFp4Max * kE4M3Max), 1.0e-12f);
+    const auto stream = at::cuda::getCurrentCUDAStream();
+    auto err = cudaMemcpyAsync(
+        G_sg_row.data_ptr<float>(),
+        &g_sg,
+        sizeof(float),
+        cudaMemcpyHostToDevice,
+        stream.stream());
+    TORCH_CHECK(err == cudaSuccess,
+                "Failed to update v6 public-v3 bridge analytic G_sg_row: ",
+                cudaGetErrorString(err));
+
+    G g {
+        .A = kittens::py::tensor_to_gl<typename G::A_fp4x2_gl>(A),
+        .A_sc = kittens::py::tensor_to_gl<typename G::A_sc_gl, false>(
+            A_sc, 1,
+            A_sc.dim() == 2 ? A_sc.size(0) / 128 : A_sc.size(0),
+            A_sc.dim() == 2 ? A_sc.size(1) / 4 : A_sc.size(1), 256),
+        .A_sc_global = kittens::py::tensor_to_gl<typename G::A_sc_global_gl>(A_sc_global),
+        .B = kittens::py::tensor_to_gl<typename G::B_fp4x2_gl>(B),
+        .B_sc = kittens::py::tensor_to_gl<typename G::B_sc_gl, false>(
+            B_sc, 1,
+            B_sc.dim() == 2 ? B_sc.size(0) / 128 : B_sc.size(0),
+            B_sc.dim() == 2 ? B_sc.size(1) / 4 : B_sc.size(1), 256),
+        .B_sc_global = kittens::py::tensor_to_gl<typename G::B_sc_global_gl>(B_sc_global),
+        .G_fp4_row = kittens::py::tensor_to_gl<typename G::G_fp4_row_gl>(G_fp4_row),
+        .G_sc_row_ptr = reinterpret_cast<uint8_t*>(G_sc_row.data_ptr()),
+        .G_sc_row_kgroups = N / 64,
+        .G_sg_row = kittens::py::tensor_to_gl<typename G::G_sg_row_gl>(G_sg_row),
+        .G_fp4_col_ptr = reinterpret_cast<uint8_t*>(G_fp4_col.data_ptr()),
+        .G_sc_col_ptr = reinterpret_cast<uint8_t*>(G_sc_col.data_ptr()),
+        .G_sc_col_kgroups = M / 64,
+        .lse = lse.data_ptr<float>(),
+        .targets = targets.data_ptr<int64_t>(),
+        .grad_scale = grad_scale,
+        .filter_eps = filter_eps,
+        .M = M,
+        .N = N,
+        .encode_centric = encode_centric,
+        .C_col = kittens::py::tensor_to_gl<typename G::combo_p3_C_gl>(C_col),
+        .C_col_sc = kittens::py::tensor_to_gl<typename G::combo_p3_C_sc_gl, false>(
+            C_col_sc, 1, C_col_sc.size(0), C_col_sc.size(1), 256),
+        .C_col_sc_global = kittens::py::tensor_to_gl<typename G::combo_p3_C_sc_global_gl>(C_col_sc_global),
+        .E_col = kittens::py::tensor_to_gl<typename G::combo_p3_E_gl>(E_col),
+        .E_col_sc = kittens::py::tensor_to_gl<typename G::combo_p3_E_sc_gl, false>(
+            E_col_sc, 1, E_col_sc.size(0), E_col_sc.size(1), 256),
+        .E_col_sc_global = kittens::py::tensor_to_gl<typename G::combo_p3_E_sc_global_gl>(E_col_sc_global),
+        .dE_out = kittens::py::tensor_to_gl<typename G::combo_dE_gl>(dE_out),
+        .dC_out = kittens::py::tensor_to_gl<typename G::combo_dC_gl>(dC_out),
+        .combo_mode = G::COMBO_MODE_GONLY,
+    };
+    kittens::py::launch_kernel<C, G, nvfp4_cce_backward_v3::backward_kernel_v3_streaming_3wg<C>>(g);
+}
 
 template <typename C>
 static void launch_nvfp4_gemm_bridge_with_config(
@@ -150,12 +228,7 @@ static void launch_experimental_backward_v6_combo_publicv3_fp4_5wg(
     float grad_scale, int M, int N, int K, float filter_eps = 0.0f,
     bool encode_centric = false)
 {
-    using FrontendC = exp_bwd_v6_combo_publicv3_fp4_L4_SG8;
-    constexpr int FrontendGonlyMode =
-        nvfp4_cce_backward_v3::globals_3wg<FrontendC>::COMBO_MODE_GONLY;
-
-    launch_experimental_backward_v6_combo_publicv3_fp4<
-        FrontendC, FrontendGonlyMode>(
+    launch_public_v3_fp4_frontend_for_bridge<pub_bwd_v3_fp4_frontend_L4_SG8>(
         A, A_sc, A_sc_global,
         B, B_sc, B_sc_global,
         C_col, C_col_sc, C_col_sc_global,
@@ -163,7 +236,7 @@ static void launch_experimental_backward_v6_combo_publicv3_fp4_5wg(
         dE_out, dC_out,
         G_fp4_row, G_sc_row, G_sg_row,
         G_fp4_col, G_sc_col,
-        lse, targets, grad_scale, M, N, K, filter_eps, encode_centric);
+        lse, targets, grad_scale, M, N, filter_eps, encode_centric);
 
     if constexpr (ComboMode == nvfp4_cce_backward_v3::globals_5wg<C>::COMBO_MODE_GONLY) {
         return;
