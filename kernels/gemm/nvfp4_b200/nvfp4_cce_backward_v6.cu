@@ -6,6 +6,8 @@
 int main() { return 0; }
 #else
 #include "pyutils/torchutils.cuh"
+#include <ATen/cuda/CUDAContext.h>
+#include <c10/cuda/CUDAGuard.h>
 
 using exp_bwd_v6_combo_publicv3_fp4_L4_SG8 =
     nvfp4_cce_backward_v3::experimental_config_colwg_colpairpad_rowpair_lanepairrecord_rowsync_dualfloatcache_rowhwfp4_row16ready_overlap_combo_storeadd<4, 8, true, 4>;
@@ -138,6 +140,68 @@ static void launch_nvfp4_gemm_bridge(
     }
 }
 
+static void launch_nvfp4_gemm_bridge_nopdl(
+    const at::Tensor &A, const at::Tensor &A_sc, const at::Tensor &A_sc_global,
+    const at::Tensor &B, const at::Tensor &B_sc, const at::Tensor &B_sc_global,
+    at::Tensor &D)
+{
+    const int K = B.size(1) * 2;
+    if (K <= 2048) {
+        using C = nvfp4_gemm::config<256, 5, 8, 4, 2, false, 256, false, 2>;
+        launch_nvfp4_gemm_bridge_with_config<C>(A, A_sc, A_sc_global, B, B_sc, B_sc_global, D);
+    } else {
+        using C = nvfp4_gemm::config<256, 4, 8, 12, 2, false, 256, false, 2>;
+        launch_nvfp4_gemm_bridge_with_config<C>(A, A_sc, A_sc_global, B, B_sc, B_sc_global, D);
+    }
+}
+
+static void launch_nvfp4_gemm_bridge_overlap_combo(
+    const at::Tensor &G_fp4_row, const at::Tensor &G_sc_row, const at::Tensor &G_sg_row,
+    const at::Tensor &G_fp4_col, const at::Tensor &G_sc_col,
+    const at::Tensor &C_col, const at::Tensor &C_col_sc, const at::Tensor &C_col_sc_global,
+    const at::Tensor &E_col, const at::Tensor &E_col_sc, const at::Tensor &E_col_sc_global,
+    at::Tensor &dE_out, at::Tensor &dC_out)
+{
+    auto current_stream = at::cuda::getCurrentCUDAStream();
+    const auto device_index = current_stream.device_index();
+    const auto de_stream = c10::cuda::getStreamFromPool(false, device_index);
+    const auto dc_stream = c10::cuda::getStreamFromPool(false, device_index);
+
+    thread_local cudaEvent_t frontend_done_event = nullptr;
+    thread_local cudaEvent_t de_done_event = nullptr;
+    thread_local cudaEvent_t dc_done_event = nullptr;
+    if (frontend_done_event == nullptr) cudaEventCreateWithFlags(&frontend_done_event, cudaEventDisableTiming);
+    if (de_done_event == nullptr) cudaEventCreateWithFlags(&de_done_event, cudaEventDisableTiming);
+    if (dc_done_event == nullptr) cudaEventCreateWithFlags(&dc_done_event, cudaEventDisableTiming);
+
+    cudaEventRecord(frontend_done_event, current_stream.stream());
+    cudaStreamWaitEvent(de_stream.stream(), frontend_done_event, 0);
+    cudaStreamWaitEvent(dc_stream.stream(), frontend_done_event, 0);
+
+    {
+        c10::cuda::CUDAStreamGuard guard(de_stream);
+        auto G_sc_row_fp8 = G_sc_row.view(at::kFloat8_e4m3fn);
+        launch_nvfp4_gemm_bridge_nopdl(
+            G_fp4_row, G_sc_row_fp8, G_sg_row,
+            C_col, C_col_sc, C_col_sc_global,
+            dE_out);
+        cudaEventRecord(de_done_event, de_stream.stream());
+    }
+    {
+        c10::cuda::CUDAStreamGuard guard(dc_stream);
+        auto G_fp4_col_fp4x2 = G_fp4_col.view(at::kFloat4_e2m1fn_x2);
+        auto G_sc_col_fp8 = G_sc_col.view(at::kFloat8_e4m3fn);
+        launch_nvfp4_gemm_bridge_nopdl(
+            G_fp4_col_fp4x2, G_sc_col_fp8, G_sg_row,
+            E_col, E_col_sc, E_col_sc_global,
+            dC_out);
+        cudaEventRecord(dc_done_event, dc_stream.stream());
+    }
+
+    cudaStreamWaitEvent(current_stream.stream(), de_done_event, 0);
+    cudaStreamWaitEvent(current_stream.stream(), dc_done_event, 0);
+}
+
 template <int ComboMode>
 static void launch_experimental_backward_v6_combo_publicv3_fp4_bridge(
     const at::Tensor &A, const at::Tensor &A_sc, const at::Tensor &A_sc_global,
@@ -167,7 +231,17 @@ static void launch_experimental_backward_v6_combo_publicv3_fp4_bridge(
         return;
     }
 
-    if constexpr (ComboMode == 0 || ComboMode == 2) {
+    if constexpr (ComboMode == 0) {
+        launch_nvfp4_gemm_bridge_overlap_combo(
+            G_fp4_row, G_sc_row, G_sg_row,
+            G_fp4_col, G_sc_col,
+            C_col, C_col_sc, C_col_sc_global,
+            E_col, E_col_sc, E_col_sc_global,
+            dE_out, dC_out);
+        return;
+    }
+
+    if constexpr (ComboMode == 2) {
         auto G_sc_row_fp8 = G_sc_row.view(at::kFloat8_e4m3fn);
         launch_nvfp4_gemm_bridge(
             G_fp4_row, G_sc_row_fp8, G_sg_row,
@@ -175,7 +249,7 @@ static void launch_experimental_backward_v6_combo_publicv3_fp4_bridge(
             dE_out);
     }
 
-    if constexpr (ComboMode == 0 || ComboMode == 3) {
+    if constexpr (ComboMode == 3) {
         auto G_fp4_col_fp4x2 = G_fp4_col.view(at::kFloat4_e2m1fn_x2);
         auto G_sc_col_fp8 = G_sc_col.view(at::kFloat8_e4m3fn);
         launch_nvfp4_gemm_bridge(
