@@ -164,42 +164,53 @@ static void launch_nvfp4_gemm_bridge_overlap_combo(
 {
     auto current_stream = at::cuda::getCurrentCUDAStream();
     const auto device_index = current_stream.device_index();
-    const auto de_stream = c10::cuda::getStreamFromPool(false, device_index);
-    const auto dc_stream = c10::cuda::getStreamFromPool(false, device_index);
+    const auto side_stream = c10::cuda::getStreamFromPool(false, device_index);
 
     thread_local cudaEvent_t frontend_done_event = nullptr;
-    thread_local cudaEvent_t de_done_event = nullptr;
-    thread_local cudaEvent_t dc_done_event = nullptr;
+    thread_local cudaEvent_t side_done_event = nullptr;
     if (frontend_done_event == nullptr) cudaEventCreateWithFlags(&frontend_done_event, cudaEventDisableTiming);
-    if (de_done_event == nullptr) cudaEventCreateWithFlags(&de_done_event, cudaEventDisableTiming);
-    if (dc_done_event == nullptr) cudaEventCreateWithFlags(&dc_done_event, cudaEventDisableTiming);
+    if (side_done_event == nullptr) cudaEventCreateWithFlags(&side_done_event, cudaEventDisableTiming);
 
     cudaEventRecord(frontend_done_event, current_stream.stream());
-    cudaStreamWaitEvent(de_stream.stream(), frontend_done_event, 0);
-    cudaStreamWaitEvent(dc_stream.stream(), frontend_done_event, 0);
+    cudaStreamWaitEvent(side_stream.stream(), frontend_done_event, 0);
 
-    {
-        c10::cuda::CUDAStreamGuard guard(de_stream);
+    const bool de_on_current = dE_out.size(0) >= dC_out.size(0);
+
+    if (de_on_current) {
+        {
+            c10::cuda::CUDAStreamGuard guard(side_stream);
+            auto G_fp4_col_fp4x2 = G_fp4_col.view(at::kFloat4_e2m1fn_x2);
+            auto G_sc_col_fp8 = G_sc_col.view(at::kFloat8_e4m3fn);
+            launch_nvfp4_gemm_bridge_nopdl(
+                G_fp4_col_fp4x2, G_sc_col_fp8, G_sg_row,
+                E_col, E_col_sc, E_col_sc_global,
+                dC_out);
+            cudaEventRecord(side_done_event, side_stream.stream());
+        }
         auto G_sc_row_fp8 = G_sc_row.view(at::kFloat8_e4m3fn);
         launch_nvfp4_gemm_bridge_nopdl(
             G_fp4_row, G_sc_row_fp8, G_sg_row,
             C_col, C_col_sc, C_col_sc_global,
             dE_out);
-        cudaEventRecord(de_done_event, de_stream.stream());
-    }
-    {
-        c10::cuda::CUDAStreamGuard guard(dc_stream);
+    } else {
+        {
+            c10::cuda::CUDAStreamGuard guard(side_stream);
+            auto G_sc_row_fp8 = G_sc_row.view(at::kFloat8_e4m3fn);
+            launch_nvfp4_gemm_bridge_nopdl(
+                G_fp4_row, G_sc_row_fp8, G_sg_row,
+                C_col, C_col_sc, C_col_sc_global,
+                dE_out);
+            cudaEventRecord(side_done_event, side_stream.stream());
+        }
         auto G_fp4_col_fp4x2 = G_fp4_col.view(at::kFloat4_e2m1fn_x2);
         auto G_sc_col_fp8 = G_sc_col.view(at::kFloat8_e4m3fn);
         launch_nvfp4_gemm_bridge_nopdl(
             G_fp4_col_fp4x2, G_sc_col_fp8, G_sg_row,
             E_col, E_col_sc, E_col_sc_global,
             dC_out);
-        cudaEventRecord(dc_done_event, dc_stream.stream());
     }
 
-    cudaStreamWaitEvent(current_stream.stream(), de_done_event, 0);
-    cudaStreamWaitEvent(current_stream.stream(), dc_done_event, 0);
+    cudaStreamWaitEvent(current_stream.stream(), side_done_event, 0);
 }
 
 template <int ComboMode>
