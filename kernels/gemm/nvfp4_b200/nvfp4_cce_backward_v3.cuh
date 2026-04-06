@@ -752,6 +752,7 @@ struct config_traits_3wg {
     static constexpr bool DEBUG_ROW_WAIT_ON_COL_READY = false;
     static constexpr bool DEBUG_DISABLE_CONSUMER_ROW_STAGE_PRODUCTION = false;
     static constexpr bool DEBUG_DISABLE_CONSUMER_COL_STAGE_PRODUCTION = false;
+    static constexpr bool ENABLE_STOREADD_COMBO = false;
 };
 
 template <typename C>
@@ -837,6 +838,46 @@ struct config_traits_row_quant_use_hw_fp4x2 {
 template <typename C>
 struct config_traits_row_quant_use_hw_fp4x2<C, std::void_t<decltype(config_traits_3wg<C>::ROW_QUANT_USE_HW_FP4X2)>> {
     static constexpr bool value = config_traits_3wg<C>::ROW_QUANT_USE_HW_FP4X2;
+};
+
+template <typename C, typename = void>
+struct config_traits_storeadd_combo {
+    static constexpr bool value = false;
+};
+
+template <typename C>
+struct config_traits_storeadd_combo<C, std::void_t<decltype(config_traits_3wg<C>::ENABLE_STOREADD_COMBO)>> {
+    static constexpr bool value = config_traits_3wg<C>::ENABLE_STOREADD_COMBO;
+};
+
+template <typename C, typename = void>
+struct config_traits_separate_backhalf_consumers {
+    static constexpr bool value = false;
+};
+
+template <typename C>
+struct config_traits_separate_backhalf_consumers<C, std::void_t<decltype(config_traits_3wg<C>::SEPARATE_BACKHALF_CONSUMERS)>> {
+    static constexpr bool value = config_traits_3wg<C>::SEPARATE_BACKHALF_CONSUMERS;
+};
+
+template <typename C, typename = void>
+struct config_traits_combo_de_warpgroups {
+    static constexpr int value = 0;
+};
+
+template <typename C>
+struct config_traits_combo_de_warpgroups<C, std::void_t<decltype(config_traits_3wg<C>::COMBO_DE_WARPGROUPS)>> {
+    static constexpr int value = config_traits_3wg<C>::COMBO_DE_WARPGROUPS;
+};
+
+template <typename C, typename = void>
+struct config_traits_combo_dc_warpgroups {
+    static constexpr int value = 0;
+};
+
+template <typename C>
+struct config_traits_combo_dc_warpgroups<C, std::void_t<decltype(config_traits_3wg<C>::COMBO_DC_WARPGROUPS)>> {
+    static constexpr int value = config_traits_3wg<C>::COMBO_DC_WARPGROUPS;
 };
 
 template <typename C, typename = void>
@@ -2048,6 +2089,109 @@ struct config_traits_3wg<experimental_config_colwg_colpairpad_rowpair_lanepairre
 
 template <int _LOAD_PIPE_DEPTH, int _SUPERGROUP_SIZE, bool _PINGPONG, int _EPI_PIPE_DEPTH>
 struct config_traits_col_ready_per_row16<experimental_config_colwg_colpairpad_rowpair_lanepairrecord_rowsync_dualfloatcache_rowhwfp4_row16ready_overlap<_LOAD_PIPE_DEPTH, _SUPERGROUP_SIZE, _PINGPONG, _EPI_PIPE_DEPTH>> {
+    static constexpr bool value = true;
+};
+
+template <int _LOAD_PIPE_DEPTH, int _SUPERGROUP_SIZE, bool _PINGPONG = true, int _EPI_PIPE_DEPTH = 4>
+struct experimental_config_colwg_colpairpad_rowpair_lanepairrecord_rowsync_dualfloatcache_rowhwfp4_row16ready_overlap_combo_storeadd {
+    using base = experimental_config_colwg_colpairpad_rowpair_lanepairrecord_rowsync_dualfloatcache_rowhwfp4_row16ready_overlap<_LOAD_PIPE_DEPTH, _SUPERGROUP_SIZE, _PINGPONG, _EPI_PIPE_DEPTH>;
+    static constexpr int CLUSTER_SIZE = base::CLUSTER_SIZE;
+    static constexpr bool USE_PDL = base::USE_PDL;
+    static constexpr int CONSUMER_WARPGROUPS = base::CONSUMER_WARPGROUPS;
+    static constexpr int QUANTIZER_WARPGROUPS = base::QUANTIZER_WARPGROUPS;
+    static constexpr int ROW_QUANTIZER_WARPGROUPS = base::ROW_QUANTIZER_WARPGROUPS;
+    static constexpr int COL_QUANTIZER_WARPGROUPS = base::COL_QUANTIZER_WARPGROUPS;
+    static constexpr int PRODUCER_WARPGROUPS = base::PRODUCER_WARPGROUPS;
+    static constexpr int NUM_WARPGROUPS = base::NUM_WARPGROUPS;
+    static constexpr int NUM_WARPS = base::NUM_WARPS;
+    static constexpr int NUM_THREADS = base::NUM_THREADS;
+    static constexpr int LOAD_PIPE_DEPTH = base::LOAD_PIPE_DEPTH;
+    static constexpr int EPI_PIPE_DEPTH = base::EPI_PIPE_DEPTH;
+    static constexpr bool OVERLAP_EPI = base::OVERLAP_EPI;
+    static constexpr bool PINGPONG = base::PINGPONG;
+    static constexpr int SUPERGROUP_SIZE = base::SUPERGROUP_SIZE;
+    static constexpr int Mb = base::Mb;
+    static constexpr int Nb = base::Nb;
+    static constexpr int Kb = base::Kb;
+    static constexpr int B_SC_SIZE = base::B_SC_SIZE;
+    static constexpr int MMA_PER_TILE = base::MMA_PER_TILE;
+    static constexpr int BF16_STAGE_COUNT = base::BF16_STAGE_COUNT;
+    static constexpr int NUM_D_TILES = base::NUM_D_TILES;
+    static constexpr bool USE_BF16_ACCUM = base::USE_BF16_ACCUM;
+    static constexpr bool CONSUMER_DO_ROW = base::CONSUMER_DO_ROW;
+    static constexpr bool COL_HELPERS_USE_ALL_QUANTIZER_WGS = base::COL_HELPERS_USE_ALL_QUANTIZER_WGS;
+    static constexpr bool USE_COL_PLAIN_STAGE = base::USE_COL_PLAIN_STAGE;
+    static constexpr bool EARLY_COL_READY = base::EARLY_COL_READY;
+    static constexpr bool CACHE_COL_VALUES = base::CACHE_COL_VALUES;
+    static constexpr bool CACHE_COL_VALUES_BF16 = base::CACHE_COL_VALUES_BF16;
+    static constexpr bool CACHE_COL_VALUES_BF16_PAIRS = base::CACHE_COL_VALUES_BF16_PAIRS;
+    static constexpr bool FAST_ALIGNED_QUANT = base::FAST_ALIGNED_QUANT;
+    static constexpr bool ROW_QUANT_FROM_REGS = base::ROW_QUANT_FROM_REGS;
+};
+
+template <int _LOAD_PIPE_DEPTH, int _SUPERGROUP_SIZE, bool _PINGPONG, int _EPI_PIPE_DEPTH>
+struct config_traits_3wg<experimental_config_colwg_colpairpad_rowpair_lanepairrecord_rowsync_dualfloatcache_rowhwfp4_row16ready_overlap_combo_storeadd<_LOAD_PIPE_DEPTH, _SUPERGROUP_SIZE, _PINGPONG, _EPI_PIPE_DEPTH>>
+    : config_traits_3wg<experimental_config_colwg_colpairpad_rowpair_lanepairrecord_rowsync_dualfloatcache_rowhwfp4_row16ready_overlap<_LOAD_PIPE_DEPTH, _SUPERGROUP_SIZE, _PINGPONG, _EPI_PIPE_DEPTH>> {
+    static constexpr bool ENABLE_STOREADD_COMBO = true;
+};
+
+template <int _LOAD_PIPE_DEPTH, int _SUPERGROUP_SIZE, bool _PINGPONG, int _EPI_PIPE_DEPTH>
+struct config_traits_col_ready_per_row16<experimental_config_colwg_colpairpad_rowpair_lanepairrecord_rowsync_dualfloatcache_rowhwfp4_row16ready_overlap_combo_storeadd<_LOAD_PIPE_DEPTH, _SUPERGROUP_SIZE, _PINGPONG, _EPI_PIPE_DEPTH>> {
+    static constexpr bool value = true;
+};
+
+template <int _LOAD_PIPE_DEPTH, int _SUPERGROUP_SIZE, bool _PINGPONG = true, int _EPI_PIPE_DEPTH = 4>
+struct experimental_config_colwg_colpairpad_rowpair_lanepairrecord_rowsync_dualfloatcache_rowhwfp4_row16ready_overlap_combo_storeadd_5wg {
+    using base = experimental_config_colwg_colpairpad_rowpair_lanepairrecord_rowsync_dualfloatcache_rowhwfp4_row16ready_overlap<_LOAD_PIPE_DEPTH, _SUPERGROUP_SIZE, _PINGPONG, _EPI_PIPE_DEPTH>;
+    static constexpr int CLUSTER_SIZE = base::CLUSTER_SIZE;
+    static constexpr bool USE_PDL = base::USE_PDL;
+    static constexpr int CONSUMER_WARPGROUPS = base::CONSUMER_WARPGROUPS;
+    static constexpr int ROW_QUANTIZER_WARPGROUPS = 0;
+    static constexpr int COL_QUANTIZER_WARPGROUPS = 1;
+    static constexpr int COMBO_DE_WARPGROUPS = 1;
+    static constexpr int COMBO_DC_WARPGROUPS = 1;
+    static constexpr int QUANTIZER_WARPGROUPS =
+        COL_QUANTIZER_WARPGROUPS + COMBO_DE_WARPGROUPS + COMBO_DC_WARPGROUPS;
+    static constexpr int PRODUCER_WARPGROUPS = base::PRODUCER_WARPGROUPS;
+    static constexpr int NUM_WARPGROUPS =
+        CONSUMER_WARPGROUPS + QUANTIZER_WARPGROUPS + PRODUCER_WARPGROUPS;
+    static constexpr int NUM_WARPS = NUM_WARPGROUPS * WARPGROUP_WARPS;
+    static constexpr int NUM_THREADS = NUM_WARPS * WARP_THREADS;
+    static constexpr int LOAD_PIPE_DEPTH = base::LOAD_PIPE_DEPTH;
+    static constexpr int EPI_PIPE_DEPTH = base::EPI_PIPE_DEPTH;
+    static constexpr bool OVERLAP_EPI = base::OVERLAP_EPI;
+    static constexpr bool PINGPONG = base::PINGPONG;
+    static constexpr int SUPERGROUP_SIZE = base::SUPERGROUP_SIZE;
+    static constexpr int Mb = base::Mb;
+    static constexpr int Nb = base::Nb;
+    static constexpr int Kb = base::Kb;
+    static constexpr int B_SC_SIZE = base::B_SC_SIZE;
+    static constexpr int MMA_PER_TILE = base::MMA_PER_TILE;
+    static constexpr int BF16_STAGE_COUNT = base::BF16_STAGE_COUNT;
+    static constexpr int NUM_D_TILES = base::NUM_D_TILES;
+    static constexpr bool USE_BF16_ACCUM = base::USE_BF16_ACCUM;
+    static constexpr bool CONSUMER_DO_ROW = base::CONSUMER_DO_ROW;
+    static constexpr bool COL_HELPERS_USE_ALL_QUANTIZER_WGS = false;
+    static constexpr bool USE_COL_PLAIN_STAGE = base::USE_COL_PLAIN_STAGE;
+    static constexpr bool EARLY_COL_READY = base::EARLY_COL_READY;
+    static constexpr bool CACHE_COL_VALUES = base::CACHE_COL_VALUES;
+    static constexpr bool CACHE_COL_VALUES_BF16 = base::CACHE_COL_VALUES_BF16;
+    static constexpr bool CACHE_COL_VALUES_BF16_PAIRS = base::CACHE_COL_VALUES_BF16_PAIRS;
+    static constexpr bool FAST_ALIGNED_QUANT = base::FAST_ALIGNED_QUANT;
+    static constexpr bool ROW_QUANT_FROM_REGS = base::ROW_QUANT_FROM_REGS;
+};
+
+template <int _LOAD_PIPE_DEPTH, int _SUPERGROUP_SIZE, bool _PINGPONG, int _EPI_PIPE_DEPTH>
+struct config_traits_3wg<experimental_config_colwg_colpairpad_rowpair_lanepairrecord_rowsync_dualfloatcache_rowhwfp4_row16ready_overlap_combo_storeadd_5wg<_LOAD_PIPE_DEPTH, _SUPERGROUP_SIZE, _PINGPONG, _EPI_PIPE_DEPTH>>
+    : config_traits_3wg<experimental_config_colwg_colpairpad_rowpair_lanepairrecord_rowsync_dualfloatcache_rowhwfp4_row16ready_overlap<_LOAD_PIPE_DEPTH, _SUPERGROUP_SIZE, _PINGPONG, _EPI_PIPE_DEPTH>> {
+    static constexpr bool ENABLE_STOREADD_COMBO = true;
+    static constexpr bool SEPARATE_BACKHALF_CONSUMERS = true;
+    static constexpr int COMBO_DE_WARPGROUPS = 1;
+    static constexpr int COMBO_DC_WARPGROUPS = 1;
+};
+
+template <int _LOAD_PIPE_DEPTH, int _SUPERGROUP_SIZE, bool _PINGPONG, int _EPI_PIPE_DEPTH>
+struct config_traits_col_ready_per_row16<experimental_config_colwg_colpairpad_rowpair_lanepairrecord_rowsync_dualfloatcache_rowhwfp4_row16ready_overlap_combo_storeadd_5wg<_LOAD_PIPE_DEPTH, _SUPERGROUP_SIZE, _PINGPONG, _EPI_PIPE_DEPTH>> {
     static constexpr bool value = true;
 };
 
@@ -4041,6 +4185,92 @@ __device__ __forceinline__ void store_global_u64(uint8_t* dst, uint64_t value) {
     *reinterpret_cast<uint64_t*>(dst) = value;
 }
 
+template <typename G>
+__device__ __forceinline__ void store_combo_row_stage_u64(
+    typename G::combo_row_stage_t *combo_row_stage,
+    int local_row,
+    int local_fp4x2_col_base,
+    uint64_t packed_fp4)
+{
+    if constexpr (!G::ENABLE_STOREADD_COMBO) {
+        (void)combo_row_stage;
+        (void)local_row;
+        (void)local_fp4x2_col_base;
+        (void)packed_fp4;
+        return;
+    } else {
+        uint8_t *fp4_bytes = reinterpret_cast<uint8_t*>(&combo_row_stage->G_row.data[0]);
+        store_global_u64(&fp4_bytes[local_row * G::G_fp4_row_tile::cols + local_fp4x2_col_base], packed_fp4);
+    }
+}
+
+template <typename G>
+__device__ __forceinline__ void store_combo_row_stage_scale(
+    typename G::combo_row_stage_t *combo_row_stage,
+    int local_row,
+    int local_col_16,
+    uint8_t scale_byte)
+{
+    if constexpr (!G::ENABLE_STOREADD_COMBO) {
+        (void)combo_row_stage;
+        (void)local_row;
+        (void)local_col_16;
+        (void)scale_byte;
+        return;
+    } else {
+        uint8_t *sc_bytes = reinterpret_cast<uint8_t*>(&combo_row_stage->G_row_sc.data[0]);
+        const int sr = local_row % 32;
+        const int rr = (local_row / 32) % 4;
+        const int kgroup = local_col_16 / 64;
+        const int col_16_in_64 = (local_col_16 / 16) % 4;
+        const int byte_idx = sr * 16 + rr * 4 + col_16_in_64;
+        sc_bytes[kgroup * 512 + byte_idx] = scale_byte;
+    }
+}
+
+template <typename G>
+__device__ __forceinline__ void store_combo_col_stage_u64(
+    typename G::combo_col_stage_t *combo_col_stage,
+    int local_col,
+    int local_row_pair_base,
+    uint64_t packed_fp4)
+{
+    if constexpr (!G::ENABLE_STOREADD_COMBO) {
+        (void)combo_col_stage;
+        (void)local_col;
+        (void)local_row_pair_base;
+        (void)packed_fp4;
+        return;
+    } else {
+        uint8_t *fp4_bytes = reinterpret_cast<uint8_t*>(&combo_col_stage->Gt_row.data[0]);
+        store_global_u64(&fp4_bytes[local_col * G::combo_col_fp4_tile::cols + local_row_pair_base], packed_fp4);
+    }
+}
+
+template <typename G>
+__device__ __forceinline__ void store_combo_col_stage_scale(
+    typename G::combo_col_stage_t *combo_col_stage,
+    int local_col,
+    int local_row_base,
+    uint8_t scale_byte)
+{
+    if constexpr (!G::ENABLE_STOREADD_COMBO) {
+        (void)combo_col_stage;
+        (void)local_col;
+        (void)local_row_base;
+        (void)scale_byte;
+        return;
+    } else {
+        uint8_t *sc_bytes = reinterpret_cast<uint8_t*>(&combo_col_stage->Gt_row_sc.data[0]);
+        const int sr = local_col % 32;
+        const int rr = (local_col / 32) % 4;
+        const int m_kgroup = local_row_base / 64;
+        const int m_16_in_64 = (local_row_base / 16) % 4;
+        const int byte_idx = sr * 16 + rr * 4 + m_16_in_64;
+        sc_bytes[m_kgroup * 512 + byte_idx] = scale_byte;
+    }
+}
+
 __device__ __forceinline__ uint64_t shfl_u64_sync(unsigned mask, uint64_t value, int src_lane, int width = warpSize) {
     const uint32_t lo = __shfl_sync(mask, static_cast<uint32_t>(value), src_lane, width);
     const uint32_t hi = __shfl_sync(mask, static_cast<uint32_t>(value >> 32), src_lane, width);
@@ -4072,7 +4302,12 @@ __device__ __forceinline__ void quantize_rowrecord_pairbits_to_global(
     int group16,
     float g_sg_rcp,
     float g_sg,
-    bool encode_centric) {
+    bool encode_centric,
+    uint8_t* combo_row_fp4_ptr = nullptr,
+    int combo_row_fp4_stride = 0,
+    uint8_t* combo_row_sc_ptr = nullptr,
+    int combo_local_row = -1,
+    int combo_local_col_start = 0) {
     constexpr float k_fp4_max = 6.0f;
     constexpr float k_e4m3_max = 448.0f;
     float2 cached_pairs[8];
@@ -4105,6 +4340,13 @@ __device__ __forceinline__ void quantize_rowrecord_pairbits_to_global(
     store_global_u64(
         &row_fp4_ptr[global_row * row_fp4_stride + fp4x2_col_base],
         packed_fp4);
+    if (combo_row_fp4_ptr != nullptr && combo_local_row >= 0) {
+        const int local_col_16 = combo_local_col_start + group16 * 16;
+        const int local_fp4x2_col_base = local_col_16 / 2;
+        store_global_u64(
+            &combo_row_fp4_ptr[combo_local_row * combo_row_fp4_stride + local_fp4x2_col_base],
+            packed_fp4);
+    }
 
     const float scale = rcp_scale > 0.0f ? (1.0f / rcp_scale) : 0.0f;
     float stored_scale = scale * g_sg_rcp;
@@ -4119,8 +4361,17 @@ __device__ __forceinline__ void quantize_rowrecord_pairbits_to_global(
     const int rr = (global_row / 32) % 4;
     const int chunk = depth * row_sc_kgroups + kgroup;
     const int byte_idx = sr * 16 + rr * 4 + col_16_in_64;
-    row_sc_ptr[chunk * 512 + byte_idx] =
-        *reinterpret_cast<const uint8_t*>(&sc);
+    const uint8_t scale_byte = *reinterpret_cast<const uint8_t*>(&sc);
+    row_sc_ptr[chunk * 512 + byte_idx] = scale_byte;
+    if (combo_row_sc_ptr != nullptr && combo_local_row >= 0) {
+        const int local_col_16 = combo_local_col_start + group16 * 16;
+        const int local_kgroup = local_col_16 / 64;
+        const int local_col_16_in_64 = (local_col_16 / 16) % 4;
+        const int local_sr = combo_local_row % 32;
+        const int local_rr = (combo_local_row / 32) % 4;
+        const int local_byte_idx = local_sr * 16 + local_rr * 4 + local_col_16_in_64;
+        combo_row_sc_ptr[local_kgroup * 512 + local_byte_idx] = scale_byte;
+    }
 }
 
 template <bool USE_HW_FP4X2 = false>
@@ -4138,13 +4389,20 @@ __device__ __noinline__ void quantize_rowrecord_pairbits_to_global_noinline(
     int group16,
     float g_sg_rcp,
     float g_sg,
-    bool encode_centric) {
+    bool encode_centric,
+    uint8_t* combo_row_fp4_ptr = nullptr,
+    int combo_row_fp4_stride = 0,
+    uint8_t* combo_row_sc_ptr = nullptr,
+    int combo_local_row = -1,
+    int combo_local_col_start = 0) {
     quantize_rowrecord_pairbits_to_global<USE_HW_FP4X2>(
         pair_bits_0, pair_bits_1, pair_bits_2, pair_bits_3,
         row_fp4_ptr, row_fp4_stride,
         row_sc_ptr, row_sc_kgroups,
         global_row, col_start, group16,
-        g_sg_rcp, g_sg, encode_centric);
+        g_sg_rcp, g_sg, encode_centric,
+        combo_row_fp4_ptr, combo_row_fp4_stride,
+        combo_row_sc_ptr, combo_local_row, combo_local_col_start);
 }
 
 // =========================================================================
@@ -4378,6 +4636,20 @@ struct globals_3wg {
     static constexpr bool DEBUG_ROW_WAIT_ON_COL_READY = config_traits_debug_row_wait_on_col_ready<C>::value;
     static constexpr bool DEBUG_DISABLE_CONSUMER_ROW_STAGE_PRODUCTION = config_traits_debug_disable_consumer_row_stage_production<C>::value;
     static constexpr bool DEBUG_DISABLE_CONSUMER_COL_STAGE_PRODUCTION = config_traits_debug_disable_consumer_col_stage_production<C>::value;
+    static constexpr bool ENABLE_STOREADD_COMBO = config_traits_storeadd_combo<C>::value;
+    static constexpr bool SEPARATE_BACKHALF_CONSUMERS = config_traits_separate_backhalf_consumers<C>::value;
+    static constexpr int COMBO_DE_WARPGROUPS = config_traits_combo_de_warpgroups<C>::value;
+    static constexpr int COMBO_DC_WARPGROUPS = config_traits_combo_dc_warpgroups<C>::value;
+    static constexpr int FRONTEND_QUANTIZER_WARPGROUPS =
+        SEPARATE_BACKHALF_CONSUMERS
+            ? (C::ROW_QUANTIZER_WARPGROUPS + C::COL_QUANTIZER_WARPGROUPS)
+            : C::QUANTIZER_WARPGROUPS;
+    static constexpr bool FRONTEND_SINGLE_QUANTIZER_WG = (FRONTEND_QUANTIZER_WARPGROUPS == 1);
+    static constexpr bool FRONTEND_MULTI_QUANTIZER_WG = (FRONTEND_QUANTIZER_WARPGROUPS > 1);
+    static constexpr int COMBO_MODE_FULL = 0;
+    static constexpr int COMBO_MODE_GONLY = 1;
+    static constexpr int COMBO_MODE_DEONLY = 2;
+    static constexpr int COMBO_MODE_DCONLY = 3;
     using A_fp4x2_tile = st_fp4e2m1_2<C::Mb/2, C::Kb/2>;
     using A_sc_tile    = st_hf<4, 256, false>;
     using B_fp4x2_tile = st_fp4e2m1_2<C::Nb/2, C::Kb/2>;
@@ -4386,6 +4658,15 @@ struct globals_3wg {
     using D_helper_tile = st_bf<C::Mb/2, C::Nb/C::EPI_PIPE_DEPTH, false>;
     using G_fp4_row_tile = st_fp4e2m1_2<C::Mb/2, C::Nb/2>;
     using G_sc_row_tile  = st_hf<4, 256, false>;
+    using combo_row_sc_tile = st_hf<C::Nb / 64, 256, false>;
+    using combo_col_fp4_tile = st_fp4e2m1_2<C::Nb, C::Mb/2>;
+    using combo_col_sc_tile = st_hf<4, 256, false>;
+    using combo_p3_C_tile = st_fp4e2m1_2<C::Nb/2, C::Nb/2>;
+    using combo_p3_C_sc_tile = st_hf<C::Nb / 128, 256, false>;
+    using combo_p3_E_tile = st_fp4e2m1_2<C::Nb/2, C::Mb/2>;
+    using combo_p3_E_sc_tile = st_hf<4, 256, false>;
+    using combo_dE_tile = st_bf<C::Mb/2, C::Nb / C::EPI_PIPE_DEPTH>;
+    using combo_dC_tile = st_bf<C::Nb, C::Nb / C::EPI_PIPE_DEPTH>;
 
     using A_fp4x2_gl     = gl<fp4e2m1_2,  1,  1, -1, -1, A_fp4x2_tile>;
     using A_sc_gl        = gl<half,       1, -1, -1, 256, A_sc_tile>;
@@ -4396,6 +4677,14 @@ struct globals_3wg {
     using G_fp4_row_gl   = gl<fp4e2m1_2,  1,  1, -1, -1, G_fp4_row_tile>;
     using G_sc_row_gl    = gl<half,       1, -1, -1, 256, G_sc_row_tile>;
     using G_sg_row_gl    = gl<float,      1,  1,  1,  1>;
+    using combo_p3_C_gl = gl<fp4e2m1_2, 1, 1, -1, -1, combo_p3_C_tile>;
+    using combo_p3_C_sc_gl = gl<half, 1, -1, -1, 256, combo_p3_C_sc_tile>;
+    using combo_p3_C_sc_global_gl = gl<float, 1, 1, 1, 1>;
+    using combo_p3_E_gl = gl<fp4e2m1_2, 1, 1, -1, -1, combo_p3_E_tile>;
+    using combo_p3_E_sc_gl = gl<half, 1, -1, -1, 256, combo_p3_E_sc_tile>;
+    using combo_p3_E_sc_global_gl = gl<float, 1, 1, 1, 1>;
+    using combo_dE_gl = gl<bf16, 1, 1, -1, -1, combo_dE_tile>;
+    using combo_dC_gl = gl<bf16, 1, 1, -1, -1, combo_dC_tile>;
 
     A_fp4x2_gl     A;
     A_sc_gl        A_sc;
@@ -4417,6 +4706,15 @@ struct globals_3wg {
     int            M;
     int            N;
     bool           encode_centric;
+    combo_p3_C_gl  C_col;
+    combo_p3_C_sc_gl C_col_sc;
+    combo_p3_C_sc_global_gl C_col_sc_global;
+    combo_p3_E_gl  E_col;
+    combo_p3_E_sc_gl E_col_sc;
+    combo_p3_E_sc_global_gl E_col_sc_global;
+    combo_dE_gl    dE_out;
+    combo_dC_gl    dC_out;
+    int            combo_mode;
 
     struct input_tiles_t {
         A_fp4x2_tile A;
@@ -4453,7 +4751,47 @@ struct globals_3wg {
     struct col_mailbox_stage_t {
         D_helper_tile D[COL_HELPER_SLOTS];
     };
-
+    struct combo_row_stage_t {
+        G_fp4_row_tile G_row;
+        combo_row_sc_tile G_row_sc;
+    };
+    struct combo_col_stage_t {
+        combo_col_fp4_tile Gt_row;
+        combo_col_sc_tile Gt_row_sc;
+    };
+    struct combo_p3_tiles_t {
+        combo_p3_C_tile C_operand;
+        combo_p3_E_tile E_operand;
+    };
+    struct combo_p3_scales_t {
+        combo_p3_C_sc_tile C_sc;
+        combo_p3_E_sc_tile E_sc;
+    };
+    struct combo_p3_c_tile_stage_t {
+        combo_p3_C_tile C_operand;
+    };
+    struct combo_de_scales_stage_t {
+        combo_p3_C_sc_tile C_sc;
+    };
+    struct combo_de_output_stage_t {
+        combo_dE_tile dE;
+    };
+    struct combo_dc_tile_stage_t {
+        combo_p3_E_tile E_operand;
+    };
+    struct combo_dc_scales_stage_t {
+        combo_p3_E_sc_tile E_sc;
+    };
+    struct combo_dc_output_stage_t {
+        combo_dC_tile dC;
+    };
+    struct combo_output_stage_t {
+        union {
+            combo_dE_tile dE;
+            combo_dC_tile dC;
+            combo_p3_E_tile E_operand;
+        };
+    };
     __host__ inline dim3 grid() const {
         int padded_M = A.rows();
         int padded_N = B.rows();
@@ -4467,6 +4805,22 @@ struct globals_3wg {
     }
     __host__ inline dim3 block() const { return dim3(C::NUM_THREADS); }
     __host__ inline int dynamic_shared_memory() const {
+        static_assert(!ENABLE_STOREADD_COMBO || (sizeof(combo_row_stage_t) % 1024 == 0));
+        static_assert(!ENABLE_STOREADD_COMBO || (sizeof(combo_col_stage_t) % 1024 == 0));
+        static_assert(!ENABLE_STOREADD_COMBO || (sizeof(combo_p3_c_tile_stage_t) % 1024 == 0));
+        static_assert(!ENABLE_STOREADD_COMBO || (sizeof(combo_output_stage_t) % 1024 == 0));
+        constexpr int combo_dynamic_shared_memory =
+            !ENABLE_STOREADD_COMBO ? 0 :
+            (SEPARATE_BACKHALF_CONSUMERS
+                 ? (sizeof(combo_row_stage_t) +
+                    sizeof(combo_col_stage_t) +
+                    sizeof(combo_p3_c_tile_stage_t) +
+                    sizeof(combo_de_scales_stage_t) +
+                    sizeof(combo_output_stage_t) + 1024)
+                 : (sizeof(combo_row_stage_t) +
+                    sizeof(combo_col_stage_t) +
+                    sizeof(combo_p3_c_tile_stage_t) +
+                    sizeof(combo_output_stage_t) + 1024));
         constexpr int _dynamic_shared_memory =
             sizeof(input_tiles_t) * C::LOAD_PIPE_DEPTH + 1024 +
             sizeof(input_scales_t) * C::LOAD_PIPE_DEPTH + 1024 +
@@ -4475,7 +4829,8 @@ struct globals_3wg {
             (USE_COL_PAIR_STAGE ? (sizeof(col_pair_stage_t) * C::BF16_STAGE_COUNT + 1024) : 0) +
             (USE_ROW_PAIR_STAGE ? (sizeof(row_pair_stage_t) * C::BF16_STAGE_COUNT + 1024) : 0) +
             (USE_ROW_RCP_STAGE ? (sizeof(row_rcp_stage_t) * C::BF16_STAGE_COUNT + 1024) : 0) +
-            (USE_COL_HELPER_MAILBOX ? (sizeof(col_mailbox_stage_t) * C::BF16_STAGE_COUNT + 1024) : 0);
+            (USE_COL_HELPER_MAILBOX ? (sizeof(col_mailbox_stage_t) * C::BF16_STAGE_COUNT + 1024) : 0) +
+            combo_dynamic_shared_memory;
         static_assert(_dynamic_shared_memory <= MAX_SHARED_MEMORY - 1024);
         return _dynamic_shared_memory;
     }
@@ -4483,6 +4838,9 @@ struct globals_3wg {
 
 template <typename C>
 using globals_4wg = globals_3wg<C>;
+
+template <typename C>
+using globals_5wg = globals_3wg<C>;
 
 // =========================================================================
 // Main kernel
@@ -5063,6 +5421,14 @@ __device__ inline void backward_kernel_v3_streaming_impl(const globals<C>& g) {
         g.A_sc.template prefetch_tma<typename G::A_sc_tile>();
         g.B.template prefetch_tma<typename G::B_fp4x2_tile>();
         g.B_sc.template prefetch_tma<typename G::B_sc_tile>();
+        if constexpr (G::ENABLE_STOREADD_COMBO) {
+            g.C_col.template prefetch_tma<typename G::combo_p3_C_tile>();
+            g.C_col_sc.template prefetch_tma<typename G::combo_p3_C_sc_tile>();
+            g.E_col.template prefetch_tma<typename G::combo_p3_E_tile>();
+            g.E_col_sc.template prefetch_tma<typename G::combo_p3_E_sc_tile>();
+            g.dE_out.template prefetch_tma<typename G::combo_dE_tile>();
+            g.dC_out.template prefetch_tma<typename G::combo_dC_tile>();
+        }
     }
 
     const int warpgroup_id = warpgroup::groupid();
@@ -5952,7 +6318,7 @@ __device__ inline void backward_kernel_v3_streaming_2ctaSdupB_impl(const globals
     }
 }
 
-template <typename C, bool DO_ROW, bool DO_COL>
+template <typename C, bool DO_ROW, bool DO_COL, int STATIC_COMBO_MODE = -1, int EXTRA_INACTIVE_WG_BEGIN = -1>
 __device__ inline void backward_kernel_v3_streaming_3wg_impl(const globals_3wg<C>& g) {
     using G = globals_3wg<C>;
 
@@ -5964,6 +6330,22 @@ __device__ inline void backward_kernel_v3_streaming_3wg_impl(const globals_3wg<C
     }
 
     const int warpgroup_id = warpgroup::groupid();
+    constexpr bool STATIC_FRONTEND_ONLY_GONLY =
+        G::SEPARATE_BACKHALF_CONSUMERS &&
+        (STATIC_COMBO_MODE == G::COMBO_MODE_GONLY);
+    constexpr bool STATIC_FRONTEND_ONLY_DEONLY =
+        G::SEPARATE_BACKHALF_CONSUMERS &&
+        (STATIC_COMBO_MODE == G::COMBO_MODE_DEONLY);
+    constexpr bool EFFECTIVE_ENABLE_STOREADD_COMBO =
+        G::ENABLE_STOREADD_COMBO && !STATIC_FRONTEND_ONLY_GONLY;
+    constexpr bool EFFECTIVE_SEPARATE_BACKHALF_CONSUMERS =
+        G::SEPARATE_BACKHALF_CONSUMERS && EFFECTIVE_ENABLE_STOREADD_COMBO;
+    constexpr int EFFECTIVE_QUANTIZER_WARPGROUPS =
+        STATIC_FRONTEND_ONLY_GONLY ? G::FRONTEND_QUANTIZER_WARPGROUPS
+                                   : (STATIC_FRONTEND_ONLY_DEONLY ? 0 : C::QUANTIZER_WARPGROUPS);
+    constexpr int EFFECTIVE_PRODUCER_WARPGROUP_ID =
+        C::CONSUMER_WARPGROUPS + EFFECTIVE_QUANTIZER_WARPGROUPS;
+    const int effective_warpgroup_id = warpgroup_id;
     const int cta_id = cluster_ctarank();
     const int cluster_id = clusterIdx().x;
 
@@ -6009,6 +6391,37 @@ __device__ inline void backward_kernel_v3_streaming_3wg_impl(const globals_3wg<C
             sm_allocator.template allocate<typename G::row_rcp_stage_t, C::BF16_STAGE_COUNT>();
         row_rcp_stage = &row_rcp_stage_ref[0];
     }
+    typename G::combo_row_stage_t *combo_row_stage = nullptr;
+    typename G::combo_col_stage_t *combo_col_stage = nullptr;
+    typename G::combo_p3_c_tile_stage_t *combo_p3_c_tile_stage = nullptr;
+    typename G::combo_de_scales_stage_t *combo_de_scales_stage = nullptr;
+    typename G::combo_de_output_stage_t *combo_de_output_stage = nullptr;
+    typename G::combo_dc_tile_stage_t *combo_dc_tile_stage = nullptr;
+    typename G::combo_dc_scales_stage_t *combo_dc_scales_stage = nullptr;
+    typename G::combo_dc_output_stage_t *combo_dc_output_stage = nullptr;
+    typename G::combo_output_stage_t *combo_output_stage = nullptr;
+    if constexpr (EFFECTIVE_ENABLE_STOREADD_COMBO) {
+        if constexpr (EFFECTIVE_SEPARATE_BACKHALF_CONSUMERS) {
+            combo_row_stage = &sm_allocator.template allocate<typename G::combo_row_stage_t>();
+            combo_col_stage = &sm_allocator.template allocate<typename G::combo_col_stage_t>();
+            combo_p3_c_tile_stage = &sm_allocator.template allocate<typename G::combo_p3_c_tile_stage_t>();
+            combo_de_scales_stage = &sm_allocator.template allocate<typename G::combo_de_scales_stage_t>();
+            combo_output_stage = &sm_allocator.template allocate<typename G::combo_output_stage_t>();
+            combo_de_output_stage =
+                reinterpret_cast<typename G::combo_de_output_stage_t *>(combo_output_stage);
+            combo_dc_tile_stage =
+                reinterpret_cast<typename G::combo_dc_tile_stage_t *>(combo_output_stage);
+            combo_dc_scales_stage =
+                reinterpret_cast<typename G::combo_dc_scales_stage_t *>(&input_scales[0]);
+            combo_dc_output_stage =
+                reinterpret_cast<typename G::combo_dc_output_stage_t *>(combo_output_stage);
+        } else {
+            combo_row_stage = &sm_allocator.template allocate<typename G::combo_row_stage_t>();
+            combo_col_stage = &sm_allocator.template allocate<typename G::combo_col_stage_t>();
+            combo_p3_c_tile_stage = &sm_allocator.template allocate<typename G::combo_p3_c_tile_stage_t>();
+            combo_output_stage = &sm_allocator.template allocate<typename G::combo_output_stage_t>();
+        }
+    }
 
     tensor_allocator<1, C::CLUSTER_SIZE, false> tm_allocator;
 
@@ -6025,6 +6438,26 @@ __device__ inline void backward_kernel_v3_streaming_3wg_impl(const globals_3wg<C
     __shared__ semaphore slice_row_recycled[C::BF16_STAGE_COUNT];
     __shared__ semaphore slice_col_recycled[C::BF16_STAGE_COUNT];
     __shared__ volatile int slice_col_done_row16[C::BF16_STAGE_COUNT][C::Mb / 32];
+    __shared__ semaphore combo_row_stage_ready;
+    __shared__ semaphore combo_g_row_ready[C::BF16_STAGE_COUNT];
+    __shared__ semaphore combo_g_row_recycled[C::BF16_STAGE_COUNT];
+    __shared__ semaphore combo_g_col_ready[C::BF16_STAGE_COUNT];
+    __shared__ semaphore combo_g_col_recycled[C::BF16_STAGE_COUNT];
+    __shared__ semaphore combo_p3_c_tiles_arrived;
+    __shared__ semaphore combo_p3_c_scales_arrived;
+    __shared__ semaphore combo_p3_e_tiles_arrived;
+    __shared__ semaphore combo_p3_e_scales_arrived;
+    __shared__ semaphore combo_p3_inputs_finished;
+    __shared__ semaphore combo_p3_outputs_arrived;
+    __shared__ semaphore combo_de_p3_c_tiles_arrived;
+    __shared__ semaphore combo_de_p3_c_scales_arrived;
+    __shared__ semaphore combo_de_p3_inputs_finished;
+    __shared__ semaphore combo_de_p3_outputs_arrived;
+    __shared__ semaphore combo_dc_p3_e_tiles_arrived;
+    __shared__ semaphore combo_dc_p3_e_scales_arrived;
+    __shared__ semaphore combo_dc_p3_inputs_finished;
+    __shared__ semaphore combo_dc_p3_outputs_arrived;
+    __shared__ semaphore combo_backhalf_de_done;
     if (threadIdx.x == 32) {
         init_semaphore(tmem_provisioned, 0, 1);
         #pragma unroll
@@ -6035,8 +6468,8 @@ __device__ inline void backward_kernel_v3_streaming_3wg_impl(const globals_3wg<C
         }
         init_semaphore(outputs_arrived, 0, 1);
         init_semaphore(outputs_finished, 0, C::CLUSTER_SIZE);
-        constexpr int row_recycle_arrivals = (C::QUANTIZER_WARPGROUPS == 1) ? 1 : (C::ROW_QUANTIZER_WARPGROUPS > 0 ? C::ROW_QUANTIZER_WARPGROUPS : 1);
-        constexpr int col_recycle_arrivals = (C::QUANTIZER_WARPGROUPS == 1) ? 1 : (C::COL_QUANTIZER_WARPGROUPS > 0 ? C::COL_QUANTIZER_WARPGROUPS : 1);
+        constexpr int row_recycle_arrivals = G::FRONTEND_SINGLE_QUANTIZER_WG ? 1 : (C::ROW_QUANTIZER_WARPGROUPS > 0 ? C::ROW_QUANTIZER_WARPGROUPS : 1);
+        constexpr int col_recycle_arrivals = G::FRONTEND_SINGLE_QUANTIZER_WG ? 1 : (C::COL_QUANTIZER_WARPGROUPS > 0 ? C::COL_QUANTIZER_WARPGROUPS : 1);
         #pragma unroll
         for (int i = 0; i < C::BF16_STAGE_COUNT; ++i) {
             init_semaphore(slice_row_ready[i], 0, 1);
@@ -6049,10 +6482,68 @@ __device__ inline void backward_kernel_v3_streaming_3wg_impl(const globals_3wg<C
             init_semaphore(slice_row_recycled[i], 0, row_recycle_arrivals);
             init_semaphore(slice_col_recycled[i], 0, col_recycle_arrivals);
         }
+        if constexpr (EFFECTIVE_ENABLE_STOREADD_COMBO) {
+            if constexpr (EFFECTIVE_SEPARATE_BACKHALF_CONSUMERS) {
+                #pragma unroll
+                for (int i = 0; i < C::BF16_STAGE_COUNT; ++i) {
+                    init_semaphore(combo_g_row_ready[i], 0, 1);
+                    init_semaphore(combo_g_row_recycled[i], 0, 1);
+                    init_semaphore(combo_g_col_ready[i], 0, 1);
+                    init_semaphore(combo_g_col_recycled[i], 0, 1);
+                }
+                init_semaphore(combo_de_p3_c_tiles_arrived, 0, 1);
+                init_semaphore(combo_de_p3_c_scales_arrived, 0, 1);
+                init_semaphore(combo_de_p3_inputs_finished, 0, 1);
+                init_semaphore(combo_de_p3_outputs_arrived, 0, 1);
+                init_semaphore(combo_dc_p3_e_tiles_arrived, 0, 1);
+                init_semaphore(combo_dc_p3_e_scales_arrived, 0, 1);
+                init_semaphore(combo_dc_p3_inputs_finished, 0, 1);
+                init_semaphore(combo_dc_p3_outputs_arrived, 0, 1);
+                init_semaphore(combo_backhalf_de_done, 0, 1);
+            } else {
+                init_semaphore(combo_row_stage_ready, 0, 1);
+                init_semaphore(combo_p3_c_tiles_arrived, 0, 1);
+                init_semaphore(combo_p3_c_scales_arrived, 0, 1);
+                init_semaphore(combo_p3_e_tiles_arrived, 0, 1);
+                init_semaphore(combo_p3_e_scales_arrived, 0, 1);
+                init_semaphore(combo_p3_inputs_finished, 0, 1);
+                init_semaphore(combo_p3_outputs_arrived, 0, 1);
+            }
+        }
     }
     everyone::tma::cluster::arrive_aligned();
 
-    if (warpgroup_id == C::CONSUMER_WARPGROUPS + C::QUANTIZER_WARPGROUPS && warp::elect_leader()) {
+    if constexpr (EXTRA_INACTIVE_WG_BEGIN >= 0) {
+        if (warpgroup_id >= EXTRA_INACTIVE_WG_BEGIN) {
+            everyone::tma::cluster::wait_aligned();
+            return;
+        }
+    }
+
+    if constexpr (STATIC_FRONTEND_ONLY_GONLY) {
+        constexpr int first_inactive_backhalf_wg =
+            EFFECTIVE_PRODUCER_WARPGROUP_ID + C::PRODUCER_WARPGROUPS;
+        constexpr int end_inactive_backhalf_wg =
+            C::CONSUMER_WARPGROUPS + C::QUANTIZER_WARPGROUPS;
+        if (warpgroup_id >= first_inactive_backhalf_wg &&
+            warpgroup_id < end_inactive_backhalf_wg) {
+            everyone::tma::cluster::wait_aligned();
+            return;
+        }
+    }
+    if constexpr (STATIC_FRONTEND_ONLY_DEONLY) {
+        constexpr int first_inactive_backhalf_wg =
+            EFFECTIVE_PRODUCER_WARPGROUP_ID + C::PRODUCER_WARPGROUPS + G::COMBO_DE_WARPGROUPS;
+        constexpr int end_inactive_backhalf_wg =
+            C::CONSUMER_WARPGROUPS + C::QUANTIZER_WARPGROUPS;
+        if (warpgroup_id >= first_inactive_backhalf_wg &&
+            warpgroup_id < end_inactive_backhalf_wg) {
+            everyone::tma::cluster::wait_aligned();
+            return;
+        }
+    }
+
+    if (effective_warpgroup_id == EFFECTIVE_PRODUCER_WARPGROUP_ID && warp::elect_leader()) {
         int warp_id = group<WARPGROUP_WARPS * C::PRODUCER_WARPGROUPS>::warpid();
         if (warp_id == 3) {
             if constexpr (C::USE_PDL) pdl::wait();
@@ -6143,7 +6634,7 @@ __device__ inline void backward_kernel_v3_streaming_3wg_impl(const globals_3wg<C
                 phase ^= 1;
             }
         }
-    } else if (warpgroup_id < C::CONSUMER_WARPGROUPS) {
+    } else if (effective_warpgroup_id < C::CONSUMER_WARPGROUPS) {
         everyone::tma::cluster::wait_aligned();
         if (warpgroup::warpid() == 0) {
             tm_allocator.provision(tmem_addr);
@@ -6177,7 +6668,26 @@ __device__ inline void backward_kernel_v3_streaming_3wg_impl(const globals_3wg<C
         const int col_fp4_stride = g.A.rows() / 2;
         const int col_sc_kgroups = g.G_sc_col_kgroups;
         const bool encode_centric = g.encode_centric;
-        constexpr int CONSUMER_WG_SYNC_ID = G::ROW_QUANT_IMMEDIATE_PER_ROW16 ? 3 : 1;
+        constexpr bool COMBO_MODE_IS_STATIC = (STATIC_COMBO_MODE >= 0);
+        constexpr bool STATIC_COMBO_DO_DE =
+            COMBO_MODE_IS_STATIC &&
+            (STATIC_COMBO_MODE == G::COMBO_MODE_FULL || STATIC_COMBO_MODE == G::COMBO_MODE_DEONLY);
+        constexpr bool STATIC_COMBO_DO_DC =
+            COMBO_MODE_IS_STATIC &&
+            (STATIC_COMBO_MODE == G::COMBO_MODE_FULL || STATIC_COMBO_MODE == G::COMBO_MODE_DCONLY);
+        constexpr bool STATIC_COMBO_GONLY =
+            COMBO_MODE_IS_STATIC && (STATIC_COMBO_MODE == G::COMBO_MODE_GONLY);
+        const bool combo_use_de =
+            G::ENABLE_STOREADD_COMBO &&
+            G::SEPARATE_BACKHALF_CONSUMERS &&
+            (COMBO_MODE_IS_STATIC
+                ? STATIC_COMBO_DO_DE
+                : (g.combo_mode == G::COMBO_MODE_FULL || g.combo_mode == G::COMBO_MODE_DEONLY));
+        constexpr bool combo_debug_skip_consumer_row_recycle_wait = false;
+        constexpr bool combo_debug_force_row_ready_publish = false;
+        uint32_t combo_row_recycle_phasebits = 0xFFFF0000;
+        constexpr int CONSUMER_WG_SYNC_ID =
+            STATIC_FRONTEND_ONLY_GONLY ? 3 : (G::ROW_QUANT_IMMEDIATE_PER_ROW16 ? 3 : 1);
         constexpr float FP4_MAX = 6.0f;
         constexpr float E4M3_MAX = 448.0f;
 
@@ -6242,6 +6752,43 @@ __device__ inline void backward_kernel_v3_streaming_3wg_impl(const globals_3wg<C
 
                 subtile_rt_bf D_bf;
                 const int col_start = col_block_idx * C::Nb + epi * SUBTILE_COLS;
+                const bool combo_stage_first_epi = (epi == 0);
+                const bool combo_stage_publish_epi = (epi == C::EPI_PIPE_DEPTH - 1);
+                typename G::combo_row_stage_t *combo_row_stage_slot = nullptr;
+                uint8_t* combo_row_fp4_local_ptr = nullptr;
+                uint8_t* combo_row_sc_local_ptr = nullptr;
+                if constexpr (G::ENABLE_STOREADD_COMBO) {
+                    if (combo_use_de) {
+                        combo_row_stage_slot = combo_row_stage;
+                        combo_row_fp4_local_ptr =
+                            reinterpret_cast<uint8_t*>(&combo_row_stage_slot->G_row.data[0]);
+                        combo_row_sc_local_ptr =
+                            reinterpret_cast<uint8_t*>(&combo_row_stage_slot->G_row_sc.data[0]);
+                    }
+                }
+                if constexpr (EFFECTIVE_ENABLE_STOREADD_COMBO && EFFECTIVE_SEPARATE_BACKHALF_CONSUMERS) {
+                    if constexpr (DO_ROW && C::CONSUMER_DO_ROW) {
+                        if (combo_use_de && combo_stage_first_epi) {
+                            if constexpr (!combo_debug_skip_consumer_row_recycle_wait) {
+                                wait(combo_g_row_recycled[0], get_phasebit<1>(combo_row_recycle_phasebits, 0));
+                            }
+                            uint8_t *combo_row_bytes = reinterpret_cast<uint8_t*>(&combo_row_stage_slot->G_row.data[0]);
+                            for (int idx = warpgroup::warpid() * WARP_THREADS + lane_id;
+                                 idx < static_cast<int>(sizeof(typename G::combo_row_stage_t));
+                                 idx += WARPGROUP_WARPS * WARP_THREADS) {
+                                combo_row_bytes[idx] = 0;
+                            }
+                            warpgroup::sync(CONSUMER_WG_SYNC_ID);
+                            if constexpr (combo_debug_force_row_ready_publish) {
+                                if (warpgroup::warpid() == 0 && warp::laneid() == 0) {
+                                    __threadfence_block();
+                                    asm volatile("fence.proxy.async.shared::cta;\n" ::: "memory");
+                                    arrive(combo_g_row_ready[0]);
+                                }
+                            }
+                        }
+                    }
+                }
                 {
                     subtile_rt D_fl;
                     warpgroup::load_async(D_fl, accum.template subtile<full_tt_fl<SUBTILE_COLS>>(0, SUBTILE_COLS * epi));
@@ -6317,7 +6864,7 @@ __device__ inline void backward_kernel_v3_streaming_3wg_impl(const globals_3wg<C
                     warp::copy(D_bf, D_fl);
                 }
 
-                if (epi == C::EPI_PIPE_DEPTH - 1) {
+                if (epi == C::EPI_PIPE_DEPTH - 1 && !EFFECTIVE_ENABLE_STOREADD_COMBO) {
                     warpgroup::tma::cluster::arrive(outputs_finished, 0, 1);
                 }
 
@@ -7829,14 +8376,20 @@ __device__ inline void backward_kernel_v3_streaming_3wg_impl(const globals_3wg<C
                                                                     row_fp4_ptr, row_fp4_stride,
                                                                     row_sc_ptr, row_sc_kgroups,
                                                                     global_row, col_start, group16,
-                                                                    g_sg_rcp, g_sg, encode_centric);
+                                                                    g_sg_rcp, g_sg, encode_centric,
+                                                                    combo_row_fp4_local_ptr, G::G_fp4_row_tile::cols,
+                                                                    combo_row_sc_local_ptr, quant_row,
+                                                                    epi * SUBTILE_COLS);
                                                             } else if constexpr (G::ROW_QUANT_USE_HW_FP4X2) {
                                                                 quantize_rowrecord_pairbits_to_global<true>(
                                                                     pair_bits_0, pair_bits_1, pair_bits_2, pair_bits_3,
                                                                     row_fp4_ptr, row_fp4_stride,
                                                                     row_sc_ptr, row_sc_kgroups,
                                                                     global_row, col_start, group16,
-                                                                    g_sg_rcp, g_sg, encode_centric);
+                                                                    g_sg_rcp, g_sg, encode_centric,
+                                                                    combo_row_fp4_local_ptr, G::G_fp4_row_tile::cols,
+                                                                    combo_row_sc_local_ptr, quant_row,
+                                                                    epi * SUBTILE_COLS);
                                                             } else {
                                                             float2 cached_pairs[8];
                                                             const uint64_t pair_bits_arr[4] = {
@@ -8425,11 +8978,23 @@ __device__ inline void backward_kernel_v3_streaming_3wg_impl(const globals_3wg<C
                                 arrive(slice_col_ready[bf_stage]);
                             }
                         }
+                        if constexpr (EFFECTIVE_ENABLE_STOREADD_COMBO && EFFECTIVE_SEPARATE_BACKHALF_CONSUMERS) {
+                            if constexpr (DO_ROW && C::CONSUMER_DO_ROW) {
+                                if (combo_use_de && combo_stage_publish_epi) {
+                                    warpgroup::sync(CONSUMER_WG_SYNC_ID);
+                                    if (warpgroup::warpid() == 0 && warp::laneid() == 0) {
+                                        __threadfence_block();
+                                        asm volatile("fence.proxy.async.shared::cta;\n" ::: "memory");
+                                        arrive(combo_g_row_ready[0]);
+                                    }
+                                }
+                            }
+                        }
                         if constexpr (DO_ROW && !C::CONSUMER_DO_ROW) {
                             update_phasebit<1>(slice_row_recycle_phasebits, bf_stage);
                         }
                         if constexpr (DO_COL) {
-                            if constexpr (C::QUANTIZER_WARPGROUPS > 1 &&
+                            if constexpr (G::FRONTEND_MULTI_QUANTIZER_WG &&
                                           C::EARLY_COL_READY &&
                                           G::USE_COL_PAIR_STAGE) {
                             } else if constexpr (G::USE_COL_PAIR_STAGE ||
@@ -8439,6 +9004,24 @@ __device__ inline void backward_kernel_v3_streaming_3wg_impl(const globals_3wg<C
                                 update_phasebit<1>(slice_phasebits, bf_stage);
                             }
                         }
+                        if constexpr (EFFECTIVE_ENABLE_STOREADD_COMBO && EFFECTIVE_SEPARATE_BACKHALF_CONSUMERS) {
+                            if constexpr (DO_ROW && C::CONSUMER_DO_ROW) {
+                                if (combo_use_de && combo_stage_publish_epi) {
+                                    update_phasebit<1>(combo_row_recycle_phasebits, 0);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            if constexpr (EFFECTIVE_ENABLE_STOREADD_COMBO) {
+                if constexpr (!EFFECTIVE_SEPARATE_BACKHALF_CONSUMERS) {
+                    warpgroup::sync(CONSUMER_WG_SYNC_ID);
+                    if (warpgroup::warpid() == 0 && warp::laneid() == 0) {
+                        __threadfence_block();
+                        asm volatile("fence.proxy.async.shared::cta;\n" ::: "memory");
+                        arrive(combo_row_stage_ready);
                     }
                 }
             }
@@ -8448,14 +9031,19 @@ __device__ inline void backward_kernel_v3_streaming_3wg_impl(const globals_3wg<C
         }
         warpgroup::sync(CONSUMER_WG_SYNC_ID);
         if constexpr (C::USE_PDL) warpgroup::pdl::arrive();
-        if (warpgroup::warpid() == 0) tm_allocator.deprovision();
-    } else if (warpgroup_id < C::CONSUMER_WARPGROUPS + C::QUANTIZER_WARPGROUPS) {
+        if constexpr (!EFFECTIVE_ENABLE_STOREADD_COMBO) {
+            if (warpgroup::warpid() == 0) tm_allocator.deprovision();
+        }
+    } else if (effective_warpgroup_id < C::CONSUMER_WARPGROUPS + EFFECTIVE_QUANTIZER_WARPGROUPS) {
         constexpr bool ROW_IN_QUANTIZER = DO_ROW && !C::CONSUMER_DO_ROW && (C::QUANTIZER_WARPGROUPS > 0);
         constexpr bool COL_IN_QUANTIZER = DO_COL && (C::QUANTIZER_WARPGROUPS > 0);
-        if constexpr (!(ROW_IN_QUANTIZER || COL_IN_QUANTIZER)) {
+        if constexpr (!(ROW_IN_QUANTIZER || COL_IN_QUANTIZER) && !EFFECTIVE_SEPARATE_BACKHALF_CONSUMERS) {
             return;
         }
         everyone::tma::cluster::wait_aligned();
+        if constexpr (EFFECTIVE_ENABLE_STOREADD_COMBO) {
+            wait(tmem_provisioned, 0);
+        }
 
         const float g_sg = g.G_sg_row[{0}];
         const float g_sg_rcp = 1.0f / g_sg;
@@ -8470,6 +9058,9 @@ __device__ inline void backward_kernel_v3_streaming_3wg_impl(const globals_3wg<C
         uint32_t slice_phasebits = 0xFFFF0000;
         uint32_t slice_row_ready_phasebits = 0xFFFF0000;
         uint32_t slice_col_ready_phasebits = 0xFFFF0000;
+        uint32_t combo_row_ready_phasebits = 0xFFFF0000;
+        uint32_t combo_col_ready_phasebits = 0xFFFF0000;
+        uint32_t combo_col_recycle_phasebits = 0xFFFF0000;
 
         uint8_t* row_fp4_ptr = reinterpret_cast<uint8_t*>(g.G_fp4_row.raw_ptr);
         uint8_t* row_sc_ptr = g.G_sc_row_ptr;
@@ -8480,19 +9071,105 @@ __device__ inline void backward_kernel_v3_streaming_3wg_impl(const globals_3wg<C
         const int col_fp4_stride = g.A.rows() / 2;
         const int col_sc_kgroups = g.G_sc_col_kgroups;
         const bool encode_centric = g.encode_centric;
+        int combo_row_stage_phase = 0;
+        int combo_c_tiles_phase = 0;
+        int combo_c_scales_phase = 0;
+        int combo_e_tiles_phase = 0;
+        int combo_e_scales_phase = 0;
+        int combo_p3_outputs_phase = 0;
+        int combo_backhalf_de_done_phase = 0;
+        constexpr bool COMBO_MODE_IS_STATIC = (STATIC_COMBO_MODE >= 0);
+        constexpr bool STATIC_COMBO_DO_DE =
+            COMBO_MODE_IS_STATIC &&
+            (STATIC_COMBO_MODE == G::COMBO_MODE_FULL || STATIC_COMBO_MODE == G::COMBO_MODE_DEONLY);
+        constexpr bool STATIC_COMBO_DO_DC =
+            COMBO_MODE_IS_STATIC &&
+            (STATIC_COMBO_MODE == G::COMBO_MODE_FULL || STATIC_COMBO_MODE == G::COMBO_MODE_DCONLY);
+        constexpr bool STATIC_COMBO_GONLY =
+            COMBO_MODE_IS_STATIC && (STATIC_COMBO_MODE == G::COMBO_MODE_GONLY);
+        const bool combo_do_de = G::ENABLE_STOREADD_COMBO &&
+                                 (COMBO_MODE_IS_STATIC
+                                      ? STATIC_COMBO_DO_DE
+                                      : (g.combo_mode == G::COMBO_MODE_FULL || g.combo_mode == G::COMBO_MODE_DEONLY));
+        const bool combo_do_dc = G::ENABLE_STOREADD_COMBO &&
+                                 (COMBO_MODE_IS_STATIC
+                                      ? STATIC_COMBO_DO_DC
+                                      : (g.combo_mode == G::COMBO_MODE_FULL || g.combo_mode == G::COMBO_MODE_DCONLY));
+        constexpr bool combo_debug_skip_sep_de_row_ready_wait = false;
+        constexpr bool combo_debug_skip_sep_de_output_wait = false;
+        constexpr bool combo_debug_skip_sep_de_input_wait = false;
+        constexpr bool combo_debug_skip_sep_de_scale_wait = false;
+        constexpr bool combo_debug_skip_sep_de_tile_wait = false;
+        constexpr bool combo_debug_skip_sep_de_body = true;
+        constexpr bool combo_debug_skip_sep_de_drain = false;
+        constexpr bool combo_debug_skip_sep_de_row_sc_preload = true;
+        if constexpr (G::ENABLE_STOREADD_COMBO) {
+            tm_allocator.set_addr(tmem_addr);
+        }
 
         constexpr int first_quantizer_wg = C::CONSUMER_WARPGROUPS;
-        constexpr int first_col_quantizer_wg = first_quantizer_wg + (C::QUANTIZER_WARPGROUPS == 1 ? C::QUANTIZER_WARPGROUPS : C::ROW_QUANTIZER_WARPGROUPS);
-        const bool is_row_quantizer_wg = (warpgroup_id >= first_quantizer_wg) && (warpgroup_id < first_col_quantizer_wg);
-        const bool is_col_quantizer_wg = (C::QUANTIZER_WARPGROUPS > 1) &&
-                                         (warpgroup_id >= first_col_quantizer_wg) &&
-                                         (warpgroup_id < C::CONSUMER_WARPGROUPS + C::QUANTIZER_WARPGROUPS);
-        const int quantizer_sync_id =
-            (C::QUANTIZER_WARPGROUPS > 1)
+        constexpr int first_col_quantizer_wg =
+            EFFECTIVE_SEPARATE_BACKHALF_CONSUMERS
+                ? (STATIC_FRONTEND_ONLY_DEONLY
+                       ? (EFFECTIVE_PRODUCER_WARPGROUP_ID + C::PRODUCER_WARPGROUPS)
+                       : first_quantizer_wg)
+                : first_quantizer_wg + (G::FRONTEND_SINGLE_QUANTIZER_WG ? G::FRONTEND_QUANTIZER_WARPGROUPS : C::ROW_QUANTIZER_WARPGROUPS);
+        constexpr int first_de_consumer_wg =
+            EFFECTIVE_SEPARATE_BACKHALF_CONSUMERS
+                ? (STATIC_FRONTEND_ONLY_DEONLY
+                       ? (EFFECTIVE_PRODUCER_WARPGROUP_ID + C::PRODUCER_WARPGROUPS)
+                       : (first_col_quantizer_wg + C::COL_QUANTIZER_WARPGROUPS))
+                : first_col_quantizer_wg;
+        constexpr int first_dc_consumer_wg = first_de_consumer_wg + (EFFECTIVE_SEPARATE_BACKHALF_CONSUMERS ? G::COMBO_DE_WARPGROUPS : 0);
+        const bool is_row_quantizer_wg =
+            !EFFECTIVE_SEPARATE_BACKHALF_CONSUMERS &&
+            (warpgroup_id >= first_quantizer_wg) && (warpgroup_id < first_col_quantizer_wg);
+        const bool is_col_quantizer_wg =
+            EFFECTIVE_SEPARATE_BACKHALF_CONSUMERS
+                ? (warpgroup_id >= first_col_quantizer_wg &&
+                   warpgroup_id < first_de_consumer_wg)
+                : (G::FRONTEND_MULTI_QUANTIZER_WG &&
+                   (warpgroup_id >= first_col_quantizer_wg) &&
+                   (warpgroup_id < C::CONSUMER_WARPGROUPS + C::QUANTIZER_WARPGROUPS));
+        const bool is_de_consumer_wg =
+            EFFECTIVE_SEPARATE_BACKHALF_CONSUMERS &&
+            (warpgroup_id >= first_de_consumer_wg) &&
+            (warpgroup_id < first_dc_consumer_wg);
+        const bool is_dc_consumer_wg =
+            EFFECTIVE_SEPARATE_BACKHALF_CONSUMERS &&
+            (warpgroup_id >= first_dc_consumer_wg) &&
+            (warpgroup_id < C::CONSUMER_WARPGROUPS + C::QUANTIZER_WARPGROUPS);
+        const int quantizer_sync_id = EFFECTIVE_SEPARATE_BACKHALF_CONSUMERS
+            ? (STATIC_FRONTEND_ONLY_DEONLY
+                ? (is_de_consumer_wg ? 4 : 2)
+                : (is_col_quantizer_wg ? 2 : (is_de_consumer_wg ? 3 : 4)))
+            : (G::FRONTEND_MULTI_QUANTIZER_WG
                 ? (is_row_quantizer_wg ? 2 : 3)
-                : (!C::CONSUMER_DO_ROW ? 2 : 1);
-        if constexpr (C::QUANTIZER_WARPGROUPS > 1) {
-            if (!is_row_quantizer_wg && !is_col_quantizer_wg) {
+                : (!C::CONSUMER_DO_ROW ? 2 : 1));
+        if constexpr (G::FRONTEND_MULTI_QUANTIZER_WG || EFFECTIVE_SEPARATE_BACKHALF_CONSUMERS) {
+            if (!is_row_quantizer_wg && !is_col_quantizer_wg && !is_de_consumer_wg && !is_dc_consumer_wg) {
+                return;
+            }
+        }
+        if constexpr (EFFECTIVE_ENABLE_STOREADD_COMBO && EFFECTIVE_SEPARATE_BACKHALF_CONSUMERS) {
+            if (((COMBO_MODE_IS_STATIC && STATIC_COMBO_GONLY) ||
+                 (!COMBO_MODE_IS_STATIC && g.combo_mode == G::COMBO_MODE_GONLY)) &&
+                (is_de_consumer_wg || is_dc_consumer_wg)) {
+                return;
+            }
+            if (((COMBO_MODE_IS_STATIC && STATIC_COMBO_DO_DE && !STATIC_COMBO_DO_DC) ||
+                 (!COMBO_MODE_IS_STATIC && g.combo_mode == G::COMBO_MODE_DEONLY)) &&
+                is_col_quantizer_wg) {
+                return;
+            }
+            if (((COMBO_MODE_IS_STATIC && STATIC_COMBO_DO_DE && !STATIC_COMBO_DO_DC) ||
+                 (!COMBO_MODE_IS_STATIC && g.combo_mode == G::COMBO_MODE_DEONLY)) &&
+                is_dc_consumer_wg) {
+                return;
+            }
+            if (((COMBO_MODE_IS_STATIC && STATIC_COMBO_DO_DC && !STATIC_COMBO_DO_DE) ||
+                 (!COMBO_MODE_IS_STATIC && g.combo_mode == G::COMBO_MODE_DCONLY)) &&
+                is_de_consumer_wg) {
                 return;
             }
         }
@@ -8506,13 +9183,56 @@ __device__ inline void backward_kernel_v3_streaming_3wg_impl(const globals_3wg<C
             int col_block_idx = idx_within_supergroup / rows_in_supergroup;
             const int tile_row_base = row_block_idx * C::Mb + cta_id * (C::Mb / 2);
             const bool full_tile_rows = tile_row_base + (C::Mb / 2) <= g.M;
+            if constexpr (EFFECTIVE_ENABLE_STOREADD_COMBO && EFFECTIVE_SEPARATE_BACKHALF_CONSUMERS) {
+                if ((is_de_consumer_wg && !combo_do_de) ||
+                    (is_dc_consumer_wg && !combo_do_dc)) {
+                    continue;
+                }
+            }
 
             #pragma unroll
             for (int epi = 0; epi < C::EPI_PIPE_DEPTH; ++epi) {
                 const int bf_stage = epi % C::BF16_STAGE_COUNT;
                 const int col_start = col_block_idx * C::Nb + epi * SUBTILE_COLS;
+                const bool combo_stage_first_epi = (epi == 0);
+                const bool combo_stage_publish_epi = (epi == C::EPI_PIPE_DEPTH - 1);
+                typename G::combo_col_stage_t *combo_col_stage_slot = nullptr;
+                uint8_t* combo_col_fp4_local_ptr = nullptr;
+                uint8_t* combo_col_sc_local_ptr = nullptr;
+                if constexpr (EFFECTIVE_ENABLE_STOREADD_COMBO) {
+                    if (combo_do_dc) {
+                        combo_col_stage_slot = combo_col_stage;
+                        combo_col_fp4_local_ptr =
+                            reinterpret_cast<uint8_t*>(&combo_col_stage_slot->Gt_row.data[0]);
+                        combo_col_sc_local_ptr =
+                            reinterpret_cast<uint8_t*>(&combo_col_stage_slot->Gt_row_sc.data[0]);
+                    }
+                }
 
-                    if constexpr (C::QUANTIZER_WARPGROUPS == 1) {
+                if constexpr (EFFECTIVE_ENABLE_STOREADD_COMBO && EFFECTIVE_SEPARATE_BACKHALF_CONSUMERS) {
+                    if (is_col_quantizer_wg && combo_do_dc && combo_stage_first_epi) {
+                        wait(combo_g_col_recycled[0], get_phasebit<1>(combo_col_recycle_phasebits, 0));
+                        uint8_t *combo_col_bytes = reinterpret_cast<uint8_t*>(&combo_col_stage_slot->Gt_row.data[0]);
+                        for (int idx = warpgroup::warpid() * WARP_THREADS + quant_lane;
+                             idx < static_cast<int>(sizeof(typename G::combo_col_stage_t));
+                             idx += WARPGROUP_WARPS * WARP_THREADS) {
+                            combo_col_bytes[idx] = 0;
+                        }
+                        warpgroup::sync(quantizer_sync_id);
+                    }
+                    if (is_de_consumer_wg && combo_do_de && combo_stage_publish_epi) {
+                        if constexpr (!combo_debug_skip_sep_de_row_ready_wait) {
+                            wait(combo_g_row_ready[0], get_phasebit<0>(combo_row_ready_phasebits, 0));
+                            asm volatile("fence.proxy.async.shared::cta;\n" ::: "memory");
+                        }
+                    }
+                    if (is_dc_consumer_wg && combo_do_dc && combo_stage_publish_epi) {
+                        wait(combo_g_col_ready[0], get_phasebit<0>(combo_col_ready_phasebits, 0));
+                        asm volatile("fence.proxy.async.shared::cta;\n" ::: "memory");
+                    }
+                }
+
+                    if constexpr (G::FRONTEND_SINGLE_QUANTIZER_WG) {
                         if constexpr (ROW_IN_QUANTIZER) {
                             if constexpr (!G::DEBUG_SKIP_ROW_READY_WAIT) {
                                 wait(slice_row_ready[bf_stage], get_phasebit<0>(slice_row_ready_phasebits, bf_stage));
@@ -8580,7 +9300,7 @@ __device__ inline void backward_kernel_v3_streaming_3wg_impl(const globals_3wg<C
                 if constexpr (ROW_IN_QUANTIZER) {
                     if constexpr (!G::DEBUG_DISABLE_ROW_QUANT_WORK) {
                     constexpr bool SINGLE_ROW_ONLY_LANEPAIR_FLOATCACHE =
-                        (C::QUANTIZER_WARPGROUPS == 1) &&
+                        G::FRONTEND_SINGLE_QUANTIZER_WG &&
                         !COL_IN_QUANTIZER &&
                         G::USE_ROW_PAIR_STAGE &&
                         G::ROW_PAIR_STAGE_ROWRECORD &&
@@ -8657,7 +9377,7 @@ __device__ inline void backward_kernel_v3_streaming_3wg_impl(const globals_3wg<C
                                 }
                             }
                         }
-                    } else if constexpr (C::QUANTIZER_WARPGROUPS == 1) {
+                    } else if constexpr (G::FRONTEND_SINGLE_QUANTIZER_WG) {
                         constexpr int ROW_THREADS = QUANTIZER_WG_THREADS / 2;
                         if (quant_thread < ROW_THREADS) {
                             const int quant_row = quant_thread;
@@ -8830,7 +9550,7 @@ __device__ inline void backward_kernel_v3_streaming_3wg_impl(const globals_3wg<C
 
                 if constexpr (COL_IN_QUANTIZER) {
                     if constexpr (!G::DEBUG_DISABLE_COL_QUANT_WORK) {
-                    if constexpr (C::QUANTIZER_WARPGROUPS == 1) {
+                    if constexpr (G::FRONTEND_SINGLE_QUANTIZER_WG) {
                         constexpr int ROW_THREADS = ROW_IN_QUANTIZER ? (QUANTIZER_WG_THREADS / 2) : 0;
                         constexpr int COL_THREADS = QUANTIZER_WG_THREADS - ROW_THREADS;
                         constexpr int COL_ROW16_BLOCKS_PER_PASS = COL_THREADS / SUBTILE_COLS;
@@ -8894,12 +9614,30 @@ __device__ inline void backward_kernel_v3_streaming_3wg_impl(const globals_3wg<C
                                                         static_cast<uint8_t>(packed_fp4 >> (pair * 8));
                                                 }
                                             }
+                                            if (combo_do_dc) {
+                                                const int local_col = epi * SUBTILE_COLS + col_in_epi;
+                                                const int local_row_pair_base = local_row_base / 2;
+                                                store_combo_col_stage_u64<G>(
+                                                    combo_col_stage_slot,
+                                                    local_col,
+                                                    local_row_pair_base,
+                                                    packed_fp4);
+                                            }
                                             float stored_scale = col_scale * g_sg_rcp;
                                             if (encode_centric) {
                                                 stored_scale = fminf(col_rcp * g_sg, E4M3_MAX);
                                             }
                                             const __nv_fp8_e4m3 csc = __nv_fp8_e4m3(stored_scale);
-                                            col_sc_ptr[chunk * 512 + byte_idx] = *reinterpret_cast<const uint8_t*>(&csc);
+                                                const uint8_t csc_byte = *reinterpret_cast<const uint8_t*>(&csc);
+                                                col_sc_ptr[chunk * 512 + byte_idx] = csc_byte;
+                                                if (combo_do_dc) {
+                                                    const int local_col = epi * SUBTILE_COLS + col_in_epi;
+                                                    store_combo_col_stage_scale<G>(
+                                                        combo_col_stage_slot,
+                                                        local_col,
+                                                        local_row_base,
+                                                        csc_byte);
+                                                }
                                         } else {
                                             bf16_2 cached_pairs[8];
                                             #pragma unroll
@@ -8929,12 +9667,30 @@ __device__ inline void backward_kernel_v3_streaming_3wg_impl(const globals_3wg<C
                                                         static_cast<uint8_t>(packed_fp4 >> (pair * 8));
                                                 }
                                             }
+                                            if (combo_do_dc) {
+                                                const int local_col = epi * SUBTILE_COLS + col_in_epi;
+                                                const int local_row_pair_base = local_row_base / 2;
+                                                store_combo_col_stage_u64<G>(
+                                                    combo_col_stage_slot,
+                                                    local_col,
+                                                    local_row_pair_base,
+                                                    packed_fp4);
+                                            }
                                             float stored_scale = col_scale * g_sg_rcp;
                                             if (encode_centric) {
                                                 stored_scale = fminf(col_rcp * g_sg, E4M3_MAX);
                                             }
                                             const __nv_fp8_e4m3 csc = __nv_fp8_e4m3(stored_scale);
-                                            col_sc_ptr[chunk * 512 + byte_idx] = *reinterpret_cast<const uint8_t*>(&csc);
+                                                const uint8_t csc_byte = *reinterpret_cast<const uint8_t*>(&csc);
+                                                col_sc_ptr[chunk * 512 + byte_idx] = csc_byte;
+                                                if (combo_do_dc) {
+                                                    const int local_col = epi * SUBTILE_COLS + col_in_epi;
+                                                    store_combo_col_stage_scale<G>(
+                                                        combo_col_stage_slot,
+                                                        local_col,
+                                                        local_row_base,
+                                                        csc_byte);
+                                                }
                                         }
                                         if constexpr (DO_ROW && G::ROW_WAITS_FOR_COL_DONE_ROW16) {
                                             __syncwarp();
@@ -9173,9 +9929,336 @@ __device__ inline void backward_kernel_v3_streaming_3wg_impl(const globals_3wg<C
                     }
                 }
 
+                if constexpr (EFFECTIVE_ENABLE_STOREADD_COMBO && EFFECTIVE_SEPARATE_BACKHALF_CONSUMERS) {
+                    constexpr int combo_de_a_scale_chunks = C::Nb / 64;
+                    constexpr int combo_de_b_scale_chunks = C::Nb / 128;
+                    constexpr int combo_dc_a_scale_chunks = C::Nb / 64;
+                    constexpr int combo_dc_b_scale_chunks = C::Nb / 64;
+                    using combo_de_rt = rt_fl<C::Mb / 8, C::Nb / C::EPI_PIPE_DEPTH>;
+                    using combo_de_rt_bf = rt_bf<C::Mb / 8, C::Nb / C::EPI_PIPE_DEPTH>;
+                    using combo_dc_rt = rt_fl<C::Nb / 4, C::Nb / C::EPI_PIPE_DEPTH>;
+                    using combo_dc_rt_bf = rt_bf<C::Nb / 4, C::Nb / C::EPI_PIPE_DEPTH>;
+                    const bool combo_issue_leader = (warpgroup::warpid() == 0) && (quant_lane == 0);
+                    auto combo_de_tm = tm_allocator.template allocate<full_tt_fl<C::Nb>>(256);
+                    auto combo_dc_tm = tm_allocator.template allocate<full_tt_fl<C::Nb>>(384);
+                    auto combo_de_a_sc_tm =
+                        tm_allocator.template allocate<full_tt_fp8e4m3<16 * combo_de_a_scale_chunks>>(512);
+                    auto combo_de_b_sc_tm =
+                        tm_allocator.template allocate<full_tt_fp8e4m3<32 * combo_de_b_scale_chunks>>(
+                            512 + 4 * combo_de_a_scale_chunks);
+                    auto combo_dc_a_sc_tm =
+                        tm_allocator.template allocate<full_tt_fp8e4m3<16 * combo_dc_a_scale_chunks>>(640);
+                    auto combo_dc_b_sc_tm =
+                        tm_allocator.template allocate<full_tt_fp8e4m3<32 * combo_dc_b_scale_chunks>>(
+                            640 + 4 * combo_dc_a_scale_chunks);
+
+                    if (combo_stage_publish_epi && is_de_consumer_wg && combo_do_de) {
+                        const float combo_de_scale = g_sg * g.C_col_sc_global[{0}];
+                        if constexpr (!combo_debug_skip_sep_de_row_sc_preload) {
+                            #pragma unroll
+                            for (int ii = 0; ii < combo_de_a_scale_chunks; ++ii) {
+                                auto combo_a_sc_sub =
+                                    combo_de_a_sc_tm.template subtile<full_tt_fp8e4m3<16>>(ii * 16);
+                                auto &combo_g_sc_sm_sub =
+                                    *reinterpret_cast<st_fp8e4m3<32, 16, false> *>(
+                                        reinterpret_cast<uint64_t>(&combo_row_stage->G_row_sc.data[0]) + 16 * 32 * ii);
+                                load_mxnv_scale_async2(combo_a_sc_sub, combo_g_sc_sm_sub);
+                            }
+                        }
+
+                        int combo_de_c_tiles_phase = 0;
+                        int combo_de_c_scales_phase = 0;
+                        int combo_de_inputs_phase = 1;
+                        int combo_de_outputs_phase = 0;
+                        int prev_k_block_idx = -1;
+                        const int combo_num_k_blocks =
+                            combo_debug_skip_sep_de_body ? 0 : (g.dE_out.cols() / C::Nb);
+
+                        #pragma unroll 1
+                        for (int k_block_idx = 0; k_block_idx < combo_num_k_blocks; ++k_block_idx) {
+                            if (prev_k_block_idx >= 0) {
+                                if constexpr (!combo_debug_skip_sep_de_drain) {
+                                    if constexpr (!combo_debug_skip_sep_de_output_wait) {
+                                        wait(combo_de_p3_outputs_arrived, combo_de_outputs_phase);
+                                        combo_de_outputs_phase ^= 1;
+                                    }
+                                    #pragma unroll
+                                    for (int combo_epi = 0; combo_epi < C::EPI_PIPE_DEPTH; ++combo_epi) {
+                                        combo_de_rt D_reg_fl;
+                                        combo_de_rt_bf D_reg_bf;
+                                        warpgroup::tma::store_async_read_wait<0>();
+                                        warpgroup::sync(quantizer_sync_id);
+                                        warpgroup::load_async(
+                                            D_reg_fl,
+                                            combo_de_tm.template subtile<full_tt_fl<C::Nb / C::EPI_PIPE_DEPTH>>(
+                                                0,
+                                                combo_epi * (C::Nb / C::EPI_PIPE_DEPTH)));
+                                        tensor_load_wait();
+                                        tensor_before_thread_sync();
+                                        warpgroup::sync(quantizer_sync_id);
+                                        warp::mul(D_reg_fl, D_reg_fl, combo_de_scale);
+                                        warp::copy(D_reg_bf, D_reg_fl);
+                                        warpgroup::store(combo_de_output_stage->dE, D_reg_bf);
+                                        warpgroup::sync(quantizer_sync_id);
+                                        warpgroup::tma::store_add_async(
+                                            g.dE_out, combo_de_output_stage->dE,
+                                            {row_block_idx * 2 + cta_id, prev_k_block_idx * C::EPI_PIPE_DEPTH + combo_epi});
+                                        tensor_after_thread_sync();
+                                    }
+                                    warpgroup::tma::store_async_read_wait<0>();
+                                }
+                            }
+
+                            if (combo_issue_leader) {
+                                if constexpr (!combo_debug_skip_sep_de_input_wait) {
+                                    wait(combo_de_p3_inputs_finished, combo_de_inputs_phase);
+                                    combo_de_inputs_phase ^= 1;
+                                }
+                                tma::expect_bytes(combo_de_p3_c_tiles_arrived, sizeof(typename G::combo_p3_C_tile));
+                                tma::load_async(
+                                    combo_p3_c_tile_stage->C_operand, g.C_col,
+                                    {k_block_idx * 2 + cta_id, col_block_idx},
+                                    combo_de_p3_c_tiles_arrived);
+                                tma::load_async(
+                                    combo_de_scales_stage->C_sc, g.C_col_sc,
+                                    {k_block_idx, col_block_idx, 0},
+                                    combo_de_p3_c_scales_arrived);
+                            }
+                            warpgroup::sync(quantizer_sync_id);
+
+                            if (combo_issue_leader) {
+                                tma::expect_bytes(combo_de_p3_c_scales_arrived, sizeof(typename G::combo_p3_C_sc_tile));
+                                if constexpr (!combo_debug_skip_sep_de_scale_wait) {
+                                    wait(combo_de_p3_c_scales_arrived, combo_de_c_scales_phase);
+                                    combo_de_c_scales_phase ^= 1;
+                                }
+                            }
+                            warpgroup::sync(quantizer_sync_id);
+
+                            #pragma unroll
+                            for (int ii = 0; ii < combo_de_b_scale_chunks; ++ii) {
+                                auto combo_b_sc_sub =
+                                    combo_de_b_sc_tm.template subtile<full_tt_fp8e4m3<16>>(ii * 16);
+                                auto &combo_c_sc_sm_sub =
+                                    *reinterpret_cast<st_fp8e4m3<32, 16, false> *>(
+                                        reinterpret_cast<uint64_t>(&combo_de_scales_stage->C_sc.data[0]) + 16 * 32 * ii);
+                                load_mxnv_scale_async2(combo_b_sc_sub, combo_c_sc_sm_sub);
+                            }
+
+                            if (combo_issue_leader) {
+                                if constexpr (!combo_debug_skip_sep_de_tile_wait) {
+                                    wait(combo_de_p3_c_tiles_arrived, combo_de_c_tiles_phase);
+                                    combo_de_c_tiles_phase ^= 1;
+                                }
+                            }
+                            warpgroup::sync(quantizer_sync_id);
+
+                            mm2_ABt(
+                                combo_de_tm, combo_row_stage->G_row, combo_p3_c_tile_stage->C_operand,
+                                combo_de_a_sc_tm.template subtile<full_tt_fp8e4m3<16 * combo_de_a_scale_chunks>>(0),
+                                combo_de_b_sc_tm.template subtile<full_tt_fp8e4m3<32 * combo_de_b_scale_chunks>>(0),
+                                combo_de_p3_inputs_finished);
+                            tensor_commit<2>(combo_de_p3_outputs_arrived);
+                            tensor_after_thread_sync();
+                            asm volatile("fence.proxy.async.shared::cluster;\n" ::: "memory");
+                            warpgroup::sync(quantizer_sync_id);
+                            prev_k_block_idx = k_block_idx;
+                        }
+
+                        if (prev_k_block_idx >= 0) {
+                            if constexpr (!combo_debug_skip_sep_de_drain) {
+                                if constexpr (!combo_debug_skip_sep_de_output_wait) {
+                                    wait(combo_de_p3_outputs_arrived, combo_de_outputs_phase);
+                                    combo_de_outputs_phase ^= 1;
+                                }
+                                #pragma unroll
+                                for (int combo_epi = 0; combo_epi < C::EPI_PIPE_DEPTH; ++combo_epi) {
+                                    combo_de_rt D_reg_fl;
+                                    combo_de_rt_bf D_reg_bf;
+                                    warpgroup::tma::store_async_read_wait<0>();
+                                    warpgroup::sync(quantizer_sync_id);
+                                    warpgroup::load_async(
+                                        D_reg_fl,
+                                        combo_de_tm.template subtile<full_tt_fl<C::Nb / C::EPI_PIPE_DEPTH>>(
+                                            0,
+                                            combo_epi * (C::Nb / C::EPI_PIPE_DEPTH)));
+                                    tensor_load_wait();
+                                    tensor_before_thread_sync();
+                                    warpgroup::sync(quantizer_sync_id);
+                                    warp::mul(D_reg_fl, D_reg_fl, combo_de_scale);
+                                    warp::copy(D_reg_bf, D_reg_fl);
+                                    warpgroup::store(combo_de_output_stage->dE, D_reg_bf);
+                                    warpgroup::sync(quantizer_sync_id);
+                                    warpgroup::tma::store_add_async(
+                                        g.dE_out, combo_de_output_stage->dE,
+                                        {row_block_idx * 2 + cta_id, prev_k_block_idx * C::EPI_PIPE_DEPTH + combo_epi});
+                                    tensor_after_thread_sync();
+                                }
+                                warpgroup::tma::store_async_read_wait<0>();
+                            }
+                        }
+                        if (combo_do_dc) {
+                            warpgroup::sync(quantizer_sync_id);
+                            if (warpgroup::warpid() == 0 && quant_lane == 0) {
+                                arrive(combo_backhalf_de_done);
+                            }
+                        }
+                    }
+
+                    if (combo_stage_publish_epi && is_dc_consumer_wg && combo_do_dc) {
+                        if (combo_do_de) {
+                            wait(combo_backhalf_de_done, combo_backhalf_de_done_phase);
+                            combo_backhalf_de_done_phase ^= 1;
+                            asm volatile("fence.proxy.async.shared::cta;\n" ::: "memory");
+                        }
+                        const float combo_dc_scale = g_sg * g.E_col_sc_global[{0}];
+                        #pragma unroll
+                        for (int ii = 0; ii < combo_dc_a_scale_chunks; ++ii) {
+                            auto combo_a_sc_sub =
+                                combo_dc_a_sc_tm.template subtile<full_tt_fp8e4m3<16>>(ii * 16);
+                            auto &combo_gt_sc_sm_sub =
+                                *reinterpret_cast<st_fp8e4m3<32, 16, false> *>(
+                                    reinterpret_cast<uint64_t>(&combo_col_stage->Gt_row_sc.data[0]) + 16 * 32 * ii);
+                            load_mxnv_scale_async2(combo_a_sc_sub, combo_gt_sc_sm_sub);
+                        }
+
+                        int combo_dc_e_tiles_phase = 0;
+                        int combo_dc_e_scales_phase = 0;
+                        int combo_dc_inputs_phase = 1;
+                        int combo_dc_outputs_phase = 0;
+                        int prev_k_block_idx = -1;
+                        const int combo_num_k_blocks = g.dC_out.cols() / C::Nb;
+
+                        #pragma unroll 1
+                        for (int k_block_idx = 0; k_block_idx < combo_num_k_blocks; ++k_block_idx) {
+                            if (prev_k_block_idx >= 0) {
+                                wait(combo_dc_p3_outputs_arrived, combo_dc_outputs_phase);
+                                combo_dc_outputs_phase ^= 1;
+                                #pragma unroll
+                                for (int combo_epi = 0; combo_epi < C::EPI_PIPE_DEPTH; ++combo_epi) {
+                                    combo_dc_rt D_reg_fl;
+                                    combo_dc_rt_bf D_reg_bf;
+                                    warpgroup::tma::store_async_read_wait<0>();
+                                    warpgroup::sync(quantizer_sync_id);
+                                    warpgroup::load_async(
+                                        D_reg_fl,
+                                        combo_dc_tm.template subtile<full_tt_fl<C::Nb / C::EPI_PIPE_DEPTH>>(
+                                            0,
+                                            combo_epi * (C::Nb / C::EPI_PIPE_DEPTH)));
+                                    tensor_load_wait();
+                                    tensor_before_thread_sync();
+                                    warpgroup::sync(quantizer_sync_id);
+                                    warp::mul(D_reg_fl, D_reg_fl, combo_dc_scale);
+                                    warp::copy(D_reg_bf, D_reg_fl);
+                                    warpgroup::store(combo_dc_output_stage->dC, D_reg_bf);
+                                    warpgroup::sync(quantizer_sync_id);
+                                    warpgroup::tma::store_add_async(
+                                        g.dC_out, combo_dc_output_stage->dC,
+                                        {col_block_idx, prev_k_block_idx * C::EPI_PIPE_DEPTH + combo_epi});
+                                    tensor_after_thread_sync();
+                                }
+                                warpgroup::tma::store_async_read_wait<0>();
+                            }
+
+                            if (combo_issue_leader) {
+                                wait(combo_dc_p3_inputs_finished, combo_dc_inputs_phase);
+                                combo_dc_inputs_phase ^= 1;
+                                tma::expect_bytes(combo_dc_p3_e_tiles_arrived, sizeof(typename G::combo_p3_E_tile));
+                                tma::load_async(
+                                    combo_dc_tile_stage->E_operand, g.E_col,
+                                    {k_block_idx * 2 + cta_id, row_block_idx},
+                                    combo_dc_p3_e_tiles_arrived);
+                                tma::load_async(
+                                    combo_dc_scales_stage->E_sc, g.E_col_sc,
+                                    {k_block_idx, row_block_idx, 0},
+                                    combo_dc_p3_e_scales_arrived);
+                            }
+                            warpgroup::sync(quantizer_sync_id);
+
+                            if (combo_issue_leader) {
+                                tma::expect_bytes(combo_dc_p3_e_scales_arrived, sizeof(typename G::combo_p3_E_sc_tile));
+                                wait(combo_dc_p3_e_scales_arrived, combo_dc_e_scales_phase);
+                                combo_dc_e_scales_phase ^= 1;
+                            }
+                            warpgroup::sync(quantizer_sync_id);
+
+                            #pragma unroll
+                            for (int ii = 0; ii < combo_dc_b_scale_chunks; ++ii) {
+                                auto combo_b_sc_sub =
+                                    combo_dc_b_sc_tm.template subtile<full_tt_fp8e4m3<16>>(ii * 16);
+                                auto &combo_e_sc_sm_sub =
+                                    *reinterpret_cast<st_fp8e4m3<32, 16, false> *>(
+                                        reinterpret_cast<uint64_t>(&combo_dc_scales_stage->E_sc.data[0]) + 16 * 32 * ii);
+                                load_mxnv_scale_async2(combo_b_sc_sub, combo_e_sc_sm_sub);
+                            }
+
+                            if (combo_issue_leader) {
+                                wait(combo_dc_p3_e_tiles_arrived, combo_dc_e_tiles_phase);
+                                combo_dc_e_tiles_phase ^= 1;
+                            }
+                            warpgroup::sync(quantizer_sync_id);
+
+                            mm2_ABt(
+                                combo_dc_tm, combo_col_stage->Gt_row, combo_dc_tile_stage->E_operand,
+                                combo_dc_a_sc_tm.template subtile<full_tt_fp8e4m3<16 * combo_dc_a_scale_chunks>>(0),
+                                combo_dc_b_sc_tm.template subtile<full_tt_fp8e4m3<32 * combo_dc_b_scale_chunks>>(0),
+                                combo_dc_p3_inputs_finished);
+                            tensor_commit<2>(combo_dc_p3_outputs_arrived);
+                            tensor_after_thread_sync();
+                            asm volatile("fence.proxy.async.shared::cluster;\n" ::: "memory");
+                            warpgroup::sync(quantizer_sync_id);
+                            prev_k_block_idx = k_block_idx;
+                        }
+
+                        if (prev_k_block_idx >= 0) {
+                            wait(combo_dc_p3_outputs_arrived, combo_dc_outputs_phase);
+                            combo_dc_outputs_phase ^= 1;
+                            #pragma unroll
+                            for (int combo_epi = 0; combo_epi < C::EPI_PIPE_DEPTH; ++combo_epi) {
+                                combo_dc_rt D_reg_fl;
+                                combo_dc_rt_bf D_reg_bf;
+                                warpgroup::tma::store_async_read_wait<0>();
+                                warpgroup::sync(quantizer_sync_id);
+                                warpgroup::load_async(
+                                    D_reg_fl,
+                                    combo_dc_tm.template subtile<full_tt_fl<C::Nb / C::EPI_PIPE_DEPTH>>(
+                                        0,
+                                        combo_epi * (C::Nb / C::EPI_PIPE_DEPTH)));
+                                tensor_load_wait();
+                                tensor_before_thread_sync();
+                                warpgroup::sync(quantizer_sync_id);
+                                warp::mul(D_reg_fl, D_reg_fl, combo_dc_scale);
+                                warp::copy(D_reg_bf, D_reg_fl);
+                                warpgroup::store(combo_dc_output_stage->dC, D_reg_bf);
+                                warpgroup::sync(quantizer_sync_id);
+                                warpgroup::tma::store_add_async(
+                                    g.dC_out, combo_dc_output_stage->dC,
+                                    {col_block_idx, prev_k_block_idx * C::EPI_PIPE_DEPTH + combo_epi});
+                                tensor_after_thread_sync();
+                            }
+                            warpgroup::tma::store_async_read_wait<0>();
+                        }
+                    }
+                }
+
                 warpgroup::sync(quantizer_sync_id);
+                if constexpr (EFFECTIVE_ENABLE_STOREADD_COMBO && EFFECTIVE_SEPARATE_BACKHALF_CONSUMERS) {
+                    if (warpgroup::warpid() == 0 && quant_lane == 0) {
+                        if (is_col_quantizer_wg && combo_do_dc && combo_stage_publish_epi) {
+                            __threadfence_block();
+                            asm volatile("fence.proxy.async.shared::cta;\n" ::: "memory");
+                            arrive(combo_g_col_ready[0]);
+                        }
+                        if (is_de_consumer_wg && combo_do_de && combo_stage_publish_epi) {
+                            arrive(combo_g_row_recycled[0]);
+                        }
+                        if (is_dc_consumer_wg && combo_do_dc && combo_stage_publish_epi) {
+                            arrive(combo_g_col_recycled[0]);
+                        }
+                    }
+                }
                 if (warpgroup::warpid() == 0 && quant_lane == 0) {
-                    if constexpr (C::QUANTIZER_WARPGROUPS == 1) {
+                    if constexpr (G::FRONTEND_SINGLE_QUANTIZER_WG) {
                         if constexpr (ROW_IN_QUANTIZER) {
                             arrive(slice_row_recycled[bf_stage]);
                         }
@@ -9196,7 +10279,7 @@ __device__ inline void backward_kernel_v3_streaming_3wg_impl(const globals_3wg<C
                     }
                 }
                 if constexpr (ROW_IN_QUANTIZER) {
-                    if constexpr (C::QUANTIZER_WARPGROUPS == 1) {
+                    if constexpr (G::FRONTEND_SINGLE_QUANTIZER_WG) {
                         if constexpr (G::DEBUG_ROW_WAIT_ON_COL_READY && DO_COL) {
                             update_phasebit<0>(slice_col_ready_phasebits, bf_stage);
                         } else {
@@ -9211,7 +10294,7 @@ __device__ inline void backward_kernel_v3_streaming_3wg_impl(const globals_3wg<C
                     }
                 }
                 if constexpr (COL_IN_QUANTIZER) {
-                    if constexpr (C::QUANTIZER_WARPGROUPS == 1) {
+                    if constexpr (G::FRONTEND_SINGLE_QUANTIZER_WG) {
                         if constexpr (G::USE_COL_PAIR_STAGE || (DO_ROW && C::ROW_QUANT_FROM_REGS && C::CONSUMER_DO_ROW && !C::EARLY_COL_READY)) {
                             update_phasebit<0>(slice_col_ready_phasebits, bf_stage);
                         } else {
@@ -9225,9 +10308,327 @@ __device__ inline void backward_kernel_v3_streaming_3wg_impl(const globals_3wg<C
                         }
                     }
                 }
+                if constexpr (G::ENABLE_STOREADD_COMBO && G::SEPARATE_BACKHALF_CONSUMERS) {
+                    if (is_col_quantizer_wg && combo_do_dc && combo_stage_publish_epi) {
+                        update_phasebit<1>(combo_col_recycle_phasebits, 0);
+                    }
+                    if (is_de_consumer_wg && combo_do_de && combo_stage_publish_epi) {
+                        update_phasebit<0>(combo_row_ready_phasebits, 0);
+                    }
+                    if (is_dc_consumer_wg && combo_do_dc && combo_stage_publish_epi) {
+                        update_phasebit<0>(combo_col_ready_phasebits, 0);
+                    }
+                }
+            }
+
+            if constexpr (EFFECTIVE_ENABLE_STOREADD_COMBO && !EFFECTIVE_SEPARATE_BACKHALF_CONSUMERS) {
+                static_assert(C::QUANTIZER_WARPGROUPS == 1,
+                              "store-add combo currently requires the stable single-quantizer public v3 seam");
+                static_assert(C::CONSUMER_DO_ROW,
+                              "store-add combo currently requires consumer-owned row staging");
+                auto *combo_p3_c_tile = &combo_p3_c_tile_stage->C_operand;
+                auto *combo_p3_e_tile = &combo_output_stage->E_operand;
+                auto *combo_p3_scales =
+                    reinterpret_cast<typename G::combo_p3_scales_t *>(&input_scales[0]);
+                auto *combo_p3_c_scales = &combo_p3_scales->C_sc;
+                auto *combo_p3_e_scales = &combo_p3_scales->E_sc;
+
+                warpgroup::sync(quantizer_sync_id);
+                wait(combo_row_stage_ready, combo_row_stage_phase);
+                combo_row_stage_phase ^= 1;
+                asm volatile("fence.proxy.async.shared::cta;\n" ::: "memory");
+
+                auto combo_p3_tm = tm_allocator.template allocate<full_tt_fl<C::Nb>>(0);
+                constexpr int combo_sc_offset = 256;
+                constexpr int combo_de_a_scale_chunks = C::Nb / 64;
+                constexpr int combo_de_b_scale_chunks = C::Nb / 128;
+                constexpr int combo_dc_a_scale_chunks = C::Nb / 64;
+                constexpr int combo_dc_b_scale_chunks = C::Nb / 64;
+                auto combo_de_a_sc_tm =
+                    tm_allocator.template allocate<full_tt_fp8e4m3<16 * combo_de_a_scale_chunks>>(combo_sc_offset);
+                auto combo_de_b_sc_tm =
+                    tm_allocator.template allocate<full_tt_fp8e4m3<32 * combo_de_b_scale_chunks>>(
+                        combo_sc_offset + 4 * combo_de_a_scale_chunks);
+                auto combo_dc_a_sc_tm =
+                    tm_allocator.template allocate<full_tt_fp8e4m3<16 * combo_dc_a_scale_chunks>>(combo_sc_offset);
+                auto combo_dc_b_sc_tm =
+                    tm_allocator.template allocate<full_tt_fp8e4m3<32 * combo_dc_b_scale_chunks>>(
+                        combo_sc_offset + 4 * combo_dc_a_scale_chunks);
+
+                using combo_de_rt = rt_fl<C::Mb / 8, C::Nb / C::EPI_PIPE_DEPTH>;
+                using combo_de_rt_bf = rt_bf<C::Mb / 8, C::Nb / C::EPI_PIPE_DEPTH>;
+                using combo_dc_rt = rt_fl<C::Nb / 4, C::Nb / C::EPI_PIPE_DEPTH>;
+                using combo_dc_rt_bf = rt_bf<C::Nb / 4, C::Nb / C::EPI_PIPE_DEPTH>;
+                const bool combo_issue_leader = (warpgroup::warpid() == 0) && (quant_lane == 0);
+                constexpr bool combo_debug_single_k = false;
+                constexpr bool combo_debug_skip_store_add = false;
+                constexpr bool combo_debug_skip_p3_mma = false;
+                constexpr bool combo_debug_skip_p3_output_wait = false;
+                constexpr bool combo_debug_skip_p3_output_drain = false;
+                constexpr bool combo_debug_skip_de_scales = false;
+                constexpr bool combo_debug_skip_de_tiles = false;
+                constexpr bool combo_debug_skip_de_tile_wait = false;
+                constexpr bool combo_debug_skip_dc_scales = false;
+                constexpr bool combo_debug_skip_dc_tiles = false;
+                constexpr bool combo_debug_skip_dc_tile_wait = false;
+                const int combo_num_k_blocks_full =
+                    combo_do_de ? (g.dE_out.cols() / C::Nb) : (g.dC_out.cols() / C::Nb);
+                const int combo_num_k_blocks =
+                    combo_debug_single_k ? min(combo_num_k_blocks_full, 1) : combo_num_k_blocks_full;
+
+                auto combo_wait_p3_output = [&]() {
+                    wait(combo_p3_outputs_arrived, combo_p3_outputs_phase);
+                    combo_p3_outputs_phase ^= 1;
+                };
+
+                const bool combo_do_de_epi = combo_do_de;
+                const bool combo_do_dc_epi = combo_do_dc;
+                if (combo_do_de_epi || combo_do_dc_epi) {
+                    constexpr bool combo_debug_skip_local_a_scales = false;
+                    if (combo_do_de_epi) {
+                        const float combo_de_scale = g_sg * g.C_col_sc_global[{0}];
+                        if constexpr (!combo_debug_skip_local_a_scales) {
+                            #pragma unroll
+                            for (int ii = 0; ii < combo_de_a_scale_chunks; ++ii) {
+                                auto combo_a_sc_sub =
+                                    combo_de_a_sc_tm.template subtile<full_tt_fp8e4m3<16>>(ii * 16);
+                                auto &combo_g_sc_sm_sub =
+                                    *reinterpret_cast<st_fp8e4m3<32, 16, false> *>(
+                                        reinterpret_cast<uint64_t>(&combo_row_stage->G_row_sc.data[0]) + 16 * 32 * ii);
+                                load_mxnv_scale_async2(combo_a_sc_sub, combo_g_sc_sm_sub);
+                            }
+                        }
+                        #pragma unroll 1
+                        for (int k_block_idx = 0; k_block_idx < combo_num_k_blocks; ++k_block_idx) {
+                            if (combo_issue_leader) {
+                                if constexpr (!combo_debug_skip_de_tiles) {
+                                    if constexpr (!combo_debug_skip_de_tile_wait) {
+                                        tma::expect_bytes(combo_p3_c_tiles_arrived, sizeof(typename G::combo_p3_C_tile));
+                                    }
+                                    tma::load_async(
+                                        *combo_p3_c_tile, g.C_col,
+                                        {k_block_idx * 2 + cta_id, col_block_idx},
+                                        combo_p3_c_tiles_arrived);
+                                }
+                                if constexpr (!combo_debug_skip_de_scales) {
+                                    tma::load_async(
+                                        *combo_p3_c_scales, g.C_col_sc,
+                                        {k_block_idx, col_block_idx, 0},
+                                        combo_p3_c_scales_arrived);
+                                }
+                            }
+                            warpgroup::sync(quantizer_sync_id);
+
+                            if constexpr (!combo_debug_skip_de_scales) {
+                                if (combo_issue_leader) {
+                                    tma::expect_bytes(combo_p3_c_scales_arrived, sizeof(typename G::combo_p3_C_sc_tile));
+                                    wait(combo_p3_c_scales_arrived, combo_c_scales_phase);
+                                    combo_c_scales_phase ^= 1;
+                                }
+                                warpgroup::sync(quantizer_sync_id);
+                            }
+
+                            if constexpr (!combo_debug_skip_de_scales) {
+                                #pragma unroll
+                                for (int ii = 0; ii < combo_de_b_scale_chunks; ++ii) {
+                                    auto combo_b_sc_sub =
+                                        combo_de_b_sc_tm.template subtile<full_tt_fp8e4m3<16>>(ii * 16);
+                                    auto &combo_c_sc_sm_sub =
+                                        *reinterpret_cast<st_fp8e4m3<32, 16, false> *>(
+                                            reinterpret_cast<uint64_t>(&combo_p3_c_scales->data[0]) + 16 * 32 * ii);
+                                    load_mxnv_scale_async2(combo_b_sc_sub, combo_c_sc_sm_sub);
+                                }
+                            }
+
+                            if constexpr (!combo_debug_skip_de_tiles) {
+                                if (combo_issue_leader) {
+                                    if constexpr (!combo_debug_skip_de_tile_wait) {
+                                        wait(combo_p3_c_tiles_arrived, combo_c_tiles_phase);
+                                        combo_c_tiles_phase ^= 1;
+                                    }
+                                }
+                                warpgroup::sync(quantizer_sync_id);
+                            }
+
+                            if constexpr (!combo_debug_skip_p3_mma) {
+                                mm2_ABt(
+                                    combo_p3_tm, combo_row_stage->G_row, *combo_p3_c_tile,
+                                    combo_de_a_sc_tm.template subtile<full_tt_fp8e4m3<16 * combo_de_a_scale_chunks>>(0),
+                                    combo_de_b_sc_tm.template subtile<full_tt_fp8e4m3<32 * combo_de_b_scale_chunks>>(0),
+                                    combo_p3_inputs_finished);
+                                tensor_commit<2>(combo_p3_outputs_arrived);
+                                tensor_after_thread_sync();
+                                asm volatile("fence.proxy.async.shared::cluster;\n" ::: "memory");
+                                warpgroup::sync(quantizer_sync_id);
+                                if constexpr (!combo_debug_skip_p3_output_wait) {
+                                    combo_wait_p3_output();
+                                    if constexpr (!combo_debug_skip_p3_output_drain) {
+                                        #pragma unroll
+                                        for (int combo_epi = 0; combo_epi < C::EPI_PIPE_DEPTH; ++combo_epi) {
+                                            combo_de_rt D_reg_fl;
+                                            combo_de_rt_bf D_reg_bf;
+                                            warpgroup::tma::store_async_read_wait<0>();
+                                            warpgroup::sync(quantizer_sync_id);
+                                            warpgroup::load_async(
+                                                D_reg_fl,
+                                                combo_p3_tm.template subtile<full_tt_fl<C::Nb / C::EPI_PIPE_DEPTH>>(
+                                                    0,
+                                                    combo_epi * (C::Nb / C::EPI_PIPE_DEPTH)));
+                                            tensor_load_wait();
+                                            tensor_before_thread_sync();
+                                            warpgroup::sync(quantizer_sync_id);
+                                            warp::mul(D_reg_fl, D_reg_fl, combo_de_scale);
+                                            warp::copy(D_reg_bf, D_reg_fl);
+                                            warpgroup::store(combo_output_stage->dE, D_reg_bf);
+                                            warpgroup::sync(quantizer_sync_id);
+                                            if constexpr (!combo_debug_skip_store_add) {
+                                                warpgroup::tma::store_add_async(
+                                                    g.dE_out, combo_output_stage->dE,
+                                                    {row_block_idx * 2 + cta_id, k_block_idx * C::EPI_PIPE_DEPTH + combo_epi});
+                                            }
+                                            tensor_after_thread_sync();
+                                        }
+                                        if constexpr (!combo_debug_skip_store_add) {
+                                            warpgroup::tma::store_async_read_wait<0>();
+                                        }
+                                    }
+                                }
+                            }
+                            warpgroup::sync(quantizer_sync_id);
+                            tensor_after_thread_sync();
+                        }
+                    }
+
+                    if (combo_do_dc_epi) {
+                        const float combo_dc_scale = g_sg * g.E_col_sc_global[{0}];
+                        if constexpr (!combo_debug_skip_local_a_scales) {
+                            #pragma unroll
+                            for (int ii = 0; ii < combo_dc_a_scale_chunks; ++ii) {
+                                auto combo_a_sc_sub =
+                                    combo_dc_a_sc_tm.template subtile<full_tt_fp8e4m3<16>>(ii * 16);
+                                auto &combo_gt_sc_sm_sub =
+                                    *reinterpret_cast<st_fp8e4m3<32, 16, false> *>(
+                                        reinterpret_cast<uint64_t>(&combo_col_stage->Gt_row_sc.data[0]) + 16 * 32 * ii);
+                                load_mxnv_scale_async2(combo_a_sc_sub, combo_gt_sc_sm_sub);
+                            }
+                        }
+                        #pragma unroll 1
+                        for (int k_block_idx = 0; k_block_idx < combo_num_k_blocks; ++k_block_idx) {
+                            if (combo_issue_leader) {
+                                if constexpr (!combo_debug_skip_dc_tiles) {
+                                    if constexpr (!combo_debug_skip_dc_tile_wait) {
+                                        tma::expect_bytes(combo_p3_e_tiles_arrived, sizeof(typename G::combo_p3_E_tile));
+                                    }
+                                    tma::load_async(
+                                        *combo_p3_e_tile, g.E_col,
+                                        {k_block_idx * 2 + cta_id, row_block_idx},
+                                        combo_p3_e_tiles_arrived);
+                                }
+                                if constexpr (!combo_debug_skip_dc_scales) {
+                                    tma::load_async(
+                                        *combo_p3_e_scales, g.E_col_sc,
+                                        {k_block_idx, row_block_idx, 0},
+                                        combo_p3_e_scales_arrived);
+                                }
+                            }
+                            warpgroup::sync(quantizer_sync_id);
+
+                            if constexpr (!combo_debug_skip_dc_scales) {
+                                if (combo_issue_leader) {
+                                    tma::expect_bytes(combo_p3_e_scales_arrived, sizeof(typename G::combo_p3_E_sc_tile));
+                                    wait(combo_p3_e_scales_arrived, combo_e_scales_phase);
+                                    combo_e_scales_phase ^= 1;
+                                }
+                            }
+                            warpgroup::sync(quantizer_sync_id);
+
+                            if constexpr (!combo_debug_skip_dc_scales) {
+                                #pragma unroll
+                                for (int ii = 0; ii < combo_dc_b_scale_chunks; ++ii) {
+                                    auto combo_b_sc_sub =
+                                        combo_dc_b_sc_tm.template subtile<full_tt_fp8e4m3<16>>(ii * 16);
+                                    auto &combo_e_sc_sm_sub =
+                                        *reinterpret_cast<st_fp8e4m3<32, 16, false> *>(
+                                            reinterpret_cast<uint64_t>(&combo_p3_e_scales->data[0]) + 16 * 32 * ii);
+                                        load_mxnv_scale_async2(combo_b_sc_sub, combo_e_sc_sm_sub);
+                                }
+                            }
+
+                            if constexpr (!combo_debug_skip_dc_tiles) {
+                                if (combo_issue_leader) {
+                                    if constexpr (!combo_debug_skip_dc_tile_wait) {
+                                        wait(combo_p3_e_tiles_arrived, combo_e_tiles_phase);
+                                        combo_e_tiles_phase ^= 1;
+                                    }
+                                }
+                            }
+                            warpgroup::sync(quantizer_sync_id);
+
+                            if constexpr (!combo_debug_skip_p3_mma) {
+                                mm2_ABt(
+                                    combo_p3_tm, combo_col_stage->Gt_row, *combo_p3_e_tile,
+                                    combo_dc_a_sc_tm.template subtile<full_tt_fp8e4m3<16 * combo_dc_a_scale_chunks>>(0),
+                                    combo_dc_b_sc_tm.template subtile<full_tt_fp8e4m3<32 * combo_dc_b_scale_chunks>>(0),
+                                    combo_p3_inputs_finished);
+                                tensor_commit<2>(combo_p3_outputs_arrived);
+                                tensor_after_thread_sync();
+                                asm volatile("fence.proxy.async.shared::cluster;\n" ::: "memory");
+                                warpgroup::sync(quantizer_sync_id);
+                                if constexpr (!combo_debug_skip_p3_output_wait) {
+                                    combo_wait_p3_output();
+                                    if constexpr (!combo_debug_skip_p3_output_drain) {
+                                        #pragma unroll
+                                        for (int combo_epi = 0; combo_epi < C::EPI_PIPE_DEPTH; ++combo_epi) {
+                                            combo_dc_rt D_reg_fl;
+                                            combo_dc_rt_bf D_reg_bf;
+                                            warpgroup::tma::store_async_read_wait<0>();
+                                            warpgroup::sync(quantizer_sync_id);
+                                            warpgroup::load_async(
+                                                D_reg_fl,
+                                                combo_p3_tm.template subtile<full_tt_fl<C::Nb / C::EPI_PIPE_DEPTH>>(
+                                                    0,
+                                                    combo_epi * (C::Nb / C::EPI_PIPE_DEPTH)));
+                                            tensor_load_wait();
+                                            tensor_before_thread_sync();
+                                            warpgroup::sync(quantizer_sync_id);
+                                            warp::mul(D_reg_fl, D_reg_fl, combo_dc_scale);
+                                            warp::copy(D_reg_bf, D_reg_fl);
+                                            warpgroup::store(combo_output_stage->dC, D_reg_bf);
+                                            warpgroup::sync(quantizer_sync_id);
+                                            if constexpr (!combo_debug_skip_store_add) {
+                                                warpgroup::tma::store_add_async(
+                                                    g.dC_out, combo_output_stage->dC,
+                                                    {col_block_idx, k_block_idx * C::EPI_PIPE_DEPTH + combo_epi});
+                                            }
+                                            tensor_after_thread_sync();
+                                        }
+                                        if constexpr (!combo_debug_skip_store_add) {
+                                            warpgroup::tma::store_async_read_wait<0>();
+                                        }
+                                    }
+                                }
+                            }
+                            warpgroup::sync(quantizer_sync_id);
+                            tensor_after_thread_sync();
+                        }
+                    }
+                }
+
+                warpgroup::sync(quantizer_sync_id);
+                warpgroup::tma::cluster::arrive(outputs_finished, 0, 1);
             }
         }
         warpgroup::sync(quantizer_sync_id);
+        if constexpr (EFFECTIVE_ENABLE_STOREADD_COMBO) {
+            if constexpr (EFFECTIVE_SEPARATE_BACKHALF_CONSUMERS) {
+                const bool combo_deprovision_owner =
+                    combo_do_dc ? is_dc_consumer_wg :
+                    (combo_do_de ? is_de_consumer_wg : is_col_quantizer_wg);
+                if (combo_deprovision_owner && warpgroup::warpid() == 0) tm_allocator.deprovision();
+            } else {
+                if (warpgroup::warpid() == 0) tm_allocator.deprovision();
+            }
+        }
     }
 }
 
@@ -9393,6 +10794,22 @@ __device__ inline void backward_kernel_v3_streaming_4wg(const globals_4wg<C>& g)
 template <typename C>
 __device__ inline void backward_kernel_v3_streaming_4wg_replayonly(const globals_4wg<C>& g) {
     backward_kernel_v3_streaming_3wg_impl<C, false, false>(g);
+}
+
+template <typename C>
+__device__ inline void backward_kernel_v3_streaming_5wg(const globals_5wg<C>& g) {
+    backward_kernel_v3_streaming_3wg_impl<C, true, true>(g);
+}
+
+template <typename C, int STATIC_COMBO_MODE>
+__device__ inline void backward_kernel_v3_streaming_5wg_mode(const globals_5wg<C>& g) {
+    if constexpr (STATIC_COMBO_MODE == globals_5wg<C>::COMBO_MODE_DEONLY) {
+        backward_kernel_v3_streaming_3wg_impl<C, true, false, STATIC_COMBO_MODE>(g);
+    } else if constexpr (STATIC_COMBO_MODE == globals_5wg<C>::COMBO_MODE_DCONLY) {
+        backward_kernel_v3_streaming_3wg_impl<C, false, true, STATIC_COMBO_MODE>(g);
+    } else {
+        backward_kernel_v3_streaming_3wg_impl<C, true, true, STATIC_COMBO_MODE>(g);
+    }
 }
 
 } // namespace nvfp4_cce_backward_v3
