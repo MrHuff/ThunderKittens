@@ -173,7 +173,7 @@ __device__ inline void kernel(const globals<C> &g) {
 
     // Set up mbarriers
     __shared__ uint32_t tmem_addr;
-    __shared__ semaphore tmem_provisioned;
+    __shared__ semaphore tmem_provisioned, tmem_finished;
     __shared__ semaphore tiles_arrived[C::LOAD_PIPE_DEPTH];
     __shared__ semaphore scales_arrived[C::LOAD_PIPE_DEPTH];
     __shared__ semaphore inputs_finished[C::LOAD_PIPE_DEPTH];
@@ -181,6 +181,7 @@ __device__ inline void kernel(const globals<C> &g) {
     __shared__ semaphore outputs_finished;
     if (threadIdx.x == 32) {
         init_semaphore(tmem_provisioned, 0, 1);
+        init_semaphore(tmem_finished, 0, 1);
         #pragma unroll
         for (int i = 0; i < C::LOAD_PIPE_DEPTH; ++i) {
             init_semaphore(tiles_arrived[i], 0, 1);
@@ -413,7 +414,11 @@ __device__ inline void kernel(const globals<C> &g) {
         // large M when kernels are launched back-to-back).
         warpgroup::tma::store_async_read_wait<0>();
         if constexpr (C::USE_PDL) warpgroup::pdl::arrive();
-        if (warpgroup::warpid() == 0) tm_allocator.deprovision();
+        if (warpgroup::warpid() == 0) {
+            if (warp::elect_leader()) tma::cluster::arrive(tmem_finished, 1-cta_id);
+            wait(tmem_finished, 0);
+            tm_allocator.deprovision();
+        }
     }
 }
 

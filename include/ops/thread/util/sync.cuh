@@ -5,6 +5,9 @@
 
 #pragma once
 
+#include "../../../common/common.cuh"
+#include "../../../types/types.cuh"
+
 namespace kittens {
 
 struct semaphore {
@@ -27,8 +30,9 @@ template<int num_warps> struct barrier {
  *
  * Additionally, if it is given a shared tile type, it will also call `set_bytes` to prepare for the memory transaction.
  *
- * @param[out] semaphore The semaphore variable to initialize.
- * @param[in] tc The thread counter for the semaphore.
+ * @param[out] bar The semaphore variable to initialize.
+ * @param[in] thread_count The thread counter for the semaphore.
+ * @param[in] transaction_count The transaction counter for the semaphore.
  */
 __device__ static inline void init_semaphore(semaphore& bar, int thread_count, int transaction_count=0) {
     void const* const ptr = &bar;
@@ -42,8 +46,7 @@ __device__ static inline void init_semaphore(semaphore& bar, int thread_count, i
 /**
  * @brief Invalidate an mbarrier
  *
- * @param[out] semaphore The semaphore variable to initialize.
- * @param[in] tc The thread counter for the semaphore.
+ * @param[out] bar The semaphore variable to invalidate.
  */
 __device__ static inline void invalidate_semaphore(semaphore& bar) {
     void const* const ptr = &bar;
@@ -59,8 +62,7 @@ __device__ static inline void invalidate_semaphore(semaphore& bar) {
 *
 * Marks a warp arrival at an mbarrier
 *
-* @param semaphore Reference to the semaphore variable.
-* @param kPhaseBit The phase bit used for the semaphore.
+* @param sem Reference to the semaphore variable.
 */
 __device__ static inline void arrive(semaphore& sem) {
     uint32_t mbar_ptr = static_cast<uint32_t>(__cvta_generic_to_shared(&sem)); 
@@ -81,8 +83,8 @@ template<int num_warps> __device__ static inline void arrive(barrier<num_warps> 
 *
 * Marks a warp arrival at an mbarrier
 *
-* @param semaphore Reference to the semaphore variable.
-* @param kPhaseBit The phase bit used for the semaphore.
+* @param sem Reference to the semaphore variable.
+* @param count The count value for the mbarrier arrival.
 */
 __device__ static inline void arrive(semaphore& sem, uint32_t count) {
     uint32_t mbar_ptr = static_cast<uint32_t>(__cvta_generic_to_shared(&sem));
@@ -98,7 +100,7 @@ __device__ static inline void arrive(semaphore& sem, uint32_t count) {
 /**
 * @brief Waits for the requested semaphore phase.
 *
-* @param semaphore Reference to the semaphore variable.
+* @param sem Reference to the semaphore variable.
 * @param kPhaseBit The phase bit used for the semaphore.
 */
 __device__ static inline void wait(semaphore& sem, int kPhaseBit) {
@@ -200,7 +202,7 @@ __device__ static inline void careful_wait(semaphore& sem, int kPhaseBit) {
 /**
 * @brief Checks if the requested semaphore phase is ready.
 *
-* @param semaphore Reference to the semaphore variable.
+* @param sem Reference to the semaphore variable.
 * @param kPhaseBit The phase bit used for the semaphore.
 */
 __device__ static inline int test_wait(semaphore& sem, int kPhaseBit) {

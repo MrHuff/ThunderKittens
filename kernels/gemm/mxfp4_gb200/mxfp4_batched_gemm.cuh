@@ -73,8 +73,8 @@ struct globals {
         B_fp4x2_tile B;
     };
     struct input_scales_t {
-        A_sc_tile A;
-        B_sc_tile B[C::B_SC_SIZE];
+        A_sc_tile A[C::MMA_PER_TILE];
+        B_sc_tile B[C::B_SC_SIZE * C::MMA_PER_TILE];
     };
     struct outputs_t {
         D_tile D[C::NUM_D_TILES];
@@ -191,9 +191,42 @@ __device__ inline void kernel(const globals<C> &g) {
 
                 for (int i = 0; i < num_red_blocks; ++i) {
                     wait(inputs_finished[stage], get_phasebit<1>(phasebits, stage));
-                    tma::cluster::load_async(input_scales[stage].A, proxy_A_sc, {row_block_idx*2 + cta_id, i, 0, 0}, scales_arrived[stage], (uint16_t)(1<<cta_id), 0);
-                    if constexpr (C::B_SC_SIZE == 2) tma::cluster::load_async(input_scales[stage].B[cta_id], proxy_B_sc, {col_block_idx*2 + cta_id, i, 0, 0}, scales_arrived[stage], (uint16_t)(0b11), 0);
-                    else if (cta_id == 0)            tma::cluster::load_async(input_scales[stage].B[0], proxy_B_sc, {col_block_idx, i, 0, 0}, scales_arrived[stage], (uint16_t)(0b11), 0);
+                    #pragma unroll
+                    for (int k = 0; k < C::MMA_PER_TILE; ++k) {
+                        tma::cluster::load_async(
+                            input_scales[stage].A[k],
+                            proxy_A_sc,
+                            {row_block_idx*2 + cta_id, i * C::MMA_PER_TILE + k, 0, 0},
+                            scales_arrived[stage],
+                            (uint16_t)(1<<cta_id),
+                            0
+                        );
+                    }
+                    if constexpr (C::B_SC_SIZE == 2) {
+                        #pragma unroll
+                        for (int k = 0; k < C::MMA_PER_TILE; ++k) {
+                            tma::cluster::load_async(
+                                input_scales[stage].B[cta_id * C::MMA_PER_TILE + k],
+                                proxy_B_sc,
+                                {col_block_idx*2 + cta_id, i * C::MMA_PER_TILE + k, 0, 0},
+                                scales_arrived[stage],
+                                (uint16_t)(0b11),
+                                0
+                            );
+                        }
+                    } else if (cta_id == 0) {
+                        #pragma unroll
+                        for (int k = 0; k < C::MMA_PER_TILE; ++k) {
+                            tma::cluster::load_async(
+                                input_scales[stage].B[k],
+                                proxy_B_sc,
+                                {col_block_idx, i * C::MMA_PER_TILE + k, 0, 0},
+                                scales_arrived[stage],
+                                (uint16_t)(0b11),
+                                0
+                            );
+                        }
+                    }
                     update_phasebit<1>(phasebits, stage);
                     stage = (stage + 1) % C::LOAD_PIPE_DEPTH;
                 }
@@ -204,8 +237,8 @@ __device__ inline void kernel(const globals<C> &g) {
             wait(tmem_provisioned, 0);
             tm_allocator.set_addr(tmem_addr);
             auto out_tm  = tm_allocator.template allocate<full_tt_fl<C::Nb>>(0);
-            auto A_sc_tm = tm_allocator.template allocate<full_tt_fp8e8m0<16*C::LOAD_PIPE_DEPTH>>(256);
-            auto B_sc_tm = tm_allocator.template allocate<full_tt_fp8e8m0<32*C::LOAD_PIPE_DEPTH>>(384);
+            auto A_sc_tm = tm_allocator.template allocate<full_tt_fp8e8m0<16*C::MMA_PER_TILE*C::LOAD_PIPE_DEPTH>>(256);
+            auto B_sc_tm = tm_allocator.template allocate<full_tt_fp8e8m0<32*C::MMA_PER_TILE*C::LOAD_PIPE_DEPTH>>(256 + 4 * C::MMA_PER_TILE * C::LOAD_PIPE_DEPTH);
 
             for (int block_idx = cluster_id; block_idx < num_blocks; block_idx += gridDim.x / C::CLUSTER_SIZE) {
                 wait(outputs_finished, get_phasebit<1>(phasebits, 0));
@@ -213,23 +246,26 @@ __device__ inline void kernel(const globals<C> &g) {
                 for (int i = 0; i < num_red_blocks; i++) {
                     tma::expect_bytes(scales_arrived[stage], 2*sizeof(G::input_scales_t));
                     wait(scales_arrived[stage], get_phasebit<0>(phasebits, stage));
-                    auto A_sc_tm_subtile = A_sc_tm.template subtile<full_tt_fp8e8m0<16>>(stage*16);
-                    load_mxnv_scale_async2(A_sc_tm_subtile, input_scales[stage].A);
-                    auto B_sc_tm_subtile_0 = B_sc_tm.template subtile<full_tt_fp8e8m0<16>>(stage*32);
-                    load_mxnv_scale_async2(B_sc_tm_subtile_0, input_scales[stage].B[0]);
-                    if constexpr (C::B_SC_SIZE == 2) {
-                        auto B_sc_tm_subtile_1 = B_sc_tm.template subtile<full_tt_fp8e8m0<16>>(stage*32+16);
-                        load_mxnv_scale_async2(B_sc_tm_subtile_1, input_scales[stage].B[1]);
+                    #pragma unroll
+                    for (int k = 0; k < C::MMA_PER_TILE; ++k) {
+                        auto A_sc_tm_subtile = A_sc_tm.template subtile<full_tt_fp8e8m0<16>>(stage * C::MMA_PER_TILE * 16 + k * 16);
+                        load_mxnv_scale_async2(A_sc_tm_subtile, input_scales[stage].A[k]);
+                        auto B_sc_tm_subtile_0 = B_sc_tm.template subtile<full_tt_fp8e8m0<16>>(stage * C::MMA_PER_TILE * 32 + k * C::B_SC_SIZE * 16);
+                        load_mxnv_scale_async2(B_sc_tm_subtile_0, input_scales[stage].B[k]);
+                        if constexpr (C::B_SC_SIZE == 2) {
+                            auto B_sc_tm_subtile_1 = B_sc_tm.template subtile<full_tt_fp8e8m0<16>>(stage * C::MMA_PER_TILE * 32 + k * C::B_SC_SIZE * 16 + 16);
+                            load_mxnv_scale_async2(B_sc_tm_subtile_1, input_scales[stage].B[C::MMA_PER_TILE + k]);
+                        }
                     }
                     tma::expect_bytes(tiles_arrived[stage], 2*sizeof(G::input_tiles_t));
                     wait(tiles_arrived[stage], get_phasebit<0>(phasebits, stage));
                     if (i == 0) mm2_ABt(out_tm, input_tiles[stage].A, input_tiles[stage].B,
-                                        A_sc_tm.template subtile<full_tt_fp8e8m0<16>>(stage*16),
-                                        B_sc_tm.template subtile<full_tt_fp8e8m0<32>>(stage*32),
+                                        A_sc_tm.template subtile<full_tt_fp8e8m0<C::MMA_PER_TILE * 16>>(stage * C::MMA_PER_TILE * 16),
+                                        B_sc_tm.template subtile<full_tt_fp8e8m0<C::MMA_PER_TILE * 32>>(stage * C::MMA_PER_TILE * 32),
                                         inputs_finished[stage]);
                     else       mma2_ABt(out_tm, input_tiles[stage].A, input_tiles[stage].B,
-                                        A_sc_tm.template subtile<full_tt_fp8e8m0<16>>(stage*16),
-                                        B_sc_tm.template subtile<full_tt_fp8e8m0<32>>(stage*32),
+                                        A_sc_tm.template subtile<full_tt_fp8e8m0<C::MMA_PER_TILE * 16>>(stage * C::MMA_PER_TILE * 16),
+                                        B_sc_tm.template subtile<full_tt_fp8e8m0<C::MMA_PER_TILE * 32>>(stage * C::MMA_PER_TILE * 32),
                                         inputs_finished[stage]);
                     update_phasebit<0>(phasebits, stage);
                     stage = (stage + 1) % C::LOAD_PIPE_DEPTH;

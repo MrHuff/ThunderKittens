@@ -29,9 +29,8 @@ template<kittens::ducks::st::all ST, int axis> __device__ inline int4 tma_coords
  *
  * @tparam ST A shared tile type with a TMA-compatible layout
  * @param[out] dst The destination shared memory tile.
- * @param[in] src_tma_map The source tensormap address in global memory
- * @param[in] tile_row_idx The row coord of the requested tile. This is in units of complete tiles.
- * @param[in] tile_col_idx The column coord of the requested tile. This is in units of complete tiles.
+ * @param[in] src The source tensormap address in global memory
+ * @param[in] idx The coordinate of the requested tile. This is in units of complete tiles.
  */
 template<int axis, cache_policy policy, ducks::st::all ST, ducks::gl::all GL, ducks::coord::tile COORD=coord<ST>>
 __device__ static inline void prefetch(ST &dst, const GL &src, const COORD &idx) {
@@ -99,9 +98,8 @@ __device__ static inline void prefetch(ST &dst, const GL &src, const COORD &idx)
  *
  * @tparam ST A shared tile type with a TMA-compatible layout
  * @param[out] dst The destination tensormap address in global memory
- * @param[in] src_tma_map The source shared memory tile.
- * @param[in] tile_row_idx The row coord of the tile destination. This is in units of complete tiles.
- * @param[in] tile_col_idx The column coord of the tile destination. This is in units of complete tiles.
+ * @param[in] src The source shared memory tile.
+ * @param[in] idx The coordinate of the tile destination. This is in units of complete tiles.
  */
 template<int axis, cache_policy policy, ducks::st::all ST, ducks::gl::all GL, ducks::coord::tile COORD=coord<ST>>
 __device__ static inline void store_async(const GL &dst, const ST &src, const COORD &idx) {
@@ -235,9 +233,8 @@ __device__ static inline void store_async(const PGL &dst, const ST &src, const C
  *
  * @tparam ST A shared tile type with a TMA-compatible layout
  * @param[out] dst The destination tensormap address in global memory
- * @param[in] src_tma_map The source shared memory tile.
- * @param[in] tile_row_idx The row coord of the tile destination. This is in units of complete tiles.
- * @param[in] tile_col_idx The column coord of the tile destination. This is in units of complete tiles.
+ * @param[in] src The source shared memory tile.
+ * @param[in] idx The coordinate of the tile destination. This is in units of complete tiles.
  */
 template<int axis, cache_policy policy, ducks::st::all ST, ducks::gl::all GL, ducks::coord::tile COORD=coord<ST>>
 __device__ static inline void store_add_async(const GL &dst, const ST &src, const COORD &idx) {
@@ -379,17 +376,16 @@ __device__ static inline void store_add_async(const PGL &dst, const ST &src, con
  *
  * @tparam ST A shared tile type with a TMA-compatible layout
  * @param[out] dst The destination tensormap address in global memory
- * @param[in] src_tma_map The source shared memory tile.
- * @param[in] tile_row_idx The row coord of the tile destination. This is in units of complete tiles.
- * @param[in] tile_col_idx The column coord of the tile destination. This is in units of complete tiles.
+ * @param[in] src The source shared memory tile.
+ * @param[in] idx The coordinate of the tile destination. This is in units of complete tiles.
  */
 template<int axis, cache_policy policy, ducks::st::all ST, ducks::gl::all GL, ducks::coord::tile COORD=coord<ST>>
 __device__ static inline void store_min_async(const GL &dst, const ST &src, const COORD &idx) {
     static_assert(!std::is_same_v<typename ST::dtype, float>, "TMA does not support async min/max reductions for fp32 types.");
 
     static_assert(!(std::is_same_v<typename ST::dtype, fp8e4m3> ||
-                    std::is_same_v<typename ST::dtype, fp8e5m2>), 
-                    "TMA does not support async add reductions for fp8 types.");
+                    std::is_same_v<typename ST::dtype, fp8e5m2>),
+                    "TMA does not support async min reductions for fp8 types.");
 
     uint64_t tma_ptr = reinterpret_cast<uint64_t>(dst.template get_tma<ST, axis>());
     uint32_t src_ptr  = static_cast<uint32_t>(__cvta_generic_to_shared(&src));
@@ -455,8 +451,8 @@ __device__ static inline void store_min_async(const PGL &dst, const ST &src, con
     static_assert(!std::is_same_v<typename ST::dtype, float>, "TMA does not support async min/max reductions for fp32 types.");
 
     static_assert(!(std::is_same_v<typename ST::dtype, fp8e4m3> ||
-                    std::is_same_v<typename ST::dtype, fp8e5m2>), 
-                    "TMA does not support async add reductions for fp8 types.");
+                    std::is_same_v<typename ST::dtype, fp8e5m2>),
+                    "TMA does not support async min reductions for fp8 types.");
 
     uint64_t tma_ptr = reinterpret_cast<uint64_t>(dst.template get_tma<ST, axis>());
     uint32_t src_ptr  = static_cast<uint32_t>(__cvta_generic_to_shared(&src));
@@ -525,17 +521,16 @@ __device__ static inline void store_min_async(const PGL &dst, const ST &src, con
  *
  * @tparam ST A shared tile type with a TMA-compatible layout
  * @param[out] dst The destination tensormap address in global memory
- * @param[in] src_tma_map The source shared memory tile.
- * @param[in] tile_row_idx The row coord of the tile destination. This is in units of complete tiles.
- * @param[in] tile_col_idx The column coord of the tile destination. This is in units of complete tiles.
+ * @param[in] src The source shared memory tile.
+ * @param[in] idx The coordinate of the tile destination. This is in units of complete tiles.
  */
 template<int axis, cache_policy policy, ducks::st::all ST, ducks::gl::all GL, ducks::coord::tile COORD=coord<ST>>
 __device__ static inline void store_max_async(const GL &dst, const ST &src, const COORD &idx) {
     static_assert(!std::is_same_v<typename ST::dtype, float>, "TMA does not support async min/max reductions for fp32 types.");
 
     static_assert(!(std::is_same_v<typename ST::dtype, fp8e4m3> ||
-                    std::is_same_v<typename ST::dtype, fp8e5m2>), 
-                    "TMA does not support async add reductions for fp8 types.");
+                    std::is_same_v<typename ST::dtype, fp8e5m2>),
+                    "TMA does not support async max reductions for fp8 types.");
 
     uint64_t tma_ptr = reinterpret_cast<uint64_t>(dst.template get_tma<ST, axis>());
     uint32_t src_ptr  = static_cast<uint32_t>(__cvta_generic_to_shared(&src));
@@ -601,8 +596,8 @@ __device__ static inline void store_max_async(const PGL &dst, const ST &src, con
     static_assert(!std::is_same_v<typename ST::dtype, float>, "TMA does not support async min/max reductions for fp32 types.");
 
     static_assert(!(std::is_same_v<typename ST::dtype, fp8e4m3> ||
-                    std::is_same_v<typename ST::dtype, fp8e5m2>), 
-                    "TMA does not support async add reductions for fp8 types.");
+                    std::is_same_v<typename ST::dtype, fp8e5m2>),
+                    "TMA does not support async max reductions for fp8 types.");
 
     uint64_t tma_ptr = reinterpret_cast<uint64_t>(dst.template get_tma<ST, axis>());
     uint32_t src_ptr  = static_cast<uint32_t>(__cvta_generic_to_shared(&src));
@@ -671,10 +666,9 @@ __device__ static inline void store_max_async(const PGL &dst, const ST &src, con
  *
  * @tparam ST A shared tile type with a TMA-compatible layout
  * @param[out] dst The destination shared memory tile.
- * @param[in] src_tma_map The source tensormap address in global memory
+ * @param[in] src The source tensormap address in global memory
  * @param[in,out] bar The semaphore used for synchronization of the asynchronous copy.
- * @param[in] tile_row_idx The row coord of the requested tile. This is in units of complete tiles.
- * @param[in] tile_col_idx The column coord of the requested tile. This is in units of complete tiles.
+ * @param[in] idx The coordinate of the requested tile. This is in units of complete tiles.
  */
 template<int axis, cache_policy policy, ducks::st::all ST, ducks::gl::all GL, ducks::coord::tile COORD=coord<ST>>
 __device__ static inline void load_async(ST &dst, const GL &src, const COORD &idx, semaphore& bar) {
@@ -745,10 +739,9 @@ namespace cluster {
  *
  * @tparam ST A shared tile type with a TMA-compatible layout
  * @param[out] dst The destination shared memory tile.
- * @param[in] src_tma_map The source tensormap address in global memory
+ * @param[in] src The source tensormap address in global memory
  * @param[in,out] bar The semaphore used for synchronization of the asynchronous copy.
- * @param[in] tile_row_idx The row coord of the requested tile. This is in units of complete tiles.
- * @param[in] tile_col_idx The column coord of the requested tile. This is in units of complete tiles.
+ * @param[in] idx The coordinate of the requested tile. This is in units of complete tiles.
  * @param[in] cluster_mask The mask of the clusters to broadcast to.
  */
 #ifdef KITTENS_BLACKWELL

@@ -7876,7 +7876,6 @@ __device__ inline void backward_kernel_v3_streaming_3wg_impl(const globals_3wg<C
                     }
                 }
 
-                subtile_rt D_fl;
                 subtile_rt_bf D_bf;
                 const int col_start = col_block_idx * C::Nb + epi * SUBTILE_COLS;
                 const bool combo_stage_first_epi = (epi == 0);

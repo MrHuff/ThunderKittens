@@ -5,47 +5,6 @@
 
 #pragma once
 
-#include <concepts>
-#include <iostream>
-#include <memory>
-#include <stdint.h>
-#include <type_traits>
-
-// For checking CUDA driver API calls
-#define CUCHECK(cmd) do {                                     \
-    CUresult err = cmd;                                       \
-    if (err != CUDA_SUCCESS) {                                \
-        const char *errStr;                                   \
-        cuGetErrorString(err, &errStr);                       \
-        fprintf(stderr, "Failed: CUDA error %s:%d '%s'\n",    \
-            __FILE__, __LINE__, errStr);                      \
-        exit(EXIT_FAILURE);                                   \
-    }                                                         \
-} while(0)
-
-// For checking CUDA runtime API calls
-#define CUDACHECK(cmd) do {                                   \
-    cudaError_t err = cmd;                                    \
-    if (err != cudaSuccess) {                                 \
-        fprintf(stderr, "Failed: CUDA error %s:%d '%s'\n",    \
-            __FILE__, __LINE__, cudaGetErrorString(err));     \
-        exit(EXIT_FAILURE);                                   \
-    }                                                         \
-} while(0)
-
-// Convenience utility
-#define CHECK_CUDA_ERROR(val) check((val), #val, __FILE__, __LINE__)
-template <typename T> void check(
-    T err, char const* const func, char const* const file, int const line
-) {
-    if (err != cudaSuccess) {
-        std::cerr << "CUDA Runtime Error at: " << file << ":" << line
-                  << std::endl;
-        std::cerr << cudaGetErrorString(err) << " " << func << std::endl;
-        std::exit(EXIT_FAILURE);
-    }
-}
-
 /**
  * @namespace kittens
  *
@@ -94,6 +53,15 @@ __device__ __forceinline__ int warpgroupid() { return threadIdx.x >> 7; }
  * @return The lane ID.
  */
 __device__ __forceinline__ int laneid() { return threadIdx.x & 0x1f; }
+/**
+ * @brief Get the physical multiprocessor ID (SM index) the current CTA is executing on.
+ * @return SM ID in [0, num_sms-1] (pair with host num_sms() for device counts).
+ */
+__device__ __forceinline__ int smid() {
+    uint32_t r;
+    asm volatile("mov.u32 %0, %%smid;" : "=r"(r));
+    return static_cast<int>(r);
+}
 
 #if defined(KITTENS_HOPPER) || defined(KITTENS_BLACKWELL)
 constexpr int MAX_SHARED_MEMORY = 227 * 1024;
@@ -369,7 +337,7 @@ __device__ static inline int cluster_nctarank() {
  *
  * @param num_rows Number of rows in the 2D domain
  * @param num_cols Number of columns in the 2D domain
- * @param task_idx Linear task index
+ * @param linear_idx Linear task index
  * @tparam SUPERGROUP_SIZE Supergroup extent (columns if row-major, rows if column-major)
  * @tparam ROW_MAJOR Select row-major or column-major swizzle
  * @return int2 {row_idx, col_idx}
@@ -437,6 +405,43 @@ template<int N> __device__ static inline int ring_advance(int ring, int distance
 template<int N> __device__ static inline int ring_retreat(int ring, int distance=1) { return (ring + 16*N - distance) % N; }
 
 /* ----------  HOST-SIDE UTILS  ---------- */
+
+#ifndef KITTENS_NO_HOST
+
+// For checking CUDA driver API calls
+#define CUCHECK(cmd) do {                                  \
+    CUresult err = cmd;                                    \
+    if (err != CUDA_SUCCESS) {                             \
+        const char *errStr;                                \
+        cuGetErrorString(err, &errStr);                    \
+        fprintf(stderr, "Failed: CUDA error %s:%d '%s'\n", \
+            __FILE__, __LINE__, errStr);                   \
+        exit(EXIT_FAILURE);                                \
+    }                                                      \
+} while(0)
+
+// For checking CUDA runtime API calls
+#define CUDACHECK(cmd) do {                                \
+    cudaError_t err = cmd;                                 \
+    if (err != cudaSuccess) {                              \
+        fprintf(stderr, "Failed: CUDA error %s:%d '%s'\n", \
+            __FILE__, __LINE__, cudaGetErrorString(err));  \
+        exit(EXIT_FAILURE);                                \
+    }                                                      \
+} while(0)
+
+// Convenience utility
+#define CHECK_CUDA_ERROR(val) check((val), #val, __FILE__, __LINE__)
+template <typename T> __host__ void check(
+    T err, char const* const func, char const* const file, int const line
+) {
+    if (err != cudaSuccess) {
+        std::cerr << "CUDA Runtime Error at: " << file << ":" << line
+                  << std::endl;
+        std::cerr << cudaGetErrorString(err) << " " << func << std::endl;
+        std::exit(EXIT_FAILURE);
+    }
+}
 
 /**
  * @brief Query the number of SMs on a device.
@@ -513,11 +518,13 @@ struct LaunchConfig {
         return *this;
     }
 
-    LaunchConfig(LaunchConfig&&) = delete;
-    LaunchConfig& operator=(LaunchConfig&&) = delete;
+    __host__ LaunchConfig(LaunchConfig&&) = delete;
+    __host__ LaunchConfig& operator=(LaunchConfig&&) = delete;
 
     __host__ inline operator cudaLaunchConfig_t*() noexcept { return &config; }
     __host__ inline operator const cudaLaunchConfig_t*() const noexcept { return &config; }
 };
+
+#endif // KITTENS_NO_HOST
 
 } // namespace kittens

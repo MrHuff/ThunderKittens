@@ -7,6 +7,7 @@
 
 #include "../../../common/common.cuh"
 #include "../../../types/types.cuh"
+#include "sync.cuh"
 
 namespace kittens {
 /**
@@ -23,7 +24,7 @@ namespace tma {
 * It converts the semaphore pointer to a generic shared memory pointer and uses an inline assembly
 * instruction to set the expected number of bytes.
 *
-* @param semaphore Reference to the semaphore variable.
+* @param bar Reference to the semaphore variable.
 * @param bytes The number of bytes expected at the semaphore.
 */
 __device__ static inline void expect_bytes(semaphore& bar, uint32_t bytes) {
@@ -117,7 +118,7 @@ namespace cluster {
 /**
 * @brief Waits for the requested semaphore phase, at cluster scope
 *
-* @param semaphore Reference to the semaphore variable.
+* @param bar Reference to the semaphore variable.
 * @param kPhaseBit The phase bit used for the semaphore.
 */
 __device__ static inline void wait(semaphore& bar, int kPhaseBit) {
@@ -193,7 +194,7 @@ __device__ static inline void careful_wait(semaphore& bar, int kPhaseBit) {
 * distributed shared memory can actually be done with a normal tma::expect followed by wait. See
 * the unit tests of dsmem for an example.
 *
-* @param semaphore Reference to the semaphore variable.
+* @param bar Reference to the semaphore variable.
 * @param bytes The number of bytes expected at the semaphore.
 */
 __device__ static inline void expect_bytes(semaphore& bar, uint32_t bytes) {
@@ -237,8 +238,9 @@ __device__ static inline void expect(semaphore& bar, const T& _1, const args&...
 *
 * Marks a thread arrival at an mbarrier
 *
-* @param semaphore Reference to the semaphore variable.
-* @param kPhaseBit The phase bit used for the semaphore.
+* @param bar Reference to the semaphore variable.
+* @param dst_cta The destination CTA index.
+* @param count The count value for the arrival.
 */
 __device__ static inline void arrive(semaphore& bar, int dst_cta, uint32_t count=1) {
     uint32_t mbar_addr = static_cast<uint32_t>(__cvta_generic_to_shared(&bar)); 
@@ -271,6 +273,37 @@ __device__ static inline void load_async(void *dst, void *src, uint32_t size_byt
 template<typename T>
 __device__ static inline void load_async(T &dst, T &src, uint32_t size_bytes, semaphore& bar, uint16_t cta_mask) {
     load_async(reinterpret_cast<void*>(&dst), reinterpret_cast<void*>(&src), size_bytes, bar, cta_mask);
+}
+
+__device__ static inline void store_async(void *dst, void *src, uint32_t size_bytes, int dst_cta, semaphore &bar) {
+    const uint32_t dst_ptr = static_cast<uint32_t>(__cvta_generic_to_shared(dst));
+    const uint32_t src_ptr = static_cast<uint32_t>(__cvta_generic_to_shared(src));
+    const uint32_t bar_ptr = static_cast<uint32_t>(__cvta_generic_to_shared(&bar));
+    uint32_t remote_dst_ptr;
+    uint32_t remote_bar_ptr;
+
+    asm volatile("mapa.shared::cluster.u32 %0, %1, %2;\n"
+        : "=r"(remote_dst_ptr)
+        : "r"(dst_ptr), "r"(dst_cta));
+    asm volatile("mapa.shared::cluster.u32 %0, %1, %2;\n"
+        : "=r"(remote_bar_ptr)
+        : "r"(bar_ptr), "r"(dst_cta));
+
+    asm volatile("fence.proxy.async.shared::cta;\n" ::: "memory");
+    asm volatile("fence.proxy.async.shared::cluster;\n" ::: "memory");
+    asm volatile(
+        "cp.async.bulk.shared::cluster.shared::cta.mbarrier::complete_tx::bytes [%0], [%1], %2, [%3];\n"
+        :
+        : "r"(remote_dst_ptr),
+          "r"(src_ptr),
+          "r"(size_bytes),
+          "r"(remote_bar_ptr)
+        : "memory"
+    );
+}
+template<typename T>
+__device__ static inline void store_async(T &dst, T &src, int dst_cta, semaphore &bar) {
+    store_async(reinterpret_cast<void*>(&dst), reinterpret_cast<void*>(&src), sizeof(T), dst_cta, bar);
 }
 
 } // namespace cluster

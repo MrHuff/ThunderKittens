@@ -5,8 +5,6 @@
  
 #pragma once
 
-#include <type_traits>
-
 #include "../../common/common.cuh"
 #include "rt_layout.cuh"
 #include "rv_layout.cuh"
@@ -35,7 +33,7 @@ struct identifier {};
 /**
  * @brief Basic tile structure for computation in registers.
  *
- * @tparam T2 The packed data type used for the matrix elements.
+ * @tparam _T The data type used for the matrix elements.
  * @tparam _layout The layout of the base tile, either row-major or column-major.
  *
  * This type is a primarily utility for building larger inline templates
@@ -100,8 +98,8 @@ namespace rt_base {
 */
 template<typename T> concept all = requires {
     typename T::identifier; // Checks if T::identifier exists
-} && std::is_same_v<typename T::identifier, identifier>; // Checks if T::identifier is ducks::rt::identifier
-} // namespace rt
+} && std::is_same_v<typename T::identifier, identifier>; // Checks if T::identifier is ducks::rt_base::identifier
+} // namespace rt_base
 } // namespace ducks
 
 /* ----------  WRAPPERS FOR PRETTINESS  ---------- */

@@ -5,6 +5,9 @@
 #include "mxfp4_gemm.cuh"
 // mxfp4_quantize.cuh removed — use standalone mxfp4_v2 quantizer
 #include "mxfp4_batched_gemm.cuh"
+#include "mxfp4_split2_accum_gemm.cuh"
+#include <cstdint>
+#include <cstring>
 #include <optional>
 
 #ifndef TORCH_COMPILE
@@ -158,6 +161,264 @@ int main() {
 
 #include "pyutils/torchutils.cuh"
 
+namespace {
+
+using mxfp4_onepass_cfg1 = mxfp4_split2_accum_gemm::config<128, 5, 4, 12, 2, true, 2, false>;
+using mxfp4_onepass_cfg3 = mxfp4_split2_accum_gemm::config<256, 5, 8, 4, 2, false, 2, false>;
+using mxfp4_onepass_cfg5 = mxfp4_split2_accum_gemm::config<256, 5, 8, 12, 2, false, 2, false>;
+
+void check_fp4_matrix(const at::Tensor& t, const char* name) {
+    TORCH_CHECK(t.is_cuda(), name, " must be CUDA");
+    TORCH_CHECK(t.is_contiguous(), name, " must be contiguous");
+    TORCH_CHECK(t.dim() == 2, name, " must be 2D");
+    TORCH_CHECK(t.scalar_type() == at::kFloat4_e2m1fn_x2, name, " must be fp4x2");
+}
+
+void check_output_matrix(const at::Tensor& t, const char* name, int64_t rows, int64_t cols) {
+    TORCH_CHECK(t.is_cuda(), name, " must be CUDA");
+    TORCH_CHECK(t.is_contiguous(), name, " must be contiguous");
+    TORCH_CHECK(t.dim() == 2, name, " must be 2D");
+    TORCH_CHECK(t.scalar_type() == at::kBFloat16, name, " must be bf16");
+    TORCH_CHECK(t.size(0) == rows && t.size(1) == cols, name, " shape mismatch");
+}
+
+void check_mxfp4_scale_tensor(
+    const at::Tensor& t,
+    const char* name,
+    int64_t rows,
+    int64_t cols,
+    bool allow_views
+) {
+    TORCH_CHECK(t.is_cuda(), name, " must be CUDA");
+    if (!allow_views) {
+        TORCH_CHECK(t.is_contiguous(), name, " must be contiguous");
+    }
+    TORCH_CHECK(t.dim() == 4, name, " must be 4D");
+    TORCH_CHECK(
+        t.scalar_type() == at::kFloat8_e8m0fnu || t.scalar_type() == at::kByte,
+        name, " must be fp8 e8m0 or byte view"
+    );
+    TORCH_CHECK(t.size(0) == rows / 128, name, " first dim mismatch");
+    TORCH_CHECK(t.size(1) == cols / 128, name, " second dim mismatch");
+    TORCH_CHECK(t.size(2) == 32, name, " third dim must equal 32");
+    TORCH_CHECK(t.size(3) == 16, name, " fourth dim must equal 16");
+
+    if (allow_views) {
+        TORCH_CHECK(t.stride(3) == 1, name, " last stride must be contiguous");
+        TORCH_CHECK(t.stride(2) == 16, name, " stride(2) must equal 16");
+        TORCH_CHECK(t.stride(1) == 512, name, " stride(1) must equal 512");
+        TORCH_CHECK(t.stride(0) >= t.size(1) * 512, name, " leading stride too small");
+        const auto data_ptr = reinterpret_cast<uintptr_t>(t.data_ptr());
+        TORCH_CHECK((data_ptr & 0xF) == 0, name, " data pointer must be 16-byte aligned");
+        TORCH_CHECK((t.stride(1) % 16) == 0, name, " stride(1) must be 16-byte aligned");
+        TORCH_CHECK((t.stride(0) % 16) == 0, name, " stride(0) must be 16-byte aligned");
+    }
+}
+
+template <typename ST>
+void encode_mxfp4_scale_tensor_map(CUtensorMap* desc, const at::Tensor& t, const char* name) {
+    static_assert(std::is_same_v<typename ST::dtype, kittens::fp8e8m0>,
+                  "MXFP4 scale TMA helper assumes fp8e8m0 logical elements");
+    static_assert(!ST::swizzle, "MXFP4 scale TMA helper only supports non-swizzled tiles");
+
+    check_mxfp4_scale_tensor(t, name, t.size(0) * 128, t.size(1) * 128, true);
+
+    uint64_t gmem_shape[4] = {
+        static_cast<uint64_t>(t.size(3)),
+        static_cast<uint64_t>(t.size(2)),
+        static_cast<uint64_t>(t.size(1)),
+        static_cast<uint64_t>(t.size(0)),
+    };
+    uint64_t gmem_stride[3] = {
+        static_cast<uint64_t>(t.stride(2)),
+        static_cast<uint64_t>(t.stride(1)),
+        static_cast<uint64_t>(t.stride(0)),
+    };
+    uint32_t smem_shape[4] = {
+        static_cast<uint32_t>(ST::cols),
+        static_cast<uint32_t>(ST::rows),
+        1, 1,
+    };
+    uint32_t smem_stride[4] = {1, 1, 1, 1};
+
+    CUresult result = cuTensorMapEncodeTiled(
+        desc,
+        CU_TENSOR_MAP_DATA_TYPE_UINT8,
+        4,
+        t.data_ptr(),
+        gmem_shape,
+        gmem_stride,
+        smem_shape,
+        smem_stride,
+        CU_TENSOR_MAP_INTERLEAVE_NONE,
+        CU_TENSOR_MAP_SWIZZLE_NONE,
+        CU_TENSOR_MAP_L2_PROMOTION_NONE,
+        CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE
+    );
+    TORCH_CHECK(result == CUDA_SUCCESS, name, " TMA creation failed");
+}
+
+void check_mxfp4_split2_dgrad_inputs(
+    const at::Tensor& A_full,
+    const std::vector<at::Tensor>& A_sc_list,
+    const std::vector<int64_t>& A_col_offsets,
+    const std::vector<int64_t>& A_col_widths,
+    const std::vector<at::Tensor>& B_list,
+    const std::vector<at::Tensor>& B_sc_list
+) {
+    check_fp4_matrix(A_full, "A_full");
+    TORCH_CHECK(A_full.size(0) % 128 == 0, "A_full M must be a multiple of 128");
+    TORCH_CHECK((A_full.size(1) * 2) % 128 == 0, "A_full K must be a multiple of 128");
+
+    const int n = static_cast<int>(A_sc_list.size());
+    TORCH_CHECK(n == 2, "split2 one-pass dgrad expects exactly 2 A scale tensors");
+    TORCH_CHECK(
+        n == static_cast<int>(A_col_offsets.size()) &&
+        n == static_cast<int>(A_col_widths.size()) &&
+        n == static_cast<int>(B_list.size()) &&
+        n == static_cast<int>(B_sc_list.size()),
+        "all split2 one-pass inputs must have length 2"
+    );
+
+    for (int i = 0; i < n; ++i) {
+        TORCH_CHECK(A_col_offsets[i] >= 0, "A_col_offsets must be non-negative");
+        TORCH_CHECK(A_col_widths[i] > 0, "A_col_widths must be positive");
+        TORCH_CHECK(
+            A_col_offsets[i] + A_col_widths[i] <= A_full.size(1),
+            "A_full slice exceeds packed width"
+        );
+        TORCH_CHECK((A_col_widths[i] * 2) % 128 == 0, "split widths must be multiples of 128");
+        check_mxfp4_scale_tensor(A_sc_list[i], "A_sc_list[i]", A_full.size(0), A_col_widths[i] * 2, true);
+        check_fp4_matrix(B_list[i], "B_list[i]");
+        TORCH_CHECK(B_list[i].size(1) == A_col_widths[i], "B_list packed K must match A_col_widths");
+        TORCH_CHECK(B_list[i].size(0) % 128 == 0, "B_list rows must be multiples of 128");
+        check_mxfp4_scale_tensor(B_sc_list[i], "B_sc_list[i]", B_list[i].size(0), B_list[i].size(1) * 2, false);
+        kittens::py::device_check(A_full, A_sc_list[i], B_list[i], B_sc_list[i]);
+    }
+}
+
+template <typename C>
+void launch_mxfp4_split2_dgrad_gemm_strided_onepass_with_config(
+    const at::Tensor& A_full,
+    const std::vector<at::Tensor>& A_sc_list,
+    const std::vector<int64_t>& A_col_offsets,
+    const std::vector<int64_t>& A_col_widths,
+    const std::vector<at::Tensor>& B_list,
+    const std::vector<at::Tensor>& B_sc_list,
+    at::Tensor& D_out
+) {
+    using G = mxfp4_split2_accum_gemm::globals<C>;
+    G g_host;
+    memset(&g_host, 0, sizeof(G));
+
+    const int64_t M = D_out.size(0);
+    const int64_t N_out = D_out.size(1);
+    const int64_t K_total_fp4 = A_full.size(1);
+    const uint8_t* a_base = reinterpret_cast<const uint8_t*>(A_full.data_ptr());
+    const int64_t a_full_row_stride = K_total_fp4;
+
+    g_host.num_row_blocks = static_cast<int>(M / C::Mb);
+    g_host.num_col_blocks = static_cast<int>(N_out / C::Nb);
+
+    for (int i = 0; i < 2; ++i) {
+        constexpr int64_t swizzle_elements = 128;
+        const int64_t fp4_cols = A_col_widths[i];
+        const int64_t fp4_offset = A_col_offsets[i];
+        const void* data_ptr = a_base + fp4_offset;
+
+        TORCH_CHECK(fp4_cols > 0, "A_col_widths must be positive");
+        TORCH_CHECK((2 * fp4_cols) % C::Kb == 0,
+                    "one-pass split2 dgrad expects reduction widths aligned to Kb=", C::Kb);
+        g_host.num_red_blocks[i] = static_cast<int>((2 * fp4_cols) / C::Kb);
+
+        uint64_t gmem_shape[5] = {
+            static_cast<uint64_t>(swizzle_elements),
+            static_cast<uint64_t>(M),
+            static_cast<uint64_t>((fp4_cols + swizzle_elements - 1) / swizzle_elements),
+            1, 1
+        };
+        uint64_t gmem_stride[4] = {
+            static_cast<uint64_t>(a_full_row_stride),
+            128,
+            static_cast<uint64_t>(M * a_full_row_stride),
+            static_cast<uint64_t>(M * a_full_row_stride)
+        };
+        uint32_t smem_shape[5] = {
+            static_cast<uint32_t>(swizzle_elements),
+            static_cast<uint32_t>(C::Mb / 2),
+            1, 1, 1
+        };
+        uint32_t smem_stride[5] = {1, 1, 1, 1, 1};
+
+        CUresult result = cuTensorMapEncodeTiled(
+            &g_host.A_tma[i],
+            CU_TENSOR_MAP_DATA_TYPE_UINT8,
+            5,
+            const_cast<void*>(data_ptr),
+            gmem_shape,
+            gmem_stride,
+            smem_shape,
+            smem_stride,
+            CU_TENSOR_MAP_INTERLEAVE_NONE,
+            CU_TENSOR_MAP_SWIZZLE_128B,
+            CU_TENSOR_MAP_L2_PROMOTION_NONE,
+            CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE
+        );
+        TORCH_CHECK(result == CUDA_SUCCESS, "One-pass split2 MXFP4 A TMA creation failed for batch ", i);
+
+        if (A_sc_list[i].is_contiguous()) {
+            auto a_sc_gl = kittens::py::tensor_to_gl<typename G::A_sc_gl>(A_sc_list[i]);
+            memcpy(&g_host.A_sc_tma[i], &a_sc_gl.tma_descs.tma_desc, sizeof(CUtensorMap));
+        } else {
+            encode_mxfp4_scale_tensor_map<typename G::A_sc_tile>(&g_host.A_sc_tma[i], A_sc_list[i], "A_sc_list[i]");
+        }
+
+        auto b_gl = kittens::py::tensor_to_gl<typename G::B_fp4x2_gl>(B_list[i]);
+        auto b_sc_gl = kittens::py::tensor_to_gl<typename G::B_sc_gl>(B_sc_list[i]);
+        memcpy(&g_host.B_tma[i], &b_gl.tma_descs.tma_desc, sizeof(CUtensorMap));
+        memcpy(&g_host.B_sc_tma[i], &b_sc_gl.tma_descs.tma_desc, sizeof(CUtensorMap));
+    }
+
+    auto d_gl = kittens::py::tensor_to_gl<typename G::D_gl>(D_out);
+    memcpy(&g_host.D_tma, &d_gl.tma_descs.tma_desc, sizeof(CUtensorMap));
+
+    kittens::py::launch_kernel<C, G, mxfp4_split2_accum_gemm::kernel<C>>(g_host);
+}
+
+void launch_mxfp4_split2_dgrad_gemm_strided_onepass(
+    const at::Tensor& A_full,
+    const std::vector<at::Tensor>& A_sc_list,
+    const std::vector<int64_t>& A_col_offsets,
+    const std::vector<int64_t>& A_col_widths,
+    const std::vector<at::Tensor>& B_list,
+    const std::vector<at::Tensor>& B_sc_list,
+    at::Tensor& D_out,
+    int config_idx
+) {
+    int resolved_idx = config_idx;
+    if (resolved_idx < 0) {
+        resolved_idx = 5;
+    }
+    switch (resolved_idx) {
+        case 1:
+            launch_mxfp4_split2_dgrad_gemm_strided_onepass_with_config<mxfp4_onepass_cfg1>(
+                A_full, A_sc_list, A_col_offsets, A_col_widths, B_list, B_sc_list, D_out);
+            break;
+        case 3:
+            launch_mxfp4_split2_dgrad_gemm_strided_onepass_with_config<mxfp4_onepass_cfg3>(
+                A_full, A_sc_list, A_col_offsets, A_col_widths, B_list, B_sc_list, D_out);
+            break;
+        case 5:
+            launch_mxfp4_split2_dgrad_gemm_strided_onepass_with_config<mxfp4_onepass_cfg5>(
+                A_full, A_sc_list, A_col_offsets, A_col_widths, B_list, B_sc_list, D_out);
+            break;
+        default:
+            TORCH_CHECK(false, "Unknown MXFP4 split2 one-pass config_idx=", resolved_idx);
+    }
+}
+
+} // namespace
+
 void mxfp4_gemm_entrypoint(
     const at::Tensor &A,
     const at::Tensor &A_sc,
@@ -283,6 +544,31 @@ void mxfp4_batched_gemm_entrypoint(
     }
 }
 
+void mxfp4_split2_dgrad_strided_onepass_gemm_entrypoint(
+    const at::Tensor& A_full,
+    const std::vector<at::Tensor>& A_sc_list,
+    const std::vector<int64_t>& A_col_offsets,
+    const std::vector<int64_t>& A_col_widths,
+    const std::vector<at::Tensor>& B_list,
+    const std::vector<at::Tensor>& B_sc_list,
+    at::Tensor& D_out,
+    int64_t config_idx
+) {
+    check_mxfp4_split2_dgrad_inputs(
+        A_full, A_sc_list, A_col_offsets, A_col_widths, B_list, B_sc_list);
+    TORCH_CHECK(B_list.size() == 2, "split2 one-pass dgrad expects exactly 2 B tensors");
+    check_output_matrix(D_out, "D_out", A_full.size(0), B_list[0].size(0));
+    launch_mxfp4_split2_dgrad_gemm_strided_onepass(
+        A_full,
+        A_sc_list,
+        A_col_offsets,
+        A_col_widths,
+        B_list,
+        B_sc_list,
+        D_out,
+        static_cast<int>(config_idx));
+}
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("mxfp4_gemm", &mxfp4_gemm_entrypoint);
     m.def("mxfp4_gemm_config", &mxfp4_gemm_config_entrypoint,
@@ -296,6 +582,17 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           pybind11::arg("A_list"), pybind11::arg("A_sc_list"),
           pybind11::arg("B_list"), pybind11::arg("B_sc_list"),
           pybind11::arg("D_out_list"));
+    m.def("mxfp4_split2_dgrad_strided_onepass_gemm",
+          &mxfp4_split2_dgrad_strided_onepass_gemm_entrypoint,
+          "MXFP4 split2 one-pass dgrad GEMM with strided row slices",
+          pybind11::arg("A_full"),
+          pybind11::arg("A_sc_list"),
+          pybind11::arg("A_col_offsets"),
+          pybind11::arg("A_col_widths"),
+          pybind11::arg("B_list"),
+          pybind11::arg("B_sc_list"),
+          pybind11::arg("D_out"),
+          pybind11::arg("config_idx") = -1);
 }
 
 #endif
