@@ -18,7 +18,131 @@
 
 #include "nvfp4_cce.cuh"
 
+#ifndef ONLINE_COL_DEBUG_COMPARE
+#define ONLINE_COL_DEBUG_COMPARE 0
+#endif
+
+#ifndef SAFUSED_DIAG_MODE
+#define SAFUSED_DIAG_MODE 0
+#endif
+
+#ifndef SAFUSED_DIAG_TIMING
+#define SAFUSED_DIAG_TIMING 0
+#endif
+
+#ifndef SAFUSED_SPLIT_COL_STAGE_CUT
+#define SAFUSED_SPLIT_COL_STAGE_CUT 0
+#endif
+
+#ifndef ROWONLY_COMBO_DC_DEBUG_CUT
+#define ROWONLY_COMBO_DC_DEBUG_CUT 0
+#endif
+
+#ifndef ROWONLY_COMBO_DC_STORE_MODE
+#define ROWONLY_COMBO_DC_STORE_MODE 0
+#endif
+
+#ifndef ROWONLY_COMBO_DC_OUTPUT_PHASE_MODE
+#define ROWONLY_COMBO_DC_OUTPUT_PHASE_MODE 0
+#endif
+
+#ifndef ROWONLY_COMBO_DC_FINAL_WAIT_MODE
+#define ROWONLY_COMBO_DC_FINAL_WAIT_MODE 0
+#endif
+
+#ifndef ROWONLY_COMBO_DC_FILTER_WAIT_MODE
+#define ROWONLY_COMBO_DC_FILTER_WAIT_MODE 0
+#endif
+
+#ifndef ROWONLY_COMBO_DC_SKIP_READY_WAIT
+#define ROWONLY_COMBO_DC_SKIP_READY_WAIT 0
+#endif
+
+#ifndef ROWONLY_COMBO_DC_SKIP_RECYCLE_WAIT
+#define ROWONLY_COMBO_DC_SKIP_RECYCLE_WAIT 0
+#endif
+
+#ifndef ROWONLY_COMBO_DC_SKIP_ROW16_READY_WAIT
+#define ROWONLY_COMBO_DC_SKIP_ROW16_READY_WAIT 0
+#endif
+#ifndef ROWONLY_COMBO_DC_SKIP_POST_DCEPILOGUE_SYNC
+#define ROWONLY_COMBO_DC_SKIP_POST_DCEPILOGUE_SYNC 0
+#endif
+#ifndef ROWONLY_COMBO_DC_SKIP_POST_PUBLISH_SYNC
+#define ROWONLY_COMBO_DC_SKIP_POST_PUBLISH_SYNC 0
+#endif
+
+#ifndef ROWONLY_COMBO_DC_SKIP_POST_EPI_FINAL_CLEANUP
+#define ROWONLY_COMBO_DC_SKIP_POST_EPI_FINAL_CLEANUP 0
+#endif
+
+#ifndef ROWONLY_COMBO_DC_SKIP_DEPROVISION
+#define ROWONLY_COMBO_DC_SKIP_DEPROVISION 0
+#endif
+#ifndef ROWONLY_COMBO_DC_SKIP_FINAL_QUANTIZER_SYNC
+#define ROWONLY_COMBO_DC_SKIP_FINAL_QUANTIZER_SYNC 0
+#endif
+#ifndef ROWONLY_COMBO_DC_SKIP_PRODUCER_OUTPUTS_FINISHED_WAIT
+#define ROWONLY_COMBO_DC_SKIP_PRODUCER_OUTPUTS_FINISHED_WAIT 0
+#endif
+#ifndef ROWONLY_COMBO_DC_SKIP_PRODUCER_INPUTS_FINISHED_WAIT
+#define ROWONLY_COMBO_DC_SKIP_PRODUCER_INPUTS_FINISHED_WAIT 0
+#endif
+#ifndef ROWONLY_COMBO_DC_SKIP_PRODUCER_CLUSTER_WAIT
+#define ROWONLY_COMBO_DC_SKIP_PRODUCER_CLUSTER_WAIT 0
+#endif
+#ifndef ROWONLY_COMBO_DC_SKIP_LOOP_OUTPUT_WAIT
+#define ROWONLY_COMBO_DC_SKIP_LOOP_OUTPUT_WAIT 0
+#endif
+#ifndef ROWONLY_COMBO_DC_SKIP_INPUTS_FINISHED_WAIT
+#define ROWONLY_COMBO_DC_SKIP_INPUTS_FINISHED_WAIT 0
+#endif
+#ifndef ROWONLY_COMBO_DC_FINAL_WAIT_PHASE_XOR
+#define ROWONLY_COMBO_DC_FINAL_WAIT_PHASE_XOR 0
+#endif
+#ifndef ROWONLY_COMBO_DC_OUTPUTS_FINISHED_WAIT_PHASE_XOR
+#define ROWONLY_COMBO_DC_OUTPUTS_FINISHED_WAIT_PHASE_XOR 0
+#endif
+#ifndef ROWONLY_COMBO_DC_OUTPUTS_FINISHED_PUBLISH_MODE
+#define ROWONLY_COMBO_DC_OUTPUTS_FINISHED_PUBLISH_MODE 0
+#endif
+#ifndef ROWONLY_COMBO_DC_TRACE_BLOCK1
+#define ROWONLY_COMBO_DC_TRACE_BLOCK1 0
+#endif
+
+#ifndef DEDICATED_ROWONLY_DEBUG_STAGE
+#define DEDICATED_ROWONLY_DEBUG_STAGE 0
+#endif
+
 namespace nvfp4_cce_backward_v3 {
+
+static constexpr int kSafusedDiagFull = 0;
+static constexpr int kSafusedDiagRowOnly = 1;
+static constexpr int kSafusedDiagColAmaxOnly = 2;
+static constexpr int kSafusedDiagColPackOnly = 3;
+static constexpr int kSafusedDiagColNoFlush = 4;
+static constexpr int kSafusedDiagTimingSlots = 4;
+
+template <bool Enabled>
+__device__ inline void rowonly_combo_dc_debug_cut_helper(
+    int cut,
+    int cta_id,
+    int row_block_idx,
+    int col_block_idx,
+    int warpgroup_warpid,
+    int quant_lane,
+    int k_block_debug,
+    int prev_k_block_debug,
+    int combo_epi_debug = -1)
+{
+    if constexpr (Enabled) {
+        if (warpgroup_warpid == 0 && quant_lane == 0) {
+            printf(
+                "rowonly combo dc cut %d cta=%d row=%d col=%d k=%d prev=%d epi=%d\n",
+                cut, cta_id, row_block_idx, col_block_idx, k_block_debug, prev_k_block_debug, combo_epi_debug);
+        }
+    }
+}
 
 // =========================================================================
 // Config
@@ -723,6 +847,7 @@ struct config_traits_3wg {
     static constexpr bool USE_COL_PAIR_STAGE = false;
     static constexpr bool USE_ROW_PAIR_STAGE = false;
     static constexpr bool COL_QUANT_FROM_DBF_REGS = false;
+    static constexpr bool FUSED_SOFTMAX_QUANT = false;
     static constexpr bool DIRECT_QUANT_WARPBALANCED = false;
     static constexpr bool DIRECT_ROW_WARPBALANCED = false;
     static constexpr bool DIRECT_COL_WARPBALANCED = false;
@@ -1008,6 +1133,36 @@ struct config_traits_col_quant_from_dbf_regs {
 template <typename C>
 struct config_traits_col_quant_from_dbf_regs<C, std::void_t<decltype(config_traits_3wg<C>::COL_QUANT_FROM_DBF_REGS)>> {
     static constexpr bool value = config_traits_3wg<C>::COL_QUANT_FROM_DBF_REGS;
+};
+
+template <typename C, typename = void>
+struct config_traits_fused_softmax_quant {
+    static constexpr bool value = false;
+};
+
+template <typename C>
+struct config_traits_fused_softmax_quant<C, std::void_t<decltype(config_traits_3wg<C>::FUSED_SOFTMAX_QUANT)>> {
+    static constexpr bool value = config_traits_3wg<C>::FUSED_SOFTMAX_QUANT;
+};
+
+template <typename C, typename = void>
+struct config_traits_fused_col_in_quantizer {
+    static constexpr bool value = false;
+};
+
+template <typename C>
+struct config_traits_fused_col_in_quantizer<C, std::void_t<decltype(config_traits_3wg<C>::FUSED_COL_IN_QUANTIZER)>> {
+    static constexpr bool value = config_traits_3wg<C>::FUSED_COL_IN_QUANTIZER;
+};
+
+template <typename C, typename = void>
+struct config_traits_skip_global_col_materialization {
+    static constexpr bool value = false;
+};
+
+template <typename C>
+struct config_traits_skip_global_col_materialization<C, std::void_t<decltype(config_traits_3wg<C>::SKIP_GLOBAL_COL_MATERIALIZATION)>> {
+    static constexpr bool value = config_traits_3wg<C>::SKIP_GLOBAL_COL_MATERIALIZATION;
 };
 
 template <int _LOAD_PIPE_DEPTH, int _SUPERGROUP_SIZE, bool _PINGPONG, int _EPI_PIPE_DEPTH>
@@ -1628,6 +1783,7 @@ struct config_traits_3wg<experimental_config_colwg_consumerotf_warpbalanced<_LOA
     static constexpr bool USE_COL_PAIR_STAGE = false;
     static constexpr bool USE_ROW_PAIR_STAGE = false;
     static constexpr bool COL_QUANT_FROM_DBF_REGS = true;
+    static constexpr bool FUSED_SOFTMAX_QUANT = false;
     static constexpr bool DIRECT_QUANT_WARPBALANCED = true;
     static constexpr bool DIRECT_ROW_WARPBALANCED = true;
     static constexpr bool DIRECT_COL_WARPBALANCED = true;
@@ -1642,6 +1798,79 @@ struct config_traits_3wg<experimental_config_colwg_consumerotf_warpbalanced<_LOA
     static constexpr bool ROW_QUANT_ROWLEADER = false;
     static constexpr bool ROW_QUANT_ROWDUAL = false;
     static constexpr bool ROW_PAIR_STAGE_LANEPAIR_LAYOUT = false;
+};
+
+template <int _LOAD_PIPE_DEPTH, int _SUPERGROUP_SIZE, bool _PINGPONG = true, int _EPI_PIPE_DEPTH = 4>
+struct experimental_config_colwg_consumerotf_safused_warpbalanced {
+    static_assert(_LOAD_PIPE_DEPTH > 0 && _LOAD_PIPE_DEPTH <= 5);
+    static_assert(_SUPERGROUP_SIZE > 0);
+    static_assert(_EPI_PIPE_DEPTH > 0 && (128 % _EPI_PIPE_DEPTH) == 0);
+
+    static constexpr int CLUSTER_SIZE = 2;
+    static constexpr bool USE_PDL = true;
+
+    static constexpr int CONSUMER_WARPGROUPS = 1;
+    static constexpr int QUANTIZER_WARPGROUPS = 1;
+    static constexpr int ROW_QUANTIZER_WARPGROUPS = 0;
+    static constexpr int COL_QUANTIZER_WARPGROUPS = 1;
+    static constexpr int PRODUCER_WARPGROUPS = 1;
+    static constexpr int NUM_WARPGROUPS = CONSUMER_WARPGROUPS + QUANTIZER_WARPGROUPS + PRODUCER_WARPGROUPS;
+    static constexpr int NUM_WARPS = NUM_WARPGROUPS * WARPGROUP_WARPS;
+    static constexpr int NUM_THREADS = NUM_WARPS * WARP_THREADS;
+
+    static constexpr int LOAD_PIPE_DEPTH = _LOAD_PIPE_DEPTH;
+    static constexpr int EPI_PIPE_DEPTH = _EPI_PIPE_DEPTH;
+    static constexpr bool OVERLAP_EPI = false;
+    static constexpr bool PINGPONG = _PINGPONG;
+
+    static constexpr int SUPERGROUP_SIZE = _SUPERGROUP_SIZE;
+    static constexpr int Mb = 256;
+    static constexpr int Nb = 128;
+    static constexpr int Kb = 256;
+    static constexpr int B_SC_SIZE = Nb / 128;
+    static constexpr int MMA_PER_TILE = Kb / 64;
+
+    static constexpr int BF16_STAGE_COUNT = 2;
+    static constexpr int NUM_D_TILES = BF16_STAGE_COUNT;
+    static constexpr bool USE_BF16_ACCUM = false;
+    static constexpr bool CONSUMER_DO_ROW = true;
+    static constexpr bool COL_HELPERS_USE_ALL_QUANTIZER_WGS = false;
+    static constexpr bool USE_COL_PLAIN_STAGE = false;
+    static constexpr bool EARLY_COL_READY = true;
+    static constexpr bool CACHE_COL_VALUES = false;
+    static constexpr bool CACHE_COL_VALUES_BF16 = false;
+    static constexpr bool CACHE_COL_VALUES_BF16_PAIRS = false;
+    static constexpr bool FAST_ALIGNED_QUANT = false;
+    static constexpr bool ROW_QUANT_FROM_REGS = false;
+};
+
+template <int _LOAD_PIPE_DEPTH, int _SUPERGROUP_SIZE, bool _PINGPONG, int _EPI_PIPE_DEPTH>
+struct config_traits_3wg<experimental_config_colwg_consumerotf_safused_warpbalanced<_LOAD_PIPE_DEPTH, _SUPERGROUP_SIZE, _PINGPONG, _EPI_PIPE_DEPTH>> {
+    static constexpr bool USE_COL_PAIR_STAGE = false;
+    static constexpr bool USE_ROW_PAIR_STAGE = false;
+    static constexpr bool COL_QUANT_FROM_DBF_REGS = true;
+    static constexpr bool FUSED_SOFTMAX_QUANT = true;
+    static constexpr bool FUSED_COL_IN_QUANTIZER = true;
+    static constexpr bool DIRECT_QUANT_WARPBALANCED = true;
+    static constexpr bool DIRECT_ROW_WARPBALANCED = true;
+    static constexpr bool DIRECT_COL_WARPBALANCED = true;
+    static constexpr bool ROW_QUANT_FROM_COL_PAIR_STAGE = false;
+    static constexpr bool ROW_QUANT_FROM_ROWRECORD_REGS = true;
+    static constexpr bool ROW_PAIR_STAGE_ROWRECORD = false;
+    static constexpr bool ROW_PAIR_STAGE_WARP_SYNC_ONLY = false;
+    static constexpr bool ROW_PAIR_STAGE_SLOTMAJOR = false;
+    static constexpr bool USE_ROW_RCP_STAGE = false;
+    static constexpr bool ROW_PAIR_STAGE_FLOATCACHE = false;
+    static constexpr bool PACK_COL_FP4_U64 = true;
+    static constexpr bool ROW_QUANT_ROWLEADER = false;
+    static constexpr bool ROW_QUANT_ROWDUAL = false;
+    static constexpr bool ROW_PAIR_STAGE_LANEPAIR_LAYOUT = false;
+};
+
+template <int _LOAD_PIPE_DEPTH, int _SUPERGROUP_SIZE, bool _PINGPONG, int _EPI_PIPE_DEPTH>
+struct config_traits_col_ready_per_row16<
+    experimental_config_colwg_consumerotf_safused_warpbalanced<_LOAD_PIPE_DEPTH, _SUPERGROUP_SIZE, _PINGPONG, _EPI_PIPE_DEPTH>> {
+    static constexpr bool value = true;
 };
 
 template <int _LOAD_PIPE_DEPTH, int _SUPERGROUP_SIZE, bool _PINGPONG = true, int _EPI_PIPE_DEPTH = 4>
@@ -2193,6 +2422,174 @@ struct config_traits_3wg<experimental_config_colwg_colpairpad_rowpair_lanepairre
 template <int _LOAD_PIPE_DEPTH, int _SUPERGROUP_SIZE, bool _PINGPONG, int _EPI_PIPE_DEPTH>
 struct config_traits_col_ready_per_row16<experimental_config_colwg_colpairpad_rowpair_lanepairrecord_rowsync_dualfloatcache_rowhwfp4_row16ready_overlap_combo_storeadd_5wg<_LOAD_PIPE_DEPTH, _SUPERGROUP_SIZE, _PINGPONG, _EPI_PIPE_DEPTH>> {
     static constexpr bool value = true;
+};
+
+template <int _LOAD_PIPE_DEPTH, int _SUPERGROUP_SIZE, bool _PINGPONG = true, int _EPI_PIPE_DEPTH = 4>
+struct experimental_config_colwg_colpairpad_rowpair_lanepairrecord_rowsync_dualfloatcache_rowhwfp4_row16ready_overlap_combo_storeadd_rowonlydc {
+    using base = experimental_config_colwg_colpairpad_rowpair_lanepairrecord_rowsync_dualfloatcache_rowhwfp4_row16ready_overlap<_LOAD_PIPE_DEPTH, _SUPERGROUP_SIZE, _PINGPONG, _EPI_PIPE_DEPTH>;
+    static constexpr int CLUSTER_SIZE = base::CLUSTER_SIZE;
+    static constexpr bool USE_PDL = base::USE_PDL;
+    static constexpr int CONSUMER_WARPGROUPS = base::CONSUMER_WARPGROUPS;
+    static constexpr int ROW_QUANTIZER_WARPGROUPS = 0;
+    static constexpr int COL_QUANTIZER_WARPGROUPS = 1;
+    static constexpr int COMBO_DE_WARPGROUPS = 1;
+    static constexpr int COMBO_DC_WARPGROUPS = 1;
+    static constexpr int QUANTIZER_WARPGROUPS =
+        COL_QUANTIZER_WARPGROUPS + COMBO_DE_WARPGROUPS + COMBO_DC_WARPGROUPS;
+    static constexpr int PRODUCER_WARPGROUPS = base::PRODUCER_WARPGROUPS;
+    static constexpr int NUM_WARPGROUPS =
+        CONSUMER_WARPGROUPS + QUANTIZER_WARPGROUPS + PRODUCER_WARPGROUPS;
+    static constexpr int NUM_WARPS = NUM_WARPGROUPS * WARPGROUP_WARPS;
+    static constexpr int NUM_THREADS = NUM_WARPS * WARP_THREADS;
+    static constexpr int LOAD_PIPE_DEPTH = base::LOAD_PIPE_DEPTH;
+    static constexpr int EPI_PIPE_DEPTH = base::EPI_PIPE_DEPTH;
+    static constexpr bool OVERLAP_EPI = base::OVERLAP_EPI;
+    static constexpr bool PINGPONG = base::PINGPONG;
+    static constexpr int SUPERGROUP_SIZE = base::SUPERGROUP_SIZE;
+    static constexpr int Mb = base::Mb;
+    static constexpr int Nb = base::Nb;
+    static constexpr int Kb = base::Kb;
+    static constexpr int B_SC_SIZE = base::B_SC_SIZE;
+    static constexpr int MMA_PER_TILE = base::MMA_PER_TILE;
+    static constexpr int BF16_STAGE_COUNT = base::BF16_STAGE_COUNT;
+    static constexpr int NUM_D_TILES = base::NUM_D_TILES;
+    static constexpr bool USE_BF16_ACCUM = base::USE_BF16_ACCUM;
+    static constexpr bool CONSUMER_DO_ROW = base::CONSUMER_DO_ROW;
+    static constexpr bool COL_HELPERS_USE_ALL_QUANTIZER_WGS = false;
+    static constexpr bool USE_COL_PLAIN_STAGE = base::USE_COL_PLAIN_STAGE;
+    static constexpr bool EARLY_COL_READY = base::EARLY_COL_READY;
+    static constexpr bool CACHE_COL_VALUES = base::CACHE_COL_VALUES;
+    static constexpr bool CACHE_COL_VALUES_BF16 = base::CACHE_COL_VALUES_BF16;
+    static constexpr bool CACHE_COL_VALUES_BF16_PAIRS = base::CACHE_COL_VALUES_BF16_PAIRS;
+    static constexpr bool FAST_ALIGNED_QUANT = base::FAST_ALIGNED_QUANT;
+    static constexpr bool ROW_QUANT_FROM_REGS = base::ROW_QUANT_FROM_REGS;
+};
+
+template <int _LOAD_PIPE_DEPTH, int _SUPERGROUP_SIZE, bool _PINGPONG, int _EPI_PIPE_DEPTH>
+struct config_traits_3wg<experimental_config_colwg_colpairpad_rowpair_lanepairrecord_rowsync_dualfloatcache_rowhwfp4_row16ready_overlap_combo_storeadd_rowonlydc<_LOAD_PIPE_DEPTH, _SUPERGROUP_SIZE, _PINGPONG, _EPI_PIPE_DEPTH>>
+    : config_traits_3wg<experimental_config_colwg_colpairpad_rowpair_lanepairrecord_rowsync_dualfloatcache_rowhwfp4_row16ready_overlap<_LOAD_PIPE_DEPTH, _SUPERGROUP_SIZE, _PINGPONG, _EPI_PIPE_DEPTH>> {
+    static constexpr bool ENABLE_STOREADD_COMBO = true;
+    static constexpr bool SEPARATE_BACKHALF_CONSUMERS = true;
+    static constexpr int COMBO_DE_WARPGROUPS = 1;
+    static constexpr int COMBO_DC_WARPGROUPS = 1;
+    static constexpr bool SKIP_GLOBAL_COL_MATERIALIZATION = true;
+};
+
+template <int _LOAD_PIPE_DEPTH, int _SUPERGROUP_SIZE, bool _PINGPONG, int _EPI_PIPE_DEPTH>
+struct config_traits_col_ready_per_row16<experimental_config_colwg_colpairpad_rowpair_lanepairrecord_rowsync_dualfloatcache_rowhwfp4_row16ready_overlap_combo_storeadd_rowonlydc<_LOAD_PIPE_DEPTH, _SUPERGROUP_SIZE, _PINGPONG, _EPI_PIPE_DEPTH>> {
+    static constexpr bool value = true;
+};
+
+template <int _LOAD_PIPE_DEPTH, int _SUPERGROUP_SIZE, bool _PINGPONG = true, int _EPI_PIPE_DEPTH = 4>
+struct experimental_config_colwg_colpairpad_rowpair_lanepairrecord_rowsync_dualfloatcache_rowhwfp4_dedicated_rowonly_gonly {
+    using base = experimental_config_colwg_colpairpad_rowpair_lanepairrecord_rowsync_dualfloatcache_rowhwfp4_row16ready_overlap<_LOAD_PIPE_DEPTH, _SUPERGROUP_SIZE, _PINGPONG, _EPI_PIPE_DEPTH>;
+    static constexpr int CLUSTER_SIZE = base::CLUSTER_SIZE;
+    static constexpr bool USE_PDL = base::USE_PDL;
+    static constexpr int CONSUMER_WARPGROUPS = base::CONSUMER_WARPGROUPS;
+    static constexpr int ROW_QUANTIZER_WARPGROUPS = 0;
+    static constexpr int COL_QUANTIZER_WARPGROUPS = 1;
+    static constexpr int COMBO_DE_WARPGROUPS = 0;
+    static constexpr int COMBO_DC_WARPGROUPS = 0;
+    static constexpr int QUANTIZER_WARPGROUPS =
+        COL_QUANTIZER_WARPGROUPS + COMBO_DE_WARPGROUPS + COMBO_DC_WARPGROUPS;
+    static constexpr int PRODUCER_WARPGROUPS = base::PRODUCER_WARPGROUPS;
+    static constexpr int NUM_WARPGROUPS =
+        CONSUMER_WARPGROUPS + QUANTIZER_WARPGROUPS + PRODUCER_WARPGROUPS;
+    static constexpr int NUM_WARPS = NUM_WARPGROUPS * WARPGROUP_WARPS;
+    static constexpr int NUM_THREADS = NUM_WARPS * WARP_THREADS;
+    static constexpr int LOAD_PIPE_DEPTH = base::LOAD_PIPE_DEPTH;
+    static constexpr int EPI_PIPE_DEPTH = base::EPI_PIPE_DEPTH;
+    static constexpr bool OVERLAP_EPI = base::OVERLAP_EPI;
+    static constexpr bool PINGPONG = base::PINGPONG;
+    static constexpr int SUPERGROUP_SIZE = base::SUPERGROUP_SIZE;
+    static constexpr int Mb = base::Mb;
+    static constexpr int Nb = base::Nb;
+    static constexpr int Kb = base::Kb;
+    static constexpr int B_SC_SIZE = base::B_SC_SIZE;
+    static constexpr int MMA_PER_TILE = base::MMA_PER_TILE;
+    static constexpr int BF16_STAGE_COUNT = base::BF16_STAGE_COUNT;
+    static constexpr int NUM_D_TILES = base::NUM_D_TILES;
+    static constexpr bool USE_BF16_ACCUM = base::USE_BF16_ACCUM;
+    static constexpr bool CONSUMER_DO_ROW = base::CONSUMER_DO_ROW;
+    static constexpr bool COL_HELPERS_USE_ALL_QUANTIZER_WGS = false;
+    static constexpr bool USE_COL_PLAIN_STAGE = base::USE_COL_PLAIN_STAGE;
+    static constexpr bool EARLY_COL_READY = false;
+    static constexpr bool CACHE_COL_VALUES = base::CACHE_COL_VALUES;
+    static constexpr bool CACHE_COL_VALUES_BF16 = base::CACHE_COL_VALUES_BF16;
+    static constexpr bool CACHE_COL_VALUES_BF16_PAIRS = base::CACHE_COL_VALUES_BF16_PAIRS;
+    static constexpr bool FAST_ALIGNED_QUANT = base::FAST_ALIGNED_QUANT;
+    static constexpr bool ROW_QUANT_FROM_REGS = base::ROW_QUANT_FROM_REGS;
+};
+
+template <int _LOAD_PIPE_DEPTH, int _SUPERGROUP_SIZE, bool _PINGPONG, int _EPI_PIPE_DEPTH>
+struct config_traits_3wg<experimental_config_colwg_colpairpad_rowpair_lanepairrecord_rowsync_dualfloatcache_rowhwfp4_dedicated_rowonly_gonly<_LOAD_PIPE_DEPTH, _SUPERGROUP_SIZE, _PINGPONG, _EPI_PIPE_DEPTH>>
+    : config_traits_3wg<experimental_config_colwg_colpairpad_rowpair_lanepairrecord_rowsync_dualfloatcache_rowhwfp4_row16ready_overlap<_LOAD_PIPE_DEPTH, _SUPERGROUP_SIZE, _PINGPONG, _EPI_PIPE_DEPTH>> {
+    static constexpr bool ENABLE_STOREADD_COMBO = false;
+    static constexpr bool SEPARATE_BACKHALF_CONSUMERS = false;
+    static constexpr int COMBO_DE_WARPGROUPS = 0;
+    static constexpr int COMBO_DC_WARPGROUPS = 0;
+    static constexpr bool SKIP_GLOBAL_COL_MATERIALIZATION = true;
+};
+
+template <int _LOAD_PIPE_DEPTH, int _SUPERGROUP_SIZE, bool _PINGPONG, int _EPI_PIPE_DEPTH>
+struct config_traits_col_ready_per_row16<experimental_config_colwg_colpairpad_rowpair_lanepairrecord_rowsync_dualfloatcache_rowhwfp4_dedicated_rowonly_gonly<_LOAD_PIPE_DEPTH, _SUPERGROUP_SIZE, _PINGPONG, _EPI_PIPE_DEPTH>> {
+    static constexpr bool value = false;
+};
+
+template <int _LOAD_PIPE_DEPTH, int _SUPERGROUP_SIZE, bool _PINGPONG = true, int _EPI_PIPE_DEPTH = 4>
+struct experimental_config_colwg_colpairpad_rowpair_lanepairrecord_rowsync_dualfloatcache_rowhwfp4_dedicated_rowonly_combo_dc {
+    using base = experimental_config_colwg_colpairpad_rowpair_lanepairrecord_rowsync_dualfloatcache_rowhwfp4_row16ready_overlap<_LOAD_PIPE_DEPTH, _SUPERGROUP_SIZE, _PINGPONG, _EPI_PIPE_DEPTH>;
+    static constexpr int CLUSTER_SIZE = base::CLUSTER_SIZE;
+    static constexpr bool USE_PDL = base::USE_PDL;
+    static constexpr int CONSUMER_WARPGROUPS = base::CONSUMER_WARPGROUPS;
+    static constexpr int ROW_QUANTIZER_WARPGROUPS = 0;
+    static constexpr int COL_QUANTIZER_WARPGROUPS = 1;
+    static constexpr int COMBO_DE_WARPGROUPS = 0;
+    static constexpr int COMBO_DC_WARPGROUPS = 1;
+    static constexpr int QUANTIZER_WARPGROUPS =
+        COL_QUANTIZER_WARPGROUPS + COMBO_DE_WARPGROUPS + COMBO_DC_WARPGROUPS;
+    static constexpr int PRODUCER_WARPGROUPS = base::PRODUCER_WARPGROUPS;
+    static constexpr int NUM_WARPGROUPS =
+        CONSUMER_WARPGROUPS + QUANTIZER_WARPGROUPS + PRODUCER_WARPGROUPS;
+    static constexpr int NUM_WARPS = NUM_WARPGROUPS * WARPGROUP_WARPS;
+    static constexpr int NUM_THREADS = NUM_WARPS * WARP_THREADS;
+    static constexpr int LOAD_PIPE_DEPTH = base::LOAD_PIPE_DEPTH;
+    static constexpr int EPI_PIPE_DEPTH = base::EPI_PIPE_DEPTH;
+    static constexpr bool OVERLAP_EPI = base::OVERLAP_EPI;
+    static constexpr bool PINGPONG = base::PINGPONG;
+    static constexpr int SUPERGROUP_SIZE = base::SUPERGROUP_SIZE;
+    static constexpr int Mb = base::Mb;
+    static constexpr int Nb = base::Nb;
+    static constexpr int Kb = base::Kb;
+    static constexpr int B_SC_SIZE = base::B_SC_SIZE;
+    static constexpr int MMA_PER_TILE = base::MMA_PER_TILE;
+    static constexpr int BF16_STAGE_COUNT = base::BF16_STAGE_COUNT;
+    static constexpr int NUM_D_TILES = base::NUM_D_TILES;
+    static constexpr bool USE_BF16_ACCUM = base::USE_BF16_ACCUM;
+    static constexpr bool CONSUMER_DO_ROW = base::CONSUMER_DO_ROW;
+    static constexpr bool COL_HELPERS_USE_ALL_QUANTIZER_WGS = false;
+    static constexpr bool USE_COL_PLAIN_STAGE = base::USE_COL_PLAIN_STAGE;
+    static constexpr bool EARLY_COL_READY = false;
+    static constexpr bool CACHE_COL_VALUES = base::CACHE_COL_VALUES;
+    static constexpr bool CACHE_COL_VALUES_BF16 = base::CACHE_COL_VALUES_BF16;
+    static constexpr bool CACHE_COL_VALUES_BF16_PAIRS = base::CACHE_COL_VALUES_BF16_PAIRS;
+    static constexpr bool FAST_ALIGNED_QUANT = base::FAST_ALIGNED_QUANT;
+    static constexpr bool ROW_QUANT_FROM_REGS = base::ROW_QUANT_FROM_REGS;
+};
+
+template <int _LOAD_PIPE_DEPTH, int _SUPERGROUP_SIZE, bool _PINGPONG, int _EPI_PIPE_DEPTH>
+struct config_traits_3wg<experimental_config_colwg_colpairpad_rowpair_lanepairrecord_rowsync_dualfloatcache_rowhwfp4_dedicated_rowonly_combo_dc<_LOAD_PIPE_DEPTH, _SUPERGROUP_SIZE, _PINGPONG, _EPI_PIPE_DEPTH>>
+    : config_traits_3wg<experimental_config_colwg_colpairpad_rowpair_lanepairrecord_rowsync_dualfloatcache_rowhwfp4_row16ready_overlap<_LOAD_PIPE_DEPTH, _SUPERGROUP_SIZE, _PINGPONG, _EPI_PIPE_DEPTH>> {
+    static constexpr bool ENABLE_STOREADD_COMBO = true;
+    static constexpr bool SEPARATE_BACKHALF_CONSUMERS = true;
+    static constexpr int COMBO_DE_WARPGROUPS = 0;
+    static constexpr int COMBO_DC_WARPGROUPS = 1;
+    static constexpr bool SKIP_GLOBAL_COL_MATERIALIZATION = true;
+};
+
+template <int _LOAD_PIPE_DEPTH, int _SUPERGROUP_SIZE, bool _PINGPONG, int _EPI_PIPE_DEPTH>
+struct config_traits_col_ready_per_row16<experimental_config_colwg_colpairpad_rowpair_lanepairrecord_rowsync_dualfloatcache_rowhwfp4_dedicated_rowonly_combo_dc<_LOAD_PIPE_DEPTH, _SUPERGROUP_SIZE, _PINGPONG, _EPI_PIPE_DEPTH>> {
+    static constexpr bool value = false;
 };
 
 template <int _LOAD_PIPE_DEPTH, int _SUPERGROUP_SIZE, bool _PINGPONG = true, int _EPI_PIPE_DEPTH = 4>
@@ -4067,6 +4464,222 @@ __device__ __forceinline__ uint8_t quantize_fp4_pair(float v0, float v1, float r
     return q0 | (q1 << 4);
 }
 
+struct fp4_scale_contract {
+    float quant_rcp_scale;
+    uint8_t scale_byte;
+};
+
+__device__ __forceinline__ fp4_scale_contract make_fp4_scale_contract(
+    float amax,
+    float g_sg_rcp,
+    float g_sg,
+    bool encode_centric)
+{
+    constexpr float k_fp4_max = 6.0f;
+    constexpr float k_e4m3_max = 448.0f;
+    fp4_scale_contract contract{};
+    const float exact_rcp_scale = (amax > 0.0f) ? (k_fp4_max / amax) : 0.0f;
+    float stored_scale = 0.0f;
+    if (encode_centric) {
+        stored_scale = fminf(exact_rcp_scale * g_sg, k_e4m3_max);
+    } else {
+        const float exact_scale = (exact_rcp_scale > 0.0f) ? (1.0f / exact_rcp_scale) : 0.0f;
+        stored_scale = exact_scale * g_sg_rcp;
+    }
+    reinterpret_cast<__nv_fp8_e4m3&>(contract.scale_byte) = __nv_fp8_e4m3(stored_scale);
+    const float rounded_stored_scale = float(reinterpret_cast<__nv_fp8_e4m3&>(contract.scale_byte));
+    if (encode_centric) {
+        contract.quant_rcp_scale = rounded_stored_scale * g_sg_rcp;
+    } else {
+        contract.quant_rcp_scale =
+            (rounded_stored_scale > 0.0f) ? (1.0f / (rounded_stored_scale * g_sg)) : 0.0f;
+    }
+    return contract;
+}
+
+__device__ __forceinline__ fp4_scale_contract decode_fp4_scale_contract(
+    uint8_t scale_byte,
+    float g_sg_rcp,
+    float g_sg,
+    bool encode_centric)
+{
+    fp4_scale_contract contract{};
+    contract.scale_byte = scale_byte;
+    const float rounded_stored_scale = float(reinterpret_cast<__nv_fp8_e4m3&>(contract.scale_byte));
+    if (encode_centric) {
+        contract.quant_rcp_scale = rounded_stored_scale * g_sg_rcp;
+    } else {
+        contract.quant_rcp_scale =
+            (rounded_stored_scale > 0.0f) ? (1.0f / (rounded_stored_scale * g_sg)) : 0.0f;
+    }
+    return contract;
+}
+
+__device__ __forceinline__ float2 gather_live_col_pair_warpbalanced(
+    unsigned mask,
+    float2 pass_lo,
+    float2 pass_hi,
+    bool use_hi,
+    bool use_y,
+    int src_even,
+    int src_odd)
+{
+    const float2 even_src = use_hi ? pass_hi : pass_lo;
+    const float2 odd_src = use_hi ? pass_hi : pass_lo;
+    const float2 even_pair = make_float2(
+        __shfl_sync(mask, even_src.x, src_even),
+        __shfl_sync(mask, even_src.y, src_even));
+    const float2 odd_pair = make_float2(
+        __shfl_sync(mask, odd_src.x, src_odd),
+        __shfl_sync(mask, odd_src.y, src_odd));
+    return use_y ? make_float2(even_pair.y, odd_pair.y)
+                 : make_float2(even_pair.x, odd_pair.x);
+}
+
+struct live_col_fp4_quant_result {
+    uint64_t packed_fp4;
+    uint8_t scale_byte;
+};
+
+__device__ __forceinline__ fp4_scale_contract make_live_col_scale_contract_warpbalanced(
+    unsigned mask,
+    float2 local_lo_0_fl,
+    float2 local_hi_0_fl,
+    float2 local_lo_1_fl,
+    float2 local_hi_1_fl,
+    int lane_id,
+    int lane_pair_src,
+    bool use_hi,
+    bool use_y,
+    int global_row_base,
+    int g_m,
+    bool full_tile_rows,
+    float g_sg_rcp,
+    float g_sg,
+    bool encode_centric)
+{
+    const bool lower_owner_lane = lane_id < 16;
+    float partial_amax = 0.0f;
+    if (lower_owner_lane) {
+        #pragma unroll
+        for (int local_pair = 0; local_pair < 4; ++local_pair) {
+            const int src_even = local_pair * 8 + lane_pair_src;
+            const int src_odd = src_even + 4;
+            const float2 pair_vals = gather_live_col_pair_warpbalanced(
+                mask, local_lo_0_fl, local_hi_0_fl, use_hi, use_y, src_even, src_odd);
+            const int global_row = global_row_base + local_pair * 2;
+            const float v0 = full_tile_rows || global_row < g_m ? pair_vals.x : 0.0f;
+            const float v1 = full_tile_rows || (global_row + 1) < g_m ? pair_vals.y : 0.0f;
+            partial_amax = fmaxf(partial_amax, fabsf(v0));
+            partial_amax = fmaxf(partial_amax, fabsf(v1));
+        }
+    } else {
+        #pragma unroll
+        for (int local_pair = 0; local_pair < 4; ++local_pair) {
+            const int src_even = local_pair * 8 + lane_pair_src;
+            const int src_odd = src_even + 4;
+            const float2 pair_vals = gather_live_col_pair_warpbalanced(
+                mask, local_lo_1_fl, local_hi_1_fl, use_hi, use_y, src_even, src_odd);
+            const int global_row = global_row_base + (4 + local_pair) * 2;
+            const float v0 = full_tile_rows || global_row < g_m ? pair_vals.x : 0.0f;
+            const float v1 = full_tile_rows || (global_row + 1) < g_m ? pair_vals.y : 0.0f;
+            partial_amax = fmaxf(partial_amax, fabsf(v0));
+            partial_amax = fmaxf(partial_amax, fabsf(v1));
+        }
+    }
+    const float col_amax = fmaxf(partial_amax, __shfl_xor_sync(mask, partial_amax, 16));
+    return make_fp4_scale_contract(col_amax, g_sg_rcp, g_sg, encode_centric);
+}
+
+template <bool USE_FIXED_SCALE = false, bool SKIP_PACK = false>
+__device__ __forceinline__ live_col_fp4_quant_result quantize_live_col_warpbalanced(
+    unsigned mask,
+    float2 local_lo_0_fl,
+    float2 local_hi_0_fl,
+    float2 local_lo_1_fl,
+    float2 local_hi_1_fl,
+    int lane_pair_src,
+    bool use_hi,
+    bool use_y,
+    int global_row_base,
+    int g_m,
+    bool full_tile_rows,
+    float g_sg_rcp,
+    float g_sg,
+    bool encode_centric)
+{
+    live_col_fp4_quant_result result{};
+    fp4_scale_contract scale_contract{};
+    if constexpr (USE_FIXED_SCALE) {
+        scale_contract = make_fp4_scale_contract(1.0f, g_sg_rcp, g_sg, encode_centric);
+    } else {
+        float col_amax = 0.0f;
+        #pragma unroll
+        for (int local_pair_total = 0; local_pair_total < 8; ++local_pair_total) {
+            const bool upper_half = local_pair_total >= 4;
+            const int local_pair = local_pair_total & 3;
+            const int src_even = local_pair * 8 + lane_pair_src;
+            const int src_odd = src_even + 4;
+            const float2 pair_vals = upper_half
+                ? gather_live_col_pair_warpbalanced(
+                    mask, local_lo_1_fl, local_hi_1_fl, use_hi, use_y, src_even, src_odd)
+                : gather_live_col_pair_warpbalanced(
+                    mask, local_lo_0_fl, local_hi_0_fl, use_hi, use_y, src_even, src_odd);
+            const int global_row = global_row_base + local_pair_total * 2;
+            const float v0 = (full_tile_rows || global_row < g_m) ? pair_vals.x : 0.0f;
+            const float v1 = (full_tile_rows || (global_row + 1) < g_m) ? pair_vals.y : 0.0f;
+            col_amax = fmaxf(col_amax, fabsf(v0));
+            col_amax = fmaxf(col_amax, fabsf(v1));
+        }
+        scale_contract = make_fp4_scale_contract(col_amax, g_sg_rcp, g_sg, encode_centric);
+    }
+    result.scale_byte = scale_contract.scale_byte;
+
+    if constexpr (!SKIP_PACK) {
+        uint64_t packed_fp4 = 0;
+        #pragma unroll
+        for (int local_pair_total = 0; local_pair_total < 8; ++local_pair_total) {
+            const bool upper_half = local_pair_total >= 4;
+            const int local_pair = local_pair_total & 3;
+            const int src_even = local_pair * 8 + lane_pair_src;
+            const int src_odd = src_even + 4;
+            const float2 pair_vals = upper_half
+                ? gather_live_col_pair_warpbalanced(
+                    mask, local_lo_1_fl, local_hi_1_fl, use_hi, use_y, src_even, src_odd)
+                : gather_live_col_pair_warpbalanced(
+                    mask, local_lo_0_fl, local_hi_0_fl, use_hi, use_y, src_even, src_odd);
+            const int global_row = global_row_base + local_pair_total * 2;
+            const float v0 = (full_tile_rows || global_row < g_m) ? pair_vals.x : 0.0f;
+            const float v1 = (full_tile_rows || (global_row + 1) < g_m) ? pair_vals.y : 0.0f;
+            packed_fp4 |= static_cast<uint64_t>(
+                quantize_fp4_pair(v0, v1, scale_contract.quant_rcp_scale)) << (local_pair_total * 8);
+        }
+        result.packed_fp4 = packed_fp4;
+    }
+    return result;
+}
+
+__device__ __forceinline__ uint64_t pack_col_microtile_fp4_from_scale(
+    const float *col_values,
+    int global_row_base,
+    int g_m,
+    bool full_tile_rows,
+    float quant_rcp_scale)
+{
+    uint64_t packed_fp4 = 0;
+    #pragma unroll
+    for (int local_pair = 0; local_pair < 8; ++local_pair) {
+        const int global_row = global_row_base + local_pair * 2;
+        const float v0 =
+            (full_tile_rows || global_row < g_m) ? col_values[local_pair * 2 + 0] : 0.0f;
+        const float v1 =
+            (full_tile_rows || (global_row + 1) < g_m) ? col_values[local_pair * 2 + 1] : 0.0f;
+        packed_fp4 |= static_cast<uint64_t>(
+            quantize_fp4_pair(v0, v1, quant_rcp_scale)) << (local_pair * 8);
+    }
+    return packed_fp4;
+}
+
 __device__ __forceinline__ bf16 bf16_from_bits(uint16_t bits) {
     bf16 value;
     *reinterpret_cast<uint16_t*>(&value) = bits;
@@ -4122,6 +4735,17 @@ __device__ __forceinline__ void store_col_pair_stage_pair(
 }
 
 __device__ __forceinline__ void store_u64x2(uint64_t *dst, uint64_t bits0, uint64_t bits1);
+
+template <typename PairT>
+__device__ __forceinline__ float2 pair_to_float2(const PairT &pair) {
+    return make_float2(pair.x, pair.y);
+}
+
+__device__ __forceinline__ float2 shfl_float2_sync(unsigned mask, float2 value, int src_lane, int width = warpSize) {
+    return make_float2(
+        __shfl_sync(mask, value.x, src_lane, width),
+        __shfl_sync(mask, value.y, src_lane, width));
+}
 
 template <typename G>
 __device__ __forceinline__ void store_row_pair_stage_record(
@@ -4271,6 +4895,61 @@ __device__ __forceinline__ void store_combo_col_stage_scale(
     }
 }
 
+template <typename G>
+__device__ __forceinline__ void maybe_store_global_col_u64(
+    uint8_t *col_fp4_ptr,
+    int col_fp4_stride,
+    int global_col,
+    int global_row_pair_base,
+    uint64_t packed_fp4)
+{
+    if constexpr (!G::SKIP_GLOBAL_COL_MATERIALIZATION) {
+        store_global_u64(col_fp4_ptr + global_col * col_fp4_stride + global_row_pair_base, packed_fp4);
+    } else {
+        (void)col_fp4_ptr;
+        (void)col_fp4_stride;
+        (void)global_col;
+        (void)global_row_pair_base;
+        (void)packed_fp4;
+    }
+}
+
+template <typename G>
+__device__ __forceinline__ void maybe_store_global_col_byte(
+    uint8_t *col_fp4_ptr,
+    int col_fp4_stride,
+    int global_col,
+    int global_row_pair_index,
+    uint8_t packed_pair)
+{
+    if constexpr (!G::SKIP_GLOBAL_COL_MATERIALIZATION) {
+        col_fp4_ptr[global_col * col_fp4_stride + global_row_pair_index] = packed_pair;
+    } else {
+        (void)col_fp4_ptr;
+        (void)col_fp4_stride;
+        (void)global_col;
+        (void)global_row_pair_index;
+        (void)packed_pair;
+    }
+}
+
+template <typename G>
+__device__ __forceinline__ void maybe_store_global_col_scale(
+    uint8_t *col_sc_ptr,
+    int chunk,
+    int byte_idx,
+    uint8_t scale_byte)
+{
+    if constexpr (!G::SKIP_GLOBAL_COL_MATERIALIZATION) {
+        col_sc_ptr[chunk * 512 + byte_idx] = scale_byte;
+    } else {
+        (void)col_sc_ptr;
+        (void)chunk;
+        (void)byte_idx;
+        (void)scale_byte;
+    }
+}
+
 __device__ __forceinline__ uint64_t shfl_u64_sync(unsigned mask, uint64_t value, int src_lane, int width = warpSize) {
     const uint32_t lo = __shfl_sync(mask, static_cast<uint32_t>(value), src_lane, width);
     const uint32_t hi = __shfl_sync(mask, static_cast<uint32_t>(value >> 32), src_lane, width);
@@ -4308,8 +4987,6 @@ __device__ __forceinline__ void quantize_rowrecord_pairbits_to_global(
     uint8_t* combo_row_sc_ptr = nullptr,
     int combo_local_row = -1,
     int combo_local_col_start = 0) {
-    constexpr float k_fp4_max = 6.0f;
-    constexpr float k_e4m3_max = 448.0f;
     float2 cached_pairs[8];
     const uint64_t pair_bits_arr[4] = {pair_bits_0, pair_bits_1, pair_bits_2, pair_bits_3};
     float amax = 0.0f;
@@ -4328,14 +5005,16 @@ __device__ __forceinline__ void quantize_rowrecord_pairbits_to_global(
         amax = fmaxf(amax, fabsf(pair_hi.y));
     }
 
-    const float rcp_scale = (amax > 0.0f) ? (k_fp4_max / amax) : 0.0f;
+    const fp4_scale_contract scale_contract =
+        make_fp4_scale_contract(amax, g_sg_rcp, g_sg, encode_centric);
     const int global_col_16 = col_start + group16 * 16;
     const int fp4x2_col_base = global_col_16 / 2;
     uint64_t packed_fp4 = 0;
     #pragma unroll
     for (int pair = 0; pair < 8; ++pair) {
         packed_fp4 |= static_cast<uint64_t>(
-            quantize_rowrecord_cached_pair<USE_HW_FP4X2>(cached_pairs[pair], rcp_scale)) << (pair * 8);
+            quantize_rowrecord_cached_pair<USE_HW_FP4X2>(
+                cached_pairs[pair], scale_contract.quant_rcp_scale)) << (pair * 8);
     }
     store_global_u64(
         &row_fp4_ptr[global_row * row_fp4_stride + fp4x2_col_base],
@@ -4348,12 +5027,6 @@ __device__ __forceinline__ void quantize_rowrecord_pairbits_to_global(
             packed_fp4);
     }
 
-    const float scale = rcp_scale > 0.0f ? (1.0f / rcp_scale) : 0.0f;
-    float stored_scale = scale * g_sg_rcp;
-    if (encode_centric) {
-        stored_scale = fminf(rcp_scale * g_sg, k_e4m3_max);
-    }
-    const __nv_fp8_e4m3 sc = __nv_fp8_e4m3(stored_scale);
     const int kgroup = global_col_16 / 64;
     const int col_16_in_64 = (global_col_16 / 16) % 4;
     const int depth = global_row / 128;
@@ -4361,8 +5034,7 @@ __device__ __forceinline__ void quantize_rowrecord_pairbits_to_global(
     const int rr = (global_row / 32) % 4;
     const int chunk = depth * row_sc_kgroups + kgroup;
     const int byte_idx = sr * 16 + rr * 4 + col_16_in_64;
-    const uint8_t scale_byte = *reinterpret_cast<const uint8_t*>(&sc);
-    row_sc_ptr[chunk * 512 + byte_idx] = scale_byte;
+    row_sc_ptr[chunk * 512 + byte_idx] = scale_contract.scale_byte;
     if (combo_row_sc_ptr != nullptr && combo_local_row >= 0) {
         const int local_col_16 = combo_local_col_start + group16 * 16;
         const int local_kgroup = local_col_16 / 64;
@@ -4370,8 +5042,54 @@ __device__ __forceinline__ void quantize_rowrecord_pairbits_to_global(
         const int local_sr = combo_local_row % 32;
         const int local_rr = (combo_local_row / 32) % 4;
         const int local_byte_idx = local_sr * 16 + local_rr * 4 + local_col_16_in_64;
-        combo_row_sc_ptr[local_kgroup * 512 + local_byte_idx] = scale_byte;
+        combo_row_sc_ptr[local_kgroup * 512 + local_byte_idx] = scale_contract.scale_byte;
     }
+}
+
+template <bool USE_HW_FP4X2 = false>
+__device__ __forceinline__ void quantize_rowrecord_floatpairs_to_global(
+    const float2 *cached_pairs,
+    uint8_t* row_fp4_ptr,
+    int row_fp4_stride,
+    uint8_t* row_sc_ptr,
+    int row_sc_kgroups,
+    int global_row,
+    int col_start,
+    int group16,
+    float g_sg_rcp,
+    float g_sg,
+    bool encode_centric)
+{
+    float amax = 0.0f;
+    #pragma unroll
+    for (int pair = 0; pair < 8; ++pair) {
+        amax = fmaxf(amax, fabsf(cached_pairs[pair].x));
+        amax = fmaxf(amax, fabsf(cached_pairs[pair].y));
+    }
+
+    const fp4_scale_contract scale_contract =
+        make_fp4_scale_contract(amax, g_sg_rcp, g_sg, encode_centric);
+    const int global_col_16 = col_start + group16 * 16;
+    const int fp4x2_col_base = global_col_16 / 2;
+    uint64_t packed_fp4 = 0;
+    #pragma unroll
+    for (int pair = 0; pair < 8; ++pair) {
+        packed_fp4 |= static_cast<uint64_t>(
+            quantize_rowrecord_cached_pair<USE_HW_FP4X2>(
+                cached_pairs[pair], scale_contract.quant_rcp_scale)) << (pair * 8);
+    }
+    store_global_u64(
+        &row_fp4_ptr[global_row * row_fp4_stride + fp4x2_col_base],
+        packed_fp4);
+
+    const int kgroup = global_col_16 / 64;
+    const int col_16_in_64 = (global_col_16 / 16) % 4;
+    const int depth = global_row / 128;
+    const int sr = global_row % 32;
+    const int rr = (global_row / 32) % 4;
+    const int chunk = depth * row_sc_kgroups + kgroup;
+    const int byte_idx = sr * 16 + rr * 4 + col_16_in_64;
+    row_sc_ptr[chunk * 512 + byte_idx] = scale_contract.scale_byte;
 }
 
 template <bool USE_HW_FP4X2 = false>
@@ -4404,6 +5122,22 @@ __device__ __noinline__ void quantize_rowrecord_pairbits_to_global_noinline(
         combo_row_fp4_ptr, combo_row_fp4_stride,
         combo_row_sc_ptr, combo_local_row, combo_local_col_start);
 }
+
+template <typename C, bool ENABLE>
+struct fused_quant_stage_storage_3wg {
+    struct type { };
+};
+
+template <typename C>
+struct fused_quant_stage_storage_3wg<C, true> {
+    struct alignas(16) type {
+        uint8_t row_fp4[(C::Mb / 2) * (C::Nb / 2)];
+        uint8_t row_sc[(C::Nb / 64) * 512];
+        uint8_t col_fp4[C::Nb * (C::Mb / 4)];
+        uint8_t col_sc[(C::Mb / 64) * 512];
+        float col_values[C::BF16_STAGE_COUNT][C::Mb / 32][C::Nb / C::EPI_PIPE_DEPTH][16];
+    };
+};
 
 // =========================================================================
 // Globals
@@ -4605,6 +5339,7 @@ struct globals_3wg {
     static constexpr bool USE_COL_PAIR_STAGE = config_traits_3wg<C>::USE_COL_PAIR_STAGE;
     static constexpr bool COL_PAIR_STAGE_PADDED_LAYOUT = config_traits_col_pair_stage_padded<C>::value;
     static constexpr bool COL_QUANT_FROM_DBF_REGS = config_traits_col_quant_from_dbf_regs<C>::value;
+    static constexpr bool FUSED_SOFTMAX_QUANT = config_traits_fused_softmax_quant<C>::value;
     static constexpr bool DIRECT_QUANT_WARPBALANCED = config_traits_3wg<C>::DIRECT_QUANT_WARPBALANCED;
     static constexpr bool DIRECT_ROW_WARPBALANCED = config_traits_3wg<C>::DIRECT_ROW_WARPBALANCED;
     static constexpr bool DIRECT_COL_WARPBALANCED = config_traits_3wg<C>::DIRECT_COL_WARPBALANCED;
@@ -4638,14 +5373,46 @@ struct globals_3wg {
     static constexpr bool DEBUG_DISABLE_CONSUMER_COL_STAGE_PRODUCTION = config_traits_debug_disable_consumer_col_stage_production<C>::value;
     static constexpr bool ENABLE_STOREADD_COMBO = config_traits_storeadd_combo<C>::value;
     static constexpr bool SEPARATE_BACKHALF_CONSUMERS = config_traits_separate_backhalf_consumers<C>::value;
+    static constexpr bool FUSED_COL_IN_QUANTIZER = config_traits_fused_col_in_quantizer<C>::value;
+    static constexpr bool SKIP_GLOBAL_COL_MATERIALIZATION = config_traits_skip_global_col_materialization<C>::value;
     static constexpr int COMBO_DE_WARPGROUPS = config_traits_combo_de_warpgroups<C>::value;
     static constexpr int COMBO_DC_WARPGROUPS = config_traits_combo_dc_warpgroups<C>::value;
+    static constexpr bool COMBO_NEEDS_DE_PATH =
+        ENABLE_STOREADD_COMBO && (COMBO_DE_WARPGROUPS > 0);
+    static constexpr bool COMBO_NEEDS_DC_PATH =
+        ENABLE_STOREADD_COMBO && (COMBO_DC_WARPGROUPS > 0);
+    static constexpr bool COMBO_NEEDS_ROW_STAGE = COMBO_NEEDS_DE_PATH;
+    static constexpr bool COMBO_NEEDS_COL_STAGE = COMBO_NEEDS_DC_PATH;
+    static constexpr bool COMBO_NEEDS_P3_C_TILE_STAGE = COMBO_NEEDS_DE_PATH;
+    static constexpr bool COMBO_NEEDS_DE_SCALES_STAGE =
+        COMBO_NEEDS_DE_PATH && SEPARATE_BACKHALF_CONSUMERS;
+    static constexpr bool COMBO_NEEDS_OUTPUT_STAGE =
+        ENABLE_STOREADD_COMBO && (COMBO_NEEDS_DE_PATH || COMBO_NEEDS_DC_PATH);
     static constexpr int FRONTEND_QUANTIZER_WARPGROUPS =
         SEPARATE_BACKHALF_CONSUMERS
             ? (C::ROW_QUANTIZER_WARPGROUPS + C::COL_QUANTIZER_WARPGROUPS)
             : C::QUANTIZER_WARPGROUPS;
     static constexpr bool FRONTEND_SINGLE_QUANTIZER_WG = (FRONTEND_QUANTIZER_WARPGROUPS == 1);
     static constexpr bool FRONTEND_MULTI_QUANTIZER_WG = (FRONTEND_QUANTIZER_WARPGROUPS > 1);
+    static constexpr bool USES_BF16_STAGE_STORAGE =
+        !(FUSED_SOFTMAX_QUANT && COL_QUANT_FROM_DBF_REGS && FRONTEND_QUANTIZER_WARPGROUPS == 0);
+    static constexpr int SAFUSED_DIAG_MODE_VALUE = SAFUSED_DIAG_MODE;
+    static constexpr bool SAFUSED_DIAG_TIMING_ENABLED = (SAFUSED_DIAG_TIMING != 0);
+    static constexpr bool SAFUSED_SKIP_COL_WORK =
+        FUSED_SOFTMAX_QUANT &&
+        (SAFUSED_DIAG_MODE_VALUE == kSafusedDiagRowOnly);
+    static constexpr bool SAFUSED_FIXED_COL_SCALE =
+        FUSED_SOFTMAX_QUANT &&
+        (SAFUSED_DIAG_MODE_VALUE == kSafusedDiagColPackOnly);
+    static constexpr bool SAFUSED_SKIP_COL_PACK =
+        FUSED_SOFTMAX_QUANT &&
+        ((SAFUSED_DIAG_MODE_VALUE == kSafusedDiagRowOnly) ||
+         (SAFUSED_DIAG_MODE_VALUE == kSafusedDiagColAmaxOnly));
+    static constexpr bool SAFUSED_SKIP_COL_FLUSH =
+        FUSED_SOFTMAX_QUANT &&
+        ((SAFUSED_DIAG_MODE_VALUE == kSafusedDiagRowOnly) ||
+         (SAFUSED_DIAG_MODE_VALUE == kSafusedDiagColAmaxOnly) ||
+         (SAFUSED_DIAG_MODE_VALUE == kSafusedDiagColNoFlush));
     static constexpr int COMBO_MODE_FULL = 0;
     static constexpr int COMBO_MODE_GONLY = 1;
     static constexpr int COMBO_MODE_DEONLY = 2;
@@ -4715,6 +5482,7 @@ struct globals_3wg {
     combo_dE_gl    dE_out;
     combo_dC_gl    dC_out;
     int            combo_mode;
+    uint64_t*      diag_stage_cycles;
 
     struct input_tiles_t {
         A_fp4x2_tile A;
@@ -4751,6 +5519,8 @@ struct globals_3wg {
     struct col_mailbox_stage_t {
         D_helper_tile D[COL_HELPER_SLOTS];
     };
+    using fused_quant_stage_t =
+        typename fused_quant_stage_storage_3wg<C, FUSED_SOFTMAX_QUANT>::type;
     struct combo_row_stage_t {
         G_fp4_row_tile G_row;
         combo_row_sc_tile G_row_sc;
@@ -4811,24 +5581,20 @@ struct globals_3wg {
         static_assert(!ENABLE_STOREADD_COMBO || (sizeof(combo_output_stage_t) % 1024 == 0));
         constexpr int combo_dynamic_shared_memory =
             !ENABLE_STOREADD_COMBO ? 0 :
-            (SEPARATE_BACKHALF_CONSUMERS
-                 ? (sizeof(combo_row_stage_t) +
-                    sizeof(combo_col_stage_t) +
-                    sizeof(combo_p3_c_tile_stage_t) +
-                    sizeof(combo_de_scales_stage_t) +
-                    sizeof(combo_output_stage_t) + 1024)
-                 : (sizeof(combo_row_stage_t) +
-                    sizeof(combo_col_stage_t) +
-                    sizeof(combo_p3_c_tile_stage_t) +
-                    sizeof(combo_output_stage_t) + 1024));
+            ((COMBO_NEEDS_ROW_STAGE ? sizeof(combo_row_stage_t) : 0) +
+             (COMBO_NEEDS_COL_STAGE ? sizeof(combo_col_stage_t) : 0) +
+             (COMBO_NEEDS_P3_C_TILE_STAGE ? sizeof(combo_p3_c_tile_stage_t) : 0) +
+             (COMBO_NEEDS_DE_SCALES_STAGE ? sizeof(combo_de_scales_stage_t) : 0) +
+             (COMBO_NEEDS_OUTPUT_STAGE ? sizeof(combo_output_stage_t) : 0) + 1024);
         constexpr int _dynamic_shared_memory =
             sizeof(input_tiles_t) * C::LOAD_PIPE_DEPTH + 1024 +
             sizeof(input_scales_t) * C::LOAD_PIPE_DEPTH + 1024 +
-            sizeof(bf16_stage_t) * C::BF16_STAGE_COUNT + 1024 +
+            (USES_BF16_STAGE_STORAGE ? (sizeof(bf16_stage_t) * C::BF16_STAGE_COUNT + 1024) : 0) +
             (USE_COL_PLAIN_STAGE ? (sizeof(col_plain_stage_t) * C::BF16_STAGE_COUNT + 1024) : 0) +
             (USE_COL_PAIR_STAGE ? (sizeof(col_pair_stage_t) * C::BF16_STAGE_COUNT + 1024) : 0) +
             (USE_ROW_PAIR_STAGE ? (sizeof(row_pair_stage_t) * C::BF16_STAGE_COUNT + 1024) : 0) +
             (USE_ROW_RCP_STAGE ? (sizeof(row_rcp_stage_t) * C::BF16_STAGE_COUNT + 1024) : 0) +
+            (FUSED_SOFTMAX_QUANT ? (sizeof(fused_quant_stage_t) + 1024) : 0) +
             (USE_COL_HELPER_MAILBOX ? (sizeof(col_mailbox_stage_t) * C::BF16_STAGE_COUNT + 1024) : 0) +
             combo_dynamic_shared_memory;
         static_assert(_dynamic_shared_memory <= MAX_SHARED_MEMORY - 1024);
@@ -4952,6 +5718,7 @@ __device__ inline void backward_kernel_v3_impl(const globals<C>& g) {
             auto B_sc_tm = tm_allocator.template allocate<full_tt_fp8e4m3<32*C::MMA_PER_TILE*C::LOAD_PIPE_DEPTH>>(256+4*C::MMA_PER_TILE*C::LOAD_PIPE_DEPTH);
 
             int phase = 0;
+            int rowonly_output_reuse_wait_phase = 1;
 
             auto do_mma_block = [&](auto& accum) {
                 for (int i = 0; i < num_iters_per_block; i++) {
@@ -5231,8 +5998,8 @@ __device__ inline void backward_kernel_v3_impl(const globals<C>& g) {
                                     amax = fmaxf(amax, fabsf(__bfloat162float(vals[pair].y)));
                                 }
 
-                                const float scale = amax * (1.0f / FP4_MAX);
-                                const float rcp_scale = (amax > 0.0f) ? (FP4_MAX / amax) : 0.0f;
+                                const fp4_scale_contract scale_contract =
+                                    make_fp4_scale_contract(amax, g_sg_rcp, g_sg, encode_centric);
 
                                 if (global_row < g.M) {
                                     #pragma unroll
@@ -5240,16 +6007,11 @@ __device__ inline void backward_kernel_v3_impl(const globals<C>& g) {
                                         const uint8_t fp4_pair = quantize_fp4_pair(
                                             __bfloat162float(vals[pair].x),
                                             __bfloat162float(vals[pair].y),
-                                            rcp_scale);
+                                            scale_contract.quant_rcp_scale);
                                         const int fp4x2_col = (col_start + group16 * 16 + pair * 2) / 2;
                                         row_fp4_ptr[global_row * row_fp4_stride + fp4x2_col] = fp4_pair;
                                     }
 
-                                    float stored_scale = scale * g_sg_rcp;
-                                    if (encode_centric) {
-                                        stored_scale = fminf(rcp_scale * g_sg, E4M3_MAX);
-                                    }
-                                    const __nv_fp8_e4m3 sc = __nv_fp8_e4m3(stored_scale);
                                     const int global_col_16 = col_start + group16 * 16;
                                     const int kgroup = global_col_16 / 64;
                                     const int col_16_in_64 = (global_col_16 / 16) % 4;
@@ -5258,8 +6020,7 @@ __device__ inline void backward_kernel_v3_impl(const globals<C>& g) {
                                     const int rr = (global_row / 32) % 4;
                                     const int chunk = depth * row_sc_kgroups + kgroup;
                                     const int byte_idx = sr * 16 + rr * 4 + col_16_in_64;
-                                    row_sc_ptr[chunk * 512 + byte_idx] =
-                                        *reinterpret_cast<const uint8_t*>(&sc);
+                                    row_sc_ptr[chunk * 512 + byte_idx] = scale_contract.scale_byte;
                                 }
                             }
                         }
@@ -5293,8 +6054,8 @@ __device__ inline void backward_kernel_v3_impl(const globals<C>& g) {
                                             }
                                         }
 
-                                        const float col_scale = col_amax * (1.0f / FP4_MAX);
-                                        const float col_rcp = (col_amax > 0.0f) ? (FP4_MAX / col_amax) : 0.0f;
+                                        const fp4_scale_contract scale_contract =
+                                            make_fp4_scale_contract(col_amax, g_sg_rcp, g_sg, encode_centric);
                                         const int global_row_pair_base = global_row_base / 2;
 
                                         #pragma unroll
@@ -5307,15 +6068,10 @@ __device__ inline void backward_kernel_v3_impl(const globals<C>& g) {
                                                     v1 = __bfloat162float(col_quant_scratch[warp_row16_base][lane_id][pair * 2 + 1]);
                                                 }
                                                 col_fp4_ptr[global_col * col_fp4_stride + global_row_pair_base + pair] =
-                                                    quantize_fp4_pair(v0, v1, col_rcp);
+                                                    quantize_fp4_pair(v0, v1, scale_contract.quant_rcp_scale);
                                             }
                                         }
 
-                                        float stored_scale = col_scale * g_sg_rcp;
-                                        if (encode_centric) {
-                                            stored_scale = fminf(col_rcp * g_sg, E4M3_MAX);
-                                        }
-                                        const __nv_fp8_e4m3 csc = __nv_fp8_e4m3(stored_scale);
                                         const int depth = global_col / 128;
                                         const int sr = global_col % 32;
                                         const int rr = (global_col / 32) % 4;
@@ -5323,8 +6079,7 @@ __device__ inline void backward_kernel_v3_impl(const globals<C>& g) {
                                         const int m_16_in_64 = (global_row_base / 16) % 4;
                                         const int chunk = depth * col_sc_kgroups + m_kgroup;
                                         const int byte_idx = sr * 16 + rr * 4 + m_16_in_64;
-                                        col_sc_ptr[chunk * 512 + byte_idx] =
-                                            *reinterpret_cast<const uint8_t*>(&csc);
+                                        col_sc_ptr[chunk * 512 + byte_idx] = scale_contract.scale_byte;
                                     }
                                     __syncwarp();
                                 }
@@ -5350,8 +6105,8 @@ __device__ inline void backward_kernel_v3_impl(const globals<C>& g) {
                                         }
                                     }
 
-                                    const float col_scale = col_amax * (1.0f / FP4_MAX);
-                                    const float col_rcp = (col_amax > 0.0f) ? (FP4_MAX / col_amax) : 0.0f;
+                                    const fp4_scale_contract scale_contract =
+                                        make_fp4_scale_contract(col_amax, g_sg_rcp, g_sg, encode_centric);
 
                                     const int global_row_pair_base = global_row_base / 2;
                                     #pragma unroll
@@ -5368,15 +6123,10 @@ __device__ inline void backward_kernel_v3_impl(const globals<C>& g) {
                                                 v1 = __bfloat162float(value1_bf);
                                             }
                                             col_fp4_ptr[global_col * col_fp4_stride + global_row_pair_base + pair] =
-                                                quantize_fp4_pair(v0, v1, col_rcp);
+                                                quantize_fp4_pair(v0, v1, scale_contract.quant_rcp_scale);
                                         }
                                     }
 
-                                    float stored_scale = col_scale * g_sg_rcp;
-                                    if (encode_centric) {
-                                        stored_scale = fminf(col_rcp * g_sg, E4M3_MAX);
-                                    }
-                                    const __nv_fp8_e4m3 csc = __nv_fp8_e4m3(stored_scale);
                                     const int depth = global_col / 128;
                                     const int sr = global_col % 32;
                                     const int rr = (global_col / 32) % 4;
@@ -5384,8 +6134,7 @@ __device__ inline void backward_kernel_v3_impl(const globals<C>& g) {
                                     const int m_16_in_64 = (global_row_base / 16) % 4;
                                     const int chunk = depth * col_sc_kgroups + m_kgroup;
                                     const int byte_idx = sr * 16 + rr * 4 + m_16_in_64;
-                                    col_sc_ptr[chunk * 512 + byte_idx] =
-                                        *reinterpret_cast<const uint8_t*>(&csc);
+                                    col_sc_ptr[chunk * 512 + byte_idx] = scale_contract.scale_byte;
                                 }
                             }
                         }
@@ -5524,6 +6273,7 @@ __device__ inline void backward_kernel_v3_streaming_impl(const globals<C>& g) {
             auto B_sc_tm = tm_allocator.template allocate<full_tt_fp8e4m3<32*C::MMA_PER_TILE*C::LOAD_PIPE_DEPTH>>(256+4*C::MMA_PER_TILE*C::LOAD_PIPE_DEPTH);
 
             int phase = 0;
+            int rowonly_output_reuse_wait_phase = 1;
 
             auto do_mma_block = [&](auto& accum) {
                 for (int i = 0; i < num_iters_per_block; i++) {
@@ -5603,7 +6353,7 @@ __device__ inline void backward_kernel_v3_streaming_impl(const globals<C>& g) {
             const int tile_row_base = row_block_idx * C::Mb + cta_id * (C::Mb / 2);
             const int warp_row_base = tile_row_base + warpgroup::warpid() * (C::Mb / 8);
             const bool full_tile_rows = tile_row_base + (C::Mb / 2) <= g.M;
-
+            const bool full_tile_cols = (col_block_idx + 1) * C::Nb <= g.N;
             int my_targets_x[subtile_rt::height];
             int my_targets_y[subtile_rt::height];
             float my_lse_x[subtile_rt::height];
@@ -5756,8 +6506,8 @@ __device__ inline void backward_kernel_v3_streaming_impl(const globals<C>& g) {
                                 amax = fmaxf(amax, fabsf(__bfloat162float(vals[pair].y)));
                             }
 
-                            const float scale = amax * (1.0f / FP4_MAX);
-                            const float rcp_scale = (amax > 0.0f) ? (FP4_MAX / amax) : 0.0f;
+                            const fp4_scale_contract scale_contract =
+                                make_fp4_scale_contract(amax, g_sg_rcp, g_sg, encode_centric);
 
                             if (global_row < g.M) {
                                 #pragma unroll
@@ -5765,16 +6515,11 @@ __device__ inline void backward_kernel_v3_streaming_impl(const globals<C>& g) {
                                     const uint8_t fp4_pair = quantize_fp4_pair(
                                         __bfloat162float(vals[pair].x),
                                         __bfloat162float(vals[pair].y),
-                                        rcp_scale);
+                                        scale_contract.quant_rcp_scale);
                                     const int fp4x2_col = (col_start + group16 * 16 + pair * 2) / 2;
                                     row_fp4_ptr[global_row * row_fp4_stride + fp4x2_col] = fp4_pair;
                                 }
 
-                                float stored_scale = scale * g_sg_rcp;
-                                if (encode_centric) {
-                                    stored_scale = fminf(rcp_scale * g_sg, E4M3_MAX);
-                                }
-                                const __nv_fp8_e4m3 sc = __nv_fp8_e4m3(stored_scale);
                                 const int global_col_16 = col_start + group16 * 16;
                                 const int kgroup = global_col_16 / 64;
                                 const int col_16_in_64 = (global_col_16 / 16) % 4;
@@ -5783,8 +6528,7 @@ __device__ inline void backward_kernel_v3_streaming_impl(const globals<C>& g) {
                                 const int rr = (global_row / 32) % 4;
                                 const int chunk = depth * row_sc_kgroups + kgroup;
                                 const int byte_idx = sr * 16 + rr * 4 + col_16_in_64;
-                                row_sc_ptr[chunk * 512 + byte_idx] =
-                                    *reinterpret_cast<const uint8_t*>(&sc);
+                                row_sc_ptr[chunk * 512 + byte_idx] = scale_contract.scale_byte;
                             }
                         }
                     }
@@ -5810,8 +6554,8 @@ __device__ inline void backward_kernel_v3_streaming_impl(const globals<C>& g) {
                                 }
                             }
 
-                            const float col_scale = col_amax * (1.0f / FP4_MAX);
-                            const float col_rcp = (col_amax > 0.0f) ? (FP4_MAX / col_amax) : 0.0f;
+                            const fp4_scale_contract scale_contract =
+                                make_fp4_scale_contract(col_amax, g_sg_rcp, g_sg, encode_centric);
                             const int global_row_pair_base = global_row_base / 2;
 
                             #pragma unroll
@@ -5828,15 +6572,10 @@ __device__ inline void backward_kernel_v3_streaming_impl(const globals<C>& g) {
                                         v1 = __bfloat162float(value1_bf);
                                     }
                                     col_fp4_ptr[global_col * col_fp4_stride + global_row_pair_base + pair] =
-                                        quantize_fp4_pair(v0, v1, col_rcp);
+                                        quantize_fp4_pair(v0, v1, scale_contract.quant_rcp_scale);
                                 }
                             }
 
-                            float stored_scale = col_scale * g_sg_rcp;
-                            if (encode_centric) {
-                                stored_scale = fminf(col_rcp * g_sg, E4M3_MAX);
-                            }
-                            const __nv_fp8_e4m3 csc = __nv_fp8_e4m3(stored_scale);
                             const int depth = global_col / 128;
                             const int sr = global_col % 32;
                             const int rr = (global_col / 32) % 4;
@@ -5844,8 +6583,7 @@ __device__ inline void backward_kernel_v3_streaming_impl(const globals<C>& g) {
                             const int m_16_in_64 = (global_row_base / 16) % 4;
                             const int chunk = depth * col_sc_kgroups + m_kgroup;
                             const int byte_idx = sr * 16 + rr * 4 + m_16_in_64;
-                            col_sc_ptr[chunk * 512 + byte_idx] =
-                                *reinterpret_cast<const uint8_t*>(&csc);
+                            col_sc_ptr[chunk * 512 + byte_idx] = scale_contract.scale_byte;
                         }
                     }
                 }
@@ -6057,7 +6795,6 @@ __device__ inline void backward_kernel_v3_streaming_2ctaSdupB_impl(const globals
             const int tile_row_base = row_block_idx * C::Mb + cta_id * (C::Mb / 2);
             const int warp_row_base = tile_row_base + warpgroup::warpid() * (C::Mb / 8);
             const bool full_tile_rows = tile_row_base + (C::Mb / 2) <= g.M;
-
             int my_targets_x[subtile_rt::height];
             int my_targets_y[subtile_rt::height];
             float my_lse_x[subtile_rt::height];
@@ -6160,7 +6897,9 @@ __device__ inline void backward_kernel_v3_streaming_2ctaSdupB_impl(const globals
                         }
                     }
                     warp::mul(D_fl, D_fl, g.grad_scale);
-                    warp::copy(D_bf, D_fl);
+                    if constexpr (!G::COL_QUANT_FROM_DBF_REGS) {
+                        warp::copy(D_bf, D_fl);
+                    }
 
                     if (release_outputs && epi == C::EPI_PIPE_DEPTH - 1) {
                         if (warpgroup::warpid() == 0 && warp::laneid() == 0) arrive(outputs_finished);
@@ -6189,8 +6928,8 @@ __device__ inline void backward_kernel_v3_streaming_2ctaSdupB_impl(const globals
                                     amax = fmaxf(amax, fabsf(__bfloat162float(vals[pair].x)));
                                     amax = fmaxf(amax, fabsf(__bfloat162float(vals[pair].y)));
                                 }
-                                const float scale = amax * (1.0f / FP4_MAX);
-                                const float rcp_scale = (amax > 0.0f) ? (FP4_MAX / amax) : 0.0f;
+                                const fp4_scale_contract scale_contract =
+                                    make_fp4_scale_contract(amax, g_sg_rcp, g_sg, encode_centric);
                                 if constexpr (C::FAST_ALIGNED_QUANT) {
                                     if (full_row) {
                                         #pragma unroll
@@ -6198,15 +6937,10 @@ __device__ inline void backward_kernel_v3_streaming_2ctaSdupB_impl(const globals
                                             const uint8_t fp4_pair = quantize_fp4_pair(
                                                 __bfloat162float(vals[pair].x),
                                                 __bfloat162float(vals[pair].y),
-                                                rcp_scale);
+                                                scale_contract.quant_rcp_scale);
                                             const int fp4x2_col = (col_start + group16 * 16 + pair * 2) / 2;
                                             row_fp4_ptr[global_row * row_fp4_stride + fp4x2_col] = fp4_pair;
                                         }
-                                        float stored_scale = scale * g_sg_rcp;
-                                        if (encode_centric) {
-                                            stored_scale = fminf(rcp_scale * g_sg, E4M3_MAX);
-                                        }
-                                        const __nv_fp8_e4m3 sc = __nv_fp8_e4m3(stored_scale);
                                         const int global_col_16 = col_start + group16 * 16;
                                         const int kgroup = global_col_16 / 64;
                                         const int col_16_in_64 = (global_col_16 / 16) % 4;
@@ -6215,7 +6949,7 @@ __device__ inline void backward_kernel_v3_streaming_2ctaSdupB_impl(const globals
                                         const int rr = (global_row / 32) % 4;
                                         const int chunk = depth * row_sc_kgroups + kgroup;
                                         const int byte_idx = sr * 16 + rr * 4 + col_16_in_64;
-                                        row_sc_ptr[chunk * 512 + byte_idx] = *reinterpret_cast<const uint8_t*>(&sc);
+                                        row_sc_ptr[chunk * 512 + byte_idx] = scale_contract.scale_byte;
                                         continue;
                                     }
                                 }
@@ -6225,14 +6959,11 @@ __device__ inline void backward_kernel_v3_streaming_2ctaSdupB_impl(const globals
                                         const uint8_t fp4_pair = quantize_fp4_pair(
                                             __bfloat162float(vals[pair].x),
                                             __bfloat162float(vals[pair].y),
-                                            rcp_scale);
+                                            scale_contract.quant_rcp_scale);
                                         const int fp4x2_col = (col_start + group16 * 16 + pair * 2) / 2;
                                         row_fp4_ptr[global_row * row_fp4_stride + fp4x2_col] = fp4_pair;
                                     }
 
-                                    float stored_scale = scale * g_sg_rcp;
-                                    if (encode_centric) stored_scale = fminf(rcp_scale * g_sg, E4M3_MAX);
-                                    const __nv_fp8_e4m3 sc = __nv_fp8_e4m3(stored_scale);
                                     const int global_col_16 = col_start + group16 * 16;
                                     const int kgroup = global_col_16 / 64;
                                     const int col_16_in_64 = (global_col_16 / 16) % 4;
@@ -6241,7 +6972,7 @@ __device__ inline void backward_kernel_v3_streaming_2ctaSdupB_impl(const globals
                                     const int rr = (global_row / 32) % 4;
                                     const int chunk = depth * row_sc_kgroups + kgroup;
                                     const int byte_idx = sr * 16 + rr * 4 + col_16_in_64;
-                                    row_sc_ptr[chunk * 512 + byte_idx] = *reinterpret_cast<const uint8_t*>(&sc);
+                                    row_sc_ptr[chunk * 512 + byte_idx] = scale_contract.scale_byte;
                                 }
                             }
                         }
@@ -6265,8 +6996,8 @@ __device__ inline void backward_kernel_v3_streaming_2ctaSdupB_impl(const globals
                                     if (global_row_base + r < g.M) col_amax = fmaxf(col_amax, fabsf(__bfloat162float(value)));
                                 }
 
-                                const float col_scale = col_amax * (1.0f / FP4_MAX);
-                                const float col_rcp = (col_amax > 0.0f) ? (FP4_MAX / col_amax) : 0.0f;
+                                const fp4_scale_contract scale_contract =
+                                    make_fp4_scale_contract(col_amax, g_sg_rcp, g_sg, encode_centric);
                                 const int global_row_pair_base = global_row_base / 2;
 
                                 #pragma unroll
@@ -6283,13 +7014,10 @@ __device__ inline void backward_kernel_v3_streaming_2ctaSdupB_impl(const globals
                                             v1 = __bfloat162float(value1_bf);
                                         }
                                         col_fp4_ptr[global_col * col_fp4_stride + global_row_pair_base + pair] =
-                                            quantize_fp4_pair(v0, v1, col_rcp);
+                                            quantize_fp4_pair(v0, v1, scale_contract.quant_rcp_scale);
                                     }
                                 }
 
-                                float stored_scale = col_scale * g_sg_rcp;
-                                if (encode_centric) stored_scale = fminf(col_rcp * g_sg, E4M3_MAX);
-                                const __nv_fp8_e4m3 csc = __nv_fp8_e4m3(stored_scale);
                                 const int depth = global_col / 128;
                                 const int sr = global_col % 32;
                                 const int rr = (global_col / 32) % 4;
@@ -6297,7 +7025,7 @@ __device__ inline void backward_kernel_v3_streaming_2ctaSdupB_impl(const globals
                                 const int m_16_in_64 = (global_row_base / 16) % 4;
                                 const int chunk = depth * col_sc_kgroups + m_kgroup;
                                 const int byte_idx = sr * 16 + rr * 4 + m_16_in_64;
-                                col_sc_ptr[chunk * 512 + byte_idx] = *reinterpret_cast<const uint8_t*>(&csc);
+                                col_sc_ptr[chunk * 512 + byte_idx] = scale_contract.scale_byte;
                             }
                         }
                     }
@@ -6365,8 +7093,12 @@ __device__ inline void backward_kernel_v3_streaming_3wg_impl(const globals_3wg<C
         sm_allocator.allocate<typename G::input_tiles_t, C::LOAD_PIPE_DEPTH>();
     typename G::input_scales_t (&input_scales)[C::LOAD_PIPE_DEPTH] =
         sm_allocator.allocate<typename G::input_scales_t, C::LOAD_PIPE_DEPTH>();
-    typename G::bf16_stage_t (&bf16_epi_stage)[C::BF16_STAGE_COUNT] =
-        sm_allocator.allocate<typename G::bf16_stage_t, C::BF16_STAGE_COUNT>();
+    typename G::bf16_stage_t *bf16_epi_stage = nullptr;
+    if constexpr (G::USES_BF16_STAGE_STORAGE) {
+        auto &bf16_epi_stage_ref =
+            sm_allocator.template allocate<typename G::bf16_stage_t, C::BF16_STAGE_COUNT>();
+        bf16_epi_stage = &bf16_epi_stage_ref[0];
+    }
     typename G::col_plain_stage_t *col_plain_stage = nullptr;
     if constexpr (G::USE_COL_PLAIN_STAGE) {
         auto &col_plain_stage_ref =
@@ -6391,6 +7123,10 @@ __device__ inline void backward_kernel_v3_streaming_3wg_impl(const globals_3wg<C
             sm_allocator.template allocate<typename G::row_rcp_stage_t, C::BF16_STAGE_COUNT>();
         row_rcp_stage = &row_rcp_stage_ref[0];
     }
+    typename G::fused_quant_stage_t *fused_quant_stage = nullptr;
+    if constexpr (G::FUSED_SOFTMAX_QUANT) {
+        fused_quant_stage = &sm_allocator.template allocate<typename G::fused_quant_stage_t>();
+    }
     typename G::combo_row_stage_t *combo_row_stage = nullptr;
     typename G::combo_col_stage_t *combo_col_stage = nullptr;
     typename G::combo_p3_c_tile_stage_t *combo_p3_c_tile_stage = nullptr;
@@ -6401,25 +7137,38 @@ __device__ inline void backward_kernel_v3_streaming_3wg_impl(const globals_3wg<C
     typename G::combo_dc_output_stage_t *combo_dc_output_stage = nullptr;
     typename G::combo_output_stage_t *combo_output_stage = nullptr;
     if constexpr (EFFECTIVE_ENABLE_STOREADD_COMBO) {
+        if constexpr (G::COMBO_NEEDS_ROW_STAGE) {
+            combo_row_stage = &sm_allocator.template allocate<typename G::combo_row_stage_t>();
+        }
+        if constexpr (G::COMBO_NEEDS_COL_STAGE) {
+            combo_col_stage = &sm_allocator.template allocate<typename G::combo_col_stage_t>();
+        }
+        if constexpr (G::COMBO_NEEDS_P3_C_TILE_STAGE) {
+            combo_p3_c_tile_stage = &sm_allocator.template allocate<typename G::combo_p3_c_tile_stage_t>();
+        }
         if constexpr (EFFECTIVE_SEPARATE_BACKHALF_CONSUMERS) {
-            combo_row_stage = &sm_allocator.template allocate<typename G::combo_row_stage_t>();
-            combo_col_stage = &sm_allocator.template allocate<typename G::combo_col_stage_t>();
-            combo_p3_c_tile_stage = &sm_allocator.template allocate<typename G::combo_p3_c_tile_stage_t>();
-            combo_de_scales_stage = &sm_allocator.template allocate<typename G::combo_de_scales_stage_t>();
-            combo_output_stage = &sm_allocator.template allocate<typename G::combo_output_stage_t>();
-            combo_de_output_stage =
-                reinterpret_cast<typename G::combo_de_output_stage_t *>(combo_output_stage);
-            combo_dc_tile_stage =
-                reinterpret_cast<typename G::combo_dc_tile_stage_t *>(combo_output_stage);
-            combo_dc_scales_stage =
-                reinterpret_cast<typename G::combo_dc_scales_stage_t *>(&input_scales[0]);
-            combo_dc_output_stage =
-                reinterpret_cast<typename G::combo_dc_output_stage_t *>(combo_output_stage);
+            if constexpr (G::COMBO_NEEDS_DE_SCALES_STAGE) {
+                combo_de_scales_stage = &sm_allocator.template allocate<typename G::combo_de_scales_stage_t>();
+            }
+            if constexpr (G::COMBO_NEEDS_OUTPUT_STAGE) {
+                combo_output_stage = &sm_allocator.template allocate<typename G::combo_output_stage_t>();
+            }
+            if constexpr (G::COMBO_NEEDS_DE_PATH) {
+                combo_de_output_stage =
+                    reinterpret_cast<typename G::combo_de_output_stage_t *>(combo_output_stage);
+            }
+            if constexpr (G::COMBO_NEEDS_DC_PATH) {
+                combo_dc_tile_stage =
+                    reinterpret_cast<typename G::combo_dc_tile_stage_t *>(combo_output_stage);
+                combo_dc_scales_stage =
+                    reinterpret_cast<typename G::combo_dc_scales_stage_t *>(&input_scales[0]);
+                combo_dc_output_stage =
+                    reinterpret_cast<typename G::combo_dc_output_stage_t *>(combo_output_stage);
+            }
         } else {
-            combo_row_stage = &sm_allocator.template allocate<typename G::combo_row_stage_t>();
-            combo_col_stage = &sm_allocator.template allocate<typename G::combo_col_stage_t>();
-            combo_p3_c_tile_stage = &sm_allocator.template allocate<typename G::combo_p3_c_tile_stage_t>();
-            combo_output_stage = &sm_allocator.template allocate<typename G::combo_output_stage_t>();
+            if constexpr (G::COMBO_NEEDS_OUTPUT_STAGE) {
+                combo_output_stage = &sm_allocator.template allocate<typename G::combo_output_stage_t>();
+            }
         }
     }
 
@@ -6438,6 +7187,10 @@ __device__ inline void backward_kernel_v3_streaming_3wg_impl(const globals_3wg<C
     __shared__ semaphore slice_row_recycled[C::BF16_STAGE_COUNT];
     __shared__ semaphore slice_col_recycled[C::BF16_STAGE_COUNT];
     __shared__ volatile int slice_col_done_row16[C::BF16_STAGE_COUNT][C::Mb / 32];
+    __shared__ semaphore fused_col_filter_ready;
+    __shared__ int fused_col_keep_tile;
+    __shared__ int safused_split_abort_stage;
+    __shared__ int safused_split_abort_published;
     __shared__ semaphore combo_row_stage_ready;
     __shared__ semaphore combo_g_row_ready[C::BF16_STAGE_COUNT];
     __shared__ semaphore combo_g_row_recycled[C::BF16_STAGE_COUNT];
@@ -6458,6 +7211,8 @@ __device__ inline void backward_kernel_v3_streaming_3wg_impl(const globals_3wg<C
     __shared__ semaphore combo_dc_p3_inputs_finished;
     __shared__ semaphore combo_dc_p3_outputs_arrived;
     __shared__ semaphore combo_backhalf_de_done;
+    __shared__ semaphore combo_rowonly_output_recycled;
+    __shared__ semaphore combo_rowonly_tail_done;
     if (threadIdx.x == 32) {
         init_semaphore(tmem_provisioned, 0, 1);
         #pragma unroll
@@ -6482,6 +7237,10 @@ __device__ inline void backward_kernel_v3_streaming_3wg_impl(const globals_3wg<C
             init_semaphore(slice_row_recycled[i], 0, row_recycle_arrivals);
             init_semaphore(slice_col_recycled[i], 0, col_recycle_arrivals);
         }
+        init_semaphore(fused_col_filter_ready, 0, 1);
+        fused_col_keep_tile = 0;
+        safused_split_abort_stage = 0;
+        safused_split_abort_published = 0;
         if constexpr (EFFECTIVE_ENABLE_STOREADD_COMBO) {
             if constexpr (EFFECTIVE_SEPARATE_BACKHALF_CONSUMERS) {
                 #pragma unroll
@@ -6500,6 +7259,9 @@ __device__ inline void backward_kernel_v3_streaming_3wg_impl(const globals_3wg<C
                 init_semaphore(combo_dc_p3_inputs_finished, 0, 1);
                 init_semaphore(combo_dc_p3_outputs_arrived, 0, 1);
                 init_semaphore(combo_backhalf_de_done, 0, 1);
+                init_semaphore(combo_rowonly_output_recycled, 0, C::CLUSTER_SIZE);
+                const int rowonly_tail_arrivals = cta_id == 0 ? 3 : 2;
+                init_semaphore(combo_rowonly_tail_done, 0, rowonly_tail_arrivals);
             } else {
                 init_semaphore(combo_row_stage_ready, 0, 1);
                 init_semaphore(combo_p3_c_tiles_arrived, 0, 1);
@@ -6544,10 +7306,18 @@ __device__ inline void backward_kernel_v3_streaming_3wg_impl(const globals_3wg<C
     }
 
     if (effective_warpgroup_id == EFFECTIVE_PRODUCER_WARPGROUP_ID && warp::elect_leader()) {
+        constexpr bool DEDICATED_ROWONLY_DCONLY_PRODUCER_ROUTE =
+            G::SKIP_GLOBAL_COL_MATERIALIZATION &&
+            DO_ROW && !DO_COL &&
+            G::ENABLE_STOREADD_COMBO &&
+            G::SEPARATE_BACKHALF_CONSUMERS &&
+            (STATIC_COMBO_MODE == G::COMBO_MODE_DCONLY);
         int warp_id = group<WARPGROUP_WARPS * C::PRODUCER_WARPGROUPS>::warpid();
         if (warp_id == 3) {
             if constexpr (C::USE_PDL) pdl::wait();
-            everyone::tma::cluster::wait();
+            if constexpr (!DEDICATED_ROWONLY_DCONLY_PRODUCER_ROUTE) {
+                everyone::tma::cluster::wait();
+            }
             for (int block_idx = cluster_id; block_idx < num_blocks; block_idx += gridDim.x / C::CLUSTER_SIZE) {
                 int supergroup_idx = block_idx / num_blocks_per_supergroup;
                 int idx_within_supergroup = block_idx % num_blocks_per_supergroup;
@@ -6556,16 +7326,30 @@ __device__ inline void backward_kernel_v3_streaming_3wg_impl(const globals_3wg<C
                 int row_block_idx = supergroup_idx * C::SUPERGROUP_SIZE + row_within_supergroup;
                 int col_block_idx = idx_within_supergroup / rows_in_supergroup;
                 for (int i = 0; i < num_iters_per_block; ++i) {
-                    wait(inputs_finished[stage], get_phasebit<1>(phasebits, stage));
+                    if constexpr (!(DEDICATED_ROWONLY_DCONLY_PRODUCER_ROUTE &&
+                                    ROWONLY_COMBO_DC_SKIP_PRODUCER_INPUTS_FINISHED_WAIT == 1)) {
+                        wait(inputs_finished[stage], get_phasebit<1>(phasebits, stage));
+                    }
                     tma::cluster::load_async(input_tiles[stage].A, g.A, {row_block_idx * 2 + cta_id, i}, tiles_arrived[stage], (uint16_t)(1 << cta_id), 0);
                     tma::cluster::load_async(input_tiles[stage].B, g.B, {col_block_idx * 2 + cta_id, i}, tiles_arrived[stage], (uint16_t)(1 << cta_id), 0);
+                    if constexpr (DEDICATED_ROWONLY_DCONLY_PRODUCER_ROUTE) {
+                        if constexpr (ROWONLY_COMBO_DC_DEBUG_CUT == 156) {
+                            if (block_idx == cluster_id && i == 0) {
+                                printf("rowonly combo dc cut 156 cta=%d roles=0010 stage=%d\n",
+                                       cta_id, stage);
+                                return;
+                            }
+                        }
+                    }
                     update_phasebit<1>(phasebits, stage);
                     stage = (stage + 1) % C::LOAD_PIPE_DEPTH;
                 }
             }
         } else if (warp_id == 2) {
             if constexpr (C::USE_PDL) pdl::wait();
-            everyone::tma::cluster::wait();
+            if constexpr (!DEDICATED_ROWONLY_DCONLY_PRODUCER_ROUTE) {
+                everyone::tma::cluster::wait();
+            }
             for (int block_idx = cluster_id; block_idx < num_blocks; block_idx += gridDim.x / C::CLUSTER_SIZE) {
                 int supergroup_idx = block_idx / num_blocks_per_supergroup;
                 int idx_within_supergroup = block_idx % num_blocks_per_supergroup;
@@ -6574,10 +7358,22 @@ __device__ inline void backward_kernel_v3_streaming_3wg_impl(const globals_3wg<C
                 int row_block_idx = supergroup_idx * C::SUPERGROUP_SIZE + row_within_supergroup;
                 int col_block_idx = idx_within_supergroup / rows_in_supergroup;
                 for (int i = 0; i < num_iters_per_block; ++i) {
-                    wait(inputs_finished[stage], get_phasebit<1>(phasebits, stage));
+                    if constexpr (!(DEDICATED_ROWONLY_DCONLY_PRODUCER_ROUTE &&
+                                    ROWONLY_COMBO_DC_SKIP_PRODUCER_INPUTS_FINISHED_WAIT == 1)) {
+                        wait(inputs_finished[stage], get_phasebit<1>(phasebits, stage));
+                    }
                     tma::cluster::load_async(input_scales[stage].A, g.A_sc, {row_block_idx * 2 + cta_id, i, 0}, scales_arrived[stage], (uint16_t)(1 << cta_id), 0);
                     if (cta_id == 0) {
                         tma::cluster::load_async(input_scales[stage].B[0], g.B_sc, {col_block_idx, i, 0}, scales_arrived[stage], (uint16_t)(0b11), 0);
+                    }
+                    if constexpr (DEDICATED_ROWONLY_DCONLY_PRODUCER_ROUTE) {
+                        if constexpr (ROWONLY_COMBO_DC_DEBUG_CUT == 155) {
+                            if (block_idx == cluster_id && i == 0) {
+                                printf("rowonly combo dc cut 155 cta=%d roles=0010 stage=%d\n",
+                                       cta_id, stage);
+                                return;
+                            }
+                        }
                     }
                     update_phasebit<1>(phasebits, stage);
                     stage = (stage + 1) % C::LOAD_PIPE_DEPTH;
@@ -6585,21 +7381,68 @@ __device__ inline void backward_kernel_v3_streaming_3wg_impl(const globals_3wg<C
             }
         } else if (cta_id == 0 && warp_id == 0) {
             if constexpr (C::USE_PDL) pdl::wait();
-            everyone::tma::cluster::wait();
+            if constexpr (DEDICATED_ROWONLY_DCONLY_PRODUCER_ROUTE) {
+                if constexpr (ROWONLY_COMBO_DC_DEBUG_CUT == 145) {
+                    printf("rowonly combo dc cut 145 cta=%d roles=0010\n", cta_id);
+                    return;
+                }
+            }
+            if constexpr (!DEDICATED_ROWONLY_DCONLY_PRODUCER_ROUTE) {
+                everyone::tma::cluster::wait();
+            }
+            if constexpr (DEDICATED_ROWONLY_DCONLY_PRODUCER_ROUTE) {
+                if constexpr (ROWONLY_COMBO_DC_DEBUG_CUT == 146) {
+                    printf("rowonly combo dc cut 146 cta=%d roles=0010\n", cta_id);
+                    return;
+                }
+            }
+            if constexpr (DEDICATED_ROWONLY_DCONLY_PRODUCER_ROUTE) {
+                if constexpr (ROWONLY_COMBO_DC_DEBUG_CUT == 142) {
+                    printf("rowonly combo dc cut 142 cta=%d roles=0010\n", cta_id);
+                    return;
+                }
+            }
             wait(tmem_provisioned, 0);
+            if constexpr (DEDICATED_ROWONLY_DCONLY_PRODUCER_ROUTE) {
+                if constexpr (ROWONLY_COMBO_DC_DEBUG_CUT == 143) {
+                    printf("rowonly combo dc cut 143 cta=%d roles=0010\n", cta_id);
+                    return;
+                }
+            }
             tm_allocator.set_addr(tmem_addr);
+            if constexpr (DEDICATED_ROWONLY_DCONLY_PRODUCER_ROUTE) {
+                if constexpr (ROWONLY_COMBO_DC_DEBUG_CUT == 147) {
+                    printf("rowonly combo dc cut 147 cta=%d roles=0010\n", cta_id);
+                    return;
+                }
+            }
 
             auto out_tm_0 = tm_allocator.template allocate<full_tt_fl<C::Nb>>(0);
             auto out_tm_1 = tm_allocator.template allocate<full_tt_fl<C::Nb>>(128);
             auto A_sc_tm = tm_allocator.template allocate<full_tt_fp8e4m3<16 * C::MMA_PER_TILE * C::LOAD_PIPE_DEPTH>>(256);
             auto B_sc_tm = tm_allocator.template allocate<full_tt_fp8e4m3<32 * C::MMA_PER_TILE * C::LOAD_PIPE_DEPTH>>(256 + 4 * C::MMA_PER_TILE * C::LOAD_PIPE_DEPTH);
+            if constexpr (DEDICATED_ROWONLY_DCONLY_PRODUCER_ROUTE) {
+                if constexpr (ROWONLY_COMBO_DC_DEBUG_CUT == 148) {
+                    printf("rowonly combo dc cut 148 cta=%d roles=0010\n", cta_id);
+                    return;
+                }
+            }
 
             int phase = 0;
+            int rowonly_output_reuse_wait_phase = 1;
 
             auto do_mma_block = [&](auto& accum) {
                 for (int i = 0; i < num_iters_per_block; ++i) {
                     tma::expect_bytes(scales_arrived[stage], 2 * sizeof(typename G::input_scales_t));
                     wait(scales_arrived[stage], get_phasebit<0>(phasebits, stage));
+                    if constexpr (DEDICATED_ROWONLY_DCONLY_PRODUCER_ROUTE) {
+                        if constexpr (ROWONLY_COMBO_DC_DEBUG_CUT == 149) {
+                            if (i == 0) {
+                                printf("rowonly combo dc cut 149 cta=%d roles=0010 stage=%d\n",
+                                       cta_id, stage);
+                            }
+                        }
+                    }
                     #pragma unroll
                     for (int ii = 0; ii < C::MMA_PER_TILE; ++ii) {
                         auto A_sc_tm_subtile = A_sc_tm.template subtile<full_tt_fp8e4m3<16>>(stage * C::MMA_PER_TILE * 16 + ii * 16);
@@ -6611,6 +7454,14 @@ __device__ inline void backward_kernel_v3_streaming_3wg_impl(const globals_3wg<C
                     }
                     tma::expect_bytes(tiles_arrived[stage], 2 * sizeof(typename G::input_tiles_t));
                     wait(tiles_arrived[stage], get_phasebit<0>(phasebits, stage));
+                    if constexpr (DEDICATED_ROWONLY_DCONLY_PRODUCER_ROUTE) {
+                        if constexpr (ROWONLY_COMBO_DC_DEBUG_CUT == 150) {
+                            if (i == 0) {
+                                printf("rowonly combo dc cut 150 cta=%d roles=0010 stage=%d\n",
+                                       cta_id, stage);
+                            }
+                        }
+                    }
                     if (i == 0) mm2_ABt(accum, input_tiles[stage].A, input_tiles[stage].B,
                                         A_sc_tm.template subtile<full_tt_fp8e4m3<C::MMA_PER_TILE * 16>>(stage * C::MMA_PER_TILE * 16),
                                         B_sc_tm.template subtile<full_tt_fp8e4m3<C::MMA_PER_TILE * 32>>(stage * C::MMA_PER_TILE * 32),
@@ -6619,19 +7470,149 @@ __device__ inline void backward_kernel_v3_streaming_3wg_impl(const globals_3wg<C
                                   A_sc_tm.template subtile<full_tt_fp8e4m3<C::MMA_PER_TILE * 16>>(stage * C::MMA_PER_TILE * 16),
                                   B_sc_tm.template subtile<full_tt_fp8e4m3<C::MMA_PER_TILE * 32>>(stage * C::MMA_PER_TILE * 32),
                                   inputs_finished[stage]);
+                    if constexpr (DEDICATED_ROWONLY_DCONLY_PRODUCER_ROUTE) {
+                        if constexpr (ROWONLY_COMBO_DC_DEBUG_CUT == 151) {
+                            if (i == 0) {
+                                printf("rowonly combo dc cut 151 cta=%d roles=0010 stage=%d\n",
+                                       cta_id, stage);
+                            }
+                        }
+                    }
                     update_phasebit<0>(phasebits, stage);
                     stage = (stage + 1) % C::LOAD_PIPE_DEPTH;
                 }
             };
-
-            for (int block_idx = cluster_id; block_idx < num_blocks; block_idx += gridDim.x / C::CLUSTER_SIZE) {
-                wait(outputs_finished, get_phasebit<1>(phasebits, 0));
+            constexpr bool SAFUSED_SPLIT_STAGE_DEBUG =
+                G::FUSED_SOFTMAX_QUANT &&
+                G::FUSED_COL_IN_QUANTIZER &&
+                (SAFUSED_SPLIT_COL_STAGE_CUT > 0);
+            const int producer_num_blocks =
+                SAFUSED_SPLIT_STAGE_DEBUG ? min(num_blocks, gridDim.x / C::CLUSTER_SIZE) : num_blocks;
+            for (int block_idx = cluster_id; block_idx < producer_num_blocks; block_idx += gridDim.x / C::CLUSTER_SIZE) {
+                if constexpr (DEDICATED_ROWONLY_DCONLY_PRODUCER_ROUTE) {
+                    if constexpr (ROWONLY_COMBO_DC_DEBUG_CUT == 141) {
+                        if (block_idx * 2 >= producer_num_blocks) {
+                            printf("rowonly combo dc cut 141 cta=%d block=%d roles=0010\n",
+                                   cta_id, block_idx);
+                            return;
+                        }
+                    }
+                    if constexpr (ROWONLY_COMBO_DC_DEBUG_CUT == 136) {
+                        if (block_idx + gridDim.x / C::CLUSTER_SIZE >= producer_num_blocks) {
+                            printf("rowonly combo dc cut 136 cta=%d block=%d roles=0010\n",
+                                   cta_id, block_idx);
+                            return;
+                        }
+                    }
+                }
+                if constexpr (!(G::SKIP_GLOBAL_COL_MATERIALIZATION &&
+                                ROWONLY_COMBO_DC_SKIP_PRODUCER_OUTPUTS_FINISHED_WAIT == 1)) {
+                    if constexpr (DEDICATED_ROWONLY_DCONLY_PRODUCER_ROUTE) {
+                        if constexpr (ROWONLY_COMBO_DC_DEBUG_CUT == 165) {
+                            if (block_idx > cluster_id) {
+                                printf("rowonly combo dc cut 165 cta=%d block=%d roles=0010 wait_phase=%d\n",
+                                       cta_id, block_idx, rowonly_output_reuse_wait_phase);
+                                return;
+                            }
+                        }
+                        wait(combo_rowonly_output_recycled, rowonly_output_reuse_wait_phase);
+                        rowonly_output_reuse_wait_phase ^= 1;
+                        if constexpr (ROWONLY_COMBO_DC_DEBUG_CUT == 167) {
+                            if (block_idx > cluster_id) {
+                                printf("rowonly combo dc cut 167 cta=%d block=%d roles=0010 wait_phase=%d\n",
+                                       cta_id, block_idx, rowonly_output_reuse_wait_phase);
+                                return;
+                            }
+                        }
+                    } else {
+                        if constexpr (ROWONLY_COMBO_DC_DEBUG_CUT == 162) {
+                            if (block_idx > cluster_id) {
+                                printf("rowonly combo dc cut 162 cta=%d block=%d roles=0010 wait_phase=%d\n",
+                                       cta_id, block_idx, get_phasebit<1>(phasebits, 0));
+                            }
+                        }
+                        if constexpr (ROWONLY_COMBO_DC_DEBUG_CUT == 152) {
+                            printf("rowonly combo dc cut 152 cta=%d block=%d roles=0010\n",
+                                   cta_id, block_idx);
+                            return;
+                        }
+                        const int outputs_finished_wait_phase =
+                            get_phasebit<1>(phasebits, 0) ^
+                            ((DEDICATED_ROWONLY_DCONLY_PRODUCER_ROUTE &&
+                              ROWONLY_COMBO_DC_OUTPUTS_FINISHED_WAIT_PHASE_XOR == 1) ? 1 : 0);
+                        wait(outputs_finished, outputs_finished_wait_phase);
+                        if constexpr (DEDICATED_ROWONLY_DCONLY_PRODUCER_ROUTE) {
+                            if constexpr (ROWONLY_COMBO_DC_DEBUG_CUT == 153) {
+                                printf("rowonly combo dc cut 153 cta=%d block=%d roles=0010\n",
+                                       cta_id, block_idx);
+                                return;
+                            }
+                        }
+                    }
+                }
+                if constexpr (DEDICATED_ROWONLY_DCONLY_PRODUCER_ROUTE) {
+                    if constexpr (ROWONLY_COMBO_DC_DEBUG_CUT == 138) {
+                        if (block_idx + 2 * (gridDim.x / C::CLUSTER_SIZE) >= producer_num_blocks &&
+                            block_idx + gridDim.x / C::CLUSTER_SIZE < producer_num_blocks) {
+                            printf("rowonly combo dc cut 138 cta=%d block=%d roles=0010\n",
+                                   cta_id, block_idx);
+                            return;
+                        }
+                    }
+                    if constexpr (ROWONLY_COMBO_DC_DEBUG_CUT == 130) {
+                        if (block_idx > cluster_id && warp::laneid() == 0) {
+                            printf("rowonly combo dc cut 130 cta=%d block=%d roles=0010\n",
+                                   cta_id, block_idx);
+                        }
+                        if (block_idx > cluster_id) return;
+                    }
+                }
                 tensor_after_thread_sync();
+                if constexpr (DEDICATED_ROWONLY_DCONLY_PRODUCER_ROUTE) {
+                    if constexpr (ROWONLY_COMBO_DC_DEBUG_CUT == 154) {
+                        printf("rowonly combo dc cut 154 cta=%d block=%d roles=0010\n",
+                               cta_id, block_idx);
+                        return;
+                    }
+                }
                 if (phase == 0) do_mma_block(out_tm_0);
                 else            do_mma_block(out_tm_1);
                 tensor_commit<2>(outputs_arrived);
+                if constexpr (DEDICATED_ROWONLY_DCONLY_PRODUCER_ROUTE) {
+                    if constexpr (ROWONLY_COMBO_DC_DEBUG_CUT == 139) {
+                        if (block_idx + 2 * (gridDim.x / C::CLUSTER_SIZE) >= producer_num_blocks &&
+                            block_idx + gridDim.x / C::CLUSTER_SIZE < producer_num_blocks) {
+                            printf("rowonly combo dc cut 139 cta=%d block=%d roles=0010\n",
+                                   cta_id, block_idx);
+                            return;
+                        }
+                    }
+                    if constexpr (ROWONLY_COMBO_DC_DEBUG_CUT == 137) {
+                        if (block_idx + gridDim.x / C::CLUSTER_SIZE >= producer_num_blocks) {
+                            printf("rowonly combo dc cut 137 cta=%d block=%d roles=0010\n",
+                                   cta_id, block_idx);
+                            return;
+                        }
+                    }
+                    if constexpr (ROWONLY_COMBO_DC_DEBUG_CUT == 131) {
+                        if (block_idx > cluster_id && warp::laneid() == 0) {
+                            printf("rowonly combo dc cut 131 cta=%d block=%d roles=0010\n",
+                                   cta_id, block_idx);
+                        }
+                        if (block_idx > cluster_id) return;
+                    }
+                }
                 update_phasebit<1>(phasebits, 0);
                 phase ^= 1;
+            }
+            if constexpr (EFFECTIVE_ENABLE_STOREADD_COMBO) {
+                if constexpr (G::SKIP_GLOBAL_COL_MATERIALIZATION) {
+                    if constexpr (ROWONLY_COMBO_DC_DEBUG_CUT == 135) {
+                        printf("rowonly combo dc cut 135 cta=%d roles=0010\n", cta_id);
+                        return;
+                    }
+                    arrive(combo_rowonly_tail_done);
+                }
             }
         }
     } else if (effective_warpgroup_id < C::CONSUMER_WARPGROUPS) {
@@ -6639,6 +7620,17 @@ __device__ inline void backward_kernel_v3_streaming_3wg_impl(const globals_3wg<C
         if (warpgroup::warpid() == 0) {
             tm_allocator.provision(tmem_addr);
             warp::arrive(tmem_provisioned);
+            if constexpr (G::SKIP_GLOBAL_COL_MATERIALIZATION &&
+                          DO_ROW && !DO_COL &&
+                          EFFECTIVE_ENABLE_STOREADD_COMBO &&
+                          EFFECTIVE_SEPARATE_BACKHALF_CONSUMERS &&
+                          (STATIC_COMBO_MODE == G::COMBO_MODE_DCONLY)) {
+                if constexpr (ROWONLY_COMBO_DC_DEBUG_CUT == 144) {
+                    printf("rowonly combo dc cut 144 cta=%d wg=%d roles=1000\n",
+                           cta_id, warpgroup_id);
+                    return;
+                }
+            }
         }
         wait(tmem_provisioned, 0);
         tm_allocator.set_addr(tmem_addr);
@@ -6683,6 +7675,12 @@ __device__ inline void backward_kernel_v3_streaming_3wg_impl(const globals_3wg<C
             (COMBO_MODE_IS_STATIC
                 ? STATIC_COMBO_DO_DE
                 : (g.combo_mode == G::COMBO_MODE_FULL || g.combo_mode == G::COMBO_MODE_DEONLY));
+        const bool combo_use_dc =
+            G::ENABLE_STOREADD_COMBO &&
+            G::SEPARATE_BACKHALF_CONSUMERS &&
+            (COMBO_MODE_IS_STATIC
+                ? STATIC_COMBO_DO_DC
+                : (g.combo_mode == G::COMBO_MODE_FULL || g.combo_mode == G::COMBO_MODE_DCONLY));
         constexpr bool combo_debug_skip_consumer_row_recycle_wait = false;
         constexpr bool combo_debug_force_row_ready_publish = false;
         uint32_t combo_row_recycle_phasebits = 0xFFFF0000;
@@ -6690,8 +7688,51 @@ __device__ inline void backward_kernel_v3_streaming_3wg_impl(const globals_3wg<C
             STATIC_FRONTEND_ONLY_GONLY ? 3 : (G::ROW_QUANT_IMMEDIATE_PER_ROW16 ? 3 : 1);
         constexpr float FP4_MAX = 6.0f;
         constexpr float E4M3_MAX = 448.0f;
+        constexpr bool SAFUSED_SPLIT_STAGE_DEBUG =
+            G::FUSED_SOFTMAX_QUANT &&
+            G::FUSED_COL_IN_QUANTIZER &&
+            (SAFUSED_SPLIT_COL_STAGE_CUT > 0);
+        auto safused_split_publish_abort_wakes = [&]() {
+            if constexpr (SAFUSED_SPLIT_STAGE_DEBUG) {
+                if (atomicCAS(&safused_split_abort_published, 0, 1) == 0) {
+                    __threadfence_block();
+                    asm volatile("fence.proxy.async.shared::cta;\n" ::: "memory");
+                    #pragma unroll
+                    for (int debug_bf_stage = 0; debug_bf_stage < C::BF16_STAGE_COUNT; ++debug_bf_stage) {
+                        #pragma unroll
+                        for (int debug_row16 = 0; debug_row16 < C::Mb / 32; ++debug_row16) {
+                            arrive(slice_col_ready_row16[debug_bf_stage][debug_row16]);
+                        }
+                        arrive(slice_col_recycled[debug_bf_stage]);
+                    }
+                    arrive(fused_col_filter_ready);
+                    __threadfence_block();
+                    asm volatile("fence.proxy.async.shared::cta;\n" ::: "memory");
+                }
+            }
+        };
+        auto safused_split_request_abort = [&](int stage) {
+            if constexpr (SAFUSED_SPLIT_STAGE_DEBUG) {
+                if (SAFUSED_SPLIT_COL_STAGE_CUT == stage) {
+                    if (atomicCAS(&safused_split_abort_stage, 0, stage) == 0) {
+                        printf("safused split cut %d cta=%d\n", stage, cta_id);
+                        safused_split_publish_abort_wakes();
+                    }
+                }
+            }
+        };
+        auto safused_split_should_abort = [&]() {
+            if constexpr (SAFUSED_SPLIT_STAGE_DEBUG) {
+                asm volatile("fence.proxy.async.shared::cta;\n" ::: "memory");
+                return safused_split_abort_stage != 0;
+            } else {
+                return false;
+            }
+        };
 
-        for (int block_idx = cluster_id; block_idx < num_blocks; block_idx += gridDim.x / C::CLUSTER_SIZE) {
+        const int consumer_num_blocks =
+            SAFUSED_SPLIT_STAGE_DEBUG ? min(num_blocks, gridDim.x / C::CLUSTER_SIZE) : num_blocks;
+        for (int block_idx = cluster_id; block_idx < consumer_num_blocks; block_idx += gridDim.x / C::CLUSTER_SIZE) {
             int supergroup_idx = block_idx / num_blocks_per_supergroup;
             int idx_within_supergroup = block_idx % num_blocks_per_supergroup;
             int rows_in_supergroup = min(C::SUPERGROUP_SIZE, num_row_blocks - supergroup_idx * C::SUPERGROUP_SIZE);
@@ -6704,6 +7745,35 @@ __device__ inline void backward_kernel_v3_streaming_3wg_impl(const globals_3wg<C
             const int tile_row_base = row_block_idx * C::Mb + cta_id * (C::Mb / 2);
             const int warp_row_base = tile_row_base + warpgroup::warpid() * (C::Mb / 8);
             const bool full_tile_rows = tile_row_base + (C::Mb / 2) <= g.M;
+            const bool full_tile_cols = (col_block_idx + 1) * C::Nb <= g.N;
+            uint8_t *fused_row_fp4_stage = nullptr;
+            uint8_t *fused_row_sc_stage = nullptr;
+            uint8_t *fused_col_fp4_stage = nullptr;
+            uint8_t *fused_col_sc_stage = nullptr;
+            float fused_filter_local_max = 0.0f;
+            uint64_t fused_diag_row_cycles = 0;
+            uint64_t fused_diag_col_amax_cycles = 0;
+            uint64_t fused_diag_col_pack_cycles = 0;
+            uint64_t fused_diag_flush_cycles = 0;
+            if constexpr (G::FUSED_SOFTMAX_QUANT) {
+                fused_row_fp4_stage = reinterpret_cast<uint8_t*>(&fused_quant_stage->row_fp4[0]);
+                fused_row_sc_stage = reinterpret_cast<uint8_t*>(&fused_quant_stage->row_sc[0]);
+                fused_col_fp4_stage = reinterpret_cast<uint8_t*>(&fused_quant_stage->col_fp4[0]);
+                fused_col_sc_stage = reinterpret_cast<uint8_t*>(&fused_quant_stage->col_sc[0]);
+                const int fused_stage_prefix_bytes =
+                    static_cast<int>(sizeof(fused_quant_stage->row_fp4) +
+                                     sizeof(fused_quant_stage->row_sc) +
+                                     sizeof(fused_quant_stage->col_fp4) +
+                                     sizeof(fused_quant_stage->col_sc));
+                uint8_t *fused_stage_bytes =
+                    reinterpret_cast<uint8_t*>(fused_quant_stage);
+                for (int idx = warpgroup::warpid() * WARP_THREADS + lane_id;
+                     idx < fused_stage_prefix_bytes;
+                     idx += WARPGROUP_WARPS * WARP_THREADS) {
+                    fused_stage_bytes[idx] = 0;
+                }
+                warpgroup::sync(CONSUMER_WG_SYNC_ID);
+            }
 
             int my_targets_x[subtile_rt::height];
             int my_targets_y[subtile_rt::height];
@@ -6720,15 +7790,34 @@ __device__ inline void backward_kernel_v3_streaming_3wg_impl(const globals_3wg<C
             }
 
             auto& accum = (phase == 0) ? out_tm_0 : out_tm_1;
-            auto wait_for_quant_stage = [&](int bf_stage) {
+            constexpr bool INTERNAL_COMBO_DC_COL_RECYCLE_WAIT =
+                G::SKIP_GLOBAL_COL_MATERIALIZATION &&
+                G::ENABLE_STOREADD_COMBO &&
+                G::SEPARATE_BACKHALF_CONSUMERS &&
+                DO_ROW && !DO_COL &&
+                G::USE_ROW_PAIR_STAGE &&
+                !G::ROW_QUANT_FROM_COL_PAIR_STAGE &&
+                C::ROW_QUANTIZER_WARPGROUPS == 0 &&
+                C::COL_QUANTIZER_WARPGROUPS > 0 &&
+                G::COMBO_DC_WARPGROUPS > 0;
+            auto wait_for_quant_stage = [&](int bf_stage, int epi_idx) {
                 if constexpr (DO_ROW && !C::CONSUMER_DO_ROW) {
                     if constexpr (!G::DEBUG_SKIP_ROW_RECYCLE_WAIT) {
                         wait(slice_row_recycled[bf_stage], get_phasebit<1>(slice_row_recycle_phasebits, bf_stage));
                     }
                 }
-                if constexpr (DO_COL) {
+                if constexpr (DO_COL || INTERNAL_COMBO_DC_COL_RECYCLE_WAIT) {
                     if constexpr (G::COL_QUANT_FROM_DBF_REGS) {
-                    } else if constexpr (G::USE_COL_PAIR_STAGE || (DO_ROW && C::ROW_QUANT_FROM_REGS && C::CONSUMER_DO_ROW && !C::EARLY_COL_READY)) {
+                        if constexpr (G::FUSED_COL_IN_QUANTIZER) {
+                            if constexpr (!G::DEBUG_SKIP_COL_RECYCLE_WAIT) {
+                                if (epi_idx >= C::BF16_STAGE_COUNT) {
+                                    wait(slice_col_recycled[bf_stage], get_phasebit<1>(slice_col_recycle_phasebits, bf_stage));
+                                }
+                            }
+                        }
+                    } else if constexpr (INTERNAL_COMBO_DC_COL_RECYCLE_WAIT ||
+                                         G::USE_COL_PAIR_STAGE ||
+                                         (DO_ROW && C::ROW_QUANT_FROM_REGS && C::CONSUMER_DO_ROW && !C::EARLY_COL_READY)) {
                         if constexpr (!G::DEBUG_SKIP_COL_RECYCLE_WAIT) {
                             wait(slice_col_recycled[bf_stage], get_phasebit<1>(slice_col_recycle_phasebits, bf_stage));
                         }
@@ -6746,10 +7835,48 @@ __device__ inline void backward_kernel_v3_streaming_3wg_impl(const globals_3wg<C
             #pragma unroll
             for (int epi = 0; epi < C::EPI_PIPE_DEPTH; ++epi) {
                 const int bf_stage = epi % C::BF16_STAGE_COUNT;
+                if constexpr (G::SKIP_GLOBAL_COL_MATERIALIZATION &&
+                              DO_ROW && !DO_COL &&
+                              EFFECTIVE_ENABLE_STOREADD_COMBO &&
+                              EFFECTIVE_SEPARATE_BACKHALF_CONSUMERS) {
+                    if (combo_use_dc) {
+                        if constexpr (ROWONLY_COMBO_DC_DEBUG_CUT == 127) {
+                            if (block_idx > cluster_id && epi == 0 &&
+                                warpgroup::warpid() == 0 &&
+                                warp::laneid() == 0) {
+                                printf("rowonly combo dc cut 127 cta=%d wg=%d block=%d row=%d col=%d epi=%d roles=1000\n",
+                                       cta_id, warpgroup_id, block_idx, row_block_idx, col_block_idx, epi);
+                            }
+                            if (block_idx > cluster_id && epi == 0) return;
+                        }
+                        const bool consumer_last_block =
+                            block_idx + gridDim.x / C::CLUSTER_SIZE >= consumer_num_blocks;
+                        if constexpr (ROWONLY_COMBO_DC_DEBUG_CUT == 126) {
+                            if (consumer_last_block &&
+                                warpgroup::warpid() == 0 &&
+                                warp::laneid() == 0) {
+                                printf("rowonly combo dc cut 126 cta=%d wg=%d row=%d col=%d epi=%d roles=1000\n",
+                                       cta_id, warpgroup_id, row_block_idx, col_block_idx, epi);
+                            }
+                            if (consumer_last_block) return;
+                        }
+                    }
+                }
                 if constexpr (!C::OVERLAP_EPI) {
-                    wait_for_quant_stage(bf_stage);
+                    wait_for_quant_stage(bf_stage, epi);
+                }
+                if constexpr (SAFUSED_SPLIT_STAGE_DEBUG) {
+                    if constexpr (G::FUSED_COL_IN_QUANTIZER) {
+                        if (epi == C::BF16_STAGE_COUNT &&
+                            warpgroup::warpid() == 0 &&
+                            lane_id == 0) {
+                            safused_split_request_abort(6);
+                        }
+                        if (safused_split_should_abort()) return;
+                    }
                 }
 
+                subtile_rt D_fl;
                 subtile_rt_bf D_bf;
                 const int col_start = col_block_idx * C::Nb + epi * SUBTILE_COLS;
                 const bool combo_stage_first_epi = (epi == 0);
@@ -6789,8 +7916,26 @@ __device__ inline void backward_kernel_v3_streaming_3wg_impl(const globals_3wg<C
                         }
                     }
                 }
+                if constexpr (G::SKIP_GLOBAL_COL_MATERIALIZATION &&
+                              DO_ROW && !DO_COL &&
+                              EFFECTIVE_ENABLE_STOREADD_COMBO &&
+                              EFFECTIVE_SEPARATE_BACKHALF_CONSUMERS) {
+                    if (combo_use_dc) {
+                        const bool consumer_last_block =
+                            block_idx + gridDim.x / C::CLUSTER_SIZE >= consumer_num_blocks;
+                        const bool consumer_last_epi = (epi == C::EPI_PIPE_DEPTH - 1);
+                        if constexpr (ROWONLY_COMBO_DC_DEBUG_CUT == 124) {
+                            if (consumer_last_block && consumer_last_epi &&
+                                warpgroup::warpid() == 0 &&
+                                warp::laneid() == 0) {
+                                printf("rowonly combo dc cut 124 cta=%d wg=%d row=%d col=%d epi=%d roles=1000\n",
+                                       cta_id, warpgroup_id, row_block_idx, col_block_idx, epi);
+                            }
+                            if (consumer_last_block && consumer_last_epi) return;
+                        }
+                    }
+                }
                 {
-                    subtile_rt D_fl;
                     warpgroup::load_async(D_fl, accum.template subtile<full_tt_fl<SUBTILE_COLS>>(0, SUBTILE_COLS * epi));
                     tensor_load_wait();
                     tensor_before_thread_sync();
@@ -6858,10 +8003,45 @@ __device__ inline void backward_kernel_v3_streaming_3wg_impl(const globals_3wg<C
                                     D_fl.tiles[i][j].data[k].y = 0.0f;
                                 }
                             }
+                    }
+                }
+                warp::mul(D_fl, D_fl, g.grad_scale);
+                if constexpr (G::FUSED_SOFTMAX_QUANT) {
+                    #pragma unroll
+                    for (int i = 0; i < subtile_rt::height; ++i) {
+                        #pragma unroll
+                        for (int j = 0; j < subtile_rt::width; ++j) {
+                            #pragma unroll
+                            for (int k = 0; k < 4; ++k) {
+                                fused_filter_local_max =
+                                    fmaxf(fused_filter_local_max, fabsf(D_fl.tiles[i][j].data[k].x));
+                                fused_filter_local_max =
+                                    fmaxf(fused_filter_local_max, fabsf(D_fl.tiles[i][j].data[k].y));
+                            }
                         }
                     }
-                    warp::mul(D_fl, D_fl, g.grad_scale);
+                } else {
                     warp::copy(D_bf, D_fl);
+                }
+                }
+                if constexpr (G::SKIP_GLOBAL_COL_MATERIALIZATION &&
+                              DO_ROW && !DO_COL &&
+                              EFFECTIVE_ENABLE_STOREADD_COMBO &&
+                              EFFECTIVE_SEPARATE_BACKHALF_CONSUMERS) {
+                    if (combo_use_dc) {
+                        const bool consumer_last_block =
+                            block_idx + gridDim.x / C::CLUSTER_SIZE >= consumer_num_blocks;
+                        const bool consumer_last_epi = (epi == C::EPI_PIPE_DEPTH - 1);
+                        if constexpr (ROWONLY_COMBO_DC_DEBUG_CUT == 125) {
+                            if (consumer_last_block && consumer_last_epi &&
+                                warpgroup::warpid() == 0 &&
+                                warp::laneid() == 0) {
+                                printf("rowonly combo dc cut 125 cta=%d wg=%d row=%d col=%d epi=%d roles=1000\n",
+                                       cta_id, warpgroup_id, row_block_idx, col_block_idx, epi);
+                            }
+                            if (consumer_last_block && consumer_last_epi) return;
+                        }
+                    }
                 }
 
                 if (epi == C::EPI_PIPE_DEPTH - 1 && !EFFECTIVE_ENABLE_STOREADD_COMBO) {
@@ -6869,60 +8049,71 @@ __device__ inline void backward_kernel_v3_streaming_3wg_impl(const globals_3wg<C
                 }
 
                 if constexpr (C::OVERLAP_EPI) {
-                    wait_for_quant_stage(bf_stage);
+                    wait_for_quant_stage(bf_stage, epi);
                 }
 
                 if constexpr (DO_ROW || DO_COL) {
+                    if constexpr (G::SKIP_GLOBAL_COL_MATERIALIZATION &&
+                                  DO_ROW && !DO_COL &&
+                                  EFFECTIVE_ENABLE_STOREADD_COMBO &&
+                                  EFFECTIVE_SEPARATE_BACKHALF_CONSUMERS) {
+                        if (combo_use_dc) {
+                            const bool consumer_last_block =
+                                block_idx + gridDim.x / C::CLUSTER_SIZE >= consumer_num_blocks;
+                            const bool consumer_last_epi = (epi == C::EPI_PIPE_DEPTH - 1);
+                            if constexpr (ROWONLY_COMBO_DC_DEBUG_CUT == 123) {
+                                if (consumer_last_block && consumer_last_epi &&
+                                    warpgroup::warpid() == 0 &&
+                                    warp::laneid() == 0) {
+                                    printf("rowonly combo dc cut 123 cta=%d wg=%d row=%d col=%d epi=%d roles=1000\n",
+                                           cta_id, warpgroup_id, row_block_idx, col_block_idx, epi);
+                                }
+                                if (consumer_last_block && consumer_last_epi) return;
+                            }
+                        }
+                    }
                     if constexpr (G::COL_QUANT_FROM_DBF_REGS) {
-                        static_assert(C::QUANTIZER_WARPGROUPS == 0,
-                                      "consumer-owned direct OTF epilogue requires zero quantizer warpgroups");
+                        if constexpr (!G::FUSED_COL_IN_QUANTIZER) {
+                            static_assert(C::QUANTIZER_WARPGROUPS == 0,
+                                          "consumer-owned direct OTF epilogue requires zero quantizer warpgroups");
+                        }
                         static_assert(C::CONSUMER_DO_ROW,
                                       "consumer-owned direct OTF epilogue requires consumer-owned row quantization");
                         const int lane_row = lane_id / 4;
                         const int lane_pair = lane_id % 4;
                         const int local_warp_row_base = warpgroup::warpid() * (C::Mb / 8);
-
-                        if constexpr (DO_ROW) {
-                            #pragma unroll
-                            for (int i = 0; i < subtile_rt_bf::height; ++i) {
+                        const bool fused_diag_timing_leader =
+                            G::SAFUSED_DIAG_TIMING_ENABLED &&
+                            g.diag_stage_cycles != nullptr &&
+                            block_idx == 0 &&
+                            warpgroup::warpid() == 0 &&
+                            lane_id == 0;
+                        uint64_t fused_diag_row_t0 = 0;
+                        if constexpr (G::FUSED_SOFTMAX_QUANT) {
+                            static_assert(G::DIRECT_ROW_WARPBALANCED && G::DIRECT_COL_WARPBALANCED,
+                                          "fused softmax quant path currently requires warp-balanced direct row/col ownership");
+                            if constexpr (G::SAFUSED_DIAG_TIMING_ENABLED) {
+                                if (fused_diag_timing_leader) fused_diag_row_t0 = clock64();
+                            }
+                            if constexpr (DO_ROW) {
                                 #pragma unroll
-                                for (int row_half = 0; row_half < 2; ++row_half) {
-                                    const bool writer_lane = (lane_row & 1) == 0;
-                                    const int peer_lane = ((lane_row ^ 1) << 2) | lane_pair;
+                                for (int i = 0; i < subtile_rt_bf::height; ++i) {
                                     #pragma unroll
-                                    for (int group16 = 0; group16 < SUBTILE_COLS / 16; ++group16) {
-                                        const bf16_2 vals0 = D_bf.tiles[i][group16].data[row_half];
-                                        const bf16_2 vals1 = D_bf.tiles[i][group16].data[row_half + 2];
-                                        const uint32_t vals0_bits = bf16x2_bits(vals0);
-                                        const uint32_t vals1_bits = bf16x2_bits(vals1);
-                                        const uint32_t vals0_peer_bits =
-                                            __shfl_sync(0xffffffff, vals0_bits, peer_lane);
-                                        const uint32_t vals1_peer_bits =
-                                            __shfl_sync(0xffffffff, vals1_bits, peer_lane);
-                                        if constexpr (G::DIRECT_ROW_WARPBALANCED) {
-                                            const uint64_t row_bits_lo =
-                                                static_cast<uint64_t>(vals0_bits) |
-                                                (static_cast<uint64_t>(vals1_bits) << 32);
-                                            const uint64_t row_bits_hi =
-                                                static_cast<uint64_t>(vals0_peer_bits) |
-                                                (static_cast<uint64_t>(vals1_peer_bits) << 32);
-                                            const bf16_2 row0_pair_lo_bf = bf16x2_from_bits(static_cast<uint32_t>(row_bits_lo));
-                                            const bf16_2 row0_pair_hi_bf = bf16x2_from_bits(static_cast<uint32_t>(row_bits_lo >> 32));
-                                            const bf16_2 row1_pair_lo_bf = bf16x2_from_bits(static_cast<uint32_t>(row_bits_hi));
-                                            const bf16_2 row1_pair_hi_bf = bf16x2_from_bits(static_cast<uint32_t>(row_bits_hi >> 32));
-
-                                            const float2 row0_pair_lo = make_float2(
-                                                __bfloat162float(row0_pair_lo_bf.x),
-                                                __bfloat162float(row0_pair_lo_bf.y));
-                                            const float2 row0_pair_hi = make_float2(
-                                                __bfloat162float(row0_pair_hi_bf.x),
-                                                __bfloat162float(row0_pair_hi_bf.y));
-                                            const float2 row1_pair_lo = make_float2(
-                                                __bfloat162float(row1_pair_lo_bf.x),
-                                                __bfloat162float(row1_pair_lo_bf.y));
-                                            const float2 row1_pair_hi = make_float2(
-                                                __bfloat162float(row1_pair_hi_bf.x),
-                                                __bfloat162float(row1_pair_hi_bf.y));
+                                    for (int row_half = 0; row_half < 2; ++row_half) {
+                                        const bool writer_lane = (lane_row & 1) == 0;
+                                        const int peer_lane = ((lane_row ^ 1) << 2) | lane_pair;
+                                        #pragma unroll
+                                        for (int group16 = 0; group16 < SUBTILE_COLS / 16; ++group16) {
+                                            const float2 vals0_fl = pair_to_float2(D_fl.tiles[i][group16].data[row_half]);
+                                            const float2 vals1_fl = pair_to_float2(D_fl.tiles[i][group16].data[row_half + 2]);
+                                            const float2 vals0_peer_fl =
+                                                shfl_float2_sync(0xffffffff, vals0_fl, peer_lane);
+                                            const float2 vals1_peer_fl =
+                                                shfl_float2_sync(0xffffffff, vals1_fl, peer_lane);
+                                            const float2 row0_pair_lo = vals0_fl;
+                                            const float2 row0_pair_hi = vals1_fl;
+                                            const float2 row1_pair_lo = vals0_peer_fl;
+                                            const float2 row1_pair_hi = vals1_peer_fl;
 
                                             float row0_amax = 0.0f;
                                             row0_amax = fmaxf(row0_amax, fabsf(row0_pair_lo.x));
@@ -6940,16 +8131,344 @@ __device__ inline void backward_kernel_v3_streaming_3wg_impl(const globals_3wg<C
                                             row1_amax = fmaxf(row1_amax, __shfl_xor_sync(0xffffffff, row1_amax, 1, 4));
                                             row1_amax = fmaxf(row1_amax, __shfl_xor_sync(0xffffffff, row1_amax, 2, 4));
 
-                                            const float row0_rcp = (row0_amax > 0.0f) ? (FP4_MAX / row0_amax) : 0.0f;
-                                            const float row1_rcp = (row1_amax > 0.0f) ? (FP4_MAX / row1_amax) : 0.0f;
+                                            const fp4_scale_contract row0_scale_contract =
+                                                make_fp4_scale_contract(row0_amax, g_sg_rcp, g_sg, encode_centric);
+                                            const fp4_scale_contract row1_scale_contract =
+                                                make_fp4_scale_contract(row1_amax, g_sg_rcp, g_sg, encode_centric);
                                             const unsigned row0_byte_lo = quantize_fp4_pair(
-                                                row0_pair_lo.x, row0_pair_lo.y, row0_rcp);
+                                                row0_pair_lo.x, row0_pair_lo.y, row0_scale_contract.quant_rcp_scale);
                                             const unsigned row0_byte_hi = quantize_fp4_pair(
-                                                row0_pair_hi.x, row0_pair_hi.y, row0_rcp);
+                                                row0_pair_hi.x, row0_pair_hi.y, row0_scale_contract.quant_rcp_scale);
                                             const unsigned row1_byte_lo = quantize_fp4_pair(
-                                                row1_pair_lo.x, row1_pair_lo.y, row1_rcp);
+                                                row1_pair_lo.x, row1_pair_lo.y, row1_scale_contract.quant_rcp_scale);
                                             const unsigned row1_byte_hi = quantize_fp4_pair(
-                                                row1_pair_hi.x, row1_pair_hi.y, row1_rcp);
+                                                row1_pair_hi.x, row1_pair_hi.y, row1_scale_contract.quant_rcp_scale);
+
+                                            uint64_t packed_row0 = 0;
+                                            uint64_t packed_row1 = 0;
+                                            #pragma unroll
+                                            for (int src_pair = 0; src_pair < 4; ++src_pair) {
+                                                packed_row0 |= static_cast<uint64_t>(
+                                                    __shfl_sync(0xffffffff, static_cast<int>(row0_byte_lo), src_pair, 4) & 0xff)
+                                                    << (src_pair * 8);
+                                                packed_row0 |= static_cast<uint64_t>(
+                                                    __shfl_sync(0xffffffff, static_cast<int>(row0_byte_hi), src_pair, 4) & 0xff)
+                                                    << ((src_pair + 4) * 8);
+                                                packed_row1 |= static_cast<uint64_t>(
+                                                    __shfl_sync(0xffffffff, static_cast<int>(row1_byte_lo), src_pair, 4) & 0xff)
+                                                    << (src_pair * 8);
+                                                packed_row1 |= static_cast<uint64_t>(
+                                                    __shfl_sync(0xffffffff, static_cast<int>(row1_byte_hi), src_pair, 4) & 0xff)
+                                                    << ((src_pair + 4) * 8);
+                                            }
+
+                                            if (writer_lane && lane_pair == 0) {
+                                                const int local_row0 =
+                                                    local_warp_row_base + i * 16 + row_half * 8 + lane_row;
+                                                const int local_row1 = local_row0 + 1;
+                                                const int local_col_16 = epi * SUBTILE_COLS + group16 * 16;
+                                                const int fp4x2_col_base = local_col_16 / 2;
+                                                const int local_kgroup = local_col_16 / 64;
+                                                const int col_16_in_64 = (local_col_16 / 16) % 4;
+
+                                                store_global_u64(
+                                                    &fused_row_fp4_stage[local_row0 * (C::Nb / 2) + fp4x2_col_base],
+                                                    packed_row0);
+                                                store_global_u64(
+                                                    &fused_row_fp4_stage[local_row1 * (C::Nb / 2) + fp4x2_col_base],
+                                                    packed_row1);
+
+                                                const int sr0 = local_row0 % 32;
+                                                const int rr0 = (local_row0 / 32) % 4;
+                                                const int byte_idx0 = local_kgroup * 512 + sr0 * 16 + rr0 * 4 + col_16_in_64;
+                                                fused_row_sc_stage[byte_idx0] = row0_scale_contract.scale_byte;
+                                                const int sr1 = local_row1 % 32;
+                                                const int rr1 = (local_row1 / 32) % 4;
+                                                const int byte_idx1 = local_kgroup * 512 + sr1 * 16 + rr1 * 4 + col_16_in_64;
+                                                fused_row_sc_stage[byte_idx1] = row1_scale_contract.scale_byte;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+
+                            if constexpr (DO_ROW && DO_COL && !G::SAFUSED_SKIP_COL_WORK) {
+                                __syncwarp();
+                            }
+
+                            if constexpr (G::SAFUSED_DIAG_TIMING_ENABLED) {
+                                if (fused_diag_timing_leader) {
+                                    fused_diag_row_cycles += clock64() - fused_diag_row_t0;
+                                }
+                            }
+
+                            if constexpr (DO_COL && !G::SAFUSED_SKIP_COL_WORK) {
+                                if constexpr (G::FUSED_COL_IN_QUANTIZER) {
+                                    #pragma unroll
+                                    for (int i = 0; i < subtile_rt_bf::height; ++i) {
+                                        uint64_t fused_diag_col_t0 = 0;
+                                        if constexpr (G::SAFUSED_DIAG_TIMING_ENABLED) {
+                                            if (fused_diag_timing_leader) fused_diag_col_t0 = clock64();
+                                        }
+                                        const int local_row_base = local_warp_row_base + i * 16;
+                                        const int row16_block = local_row_base / 16;
+                                        #pragma unroll
+                                        for (int group16 = 0; group16 < SUBTILE_COLS / 16; ++group16) {
+                                            const int col_base = group16 * 16;
+                                            const int pair_col = lane_pair * 2;
+                                            const int row_lo = lane_row;
+                                            const int row_hi = lane_row + 8;
+                                            const float2 lower_lo_fl =
+                                                pair_to_float2(D_fl.tiles[i][group16].data[0]);
+                                            const float2 lower_hi_fl =
+                                                pair_to_float2(D_fl.tiles[i][group16].data[2]);
+                                            const float2 upper_lo_fl =
+                                                pair_to_float2(D_fl.tiles[i][group16].data[1]);
+                                            const float2 upper_hi_fl =
+                                                pair_to_float2(D_fl.tiles[i][group16].data[3]);
+
+                                            auto store_col_value = [&](int local_col, int row, float value) {
+                                                fused_quant_stage->col_values[bf_stage][row16_block][local_col][row] = value;
+                                            };
+
+                                            store_col_value(col_base + pair_col + 0, row_lo, lower_lo_fl.x);
+                                            store_col_value(col_base + pair_col + 1, row_lo, lower_lo_fl.y);
+                                            store_col_value(col_base + pair_col + 8, row_lo, lower_hi_fl.x);
+                                            store_col_value(col_base + pair_col + 9, row_lo, lower_hi_fl.y);
+                                            store_col_value(col_base + pair_col + 0, row_hi, upper_lo_fl.x);
+                                            store_col_value(col_base + pair_col + 1, row_hi, upper_lo_fl.y);
+                                            store_col_value(col_base + pair_col + 8, row_hi, upper_hi_fl.x);
+                                            store_col_value(col_base + pair_col + 9, row_hi, upper_hi_fl.y);
+                                        }
+                                        if constexpr (SAFUSED_SPLIT_STAGE_DEBUG) {
+                                            if (i == 0 && warpgroup::warpid() == 0 && lane_id == 0) {
+                                                safused_split_request_abort(1);
+                                            }
+                                            if (safused_split_should_abort()) return;
+                                        }
+                                        __syncwarp();
+                                        __threadfence_block();
+                                        asm volatile("fence.proxy.async.shared::cta;\n" ::: "memory");
+                                        if (warp::laneid() == 0) {
+                                            if constexpr (G::SKIP_GLOBAL_COL_MATERIALIZATION) {
+                                                if constexpr (ROWONLY_COMBO_DC_DEBUG_CUT == 98) {
+                                                    if (block_idx > cluster_id && epi == 0 && row16_block == 0) {
+                                                        printf(
+                                                            "rowonly combo dc cut 98 site=A cta=%d wg=%d block=%d row=%d col=%d epi=%d row16=%d\n",
+                                                            cta_id, warpgroup_id, block_idx, row_block_idx, col_block_idx, epi, row16_block);
+                                                        return;
+                                                    }
+                                                }
+                                            }
+                                            arrive(slice_col_ready_row16[bf_stage][row16_block]);
+                                        }
+                                        if constexpr (SAFUSED_SPLIT_STAGE_DEBUG) {
+                                            if (i == 0 && warpgroup::warpid() == 0 && lane_id == 0) {
+                                                safused_split_request_abort(2);
+                                            }
+                                            if (safused_split_should_abort()) return;
+                                        }
+                                        if constexpr (G::SAFUSED_DIAG_TIMING_ENABLED) {
+                                            if (fused_diag_timing_leader) {
+                                                fused_diag_col_amax_cycles += clock64() - fused_diag_col_t0;
+                                            }
+                                        }
+                                    }
+                                } else {
+                                    const unsigned col_mask = 0xffffffffu;
+                                    #pragma unroll
+                                    for (int i = 0; i < subtile_rt_bf::height; ++i) {
+                                        uint64_t fused_diag_col_t0 = 0;
+                                        if constexpr (G::SAFUSED_DIAG_TIMING_ENABLED) {
+                                            if (fused_diag_timing_leader) fused_diag_col_t0 = clock64();
+                                        }
+                                        const int local_row_base = local_warp_row_base + i * 16;
+                                        const int global_row_base = tile_row_base + local_row_base;
+                                        #pragma unroll
+                                        for (int group16 = 0; group16 < SUBTILE_COLS / 16; ++group16) {
+                                            const int col_base = group16 * 16;
+                                            const int pair_col = lane_pair * 2;
+                                            const float2 lower_lo_fl =
+                                                pair_to_float2(D_fl.tiles[i][group16].data[0]);
+                                            const float2 lower_hi_fl =
+                                                pair_to_float2(D_fl.tiles[i][group16].data[2]);
+                                            const float2 upper_lo_fl =
+                                                pair_to_float2(D_fl.tiles[i][group16].data[1]);
+                                            const float2 upper_hi_fl =
+                                                pair_to_float2(D_fl.tiles[i][group16].data[3]);
+                                            const int local_m_kgroup = local_row_base / 64;
+                                            const int m_16_in_64 = (local_row_base / 16) % 4;
+                                            const int local_col_base = epi * SUBTILE_COLS + col_base + pair_col;
+                                            const int global_col_base = col_start + col_base + pair_col;
+
+                                            live_col_fp4_quant_result col_quant0{};
+                                            live_col_fp4_quant_result col_quant1{};
+                                            live_col_fp4_quant_result col_quant8{};
+                                            live_col_fp4_quant_result col_quant9{};
+                                            if constexpr (G::SAFUSED_FIXED_COL_SCALE) {
+                                                if constexpr (G::SAFUSED_SKIP_COL_PACK) {
+                                                    col_quant0 = quantize_live_col_warpbalanced<true, true>(
+                                                        col_mask, lower_lo_fl, lower_hi_fl, upper_lo_fl, upper_hi_fl,
+                                                        lane_pair, false, false, global_row_base, g.M, full_tile_rows,
+                                                        g_sg_rcp, g_sg, encode_centric);
+                                                    col_quant1 = quantize_live_col_warpbalanced<true, true>(
+                                                        col_mask, lower_lo_fl, lower_hi_fl, upper_lo_fl, upper_hi_fl,
+                                                        lane_pair, false, true, global_row_base, g.M, full_tile_rows,
+                                                        g_sg_rcp, g_sg, encode_centric);
+                                                    col_quant8 = quantize_live_col_warpbalanced<true, true>(
+                                                        col_mask, lower_lo_fl, lower_hi_fl, upper_lo_fl, upper_hi_fl,
+                                                        lane_pair, true, false, global_row_base, g.M, full_tile_rows,
+                                                        g_sg_rcp, g_sg, encode_centric);
+                                                    col_quant9 = quantize_live_col_warpbalanced<true, true>(
+                                                        col_mask, lower_lo_fl, lower_hi_fl, upper_lo_fl, upper_hi_fl,
+                                                        lane_pair, true, true, global_row_base, g.M, full_tile_rows,
+                                                        g_sg_rcp, g_sg, encode_centric);
+                                                } else {
+                                                    col_quant0 = quantize_live_col_warpbalanced<true, false>(
+                                                        col_mask, lower_lo_fl, lower_hi_fl, upper_lo_fl, upper_hi_fl,
+                                                        lane_pair, false, false, global_row_base, g.M, full_tile_rows,
+                                                        g_sg_rcp, g_sg, encode_centric);
+                                                    col_quant1 = quantize_live_col_warpbalanced<true, false>(
+                                                        col_mask, lower_lo_fl, lower_hi_fl, upper_lo_fl, upper_hi_fl,
+                                                        lane_pair, false, true, global_row_base, g.M, full_tile_rows,
+                                                        g_sg_rcp, g_sg, encode_centric);
+                                                    col_quant8 = quantize_live_col_warpbalanced<true, false>(
+                                                        col_mask, lower_lo_fl, lower_hi_fl, upper_lo_fl, upper_hi_fl,
+                                                        lane_pair, true, false, global_row_base, g.M, full_tile_rows,
+                                                        g_sg_rcp, g_sg, encode_centric);
+                                                    col_quant9 = quantize_live_col_warpbalanced<true, false>(
+                                                        col_mask, lower_lo_fl, lower_hi_fl, upper_lo_fl, upper_hi_fl,
+                                                        lane_pair, true, true, global_row_base, g.M, full_tile_rows,
+                                                        g_sg_rcp, g_sg, encode_centric);
+                                                }
+                                            } else {
+                                                if constexpr (G::SAFUSED_SKIP_COL_PACK) {
+                                                    col_quant0 = quantize_live_col_warpbalanced<false, true>(
+                                                        col_mask, lower_lo_fl, lower_hi_fl, upper_lo_fl, upper_hi_fl,
+                                                        lane_pair, false, false, global_row_base, g.M, full_tile_rows,
+                                                        g_sg_rcp, g_sg, encode_centric);
+                                                    col_quant1 = quantize_live_col_warpbalanced<false, true>(
+                                                        col_mask, lower_lo_fl, lower_hi_fl, upper_lo_fl, upper_hi_fl,
+                                                        lane_pair, false, true, global_row_base, g.M, full_tile_rows,
+                                                        g_sg_rcp, g_sg, encode_centric);
+                                                    col_quant8 = quantize_live_col_warpbalanced<false, true>(
+                                                        col_mask, lower_lo_fl, lower_hi_fl, upper_lo_fl, upper_hi_fl,
+                                                        lane_pair, true, false, global_row_base, g.M, full_tile_rows,
+                                                        g_sg_rcp, g_sg, encode_centric);
+                                                    col_quant9 = quantize_live_col_warpbalanced<false, true>(
+                                                        col_mask, lower_lo_fl, lower_hi_fl, upper_lo_fl, upper_hi_fl,
+                                                        lane_pair, true, true, global_row_base, g.M, full_tile_rows,
+                                                        g_sg_rcp, g_sg, encode_centric);
+                                                } else {
+                                                    col_quant0 = quantize_live_col_warpbalanced<false, false>(
+                                                        col_mask, lower_lo_fl, lower_hi_fl, upper_lo_fl, upper_hi_fl,
+                                                        lane_pair, false, false, global_row_base, g.M, full_tile_rows,
+                                                        g_sg_rcp, g_sg, encode_centric);
+                                                    col_quant1 = quantize_live_col_warpbalanced<false, false>(
+                                                        col_mask, lower_lo_fl, lower_hi_fl, upper_lo_fl, upper_hi_fl,
+                                                        lane_pair, false, true, global_row_base, g.M, full_tile_rows,
+                                                        g_sg_rcp, g_sg, encode_centric);
+                                                    col_quant8 = quantize_live_col_warpbalanced<false, false>(
+                                                        col_mask, lower_lo_fl, lower_hi_fl, upper_lo_fl, upper_hi_fl,
+                                                        lane_pair, true, false, global_row_base, g.M, full_tile_rows,
+                                                        g_sg_rcp, g_sg, encode_centric);
+                                                    col_quant9 = quantize_live_col_warpbalanced<false, false>(
+                                                        col_mask, lower_lo_fl, lower_hi_fl, upper_lo_fl, upper_hi_fl,
+                                                        lane_pair, true, true, global_row_base, g.M, full_tile_rows,
+                                                        g_sg_rcp, g_sg, encode_centric);
+                                                }
+                                            }
+
+                                            if (lane_row == 0) {
+                                                const auto store_col_quant = [&](int local_col, int global_col, const live_col_fp4_quant_result &col_quant) {
+                                                    if (full_tile_cols || global_col < g.N) {
+                                                        const int sr = local_col % 32;
+                                                        const int rr = (local_col / 32) % 4;
+                                                        const int byte_idx =
+                                                            local_m_kgroup * 512 + sr * 16 + rr * 4 + m_16_in_64;
+                                                        fused_col_sc_stage[byte_idx] = col_quant.scale_byte;
+                                                        if constexpr (!G::SAFUSED_SKIP_COL_PACK) {
+                                                            store_global_u64(
+                                                                fused_col_fp4_stage + local_col * (C::Mb / 4) + (local_row_base / 2),
+                                                                col_quant.packed_fp4);
+                                                        }
+                                                    }
+                                                };
+                                                store_col_quant(local_col_base + 0, global_col_base + 0, col_quant0);
+                                                store_col_quant(local_col_base + 1, global_col_base + 1, col_quant1);
+                                                store_col_quant(local_col_base + 8, global_col_base + 8, col_quant8);
+                                                store_col_quant(local_col_base + 9, global_col_base + 9, col_quant9);
+                                            }
+                                        }
+
+                                        if constexpr (G::SAFUSED_DIAG_TIMING_ENABLED) {
+                                            if (fused_diag_timing_leader) {
+                                                fused_diag_col_amax_cycles += clock64() - fused_diag_col_t0;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+
+                            warpgroup::sync(CONSUMER_WG_SYNC_ID);
+                        } else {
+                        if constexpr (DO_ROW) {
+                            #pragma unroll
+                            for (int i = 0; i < subtile_rt_bf::height; ++i) {
+                                #pragma unroll
+                                for (int row_half = 0; row_half < 2; ++row_half) {
+                                    const bool writer_lane = (lane_row & 1) == 0;
+                                    const int peer_lane = ((lane_row ^ 1) << 2) | lane_pair;
+                                    #pragma unroll
+                                    for (int group16 = 0; group16 < SUBTILE_COLS / 16; ++group16) {
+                                        const bf16_2 vals0 = D_bf.tiles[i][group16].data[row_half];
+                                        const bf16_2 vals1 = D_bf.tiles[i][group16].data[row_half + 2];
+                                        const float2 vals0_fl = pair_to_float2(D_fl.tiles[i][group16].data[row_half]);
+                                        const float2 vals1_fl = pair_to_float2(D_fl.tiles[i][group16].data[row_half + 2]);
+                                        const float2 vals0_peer_fl =
+                                            shfl_float2_sync(0xffffffff, vals0_fl, peer_lane);
+                                        const float2 vals1_peer_fl =
+                                            shfl_float2_sync(0xffffffff, vals1_fl, peer_lane);
+                                        const uint32_t vals0_bits = bf16x2_bits(vals0);
+                                        const uint32_t vals1_bits = bf16x2_bits(vals1);
+                                        const uint32_t vals0_peer_bits =
+                                            __shfl_sync(0xffffffff, vals0_bits, peer_lane);
+                                        const uint32_t vals1_peer_bits =
+                                            __shfl_sync(0xffffffff, vals1_bits, peer_lane);
+                                        if constexpr (G::DIRECT_ROW_WARPBALANCED) {
+                                            const float2 row0_pair_lo = vals0_fl;
+                                            const float2 row0_pair_hi = vals1_fl;
+                                            const float2 row1_pair_lo = vals0_peer_fl;
+                                            const float2 row1_pair_hi = vals1_peer_fl;
+
+                                            float row0_amax = 0.0f;
+                                            row0_amax = fmaxf(row0_amax, fabsf(row0_pair_lo.x));
+                                            row0_amax = fmaxf(row0_amax, fabsf(row0_pair_lo.y));
+                                            row0_amax = fmaxf(row0_amax, fabsf(row0_pair_hi.x));
+                                            row0_amax = fmaxf(row0_amax, fabsf(row0_pair_hi.y));
+                                            row0_amax = fmaxf(row0_amax, __shfl_xor_sync(0xffffffff, row0_amax, 1, 4));
+                                            row0_amax = fmaxf(row0_amax, __shfl_xor_sync(0xffffffff, row0_amax, 2, 4));
+
+                                            float row1_amax = 0.0f;
+                                            row1_amax = fmaxf(row1_amax, fabsf(row1_pair_lo.x));
+                                            row1_amax = fmaxf(row1_amax, fabsf(row1_pair_lo.y));
+                                            row1_amax = fmaxf(row1_amax, fabsf(row1_pair_hi.x));
+                                            row1_amax = fmaxf(row1_amax, fabsf(row1_pair_hi.y));
+                                            row1_amax = fmaxf(row1_amax, __shfl_xor_sync(0xffffffff, row1_amax, 1, 4));
+                                            row1_amax = fmaxf(row1_amax, __shfl_xor_sync(0xffffffff, row1_amax, 2, 4));
+
+                                            const fp4_scale_contract row0_scale_contract =
+                                                make_fp4_scale_contract(row0_amax, g_sg_rcp, g_sg, encode_centric);
+                                            const fp4_scale_contract row1_scale_contract =
+                                                make_fp4_scale_contract(row1_amax, g_sg_rcp, g_sg, encode_centric);
+                                            const unsigned row0_byte_lo = quantize_fp4_pair(
+                                                row0_pair_lo.x, row0_pair_lo.y, row0_scale_contract.quant_rcp_scale);
+                                            const unsigned row0_byte_hi = quantize_fp4_pair(
+                                                row0_pair_hi.x, row0_pair_hi.y, row0_scale_contract.quant_rcp_scale);
+                                            const unsigned row1_byte_lo = quantize_fp4_pair(
+                                                row1_pair_lo.x, row1_pair_lo.y, row1_scale_contract.quant_rcp_scale);
+                                            const unsigned row1_byte_hi = quantize_fp4_pair(
+                                                row1_pair_hi.x, row1_pair_hi.y, row1_scale_contract.quant_rcp_scale);
 
                                             uint64_t packed_row0 = 0;
                                             uint64_t packed_row1 = 0;
@@ -6985,56 +8504,41 @@ __device__ inline void backward_kernel_v3_streaming_3wg_impl(const globals_3wg<C
                                                     store_global_u64(
                                                         &row_fp4_ptr[global_row0 * row_fp4_stride + fp4x2_col_base],
                                                         packed_row0);
-                                                    const float row0_scale = row0_rcp > 0.0f ? (1.0f / row0_rcp) : 0.0f;
-                                                    float stored_scale = row0_scale * g_sg_rcp;
-                                                    if (encode_centric) {
-                                                        stored_scale = fminf(row0_rcp * g_sg, E4M3_MAX);
-                                                    }
-                                                    const __nv_fp8_e4m3 sc = __nv_fp8_e4m3(stored_scale);
                                                     const int depth = global_row0 / 128;
                                                     const int sr = global_row0 % 32;
                                                     const int rr = (global_row0 / 32) % 4;
                                                     const int chunk = depth * row_sc_kgroups + kgroup;
                                                     const int byte_idx = sr * 16 + rr * 4 + col_16_in_64;
-                                                    row_sc_ptr[chunk * 512 + byte_idx] =
-                                                        *reinterpret_cast<const uint8_t*>(&sc);
+                                                    row_sc_ptr[chunk * 512 + byte_idx] = row0_scale_contract.scale_byte;
                                                 }
                                                 if (row1_in_bounds) {
                                                     store_global_u64(
                                                         &row_fp4_ptr[global_row1 * row_fp4_stride + fp4x2_col_base],
                                                         packed_row1);
-                                                    const float row1_scale = row1_rcp > 0.0f ? (1.0f / row1_rcp) : 0.0f;
-                                                    float stored_scale = row1_scale * g_sg_rcp;
-                                                    if (encode_centric) {
-                                                        stored_scale = fminf(row1_rcp * g_sg, E4M3_MAX);
-                                                    }
-                                                    const __nv_fp8_e4m3 sc = __nv_fp8_e4m3(stored_scale);
                                                     const int depth = global_row1 / 128;
                                                     const int sr = global_row1 % 32;
                                                     const int rr = (global_row1 / 32) % 4;
                                                     const int chunk = depth * row_sc_kgroups + kgroup;
                                                     const int byte_idx = sr * 16 + rr * 4 + col_16_in_64;
-                                                    row_sc_ptr[chunk * 512 + byte_idx] =
-                                                        *reinterpret_cast<const uint8_t*>(&sc);
+                                                    row_sc_ptr[chunk * 512 + byte_idx] = row1_scale_contract.scale_byte;
                                                 }
                                             }
                                         } else if (writer_lane) {
-                                                const uint64_t row_bits_lo =
-                                                    static_cast<uint64_t>(vals0_bits) |
-                                                    (static_cast<uint64_t>(vals1_bits) << 32);
-                                                const uint64_t row_bits_hi =
-                                                    static_cast<uint64_t>(vals0_peer_bits) |
-                                                    (static_cast<uint64_t>(vals1_peer_bits) << 32);
                                                 const unsigned writer_mask = __activemask();
                                                 const int row_lane_base = (lane_id / 4) * 4;
-                                                const uint64_t pair_bits_lo_0 = shfl_u64_sync(writer_mask, row_bits_lo, row_lane_base + 0);
-                                                const uint64_t pair_bits_lo_1 = shfl_u64_sync(writer_mask, row_bits_lo, row_lane_base + 1);
-                                                const uint64_t pair_bits_lo_2 = shfl_u64_sync(writer_mask, row_bits_lo, row_lane_base + 2);
-                                                const uint64_t pair_bits_lo_3 = shfl_u64_sync(writer_mask, row_bits_lo, row_lane_base + 3);
-                                                const uint64_t pair_bits_hi_0 = shfl_u64_sync(writer_mask, row_bits_hi, row_lane_base + 0);
-                                                const uint64_t pair_bits_hi_1 = shfl_u64_sync(writer_mask, row_bits_hi, row_lane_base + 1);
-                                                const uint64_t pair_bits_hi_2 = shfl_u64_sync(writer_mask, row_bits_hi, row_lane_base + 2);
-                                                const uint64_t pair_bits_hi_3 = shfl_u64_sync(writer_mask, row_bits_hi, row_lane_base + 3);
+                                                float2 row0_pairs[8];
+                                                float2 row1_pairs[8];
+                                                #pragma unroll
+                                                for (int src_pair = 0; src_pair < 4; ++src_pair) {
+                                                    row0_pairs[src_pair] =
+                                                        shfl_float2_sync(writer_mask, vals0_fl, row_lane_base + src_pair);
+                                                    row0_pairs[src_pair + 4] =
+                                                        shfl_float2_sync(writer_mask, vals1_fl, row_lane_base + src_pair);
+                                                    row1_pairs[src_pair] =
+                                                        shfl_float2_sync(writer_mask, vals0_peer_fl, row_lane_base + src_pair);
+                                                    row1_pairs[src_pair + 4] =
+                                                        shfl_float2_sync(writer_mask, vals1_peer_fl, row_lane_base + src_pair);
+                                                }
 
                                                 if (lane_pair == 0) {
                                                     const int local_row0 =
@@ -7045,16 +8549,16 @@ __device__ inline void backward_kernel_v3_streaming_3wg_impl(const globals_3wg<C
                                                     const bool row1_in_bounds = full_tile_rows || global_row1 < g.M;
 
                                                     if (row0_in_bounds) {
-                                                        quantize_rowrecord_pairbits_to_global(
-                                                            pair_bits_lo_0, pair_bits_lo_1, pair_bits_lo_2, pair_bits_lo_3,
+                                                        quantize_rowrecord_floatpairs_to_global(
+                                                            row0_pairs,
                                                             row_fp4_ptr, row_fp4_stride,
                                                             row_sc_ptr, row_sc_kgroups,
                                                             global_row0, col_start, group16,
                                                             g_sg_rcp, g_sg, encode_centric);
                                                     }
                                                     if (row1_in_bounds) {
-                                                        quantize_rowrecord_pairbits_to_global(
-                                                            pair_bits_hi_0, pair_bits_hi_1, pair_bits_hi_2, pair_bits_hi_3,
+                                                        quantize_rowrecord_floatpairs_to_global(
+                                                            row1_pairs,
                                                             row_fp4_ptr, row_fp4_stride,
                                                             row_sc_ptr, row_sc_kgroups,
                                                             global_row1, col_start, group16,
@@ -7085,6 +8589,14 @@ __device__ inline void backward_kernel_v3_streaming_3wg_impl(const globals_3wg<C
                                     const int lane_pair_src = (col16 & 7) >> 1;
                                     const bool use_hi = col16 >= 8;
                                     const bool use_y = (col16 & 1) != 0;
+                                    const float2 local_lo_0_fl =
+                                        pair_to_float2(D_fl.tiles[i][group16].data[0]);
+                                    const float2 local_hi_0_fl =
+                                        pair_to_float2(D_fl.tiles[i][group16].data[2]);
+                                    const float2 local_lo_1_fl =
+                                        pair_to_float2(D_fl.tiles[i][group16].data[1]);
+                                    const float2 local_hi_1_fl =
+                                        pair_to_float2(D_fl.tiles[i][group16].data[3]);
                                     const uint32_t local_lo_bits_0 =
                                         bf16x2_bits(D_bf.tiles[i][group16].data[0]);
                                     const uint32_t local_hi_bits_0 =
@@ -7094,36 +8606,31 @@ __device__ inline void backward_kernel_v3_streaming_3wg_impl(const globals_3wg<C
                                     const uint32_t local_hi_bits_1 =
                                         bf16x2_bits(D_bf.tiles[i][group16].data[3]);
                                     if constexpr (G::DIRECT_COL_WARPBALANCED) {
+                                        const auto gather_col_pair = [&](float2 pass_lo, float2 pass_hi,
+                                                                         int src_even, int src_odd) {
+                                            const float2 even_pair = use_hi
+                                                ? shfl_float2_sync(0xffffffff, pass_hi, src_even)
+                                                : shfl_float2_sync(0xffffffff, pass_lo, src_even);
+                                            const float2 odd_pair = use_hi
+                                                ? shfl_float2_sync(0xffffffff, pass_hi, src_odd)
+                                                : shfl_float2_sync(0xffffffff, pass_lo, src_odd);
+                                            return use_y ? make_float2(even_pair.y, odd_pair.y)
+                                                         : make_float2(even_pair.x, odd_pair.x);
+                                        };
                                         const bool col_team_active = global_col < g.N;
                                         const bool lower_owner_lane = lane_id < 16;
                                         float partial_amax = 0.0f;
                                         {
-                                            const uint32_t pass_lo_bits = local_lo_bits_0;
-                                            const uint32_t pass_hi_bits = local_hi_bits_0;
                                             float lower_partial_amax = 0.0f;
                                             #pragma unroll
                                             for (int local_pair = 0; local_pair < 4; ++local_pair) {
                                                 const int src_even = local_pair * 8 + lane_pair_src;
                                                 const int src_odd = src_even + 4;
-                                                const uint32_t even_lo_bits =
-                                                    __shfl_sync(0xffffffff, pass_lo_bits, src_even);
-                                                const uint32_t odd_lo_bits =
-                                                    __shfl_sync(0xffffffff, pass_lo_bits, src_odd);
-                                                const uint32_t even_hi_bits =
-                                                    __shfl_sync(0xffffffff, pass_hi_bits, src_even);
-                                                const uint32_t odd_hi_bits =
-                                                    __shfl_sync(0xffffffff, pass_hi_bits, src_odd);
-                                                const uint32_t even_bits = use_hi ? even_hi_bits : even_lo_bits;
-                                                const uint32_t odd_bits = use_hi ? odd_hi_bits : odd_lo_bits;
-                                                const uint32_t pair_bits = use_y
-                                                    ? ((even_bits >> 16) | (odd_bits & 0xffff0000u))
-                                                    : ((even_bits & 0x0000ffffu) | (odd_bits << 16));
-                                                const bf16_2 bf_pair = bf16x2_from_bits(pair_bits);
+                                                const float2 pair_vals =
+                                                    gather_col_pair(local_lo_0_fl, local_hi_0_fl, src_even, src_odd);
                                                 const int global_row = global_row_base + local_pair * 2;
-                                                const float v0 =
-                                                    (global_row < g.M) ? __bfloat162float(bf_pair.x) : 0.0f;
-                                                const float v1 =
-                                                    (global_row + 1 < g.M) ? __bfloat162float(bf_pair.y) : 0.0f;
+                                                const float v0 = (global_row < g.M) ? pair_vals.x : 0.0f;
+                                                const float v1 = (global_row + 1 < g.M) ? pair_vals.y : 0.0f;
                                                 if (col_team_active && lower_owner_lane) {
                                                     lower_partial_amax = fmaxf(lower_partial_amax, fabsf(v0));
                                                     lower_partial_amax = fmaxf(lower_partial_amax, fabsf(v1));
@@ -7134,32 +8641,16 @@ __device__ inline void backward_kernel_v3_streaming_3wg_impl(const globals_3wg<C
                                             }
                                         }
                                         {
-                                            const uint32_t pass_lo_bits = local_lo_bits_1;
-                                            const uint32_t pass_hi_bits = local_hi_bits_1;
                                             float upper_partial_amax = 0.0f;
                                             #pragma unroll
                                             for (int local_pair = 0; local_pair < 4; ++local_pair) {
                                                 const int src_even = local_pair * 8 + lane_pair_src;
                                                 const int src_odd = src_even + 4;
-                                                const uint32_t even_lo_bits =
-                                                    __shfl_sync(0xffffffff, pass_lo_bits, src_even);
-                                                const uint32_t odd_lo_bits =
-                                                    __shfl_sync(0xffffffff, pass_lo_bits, src_odd);
-                                                const uint32_t even_hi_bits =
-                                                    __shfl_sync(0xffffffff, pass_hi_bits, src_even);
-                                                const uint32_t odd_hi_bits =
-                                                    __shfl_sync(0xffffffff, pass_hi_bits, src_odd);
-                                                const uint32_t even_bits = use_hi ? even_hi_bits : even_lo_bits;
-                                                const uint32_t odd_bits = use_hi ? odd_hi_bits : odd_lo_bits;
-                                                const uint32_t pair_bits = use_y
-                                                    ? ((even_bits >> 16) | (odd_bits & 0xffff0000u))
-                                                    : ((even_bits & 0x0000ffffu) | (odd_bits << 16));
-                                                const bf16_2 bf_pair = bf16x2_from_bits(pair_bits);
+                                                const float2 pair_vals =
+                                                    gather_col_pair(local_lo_1_fl, local_hi_1_fl, src_even, src_odd);
                                                 const int global_row = global_row_base + (4 + local_pair) * 2;
-                                                const float v0 =
-                                                    (global_row < g.M) ? __bfloat162float(bf_pair.x) : 0.0f;
-                                                const float v1 =
-                                                    (global_row + 1 < g.M) ? __bfloat162float(bf_pair.y) : 0.0f;
+                                                const float v0 = (global_row < g.M) ? pair_vals.x : 0.0f;
+                                                const float v1 = (global_row + 1 < g.M) ? pair_vals.y : 0.0f;
                                                 if (col_team_active && !lower_owner_lane) {
                                                     upper_partial_amax = fmaxf(upper_partial_amax, fabsf(v0));
                                                     upper_partial_amax = fmaxf(upper_partial_amax, fabsf(v1));
@@ -7172,39 +8663,23 @@ __device__ inline void backward_kernel_v3_streaming_3wg_impl(const globals_3wg<C
 
                                         float col_amax =
                                             fmaxf(partial_amax, __shfl_xor_sync(0xffffffff, partial_amax, 16));
-                                        const float col_scale = col_amax * (1.0f / FP4_MAX);
-                                        const float col_rcp = (col_amax > 0.0f) ? (FP4_MAX / col_amax) : 0.0f;
+                                        const fp4_scale_contract scale_contract =
+                                            make_fp4_scale_contract(col_amax, g_sg_rcp, g_sg, encode_centric);
                                         uint32_t local_packed_fp4 = 0;
                                         {
-                                            const uint32_t pass_lo_bits = local_lo_bits_0;
-                                            const uint32_t pass_hi_bits = local_hi_bits_0;
                                             uint32_t lower_packed_fp4 = 0;
                                             #pragma unroll
                                             for (int local_pair = 0; local_pair < 4; ++local_pair) {
                                                 const int src_even = local_pair * 8 + lane_pair_src;
                                                 const int src_odd = src_even + 4;
-                                                const uint32_t even_lo_bits =
-                                                    __shfl_sync(0xffffffff, pass_lo_bits, src_even);
-                                                const uint32_t odd_lo_bits =
-                                                    __shfl_sync(0xffffffff, pass_lo_bits, src_odd);
-                                                const uint32_t even_hi_bits =
-                                                    __shfl_sync(0xffffffff, pass_hi_bits, src_even);
-                                                const uint32_t odd_hi_bits =
-                                                    __shfl_sync(0xffffffff, pass_hi_bits, src_odd);
-                                                const uint32_t even_bits = use_hi ? even_hi_bits : even_lo_bits;
-                                                const uint32_t odd_bits = use_hi ? odd_hi_bits : odd_lo_bits;
-                                                const uint32_t pair_bits = use_y
-                                                    ? ((even_bits >> 16) | (odd_bits & 0xffff0000u))
-                                                    : ((even_bits & 0x0000ffffu) | (odd_bits << 16));
-                                                const bf16_2 bf_pair = bf16x2_from_bits(pair_bits);
+                                                const float2 pair_vals =
+                                                    gather_col_pair(local_lo_0_fl, local_hi_0_fl, src_even, src_odd);
                                                 const int global_row = global_row_base + local_pair * 2;
-                                                const float v0 =
-                                                    (global_row < g.M) ? __bfloat162float(bf_pair.x) : 0.0f;
-                                                const float v1 =
-                                                    (global_row + 1 < g.M) ? __bfloat162float(bf_pair.y) : 0.0f;
+                                                const float v0 = (global_row < g.M) ? pair_vals.x : 0.0f;
+                                                const float v1 = (global_row + 1 < g.M) ? pair_vals.y : 0.0f;
                                                 if (col_team_active && lower_owner_lane) {
                                                     lower_packed_fp4 |= static_cast<uint32_t>(
-                                                                            quantize_fp4_pair(v0, v1, col_rcp))
+                                                                            quantize_fp4_pair(v0, v1, scale_contract.quant_rcp_scale))
                                                                         << (local_pair * 8);
                                                 }
                                             }
@@ -7213,35 +8688,19 @@ __device__ inline void backward_kernel_v3_streaming_3wg_impl(const globals_3wg<C
                                             }
                                         }
                                         {
-                                            const uint32_t pass_lo_bits = local_lo_bits_1;
-                                            const uint32_t pass_hi_bits = local_hi_bits_1;
                                             uint32_t upper_packed_fp4_local = 0;
                                             #pragma unroll
                                             for (int local_pair = 0; local_pair < 4; ++local_pair) {
                                                 const int src_even = local_pair * 8 + lane_pair_src;
                                                 const int src_odd = src_even + 4;
-                                                const uint32_t even_lo_bits =
-                                                    __shfl_sync(0xffffffff, pass_lo_bits, src_even);
-                                                const uint32_t odd_lo_bits =
-                                                    __shfl_sync(0xffffffff, pass_lo_bits, src_odd);
-                                                const uint32_t even_hi_bits =
-                                                    __shfl_sync(0xffffffff, pass_hi_bits, src_even);
-                                                const uint32_t odd_hi_bits =
-                                                    __shfl_sync(0xffffffff, pass_hi_bits, src_odd);
-                                                const uint32_t even_bits = use_hi ? even_hi_bits : even_lo_bits;
-                                                const uint32_t odd_bits = use_hi ? odd_hi_bits : odd_lo_bits;
-                                                const uint32_t pair_bits = use_y
-                                                    ? ((even_bits >> 16) | (odd_bits & 0xffff0000u))
-                                                    : ((even_bits & 0x0000ffffu) | (odd_bits << 16));
-                                                const bf16_2 bf_pair = bf16x2_from_bits(pair_bits);
+                                                const float2 pair_vals =
+                                                    gather_col_pair(local_lo_1_fl, local_hi_1_fl, src_even, src_odd);
                                                 const int global_row = global_row_base + (4 + local_pair) * 2;
-                                                const float v0 =
-                                                    (global_row < g.M) ? __bfloat162float(bf_pair.x) : 0.0f;
-                                                const float v1 =
-                                                    (global_row + 1 < g.M) ? __bfloat162float(bf_pair.y) : 0.0f;
+                                                const float v0 = (global_row < g.M) ? pair_vals.x : 0.0f;
+                                                const float v1 = (global_row + 1 < g.M) ? pair_vals.y : 0.0f;
                                                 if (col_team_active && !lower_owner_lane) {
                                                     upper_packed_fp4_local |= static_cast<uint32_t>(
-                                                                                    quantize_fp4_pair(v0, v1, col_rcp))
+                                                                                    quantize_fp4_pair(v0, v1, scale_contract.quant_rcp_scale))
                                                                                 << (local_pair * 8);
                                                 }
                                             }
@@ -7255,15 +8714,13 @@ __device__ inline void backward_kernel_v3_streaming_3wg_impl(const globals_3wg<C
                                             const uint64_t packed_fp4 =
                                                 static_cast<uint64_t>(local_packed_fp4) |
                                                 (static_cast<uint64_t>(upper_packed_fp4) << 32);
-                                            store_global_u64(
-                                                col_fp4_ptr + global_col * col_fp4_stride + global_row_pair_base,
+                                            maybe_store_global_col_u64<G>(
+                                                col_fp4_ptr,
+                                                col_fp4_stride,
+                                                global_col,
+                                                global_row_pair_base,
                                                 packed_fp4);
 
-                                            float stored_scale = col_scale * g_sg_rcp;
-                                            if (encode_centric) {
-                                                stored_scale = fminf(col_rcp * g_sg, E4M3_MAX);
-                                            }
-                                            const __nv_fp8_e4m3 csc = __nv_fp8_e4m3(stored_scale);
                                             const int depth = global_col / 128;
                                             const int sr = global_col % 32;
                                             const int rr = (global_col / 32) % 4;
@@ -7271,8 +8728,11 @@ __device__ inline void backward_kernel_v3_streaming_3wg_impl(const globals_3wg<C
                                             const int m_16_in_64 = (global_row_base / 16) % 4;
                                             const int chunk = depth * col_sc_kgroups + m_kgroup;
                                             const int byte_idx = sr * 16 + rr * 4 + m_16_in_64;
-                                            col_sc_ptr[chunk * 512 + byte_idx] =
-                                                *reinterpret_cast<const uint8_t*>(&csc);
+                                            maybe_store_global_col_scale<G>(
+                                                col_sc_ptr,
+                                                chunk,
+                                                byte_idx,
+                                                scale_contract.scale_byte);
                                         }
                                     } else {
                                         const bool col_owner = (lane_id < 16) && (global_col < g.N);
@@ -7282,65 +8742,66 @@ __device__ inline void backward_kernel_v3_streaming_3wg_impl(const globals_3wg<C
                                         for (int pair = 0; pair < 8; ++pair) {
                                             const int row_half = pair >> 2;
                                             const int row_pair = pair & 3;
-                                            const uint32_t local_lo_bits = row_half == 0 ? local_lo_bits_0 : local_lo_bits_1;
-                                            const uint32_t local_hi_bits = row_half == 0 ? local_hi_bits_0 : local_hi_bits_1;
+                                            const float2 local_lo_fl = row_half == 0 ? local_lo_0_fl : local_lo_1_fl;
+                                            const float2 local_hi_fl = row_half == 0 ? local_hi_0_fl : local_hi_1_fl;
                                             const int src_even = row_pair * 8 + lane_pair_src;
                                             const int src_odd = src_even + 4;
-                                            const uint32_t even_lo_bits = __shfl_sync(0xffffffff, local_lo_bits, src_even);
-                                            const uint32_t odd_lo_bits = __shfl_sync(0xffffffff, local_lo_bits, src_odd);
-                                            const uint32_t even_hi_bits = __shfl_sync(0xffffffff, local_hi_bits, src_even);
-                                            const uint32_t odd_hi_bits = __shfl_sync(0xffffffff, local_hi_bits, src_odd);
                                             if (col_owner) {
-                                                const uint32_t even_bits = use_hi ? even_hi_bits : even_lo_bits;
-                                                const uint32_t odd_bits = use_hi ? odd_hi_bits : odd_lo_bits;
-                                                const uint32_t pair_bits = use_y
-                                                    ? ((even_bits >> 16) | (odd_bits & 0xffff0000u))
-                                                    : ((even_bits & 0x0000ffffu) | (odd_bits << 16));
-                                                const bf16_2 bf_pair = bf16x2_from_bits(pair_bits);
+                                                const float2 even_pair = use_hi
+                                                    ? shfl_float2_sync(0xffffffff, local_hi_fl, src_even)
+                                                    : shfl_float2_sync(0xffffffff, local_lo_fl, src_even);
+                                                const float2 odd_pair = use_hi
+                                                    ? shfl_float2_sync(0xffffffff, local_hi_fl, src_odd)
+                                                    : shfl_float2_sync(0xffffffff, local_lo_fl, src_odd);
                                                 const int global_row = global_row_base + pair * 2;
-                                                const float v0 = (global_row < g.M) ? __bfloat162float(bf_pair.x) : 0.0f;
-                                                const float v1 = (global_row + 1 < g.M) ? __bfloat162float(bf_pair.y) : 0.0f;
+                                                const float v0 = (global_row < g.M)
+                                                    ? (use_y ? even_pair.y : even_pair.x)
+                                                    : 0.0f;
+                                                const float v1 = (global_row + 1 < g.M)
+                                                    ? (use_y ? odd_pair.y : odd_pair.x)
+                                                    : 0.0f;
                                                 col_amax = fmaxf(col_amax, fabsf(v0));
                                                 col_amax = fmaxf(col_amax, fabsf(v1));
                                             }
                                         }
 
-                                        const float col_scale = col_amax * (1.0f / FP4_MAX);
-                                        const float col_rcp = (col_amax > 0.0f) ? (FP4_MAX / col_amax) : 0.0f;
+                                        const fp4_scale_contract scale_contract =
+                                            make_fp4_scale_contract(col_amax, g_sg_rcp, g_sg, encode_centric);
                                         #pragma unroll
                                         for (int pair = 0; pair < 8; ++pair) {
                                             const int row_half = pair >> 2;
                                             const int row_pair = pair & 3;
-                                            const uint32_t local_lo_bits = row_half == 0 ? local_lo_bits_0 : local_lo_bits_1;
-                                            const uint32_t local_hi_bits = row_half == 0 ? local_hi_bits_0 : local_hi_bits_1;
+                                            const float2 local_lo_fl = row_half == 0 ? local_lo_0_fl : local_lo_1_fl;
+                                            const float2 local_hi_fl = row_half == 0 ? local_hi_0_fl : local_hi_1_fl;
                                             const int src_even = row_pair * 8 + lane_pair_src;
                                             const int src_odd = src_even + 4;
-                                            const uint32_t even_lo_bits = __shfl_sync(0xffffffff, local_lo_bits, src_even);
-                                            const uint32_t odd_lo_bits = __shfl_sync(0xffffffff, local_lo_bits, src_odd);
-                                            const uint32_t even_hi_bits = __shfl_sync(0xffffffff, local_hi_bits, src_even);
-                                            const uint32_t odd_hi_bits = __shfl_sync(0xffffffff, local_hi_bits, src_odd);
                                             if (col_owner) {
-                                                const uint32_t even_bits = use_hi ? even_hi_bits : even_lo_bits;
-                                                const uint32_t odd_bits = use_hi ? odd_hi_bits : odd_lo_bits;
-                                                const uint32_t pair_bits = use_y
-                                                    ? ((even_bits >> 16) | (odd_bits & 0xffff0000u))
-                                                    : ((even_bits & 0x0000ffffu) | (odd_bits << 16));
-                                                const bf16_2 bf_pair = bf16x2_from_bits(pair_bits);
+                                                const float2 even_pair = use_hi
+                                                    ? shfl_float2_sync(0xffffffff, local_hi_fl, src_even)
+                                                    : shfl_float2_sync(0xffffffff, local_lo_fl, src_even);
+                                                const float2 odd_pair = use_hi
+                                                    ? shfl_float2_sync(0xffffffff, local_hi_fl, src_odd)
+                                                    : shfl_float2_sync(0xffffffff, local_lo_fl, src_odd);
                                                 const int global_row = global_row_base + pair * 2;
-                                                const float v0 = (global_row < g.M) ? __bfloat162float(bf_pair.x) : 0.0f;
-                                                const float v1 = (global_row + 1 < g.M) ? __bfloat162float(bf_pair.y) : 0.0f;
-                                                packed_fp4 |= static_cast<uint64_t>(quantize_fp4_pair(v0, v1, col_rcp))
+                                                const float v0 = (global_row < g.M)
+                                                    ? (use_y ? even_pair.y : even_pair.x)
+                                                    : 0.0f;
+                                                const float v1 = (global_row + 1 < g.M)
+                                                    ? (use_y ? odd_pair.y : odd_pair.x)
+                                                    : 0.0f;
+                                                packed_fp4 |= static_cast<uint64_t>(
+                                                                  quantize_fp4_pair(v0, v1, scale_contract.quant_rcp_scale))
                                                               << (pair * 8);
                                             }
                                         }
                                         if (col_owner) {
-                                            store_global_u64(col_fp4_ptr + global_col * col_fp4_stride + global_row_pair_base, packed_fp4);
+                                            maybe_store_global_col_u64<G>(
+                                                col_fp4_ptr,
+                                                col_fp4_stride,
+                                                global_col,
+                                                global_row_pair_base,
+                                                packed_fp4);
 
-                                            float stored_scale = col_scale * g_sg_rcp;
-                                            if (encode_centric) {
-                                                stored_scale = fminf(col_rcp * g_sg, E4M3_MAX);
-                                            }
-                                            const __nv_fp8_e4m3 csc = __nv_fp8_e4m3(stored_scale);
                                             const int depth = global_col / 128;
                                             const int sr = global_col % 32;
                                             const int rr = (global_col / 32) % 4;
@@ -7348,8 +8809,11 @@ __device__ inline void backward_kernel_v3_streaming_3wg_impl(const globals_3wg<C
                                             const int m_16_in_64 = (global_row_base / 16) % 4;
                                             const int chunk = depth * col_sc_kgroups + m_kgroup;
                                             const int byte_idx = sr * 16 + rr * 4 + m_16_in_64;
-                                            col_sc_ptr[chunk * 512 + byte_idx] =
-                                                *reinterpret_cast<const uint8_t*>(&csc);
+                                            maybe_store_global_col_scale<G>(
+                                                col_sc_ptr,
+                                                chunk,
+                                                byte_idx,
+                                                scale_contract.scale_byte);
                                         }
                                     }
                                 }
@@ -7357,6 +8821,7 @@ __device__ inline void backward_kernel_v3_streaming_3wg_impl(const globals_3wg<C
                         }
 
                         warpgroup::sync(1);
+                        }
                     } else if constexpr (G::USE_COL_PAIR_STAGE &&
                                          (DO_COL || C::CONSUMER_DO_ROW || G::ROW_QUANT_FROM_COL_PAIR_STAGE || C::ROW_QUANT_FROM_REGS)) {
                         static_assert(
@@ -7369,6 +8834,18 @@ __device__ inline void backward_kernel_v3_streaming_3wg_impl(const globals_3wg<C
                         const int lane_row = lane_id / 4;
                         const int lane_pair = lane_id % 4;
                         const int local_warp_row_base = warpgroup::warpid() * (C::Mb / 8);
+                        if constexpr (G::SKIP_GLOBAL_COL_MATERIALIZATION) {
+                            if constexpr (ROWONLY_COMBO_DC_DEBUG_CUT == 103) {
+                                if (block_idx > cluster_id && epi == 0) {
+                                    if (warpgroup::warpid() == 0 && warp::laneid() == 0) {
+                                        printf(
+                                            "rowonly combo dc cut 103 site=pre-producer-quant cta=%d wg=%d block=%d row=%d col=%d epi=%d\n",
+                                            cta_id, warpgroup_id, block_idx, row_block_idx, col_block_idx, epi);
+                                    }
+                                    return;
+                                }
+                            }
+                        }
 
                         if constexpr (C::ROW_QUANT_FROM_REGS && C::EARLY_COL_READY) {
                             if constexpr (DO_COL) {
@@ -7823,6 +9300,18 @@ __device__ inline void backward_kernel_v3_streaming_3wg_impl(const globals_3wg<C
                             }
                         } else {
                             if constexpr (DO_COL) {
+                                if constexpr (G::SKIP_GLOBAL_COL_MATERIALIZATION) {
+                                    if constexpr (ROWONLY_COMBO_DC_DEBUG_CUT == 101) {
+                                        if (block_idx > cluster_id && epi == 0) {
+                                            if (warpgroup::warpid() == 0 && warp::laneid() == 0) {
+                                                printf(
+                                                    "rowonly combo dc cut 101 site=E-enter cta=%d wg=%d block=%d row=%d col=%d epi=%d\n",
+                                                    cta_id, warpgroup_id, block_idx, row_block_idx, col_block_idx, epi);
+                                            }
+                                            return;
+                                        }
+                                    }
+                                }
                                 #pragma unroll
                                 for (int i = 0; i < subtile_rt_bf::height; ++i) {
                                     const int row16_block = (local_warp_row_base + i * 16) / 16;
@@ -7927,6 +9416,18 @@ __device__ inline void backward_kernel_v3_streaming_3wg_impl(const globals_3wg<C
                                         }
                                     }
                                 }
+                                if constexpr (G::SKIP_GLOBAL_COL_MATERIALIZATION) {
+                                    if constexpr (ROWONLY_COMBO_DC_DEBUG_CUT == 102) {
+                                        if (block_idx > cluster_id && epi == 0) {
+                                            if (warpgroup::warpid() == 0 && warp::laneid() == 0) {
+                                                printf(
+                                                    "rowonly combo dc cut 102 site=F-after-colpair cta=%d wg=%d block=%d row=%d col=%d epi=%d\n",
+                                                    cta_id, warpgroup_id, block_idx, row_block_idx, col_block_idx, epi);
+                                            }
+                                            return;
+                                        }
+                                    }
+                                }
                                 if constexpr (C::EARLY_COL_READY &&
                                               G::COL_READY_PER_ROW16 &&
                                               G::ROW_QUANT_IMMEDIATE_PER_ROW16 &&
@@ -8013,6 +9514,18 @@ __device__ inline void backward_kernel_v3_streaming_3wg_impl(const globals_3wg<C
                                 } else if constexpr (C::EARLY_COL_READY &&
                                               G::COL_READY_PER_ROW16 &&
                                               (!G::ROW_QUANT_IMMEDIATE_PER_ROW16 || !DO_ROW)) {
+                                    if constexpr (G::SKIP_GLOBAL_COL_MATERIALIZATION) {
+                                        if constexpr (ROWONLY_COMBO_DC_DEBUG_CUT == 100) {
+                                            if (block_idx > cluster_id) {
+                                                if (warpgroup::warpid() == 0 && warp::laneid() == 0) {
+                                                    printf(
+                                                        "rowonly combo dc cut 100 cta=%d wg=%d block=%d row=%d col=%d epi=%d\n",
+                                                        cta_id, warpgroup_id, block_idx, row_block_idx, col_block_idx, epi);
+                                                }
+                                                return;
+                                            }
+                                        }
+                                    }
                                     __syncwarp();
                                     __threadfence_block();
                                     asm volatile("fence.proxy.async.shared::cta;\n" ::: "memory");
@@ -8020,56 +9533,113 @@ __device__ inline void backward_kernel_v3_streaming_3wg_impl(const globals_3wg<C
                                         #pragma unroll
                                         for (int local_i = 0; local_i < subtile_rt_bf::height; ++local_i) {
                                             const int published_row16_block = (local_warp_row_base + local_i * 16) / 16;
+                                            if constexpr (G::SKIP_GLOBAL_COL_MATERIALIZATION) {
+                                                if constexpr (ROWONLY_COMBO_DC_DEBUG_CUT == 98) {
+                                                    if (block_idx > cluster_id && epi == 0 && published_row16_block == 0) {
+                                                        printf(
+                                                            "rowonly combo dc cut 98 site=B cta=%d wg=%d block=%d row=%d col=%d epi=%d row16=%d\n",
+                                                            cta_id, warpgroup_id, block_idx, row_block_idx, col_block_idx, epi, published_row16_block);
+                                                        return;
+                                                    }
+                                                }
+                                            }
                                             arrive(slice_col_ready_row16[bf_stage][published_row16_block]);
                                         }
                                     }
                                 }
                             }
 
-                            if constexpr (G::ROW_QUANT_FROM_COL_PAIR_STAGE && DO_ROW && !DO_COL) {
-                                #pragma unroll
-                                for (int i = 0; i < subtile_rt_bf::height; ++i) {
-                                    const int row16_block = (local_warp_row_base + i * 16) / 16;
+                            if constexpr ((G::ROW_QUANT_FROM_COL_PAIR_STAGE && DO_ROW && !DO_COL) ||
+                                          (G::SKIP_GLOBAL_COL_MATERIALIZATION && G::USE_COL_PAIR_STAGE &&
+                                           DO_ROW && !DO_COL)) {
+                                auto produce_col_pair_stage_rowonly = [&]() {
                                     #pragma unroll
-                                    for (int row_half = 0; row_half < 2; ++row_half) {
-                                        const int pair_slot = row_half * 4 + lane_row / 2;
+                                    for (int i = 0; i < subtile_rt_bf::height; ++i) {
+                                        const int row16_block = (local_warp_row_base + i * 16) / 16;
                                         #pragma unroll
-                                        for (int group16 = 0; group16 < SUBTILE_COLS / 16; ++group16) {
-                                            const int peer_lane = ((lane_row ^ 1) << 2) | lane_pair;
-                                            const bool writer_lane = (lane_row & 1) == 0;
-                                            const int col_base = group16 * 16 + lane_pair * 2;
-                                            const int col_pair_base = col_base / 2;
-                                            const bf16_2 vals0 =
-                                                D_bf.tiles[i][group16].data[row_half];
-                                            const bf16_2 vals1 =
-                                                D_bf.tiles[i][group16].data[row_half + 2];
-                                            const uint32_t vals0_bits = bf16x2_bits(vals0);
-                                            const uint32_t vals0_peer_bits =
-                                                __shfl_sync(0xffffffff, vals0_bits, peer_lane);
-                                            if (writer_lane) {
-                                                store_col_pair_stage_pair<G>(
-                                                    col_pair_stage,
-                                                    bf_stage,
-                                                    row16_block,
-                                                    col_pair_base + 0,
-                                                    pair_slot,
-                                                    (vals0_bits & 0x0000ffffu) | (vals0_peer_bits << 16),
-                                                    (vals0_bits >> 16) | (vals0_peer_bits & 0xffff0000u));
-                                            }
-                                            const uint32_t vals1_bits = bf16x2_bits(vals1);
-                                            const uint32_t vals1_peer_bits =
-                                                __shfl_sync(0xffffffff, vals1_bits, peer_lane);
-                                            if (writer_lane) {
-                                                store_col_pair_stage_pair<G>(
-                                                    col_pair_stage,
-                                                    bf_stage,
-                                                    row16_block,
-                                                    col_pair_base + 4,
-                                                    pair_slot,
-                                                    (vals1_bits & 0x0000ffffu) | (vals1_peer_bits << 16),
-                                                    (vals1_bits >> 16) | (vals1_peer_bits & 0xffff0000u));
+                                        for (int row_half = 0; row_half < 2; ++row_half) {
+                                            const int pair_slot = row_half * 4 + lane_row / 2;
+                                            #pragma unroll
+                                            for (int group16 = 0; group16 < SUBTILE_COLS / 16; ++group16) {
+                                                const int peer_lane = ((lane_row ^ 1) << 2) | lane_pair;
+                                                const bool writer_lane = (lane_row & 1) == 0;
+                                                const int col_base = group16 * 16 + lane_pair * 2;
+                                                const int col_pair_base = col_base / 2;
+                                                const bf16_2 vals0 =
+                                                    D_bf.tiles[i][group16].data[row_half];
+                                                const bf16_2 vals1 =
+                                                    D_bf.tiles[i][group16].data[row_half + 2];
+                                                const uint32_t vals0_bits = bf16x2_bits(vals0);
+                                                const uint32_t vals0_peer_bits =
+                                                    __shfl_sync(0xffffffff, vals0_bits, peer_lane);
+                                                if (writer_lane) {
+                                                    store_col_pair_stage_pair<G>(
+                                                        col_pair_stage,
+                                                        bf_stage,
+                                                        row16_block,
+                                                        col_pair_base + 0,
+                                                        pair_slot,
+                                                        (vals0_bits & 0x0000ffffu) | (vals0_peer_bits << 16),
+                                                        (vals0_bits >> 16) | (vals0_peer_bits & 0xffff0000u));
+                                                }
+                                                const uint32_t vals1_bits = bf16x2_bits(vals1);
+                                                const uint32_t vals1_peer_bits =
+                                                    __shfl_sync(0xffffffff, vals1_bits, peer_lane);
+                                                if (writer_lane) {
+                                                    store_col_pair_stage_pair<G>(
+                                                        col_pair_stage,
+                                                        bf_stage,
+                                                        row16_block,
+                                                        col_pair_base + 4,
+                                                        pair_slot,
+                                                        (vals1_bits & 0x0000ffffu) | (vals1_peer_bits << 16),
+                                                        (vals1_bits >> 16) | (vals1_peer_bits & 0xffff0000u));
+                                                }
                                             }
                                         }
+                                    }
+                                };
+                                if constexpr (G::ROW_QUANT_FROM_COL_PAIR_STAGE) {
+                                    produce_col_pair_stage_rowonly();
+                                } else if (combo_use_dc) {
+                                    produce_col_pair_stage_rowonly();
+                                }
+                            }
+
+                            if constexpr (C::EARLY_COL_READY &&
+                                          G::COL_READY_PER_ROW16 &&
+                                          DO_COL &&
+                                          !C::ROW_QUANT_FROM_REGS) {
+                                if constexpr (G::SKIP_GLOBAL_COL_MATERIALIZATION) {
+                                    if constexpr (ROWONLY_COMBO_DC_DEBUG_CUT == 100) {
+                                        if (block_idx > cluster_id) {
+                                            if (warpgroup::warpid() == 0 && warp::laneid() == 0) {
+                                                printf(
+                                                    "rowonly combo dc cut 100 cta=%d wg=%d block=%d row=%d col=%d epi=%d site=D\n",
+                                                    cta_id, warpgroup_id, block_idx, row_block_idx, col_block_idx, epi);
+                                            }
+                                            return;
+                                        }
+                                    }
+                                }
+                                __syncwarp();
+                                __threadfence_block();
+                                asm volatile("fence.proxy.async.shared::cta;\n" ::: "memory");
+                                if (warp::laneid() == 0) {
+                                    #pragma unroll
+                                    for (int local_i = 0; local_i < subtile_rt_bf::height; ++local_i) {
+                                        const int published_row16_block = (local_warp_row_base + local_i * 16) / 16;
+                                        if constexpr (G::SKIP_GLOBAL_COL_MATERIALIZATION) {
+                                            if constexpr (ROWONLY_COMBO_DC_DEBUG_CUT == 98) {
+                                                if (block_idx > cluster_id && epi == 0 && published_row16_block == 0) {
+                                                    printf(
+                                                        "rowonly combo dc cut 98 site=D cta=%d wg=%d block=%d row=%d col=%d epi=%d row16=%d\n",
+                                                        cta_id, warpgroup_id, block_idx, row_block_idx, col_block_idx, epi, published_row16_block);
+                                                    return;
+                                                }
+                                            }
+                                        }
+                                        arrive(slice_col_ready_row16[bf_stage][published_row16_block]);
                                     }
                                 }
                             }
@@ -8142,9 +9712,51 @@ __device__ inline void backward_kernel_v3_streaming_3wg_impl(const globals_3wg<C
                                 }
                             }
 
+                            if constexpr (G::SKIP_GLOBAL_COL_MATERIALIZATION &&
+                                          C::EARLY_COL_READY &&
+                                          G::COL_READY_PER_ROW16 &&
+                                          DO_ROW && !DO_COL &&
+                                          G::USE_COL_PAIR_STAGE) {
+                                if (combo_use_dc) {
+                                    if constexpr (ROWONLY_COMBO_DC_DEBUG_CUT == 100) {
+                                        if (block_idx > cluster_id) {
+                                            if (warpgroup::warpid() == 0 && warp::laneid() == 0) {
+                                                printf(
+                                                    "rowonly combo dc cut 100 cta=%d wg=%d block=%d row=%d col=%d epi=%d site=rowonly-do-row\n",
+                                                    cta_id, warpgroup_id, block_idx, row_block_idx, col_block_idx, epi);
+                                            }
+                                            return;
+                                        }
+                                    }
+                                    __syncwarp();
+                                    __threadfence_block();
+                                    asm volatile("fence.proxy.async.shared::cta;\n" ::: "memory");
+                                    if (warp::laneid() == 0) {
+                                        #pragma unroll
+                                        for (int local_i = 0; local_i < subtile_rt_bf::height; ++local_i) {
+                                            const int published_row16_block = (local_warp_row_base + local_i * 16) / 16;
+                                            if constexpr (ROWONLY_COMBO_DC_DEBUG_CUT == 98) {
+                                                if (block_idx > cluster_id && epi == 0 && published_row16_block == 0) {
+                                                    printf(
+                                                        "rowonly combo dc cut 98 site=C cta=%d wg=%d block=%d row=%d col=%d epi=%d row16=%d\n",
+                                                        cta_id, warpgroup_id, block_idx, row_block_idx, col_block_idx, epi, published_row16_block);
+                                                    return;
+                                                }
+                                            }
+                                            arrive(slice_col_ready_row16[bf_stage][published_row16_block]);
+                                        }
+                                    }
+                                }
+                            }
+
                             if constexpr (DO_COL && C::EARLY_COL_READY) {
                                 if constexpr (G::COL_READY_PER_ROW16) {
-                                    update_phasebit<1>(slice_col_recycle_phasebits, bf_stage);
+                                    // Split fused col quantizer mode advances the recycle phase once per epi
+                                    // in the common publish block below. Doing it here as well causes the
+                                    // first stage-reuse wait to look for the second-next recycle phase.
+                                    if constexpr (!G::FUSED_COL_IN_QUANTIZER) {
+                                        update_phasebit<1>(slice_col_recycle_phasebits, bf_stage);
+                                    }
                                 } else {
                                     warpgroup::sync(CONSUMER_WG_SYNC_ID);
                                     __threadfence_block();
@@ -8153,7 +9765,9 @@ __device__ inline void backward_kernel_v3_streaming_3wg_impl(const globals_3wg<C
                                     if (warpgroup::warpid() == 0 && warp::laneid() == 0) {
                                         arrive(slice_col_ready[bf_stage]);
                                     }
-                                    update_phasebit<1>(slice_col_recycle_phasebits, bf_stage);
+                                    if constexpr (!G::FUSED_COL_IN_QUANTIZER) {
+                                        update_phasebit<1>(slice_col_recycle_phasebits, bf_stage);
+                                    }
                                 }
                             }
 
@@ -8293,6 +9907,18 @@ __device__ inline void backward_kernel_v3_streaming_3wg_impl(const globals_3wg<C
                                         }
                                     }
                                 } else {
+                                    if constexpr (G::SKIP_GLOBAL_COL_MATERIALIZATION) {
+                                        if constexpr (ROWONLY_COMBO_DC_DEBUG_CUT == 105) {
+                                            if (block_idx > cluster_id && epi == 0) {
+                                                if (warpgroup::warpid() == 0 && warp::laneid() == 0) {
+                                                    printf(
+                                                        "rowonly combo dc cut 105 site=mid-producer-bf16-stage cta=%d wg=%d block=%d row=%d col=%d epi=%d\n",
+                                                        cta_id, warpgroup_id, block_idx, row_block_idx, col_block_idx, epi);
+                                                }
+                                                return;
+                                            }
+                                        }
+                                    }
                                     if constexpr (G::USE_ROW_PAIR_STAGE || G::ROW_QUANT_FROM_COL_PAIR_STAGE) {
                                     if constexpr (G::USE_ROW_PAIR_STAGE && G::ROW_PAIR_STAGE_WARP_SYNC_ONLY) {
                                         __syncwarp();
@@ -8803,17 +10429,83 @@ __device__ inline void backward_kernel_v3_streaming_3wg_impl(const globals_3wg<C
                                 }
                             }
                         }
-                        if constexpr (DO_COL && !C::EARLY_COL_READY) {
-                            warpgroup::sync(CONSUMER_WG_SYNC_ID);
-                            __threadfence_block();
-                            asm volatile("fence.proxy.async.shared::cta;\n" ::: "memory");
-                            warpgroup::sync(CONSUMER_WG_SYNC_ID);
-                            if (warpgroup::warpid() == 0 && warp::laneid() == 0) {
-                                arrive(slice_col_ready[bf_stage]);
+                        if constexpr (!C::EARLY_COL_READY &&
+                                      (DO_COL || (G::SKIP_GLOBAL_COL_MATERIALIZATION && G::USE_COL_PAIR_STAGE))) {
+                            if constexpr (G::SKIP_GLOBAL_COL_MATERIALIZATION &&
+                                          DO_ROW && !DO_COL &&
+                                          EFFECTIVE_ENABLE_STOREADD_COMBO &&
+                                          EFFECTIVE_SEPARATE_BACKHALF_CONSUMERS) {
+                                if (combo_use_dc) {
+                                    const bool consumer_last_block =
+                                        block_idx + gridDim.x / C::CLUSTER_SIZE >= consumer_num_blocks;
+                                    const bool consumer_last_epi = (epi == C::EPI_PIPE_DEPTH - 1);
+                                    if constexpr (ROWONLY_COMBO_DC_DEBUG_CUT == 121) {
+                                        if (consumer_last_block && consumer_last_epi &&
+                                            warpgroup::warpid() == 0 &&
+                                            warp::laneid() == 0) {
+                                            printf("rowonly combo dc cut 121 cta=%d wg=%d row=%d col=%d epi=%d roles=1000\n",
+                                                   cta_id, warpgroup_id, row_block_idx, col_block_idx, epi);
+                                        }
+                                        if (consumer_last_block && consumer_last_epi) return;
+                                    }
+                                }
                             }
-                            update_phasebit<1>(slice_col_recycle_phasebits, bf_stage);
+                            if (DO_COL || combo_use_dc) {
+                                if constexpr (G::SKIP_GLOBAL_COL_MATERIALIZATION) {
+                                    if constexpr (ROWONLY_COMBO_DC_DEBUG_CUT == 112) {
+                                        if (block_idx > cluster_id && combo_use_dc) {
+                                            if (warpgroup::warpid() == 0 && warp::laneid() == 0) {
+                                                printf(
+                                                    "rowonly combo dc cut 112 cta=%d wg=%d block=%d row=%d col=%d epi=%d combo_use_dc=%d do_col=%d\n",
+                                                    cta_id, warpgroup_id, block_idx, row_block_idx, col_block_idx, epi,
+                                                    combo_use_dc ? 1 : 0, DO_COL ? 1 : 0);
+                                            }
+                                            return;
+                                        }
+                                    }
+                                }
+                                warpgroup::sync(CONSUMER_WG_SYNC_ID);
+                                __threadfence_block();
+                                asm volatile("fence.proxy.async.shared::cta;\n" ::: "memory");
+                                warpgroup::sync(CONSUMER_WG_SYNC_ID);
+                                if (warpgroup::warpid() == 0 && warp::laneid() == 0) {
+                                    arrive(slice_col_ready[bf_stage]);
+                                }
+                                update_phasebit<1>(slice_col_recycle_phasebits, bf_stage);
+                            }
+                            if constexpr (G::SKIP_GLOBAL_COL_MATERIALIZATION &&
+                                          DO_ROW && !DO_COL &&
+                                          EFFECTIVE_ENABLE_STOREADD_COMBO &&
+                                          EFFECTIVE_SEPARATE_BACKHALF_CONSUMERS) {
+                                if (combo_use_dc) {
+                                    const bool consumer_last_block =
+                                        block_idx + gridDim.x / C::CLUSTER_SIZE >= consumer_num_blocks;
+                                    const bool consumer_last_epi = (epi == C::EPI_PIPE_DEPTH - 1);
+                                    if constexpr (ROWONLY_COMBO_DC_DEBUG_CUT == 122) {
+                                        if (consumer_last_block && consumer_last_epi &&
+                                            warpgroup::warpid() == 0 &&
+                                            warp::laneid() == 0) {
+                                            printf("rowonly combo dc cut 122 cta=%d wg=%d row=%d col=%d epi=%d roles=1000\n",
+                                                   cta_id, warpgroup_id, row_block_idx, col_block_idx, epi);
+                                        }
+                                        if (consumer_last_block && consumer_last_epi) return;
+                                    }
+                                }
+                            }
                         }
                     } else {
+                        if constexpr (G::SKIP_GLOBAL_COL_MATERIALIZATION) {
+                            if constexpr (ROWONLY_COMBO_DC_DEBUG_CUT == 104) {
+                                if (block_idx > cluster_id && epi == 0) {
+                                    if (warpgroup::warpid() == 0 && warp::laneid() == 0) {
+                                        printf(
+                                            "rowonly combo dc cut 104 site=late-producer-bf16-stage cta=%d wg=%d block=%d row=%d col=%d epi=%d\n",
+                                            cta_id, warpgroup_id, block_idx, row_block_idx, col_block_idx, epi);
+                                    }
+                                    return;
+                                }
+                            }
+                        }
                         warpgroup::sync(CONSUMER_WG_SYNC_ID);
                         warpgroup::store(bf16_epi_stage[bf_stage].D, D_bf);
                         warpgroup::sync(CONSUMER_WG_SYNC_ID);
@@ -8917,8 +10609,8 @@ __device__ inline void backward_kernel_v3_streaming_3wg_impl(const globals_3wg<C
                                             amax = fmaxf(amax, fabsf(__bfloat162float(vals[pair].y)));
                                         }
 
-                                        const float scale = amax * (1.0f / FP4_MAX);
-                                        const float rcp_scale = (amax > 0.0f) ? (FP4_MAX / amax) : 0.0f;
+                                        const fp4_scale_contract scale_contract =
+                                            make_fp4_scale_contract(amax, g_sg_rcp, g_sg, encode_centric);
 
                                         if (global_row < g.M) {
                                             #pragma unroll
@@ -8926,16 +10618,11 @@ __device__ inline void backward_kernel_v3_streaming_3wg_impl(const globals_3wg<C
                                                 const uint8_t fp4_pair = quantize_fp4_pair(
                                                     __bfloat162float(vals[pair].x),
                                                     __bfloat162float(vals[pair].y),
-                                                    rcp_scale);
+                                                    scale_contract.quant_rcp_scale);
                                                 const int fp4x2_col = (col_start + group16 * 16 + pair * 2) / 2;
                                                 row_fp4_ptr[global_row * row_fp4_stride + fp4x2_col] = fp4_pair;
                                             }
 
-                                            float stored_scale = scale * g_sg_rcp;
-                                            if (encode_centric) {
-                                                stored_scale = fminf(rcp_scale * g_sg, E4M3_MAX);
-                                            }
-                                            const __nv_fp8_e4m3 sc = __nv_fp8_e4m3(stored_scale);
                                             const int global_col_16 = col_start + group16 * 16;
                                             const int kgroup = global_col_16 / 64;
                                             const int col_16_in_64 = (global_col_16 / 16) % 4;
@@ -8944,8 +10631,7 @@ __device__ inline void backward_kernel_v3_streaming_3wg_impl(const globals_3wg<C
                                             const int rr = (global_row / 32) % 4;
                                             const int chunk = depth * row_sc_kgroups + kgroup;
                                             const int byte_idx = sr * 16 + rr * 4 + col_16_in_64;
-                                            row_sc_ptr[chunk * 512 + byte_idx] =
-                                                *reinterpret_cast<const uint8_t*>(&sc);
+                                            row_sc_ptr[chunk * 512 + byte_idx] = scale_contract.scale_byte;
                                         }
                                     }
                                 }
@@ -8970,12 +10656,14 @@ __device__ inline void backward_kernel_v3_streaming_3wg_impl(const globals_3wg<C
                                 asm volatile("fence.proxy.async.shared::cta;\n" ::: "memory");
                                 arrive(slice_row_ready[bf_stage]);
                             }
-                            if constexpr (DO_COL && !C::EARLY_COL_READY) {
-                                if constexpr (G::USE_COL_PLAIN_STAGE || C::ROW_QUANT_FROM_REGS) {
-                                    __threadfence_block();
-                                    asm volatile("fence.proxy.async.shared::cta;\n" ::: "memory");
+                            if constexpr ((DO_COL || INTERNAL_COMBO_DC_COL_RECYCLE_WAIT) && !C::EARLY_COL_READY) {
+                                if (DO_COL || combo_use_dc) {
+                                    if constexpr (G::USE_COL_PLAIN_STAGE || C::ROW_QUANT_FROM_REGS) {
+                                        __threadfence_block();
+                                        asm volatile("fence.proxy.async.shared::cta;\n" ::: "memory");
+                                    }
+                                    arrive(slice_col_ready[bf_stage]);
                                 }
-                                arrive(slice_col_ready[bf_stage]);
                             }
                         }
                         if constexpr (EFFECTIVE_ENABLE_STOREADD_COMBO && EFFECTIVE_SEPARATE_BACKHALF_CONSUMERS) {
@@ -8993,8 +10681,10 @@ __device__ inline void backward_kernel_v3_streaming_3wg_impl(const globals_3wg<C
                         if constexpr (DO_ROW && !C::CONSUMER_DO_ROW) {
                             update_phasebit<1>(slice_row_recycle_phasebits, bf_stage);
                         }
-                        if constexpr (DO_COL) {
-                            if constexpr (G::FRONTEND_MULTI_QUANTIZER_WG &&
+                        if constexpr (DO_COL || INTERNAL_COMBO_DC_COL_RECYCLE_WAIT) {
+                            if constexpr (G::FUSED_COL_IN_QUANTIZER) {
+                                update_phasebit<1>(slice_col_recycle_phasebits, bf_stage);
+                            } else if constexpr (G::FRONTEND_MULTI_QUANTIZER_WG &&
                                           C::EARLY_COL_READY &&
                                           G::USE_COL_PAIR_STAGE) {
                             } else if constexpr (G::USE_COL_PAIR_STAGE ||
@@ -9015,6 +10705,150 @@ __device__ inline void backward_kernel_v3_streaming_3wg_impl(const globals_3wg<C
                 }
             }
 
+            if constexpr (G::FUSED_SOFTMAX_QUANT) {
+                bool tile_is_filtered = false;
+                if (g.filter_eps > 0.0f) {
+                    float reduced_filter_max = fused_filter_local_max;
+                    #pragma unroll
+                    for (int offset = 16; offset > 0; offset >>= 1) {
+                        reduced_filter_max =
+                            fmaxf(reduced_filter_max, __shfl_xor_sync(0xffffffff, reduced_filter_max, offset));
+                    }
+                    __shared__ float fused_filter_max_smem[WARPGROUP_WARPS];
+                    if (lane_id == 0) {
+                        fused_filter_max_smem[warpgroup::warpid()] = reduced_filter_max;
+                    }
+                    warpgroup::sync(CONSUMER_WG_SYNC_ID);
+                    float global_max = 0.0f;
+                    #pragma unroll
+                    for (int w = 0; w < WARPGROUP_WARPS; ++w) {
+                        global_max = fmaxf(global_max, fused_filter_max_smem[w]);
+                    }
+                    tile_is_filtered = (global_max < g.filter_eps);
+                }
+
+                if (!tile_is_filtered) {
+                    const int consumer_thread = warpgroup::warpid() * WARP_THREADS + lane_id;
+                    uint64_t fused_diag_flush_t0 = 0;
+                    if constexpr (G::SAFUSED_DIAG_TIMING_ENABLED) {
+                        if (g.diag_stage_cycles != nullptr &&
+                            block_idx == 0 &&
+                            warpgroup::warpid() == 0 &&
+                            lane_id == 0) {
+                            fused_diag_flush_t0 = clock64();
+                        }
+                    }
+                    if constexpr (DO_ROW) {
+                        constexpr int row_fp4_u64s_per_row = (C::Nb / 2) / 8;
+                        for (int idx = consumer_thread;
+                             idx < (C::Mb / 2) * row_fp4_u64s_per_row;
+                             idx += WARPGROUP_WARPS * WARP_THREADS) {
+                            const int local_row = idx / row_fp4_u64s_per_row;
+                            const int local_u64 = idx % row_fp4_u64s_per_row;
+                            const int global_row = tile_row_base + local_row;
+                            const int global_fp4x2_col_base = col_block_idx * (C::Nb / 2) + local_u64 * 8;
+                            store_global_u64(
+                                &row_fp4_ptr[global_row * row_fp4_stride + global_fp4x2_col_base],
+                                *reinterpret_cast<const uint64_t*>(
+                                    &fused_row_fp4_stage[local_row * (C::Nb / 2) + local_u64 * 8]));
+                        }
+                        for (int idx = consumer_thread;
+                             idx < (C::Mb / 2) * (C::Nb / 16);
+                             idx += WARPGROUP_WARPS * WARP_THREADS) {
+                            const int local_row = idx / (C::Nb / 16);
+                            const int local_scale_slot = idx % (C::Nb / 16);
+                            const int local_kgroup = local_scale_slot / 4;
+                            const int col_16_in_64 = local_scale_slot % 4;
+                            const int sr = local_row % 32;
+                            const int rr = (local_row / 32) % 4;
+                            const int local_byte_idx = local_kgroup * 512 + sr * 16 + rr * 4 + col_16_in_64;
+                            const int global_chunk =
+                                (tile_row_base / 128) * row_sc_kgroups +
+                                col_block_idx * (C::Nb / 64) + local_kgroup;
+                            row_sc_ptr[global_chunk * 512 + sr * 16 + rr * 4 + col_16_in_64] =
+                                fused_row_sc_stage[local_byte_idx];
+                        }
+                    }
+                    if constexpr (DO_COL && !G::SAFUSED_SKIP_COL_FLUSH && !G::FUSED_COL_IN_QUANTIZER) {
+                        constexpr int fused_local_row16_blocks = (C::Mb / 2) / 16;
+                        for (int idx = consumer_thread;
+                             idx < C::Nb * fused_local_row16_blocks;
+                             idx += WARPGROUP_WARPS * WARP_THREADS) {
+                            const int local_col = idx / fused_local_row16_blocks;
+                            const int row16_block = idx % fused_local_row16_blocks;
+                            const int global_col = col_block_idx * C::Nb + local_col;
+                            const int local_row_base = row16_block * 16;
+                            const int global_row_base = tile_row_base + local_row_base;
+                            const int local_row_pair_base = local_row_base / 2;
+                            const int global_row_pair_base = global_row_base / 2;
+                            const uint64_t packed_fp4 =
+                                *reinterpret_cast<const uint64_t*>(
+                                    &fused_col_fp4_stage[local_col * (C::Mb / 4) + local_row_pair_base]);
+                            maybe_store_global_col_u64<G>(
+                                col_fp4_ptr,
+                                col_fp4_stride,
+                                global_col,
+                                global_row_pair_base,
+                                packed_fp4);
+                            const int depth = global_col / 128;
+                            const int sr = global_col % 32;
+                            const int rr = (global_col / 32) % 4;
+                            const int m_kgroup = global_row_base / 64;
+                            const int m_16_in_64 = (global_row_base / 16) % 4;
+                            const int chunk = depth * col_sc_kgroups + m_kgroup;
+                            const int byte_idx = sr * 16 + rr * 4 + m_16_in_64;
+                            const int local_m_kgroup = local_row_base / 64;
+                            const int local_byte_idx =
+                                local_m_kgroup * 512 + sr * 16 + rr * 4 + m_16_in_64;
+                            maybe_store_global_col_scale<G>(
+                                col_sc_ptr,
+                                chunk,
+                                byte_idx,
+                                fused_col_sc_stage[local_byte_idx]);
+                        }
+                    }
+                    warpgroup::sync(CONSUMER_WG_SYNC_ID);
+                    if constexpr (G::SAFUSED_DIAG_TIMING_ENABLED) {
+                        if (g.diag_stage_cycles != nullptr &&
+                            block_idx == 0 &&
+                            warpgroup::warpid() == 0 &&
+                            lane_id == 0) {
+                            fused_diag_flush_cycles += clock64() - fused_diag_flush_t0;
+                        }
+                    }
+                }
+                if constexpr (DO_COL && G::FUSED_COL_IN_QUANTIZER) {
+                    warpgroup::sync(CONSUMER_WG_SYNC_ID);
+                    if (warpgroup::warpid() == 0 && lane_id == 0) {
+                        fused_col_keep_tile = tile_is_filtered ? 0 : 1;
+                        __threadfence_block();
+                        asm volatile("fence.proxy.async.shared::cta;\n" ::: "memory");
+                        arrive(fused_col_filter_ready);
+                    }
+                    if constexpr (SAFUSED_SPLIT_STAGE_DEBUG) {
+                        if (warpgroup::warpid() == 0 && lane_id == 0) {
+                            safused_split_request_abort(7);
+                        }
+                        if (safused_split_should_abort()) return;
+                    }
+                }
+                if constexpr (G::SAFUSED_DIAG_TIMING_ENABLED) {
+                    if (g.diag_stage_cycles != nullptr &&
+                        block_idx == 0 &&
+                        warpgroup::warpid() == 0 &&
+                        lane_id == 0) {
+                        g.diag_stage_cycles[0] = fused_diag_row_cycles;
+                        if constexpr (!G::FUSED_COL_IN_QUANTIZER) {
+                            g.diag_stage_cycles[1] = fused_diag_col_amax_cycles;
+                            g.diag_stage_cycles[2] = fused_diag_col_pack_cycles;
+                            g.diag_stage_cycles[3] = fused_diag_flush_cycles;
+                        } else {
+                            g.diag_stage_cycles[2] = 0;
+                        }
+                    }
+                }
+            }
+
             if constexpr (EFFECTIVE_ENABLE_STOREADD_COMBO) {
                 if constexpr (!EFFECTIVE_SEPARATE_BACKHALF_CONSUMERS) {
                     warpgroup::sync(CONSUMER_WG_SYNC_ID);
@@ -9026,17 +10860,112 @@ __device__ inline void backward_kernel_v3_streaming_3wg_impl(const globals_3wg<C
                 }
             }
 
+            if constexpr (G::SKIP_GLOBAL_COL_MATERIALIZATION &&
+                          DO_ROW && !DO_COL &&
+                          EFFECTIVE_ENABLE_STOREADD_COMBO &&
+                          EFFECTIVE_SEPARATE_BACKHALF_CONSUMERS) {
+                if (combo_use_dc) {
+                    const bool consumer_last_block =
+                        block_idx + gridDim.x / C::CLUSTER_SIZE >= consumer_num_blocks;
+                    if constexpr (ROWONLY_COMBO_DC_DEBUG_CUT == 117) {
+                        if (consumer_last_block &&
+                            warpgroup::warpid() == 0 &&
+                            warp::laneid() == 0) {
+                            printf("rowonly combo dc cut 117 cta=%d wg=%d roles=1000\n",
+                                   cta_id, warpgroup_id);
+                        }
+                        if (consumer_last_block) return;
+                    }
+                }
+            }
             update_phasebit<0>(phasebits, 0);
             phase ^= 1;
+            if constexpr (G::SKIP_GLOBAL_COL_MATERIALIZATION &&
+                          DO_ROW && !DO_COL &&
+                          EFFECTIVE_ENABLE_STOREADD_COMBO &&
+                          EFFECTIVE_SEPARATE_BACKHALF_CONSUMERS) {
+                if (combo_use_dc) {
+                    const bool consumer_last_block =
+                        block_idx + gridDim.x / C::CLUSTER_SIZE >= consumer_num_blocks;
+                    if constexpr (ROWONLY_COMBO_DC_DEBUG_CUT == 118) {
+                        if (consumer_last_block &&
+                            warpgroup::warpid() == 0 &&
+                            warp::laneid() == 0) {
+                            printf("rowonly combo dc cut 118 cta=%d wg=%d roles=1000\n",
+                                   cta_id, warpgroup_id);
+                        }
+                        if (consumer_last_block) return;
+                    }
+                }
+            }
+        }
+        if constexpr (G::SKIP_GLOBAL_COL_MATERIALIZATION &&
+                      DO_ROW && !DO_COL &&
+                      EFFECTIVE_ENABLE_STOREADD_COMBO &&
+                      EFFECTIVE_SEPARATE_BACKHALF_CONSUMERS) {
+            if (combo_use_dc) {
+                if constexpr (ROWONLY_COMBO_DC_DEBUG_CUT == 119) {
+                    if (warpgroup::warpid() == 0 && warp::laneid() == 0) {
+                        printf("rowonly combo dc cut 119 cta=%d wg=%d roles=1000\n",
+                               cta_id, warpgroup_id);
+                    }
+                    return;
+                }
+            }
         }
         warpgroup::sync(CONSUMER_WG_SYNC_ID);
+        if constexpr (G::SKIP_GLOBAL_COL_MATERIALIZATION &&
+                      DO_ROW && !DO_COL &&
+                      EFFECTIVE_ENABLE_STOREADD_COMBO &&
+                      EFFECTIVE_SEPARATE_BACKHALF_CONSUMERS) {
+            if (combo_use_dc) {
+                if constexpr (ROWONLY_COMBO_DC_DEBUG_CUT == 120) {
+                    if (warpgroup::warpid() == 0 && warp::laneid() == 0) {
+                        printf("rowonly combo dc cut 120 cta=%d wg=%d roles=1000\n",
+                               cta_id, warpgroup_id);
+                    }
+                    return;
+                }
+            }
+        }
         if constexpr (C::USE_PDL) warpgroup::pdl::arrive();
+        if constexpr (G::SKIP_GLOBAL_COL_MATERIALIZATION &&
+                      DO_ROW && !DO_COL &&
+                      EFFECTIVE_ENABLE_STOREADD_COMBO &&
+                      EFFECTIVE_SEPARATE_BACKHALF_CONSUMERS) {
+            if (combo_use_dc) {
+                if constexpr (ROWONLY_COMBO_DC_DEBUG_CUT == 115) {
+                    if (warpgroup::warpid() == 0 && warp::laneid() == 0) {
+                        printf("rowonly combo dc cut 115 cta=%d wg=%d roles=1000\n",
+                               cta_id, warpgroup_id);
+                    }
+                    return;
+                }
+                wait(combo_rowonly_tail_done, 0);
+                asm volatile("fence.proxy.async.shared::cta;\n" ::: "memory");
+                if constexpr (ROWONLY_COMBO_DC_DEBUG_CUT == 116) {
+                    if (warpgroup::warpid() == 0 && warp::laneid() == 0) {
+                        printf("rowonly combo dc cut 116 cta=%d wg=%d roles=1000\n",
+                               cta_id, warpgroup_id);
+                    }
+                    return;
+                }
+            }
+        }
         if constexpr (!EFFECTIVE_ENABLE_STOREADD_COMBO) {
             if (warpgroup::warpid() == 0) tm_allocator.deprovision();
         }
     } else if (effective_warpgroup_id < C::CONSUMER_WARPGROUPS + EFFECTIVE_QUANTIZER_WARPGROUPS) {
         constexpr bool ROW_IN_QUANTIZER = DO_ROW && !C::CONSUMER_DO_ROW && (C::QUANTIZER_WARPGROUPS > 0);
-        constexpr bool COL_IN_QUANTIZER = DO_COL && (C::QUANTIZER_WARPGROUPS > 0);
+        constexpr bool INTERNAL_COMBO_DC_COL_IN_QUANTIZER =
+            !DO_COL &&
+            G::SKIP_GLOBAL_COL_MATERIALIZATION &&
+            G::ENABLE_STOREADD_COMBO &&
+            G::SEPARATE_BACKHALF_CONSUMERS &&
+            (STATIC_COMBO_MODE == G::COMBO_MODE_DCONLY) &&
+            (C::QUANTIZER_WARPGROUPS > 0);
+        constexpr bool COL_IN_QUANTIZER =
+            (DO_COL || INTERNAL_COMBO_DC_COL_IN_QUANTIZER) && (C::QUANTIZER_WARPGROUPS > 0);
         if constexpr (!(ROW_IN_QUANTIZER || COL_IN_QUANTIZER) && !EFFECTIVE_SEPARATE_BACKHALF_CONSUMERS) {
             return;
         }
@@ -9061,16 +10990,26 @@ __device__ inline void backward_kernel_v3_streaming_3wg_impl(const globals_3wg<C
         uint32_t combo_row_ready_phasebits = 0xFFFF0000;
         uint32_t combo_col_ready_phasebits = 0xFFFF0000;
         uint32_t combo_col_recycle_phasebits = 0xFFFF0000;
+        int combo_rowonly_output_reuse_publish_phase = 1;
+        int fused_col_filter_phase = 0;
+        uint64_t fused_diag_quant_col_cycles = 0;
+        uint64_t fused_diag_quant_flush_cycles = 0;
 
         uint8_t* row_fp4_ptr = reinterpret_cast<uint8_t*>(g.G_fp4_row.raw_ptr);
         uint8_t* row_sc_ptr = g.G_sc_row_ptr;
         uint8_t* col_fp4_ptr = g.G_fp4_col_ptr;
         uint8_t* col_sc_ptr = g.G_sc_col_ptr;
+        uint8_t* fused_col_fp4_stage = nullptr;
+        uint8_t* fused_col_sc_stage = nullptr;
         const int row_fp4_stride = g.G_fp4_row.cols();
         const int row_sc_kgroups = g.G_sc_row_kgroups;
         const int col_fp4_stride = g.A.rows() / 2;
         const int col_sc_kgroups = g.G_sc_col_kgroups;
         const bool encode_centric = g.encode_centric;
+        if constexpr (G::FUSED_SOFTMAX_QUANT) {
+            fused_col_fp4_stage = reinterpret_cast<uint8_t*>(&fused_quant_stage->col_fp4[0]);
+            fused_col_sc_stage = reinterpret_cast<uint8_t*>(&fused_quant_stage->col_sc[0]);
+        }
         int combo_row_stage_phase = 0;
         int combo_c_tiles_phase = 0;
         int combo_c_scales_phase = 0;
@@ -9095,6 +11034,7 @@ __device__ inline void backward_kernel_v3_streaming_3wg_impl(const globals_3wg<C
                                  (COMBO_MODE_IS_STATIC
                                       ? STATIC_COMBO_DO_DC
                                       : (g.combo_mode == G::COMBO_MODE_FULL || g.combo_mode == G::COMBO_MODE_DCONLY));
+        constexpr bool DEDICATED_ROWONLY_ROUTE = G::SKIP_GLOBAL_COL_MATERIALIZATION && DO_ROW && !DO_COL;
         constexpr bool combo_debug_skip_sep_de_row_ready_wait = false;
         constexpr bool combo_debug_skip_sep_de_output_wait = false;
         constexpr bool combo_debug_skip_sep_de_input_wait = false;
@@ -9103,9 +11043,24 @@ __device__ inline void backward_kernel_v3_streaming_3wg_impl(const globals_3wg<C
         constexpr bool combo_debug_skip_sep_de_body = true;
         constexpr bool combo_debug_skip_sep_de_drain = false;
         constexpr bool combo_debug_skip_sep_de_row_sc_preload = true;
+        constexpr int dedicated_rowonly_combo_dc_tm_offset = 256;
+        constexpr int dedicated_rowonly_combo_dc_sc_offset = 384;
         if constexpr (G::ENABLE_STOREADD_COMBO) {
             tm_allocator.set_addr(tmem_addr);
         }
+        auto dedicated_rowonly_combo_dc_tm =
+            DEDICATED_ROWONLY_ROUTE
+                ? tm_allocator.template allocate<full_tt_fl<C::Nb>>(dedicated_rowonly_combo_dc_tm_offset)
+                : tm_allocator.template allocate<full_tt_fl<C::Nb>>(0);
+        auto dedicated_rowonly_combo_dc_a_sc_tm =
+            DEDICATED_ROWONLY_ROUTE
+                ? tm_allocator.template allocate<full_tt_fp8e4m3<16 * (C::Nb / 64)>>(dedicated_rowonly_combo_dc_sc_offset)
+                : tm_allocator.template allocate<full_tt_fp8e4m3<16 * (C::Nb / 64)>>(0);
+        auto dedicated_rowonly_combo_dc_b_sc_tm =
+            DEDICATED_ROWONLY_ROUTE
+                ? tm_allocator.template allocate<full_tt_fp8e4m3<32 * (C::Nb / 64)>>(
+                      dedicated_rowonly_combo_dc_sc_offset + 4 * (C::Nb / 64))
+                : tm_allocator.template allocate<full_tt_fp8e4m3<32 * (C::Nb / 64)>>(0);
 
         constexpr int first_quantizer_wg = C::CONSUMER_WARPGROUPS;
         constexpr int first_col_quantizer_wg =
@@ -9146,6 +11101,47 @@ __device__ inline void backward_kernel_v3_streaming_3wg_impl(const globals_3wg<C
             : (G::FRONTEND_MULTI_QUANTIZER_WG
                 ? (is_row_quantizer_wg ? 2 : 3)
                 : (!C::CONSUMER_DO_ROW ? 2 : 1));
+        constexpr bool SAFUSED_SPLIT_STAGE_DEBUG =
+            G::FUSED_SOFTMAX_QUANT &&
+            G::FUSED_COL_IN_QUANTIZER &&
+            (SAFUSED_SPLIT_COL_STAGE_CUT > 0);
+        auto safused_split_publish_abort_wakes = [&]() {
+            if constexpr (SAFUSED_SPLIT_STAGE_DEBUG) {
+                if (atomicCAS(&safused_split_abort_published, 0, 1) == 0) {
+                    __threadfence_block();
+                    asm volatile("fence.proxy.async.shared::cta;\n" ::: "memory");
+                    #pragma unroll
+                    for (int debug_bf_stage = 0; debug_bf_stage < C::BF16_STAGE_COUNT; ++debug_bf_stage) {
+                        #pragma unroll
+                        for (int debug_row16 = 0; debug_row16 < C::Mb / 32; ++debug_row16) {
+                            arrive(slice_col_ready_row16[debug_bf_stage][debug_row16]);
+                        }
+                        arrive(slice_col_recycled[debug_bf_stage]);
+                    }
+                    arrive(fused_col_filter_ready);
+                    __threadfence_block();
+                    asm volatile("fence.proxy.async.shared::cta;\n" ::: "memory");
+                }
+            }
+        };
+        auto safused_split_request_abort = [&](int stage) {
+            if constexpr (SAFUSED_SPLIT_STAGE_DEBUG) {
+                if (SAFUSED_SPLIT_COL_STAGE_CUT == stage) {
+                    if (atomicCAS(&safused_split_abort_stage, 0, stage) == 0) {
+                        printf("safused split cut %d cta=%d\n", stage, cta_id);
+                        safused_split_publish_abort_wakes();
+                    }
+                }
+            }
+        };
+        auto safused_split_should_abort = [&]() {
+            if constexpr (SAFUSED_SPLIT_STAGE_DEBUG) {
+                asm volatile("fence.proxy.async.shared::cta;\n" ::: "memory");
+                return safused_split_abort_stage != 0;
+            } else {
+                return false;
+            }
+        };
         if constexpr (G::FRONTEND_MULTI_QUANTIZER_WG || EFFECTIVE_SEPARATE_BACKHALF_CONSUMERS) {
             if (!is_row_quantizer_wg && !is_col_quantizer_wg && !is_de_consumer_wg && !is_dc_consumer_wg) {
                 return;
@@ -9174,7 +11170,9 @@ __device__ inline void backward_kernel_v3_streaming_3wg_impl(const globals_3wg<C
             }
         }
 
-        for (int block_idx = cluster_id; block_idx < num_blocks; block_idx += gridDim.x / C::CLUSTER_SIZE) {
+        const int quantizer_num_blocks =
+            SAFUSED_SPLIT_STAGE_DEBUG ? min(num_blocks, gridDim.x / C::CLUSTER_SIZE) : num_blocks;
+        for (int block_idx = cluster_id; block_idx < quantizer_num_blocks; block_idx += gridDim.x / C::CLUSTER_SIZE) {
             int supergroup_idx = block_idx / num_blocks_per_supergroup;
             int idx_within_supergroup = block_idx % num_blocks_per_supergroup;
             int rows_in_supergroup = min(C::SUPERGROUP_SIZE, num_row_blocks - supergroup_idx * C::SUPERGROUP_SIZE);
@@ -9183,10 +11181,41 @@ __device__ inline void backward_kernel_v3_streaming_3wg_impl(const globals_3wg<C
             int col_block_idx = idx_within_supergroup / rows_in_supergroup;
             const int tile_row_base = row_block_idx * C::Mb + cta_id * (C::Mb / 2);
             const bool full_tile_rows = tile_row_base + (C::Mb / 2) <= g.M;
+            const bool full_tile_cols = (col_block_idx + 1) * C::Nb <= g.N;
             if constexpr (EFFECTIVE_ENABLE_STOREADD_COMBO && EFFECTIVE_SEPARATE_BACKHALF_CONSUMERS) {
                 if ((is_de_consumer_wg && !combo_do_de) ||
                     (is_dc_consumer_wg && !combo_do_dc)) {
                     continue;
+                }
+            }
+            if constexpr (G::SKIP_GLOBAL_COL_MATERIALIZATION && DEDICATED_ROWONLY_DEBUG_STAGE == 1) {
+                if (block_idx == cluster_id && combo_do_dc && is_dc_consumer_wg &&
+                    warpgroup::warpid() == 0 && quant_lane == 0) {
+                    printf(
+                        "dedicated rowonly stage 1 cta=%d wg=%d block=%d row=%d col=%d roles=%d%d%d%d\n",
+                        cta_id, warpgroup_id, block_idx, row_block_idx, col_block_idx,
+                        is_row_quantizer_wg ? 1 : 0,
+                        is_col_quantizer_wg ? 1 : 0,
+                        is_de_consumer_wg ? 1 : 0,
+                        is_dc_consumer_wg ? 1 : 0);
+                    return;
+                }
+            }
+            if constexpr (G::SKIP_GLOBAL_COL_MATERIALIZATION) {
+                if constexpr (ROWONLY_COMBO_DC_DEBUG_CUT == 71) {
+                    if (block_idx > cluster_id &&
+                        combo_do_dc &&
+                        (is_col_quantizer_wg || is_dc_consumer_wg) &&
+                        warpgroup::warpid() == 0 && quant_lane == 0) {
+                        printf(
+                            "rowonly combo dc cut 71 cta=%d wg=%d block=%d row=%d col=%d roles=%d%d%d%d\n",
+                            cta_id, warpgroup_id, block_idx, row_block_idx, col_block_idx,
+                            is_row_quantizer_wg ? 1 : 0,
+                            is_col_quantizer_wg ? 1 : 0,
+                            is_de_consumer_wg ? 1 : 0,
+                            is_dc_consumer_wg ? 1 : 0);
+                        return;
+                    }
                 }
             }
 
@@ -9196,6 +11225,118 @@ __device__ inline void backward_kernel_v3_streaming_3wg_impl(const globals_3wg<C
                 const int col_start = col_block_idx * C::Nb + epi * SUBTILE_COLS;
                 const bool combo_stage_first_epi = (epi == 0);
                 const bool combo_stage_publish_epi = (epi == C::EPI_PIPE_DEPTH - 1);
+                if constexpr (G::SKIP_GLOBAL_COL_MATERIALIZATION && DEDICATED_ROWONLY_DEBUG_STAGE == 2) {
+                    if (block_idx == cluster_id && combo_do_dc && is_dc_consumer_wg && epi == 0 &&
+                        warpgroup::warpid() == 0 && quant_lane == 0) {
+                        printf(
+                            "dedicated rowonly stage 2 cta=%d wg=%d block=%d row=%d col=%d epi=%d roles=%d%d%d%d\n",
+                            cta_id, warpgroup_id, block_idx, row_block_idx, col_block_idx, epi,
+                            is_row_quantizer_wg ? 1 : 0,
+                            is_col_quantizer_wg ? 1 : 0,
+                            is_de_consumer_wg ? 1 : 0,
+                            is_dc_consumer_wg ? 1 : 0);
+                        return;
+                    }
+                }
+                if constexpr (G::SKIP_GLOBAL_COL_MATERIALIZATION) {
+                    if (block_idx > cluster_id && combo_do_dc && is_dc_consumer_wg &&
+                        warpgroup::warpid() == 0 && quant_lane == 0) {
+                        if constexpr (ROWONLY_COMBO_DC_DEBUG_CUT == 80) {
+                            if (epi == 0) {
+                                printf(
+                                    "rowonly combo dc cut 80 cta=%d wg=%d block=%d row=%d col=%d epi=%d roles=%d%d%d%d\n",
+                                    cta_id, warpgroup_id, block_idx, row_block_idx, col_block_idx, epi,
+                                    is_row_quantizer_wg ? 1 : 0,
+                                    is_col_quantizer_wg ? 1 : 0,
+                                    is_de_consumer_wg ? 1 : 0,
+                                    is_dc_consumer_wg ? 1 : 0);
+                                return;
+                            }
+                        }
+                        if constexpr (ROWONLY_COMBO_DC_DEBUG_CUT == 81) {
+                            if (epi == 1) {
+                                printf(
+                                    "rowonly combo dc cut 81 cta=%d wg=%d block=%d row=%d col=%d epi=%d roles=%d%d%d%d\n",
+                                    cta_id, warpgroup_id, block_idx, row_block_idx, col_block_idx, epi,
+                                    is_row_quantizer_wg ? 1 : 0,
+                                    is_col_quantizer_wg ? 1 : 0,
+                                    is_de_consumer_wg ? 1 : 0,
+                                    is_dc_consumer_wg ? 1 : 0);
+                                return;
+                            }
+                        }
+                        if constexpr (ROWONLY_COMBO_DC_DEBUG_CUT == 82) {
+                            if (epi == 2) {
+                                printf(
+                                    "rowonly combo dc cut 82 cta=%d wg=%d block=%d row=%d col=%d epi=%d roles=%d%d%d%d\n",
+                                    cta_id, warpgroup_id, block_idx, row_block_idx, col_block_idx, epi,
+                                    is_row_quantizer_wg ? 1 : 0,
+                                    is_col_quantizer_wg ? 1 : 0,
+                                    is_de_consumer_wg ? 1 : 0,
+                                    is_dc_consumer_wg ? 1 : 0);
+                                return;
+                            }
+                        }
+                        if constexpr (ROWONLY_COMBO_DC_DEBUG_CUT == 83) {
+                            if (epi == 3) {
+                                printf(
+                                    "rowonly combo dc cut 83 cta=%d wg=%d block=%d row=%d col=%d epi=%d roles=%d%d%d%d\n",
+                                    cta_id, warpgroup_id, block_idx, row_block_idx, col_block_idx, epi,
+                                    is_row_quantizer_wg ? 1 : 0,
+                                    is_col_quantizer_wg ? 1 : 0,
+                                    is_de_consumer_wg ? 1 : 0,
+                                    is_dc_consumer_wg ? 1 : 0);
+                                return;
+                            }
+                        }
+                    }
+                    if (block_idx > cluster_id && combo_do_dc && is_col_quantizer_wg &&
+                        warpgroup::warpid() == 0 && quant_lane == 0) {
+                        if constexpr (ROWONLY_COMBO_DC_DEBUG_CUT == 109) {
+                            if (epi == 1) {
+                                printf(
+                                    "rowonly combo dc cut 109 cta=%d wg=%d block=%d row=%d col=%d epi=%d roles=%d%d%d%d\n",
+                                    cta_id, warpgroup_id, block_idx, row_block_idx, col_block_idx, epi,
+                                    is_row_quantizer_wg ? 1 : 0,
+                                    is_col_quantizer_wg ? 1 : 0,
+                                    is_de_consumer_wg ? 1 : 0,
+                                    is_dc_consumer_wg ? 1 : 0);
+                                return;
+                            }
+                        }
+                    }
+                }
+                if constexpr (G::SKIP_GLOBAL_COL_MATERIALIZATION &&
+                              EFFECTIVE_ENABLE_STOREADD_COMBO &&
+                              EFFECTIVE_SEPARATE_BACKHALF_CONSUMERS) {
+                    // The dedicated row-only route should keep the back-half WGs
+                    // out of the generic frontend quantizer epi body until the
+                    // publish epi that actually hands them work. Otherwise the
+                    // dc-consumer WG falls into frontend col-ready waits that
+                    // belong only to the single frontend quantizer WG.
+                    if ((is_de_consumer_wg && combo_do_de && !combo_stage_publish_epi) ||
+                        (is_dc_consumer_wg && combo_do_dc && !combo_stage_publish_epi)) {
+                        continue;
+                    }
+                }
+                if constexpr (G::SKIP_GLOBAL_COL_MATERIALIZATION && DEDICATED_ROWONLY_DEBUG_STAGE == 21) {
+                    if (block_idx == cluster_id && combo_do_dc && is_dc_consumer_wg && combo_stage_publish_epi &&
+                        warpgroup::warpid() == 0 && quant_lane == 0) {
+                        printf(
+                            "dedicated rowonly stage 21 cta=%d wg=%d block=%d row=%d col=%d epi=%d\n",
+                            cta_id, warpgroup_id, block_idx, row_block_idx, col_block_idx, epi);
+                        return;
+                    }
+                }
+                if constexpr (G::SKIP_GLOBAL_COL_MATERIALIZATION && DEDICATED_ROWONLY_DEBUG_STAGE == 31) {
+                    if (block_idx == cluster_id && combo_do_dc && is_col_quantizer_wg && combo_stage_publish_epi &&
+                        warpgroup::warpid() == 0 && quant_lane == 0) {
+                        printf(
+                            "dedicated rowonly stage 31 cta=%d wg=%d block=%d row=%d col=%d epi=%d\n",
+                            cta_id, warpgroup_id, block_idx, row_block_idx, col_block_idx, epi);
+                        return;
+                    }
+                }
                 typename G::combo_col_stage_t *combo_col_stage_slot = nullptr;
                 uint8_t* combo_col_fp4_local_ptr = nullptr;
                 uint8_t* combo_col_sc_local_ptr = nullptr;
@@ -9210,15 +11351,49 @@ __device__ inline void backward_kernel_v3_streaming_3wg_impl(const globals_3wg<C
                 }
 
                 if constexpr (EFFECTIVE_ENABLE_STOREADD_COMBO && EFFECTIVE_SEPARATE_BACKHALF_CONSUMERS) {
+                    if constexpr (G::SKIP_GLOBAL_COL_MATERIALIZATION && ROWONLY_COMBO_DC_DEBUG_CUT == 77) {
+                        if (block_idx > cluster_id &&
+                            combo_do_dc &&
+                            ((is_col_quantizer_wg && combo_stage_first_epi) ||
+                             (is_dc_consumer_wg && combo_stage_publish_epi)) &&
+                            warpgroup::warpid() == 0 && quant_lane == 0) {
+                            printf(
+                                "rowonly combo dc cut 77 cta=%d wg=%d block=%d row=%d col=%d epi=%d roles=%d%d%d%d\n",
+                                cta_id, warpgroup_id, block_idx, row_block_idx, col_block_idx, epi,
+                                is_row_quantizer_wg ? 1 : 0,
+                                is_col_quantizer_wg ? 1 : 0,
+                                is_de_consumer_wg ? 1 : 0,
+                                is_dc_consumer_wg ? 1 : 0);
+                            return;
+                        }
+                    }
                     if (is_col_quantizer_wg && combo_do_dc && combo_stage_first_epi) {
-                        wait(combo_g_col_recycled[0], get_phasebit<1>(combo_col_recycle_phasebits, 0));
+                        if constexpr (!(G::SKIP_GLOBAL_COL_MATERIALIZATION &&
+                                        ROWONLY_COMBO_DC_SKIP_RECYCLE_WAIT == 1)) {
+                            wait(combo_g_col_recycled[0], get_phasebit<1>(combo_col_recycle_phasebits, 0));
+                        }
+                        if constexpr (G::SKIP_GLOBAL_COL_MATERIALIZATION && ROWONLY_COMBO_DC_DEBUG_CUT == 78) {
+                            if (block_idx > cluster_id &&
+                                warpgroup::warpid() == 0 && quant_lane == 0) {
+                                printf(
+                                    "rowonly combo dc cut 78 cta=%d wg=%d block=%d row=%d col=%d epi=%d roles=%d%d%d%d\n",
+                                    cta_id, warpgroup_id, block_idx, row_block_idx, col_block_idx, epi,
+                                    is_row_quantizer_wg ? 1 : 0,
+                                    is_col_quantizer_wg ? 1 : 0,
+                                    is_de_consumer_wg ? 1 : 0,
+                                    is_dc_consumer_wg ? 1 : 0);
+                                return;
+                            }
+                        }
                         uint8_t *combo_col_bytes = reinterpret_cast<uint8_t*>(&combo_col_stage_slot->Gt_row.data[0]);
                         for (int idx = warpgroup::warpid() * WARP_THREADS + quant_lane;
                              idx < static_cast<int>(sizeof(typename G::combo_col_stage_t));
                              idx += WARPGROUP_WARPS * WARP_THREADS) {
                             combo_col_bytes[idx] = 0;
                         }
-                        warpgroup::sync(quantizer_sync_id);
+                        if (!(DEDICATED_ROWONLY_ROUTE && combo_do_dc && combo_stage_publish_epi)) {
+                            warpgroup::sync(quantizer_sync_id);
+                        }
                     }
                     if (is_de_consumer_wg && combo_do_de && combo_stage_publish_epi) {
                         if constexpr (!combo_debug_skip_sep_de_row_ready_wait) {
@@ -9227,25 +11402,142 @@ __device__ inline void backward_kernel_v3_streaming_3wg_impl(const globals_3wg<C
                         }
                     }
                     if (is_dc_consumer_wg && combo_do_dc && combo_stage_publish_epi) {
-                        wait(combo_g_col_ready[0], get_phasebit<0>(combo_col_ready_phasebits, 0));
-                        asm volatile("fence.proxy.async.shared::cta;\n" ::: "memory");
-                    }
-                }
-
-                    if constexpr (G::FRONTEND_SINGLE_QUANTIZER_WG) {
-                        if constexpr (ROW_IN_QUANTIZER) {
-                            if constexpr (!G::DEBUG_SKIP_ROW_READY_WAIT) {
-                                wait(slice_row_ready[bf_stage], get_phasebit<0>(slice_row_ready_phasebits, bf_stage));
-                                asm volatile("fence.proxy.async.shared::cta;\n" ::: "memory");
+                        if constexpr (G::SKIP_GLOBAL_COL_MATERIALIZATION &&
+                                      ROWONLY_COMBO_DC_DEBUG_CUT == 191) {
+                            if (block_idx > cluster_id &&
+                                warpgroup::warpid() == 0 && quant_lane == 0) {
+                                printf(
+                                    "rowonly combo dc cut 191 cta=%d wg=%d block=%d row=%d col=%d epi=%d roles=%d%d%d%d\n",
+                                    cta_id, warpgroup_id, block_idx, row_block_idx, col_block_idx, epi,
+                                    is_row_quantizer_wg ? 1 : 0,
+                                    is_col_quantizer_wg ? 1 : 0,
+                                    is_de_consumer_wg ? 1 : 0,
+                                    is_dc_consumer_wg ? 1 : 0);
+                                return;
                             }
                         }
-                        if constexpr (COL_IN_QUANTIZER) {
-                            if constexpr (!G::COL_READY_PER_ROW16) {
-                                if constexpr (!G::DEBUG_SKIP_COL_READY_WAIT) {
-                                    if constexpr (G::USE_COL_PAIR_STAGE || (DO_ROW && C::ROW_QUANT_FROM_REGS && C::CONSUMER_DO_ROW && !C::EARLY_COL_READY)) {
-                                        wait(slice_col_ready[bf_stage], get_phasebit<0>(slice_col_ready_phasebits, bf_stage));
-                                    } else {
-                                        wait(slice_col_ready[bf_stage], get_phasebit<0>(slice_phasebits, bf_stage));
+                        if constexpr (!(G::SKIP_GLOBAL_COL_MATERIALIZATION &&
+                                        ROWONLY_COMBO_DC_SKIP_READY_WAIT == 1)) {
+                            wait(combo_g_col_ready[0], get_phasebit<0>(combo_col_ready_phasebits, 0));
+                            asm volatile("fence.proxy.async.shared::cta;\n" ::: "memory");
+                        }
+                        if constexpr (G::SKIP_GLOBAL_COL_MATERIALIZATION && DEDICATED_ROWONLY_DEBUG_STAGE == 24) {
+                            if (block_idx == cluster_id &&
+                                warpgroup::warpid() == 0 && quant_lane == 0) {
+                                printf(
+                                    "dedicated rowonly stage 24 cta=%d wg=%d block=%d row=%d col=%d epi=%d\n",
+                                    cta_id, warpgroup_id, block_idx, row_block_idx, col_block_idx, epi);
+                                return;
+                            }
+                        }
+                        if constexpr (G::SKIP_GLOBAL_COL_MATERIALIZATION &&
+                                      ROWONLY_COMBO_DC_DEBUG_CUT == 192) {
+                            if (block_idx > cluster_id &&
+                                warpgroup::warpid() == 0 && quant_lane == 0) {
+                                printf(
+                                    "rowonly combo dc cut 192 cta=%d wg=%d block=%d row=%d col=%d epi=%d roles=%d%d%d%d\n",
+                                    cta_id, warpgroup_id, block_idx, row_block_idx, col_block_idx, epi,
+                                    is_row_quantizer_wg ? 1 : 0,
+                                    is_col_quantizer_wg ? 1 : 0,
+                                    is_de_consumer_wg ? 1 : 0,
+                                    is_dc_consumer_wg ? 1 : 0);
+                                return;
+                            }
+                        }
+                        if constexpr (G::SKIP_GLOBAL_COL_MATERIALIZATION &&
+                                      ROWONLY_COMBO_DC_DEBUG_CUT == 196) {
+                            if (block_idx > cluster_id &&
+                                warpgroup::warpid() == 0 && quant_lane == 0) {
+                                printf(
+                                    "rowonly combo dc cut 196p cta=%d wg=%d block=%d row=%d col=%d epi=%d\n",
+                                    cta_id, warpgroup_id, block_idx, row_block_idx, col_block_idx, epi);
+                            }
+                        }
+                        if constexpr (G::SKIP_GLOBAL_COL_MATERIALIZATION && ROWONLY_COMBO_DC_TRACE_BLOCK1 == 1) {
+                            if (block_idx > cluster_id &&
+                                warpgroup::warpid() == 0 && quant_lane == 0) {
+                                printf(
+                                    "rowonly combo dc trace 79 cta=%d wg=%d block=%d row=%d col=%d epi=%d roles=%d%d%d%d\n",
+                                    cta_id, warpgroup_id, block_idx, row_block_idx, col_block_idx, epi,
+                                    is_row_quantizer_wg ? 1 : 0,
+                                    is_col_quantizer_wg ? 1 : 0,
+                                    is_de_consumer_wg ? 1 : 0,
+                                    is_dc_consumer_wg ? 1 : 0);
+                            }
+                        }
+                        if constexpr (G::SKIP_GLOBAL_COL_MATERIALIZATION && ROWONLY_COMBO_DC_DEBUG_CUT == 79) {
+                            if (block_idx > cluster_id &&
+                                warpgroup::warpid() == 0 && quant_lane == 0) {
+                                printf(
+                                    "rowonly combo dc cut 79 cta=%d wg=%d block=%d row=%d col=%d epi=%d roles=%d%d%d%d\n",
+                                    cta_id, warpgroup_id, block_idx, row_block_idx, col_block_idx, epi,
+                                    is_row_quantizer_wg ? 1 : 0,
+                                    is_col_quantizer_wg ? 1 : 0,
+                                    is_de_consumer_wg ? 1 : 0,
+                                    is_dc_consumer_wg ? 1 : 0);
+                                return;
+                            }
+                        }
+                    }
+                }
+                    const bool run_single_frontend_quantizer_wg =
+                        !EFFECTIVE_SEPARATE_BACKHALF_CONSUMERS ||
+                        is_row_quantizer_wg || is_col_quantizer_wg;
+                    if constexpr (G::FRONTEND_SINGLE_QUANTIZER_WG) {
+                        if (run_single_frontend_quantizer_wg) {
+                            if constexpr (ROW_IN_QUANTIZER) {
+                                if constexpr (!G::DEBUG_SKIP_ROW_READY_WAIT) {
+                                    wait(slice_row_ready[bf_stage], get_phasebit<0>(slice_row_ready_phasebits, bf_stage));
+                                    asm volatile("fence.proxy.async.shared::cta;\n" ::: "memory");
+                                }
+                            }
+                            if constexpr (COL_IN_QUANTIZER) {
+                                if constexpr (!G::COL_READY_PER_ROW16) {
+                                    if constexpr (!G::DEBUG_SKIP_COL_READY_WAIT) {
+                                        if constexpr (G::USE_COL_PAIR_STAGE || (DO_ROW && C::ROW_QUANT_FROM_REGS && C::CONSUMER_DO_ROW && !C::EARLY_COL_READY)) {
+                                            if constexpr (G::SKIP_GLOBAL_COL_MATERIALIZATION) {
+                                                if constexpr (ROWONLY_COMBO_DC_DEBUG_CUT == 110) {
+                                                    if (block_idx > cluster_id && combo_do_dc && is_col_quantizer_wg && epi == 0) {
+                                                        if (warpgroup::warpid() == 0 && quant_lane == 0) {
+                                                            printf(
+                                                                "rowonly combo dc cut 110 cta=%d wg=%d block=%d row=%d col=%d epi=%d roles=%d%d%d%d\n",
+                                                                cta_id, warpgroup_id, block_idx, row_block_idx, col_block_idx, epi,
+                                                                is_row_quantizer_wg ? 1 : 0,
+                                                                is_col_quantizer_wg ? 1 : 0,
+                                                                is_de_consumer_wg ? 1 : 0,
+                                                                is_dc_consumer_wg ? 1 : 0);
+                                                        }
+                                                        return;
+                                                    }
+                                                }
+                                            }
+                                            // Dedicated row-only combo-dC quantizes rows from row_pair_stage
+                                            // and does not globally materialize G_col. The inherited
+                                            // USE_COL_PAIR_STAGE trait is still true, but this frontend
+                                            // quantizer path does not actually depend on the generic
+                                            // slice_col_ready contract in that mode.
+                                            if (!(DEDICATED_ROWONLY_ROUTE && combo_do_dc)) {
+                                                wait(slice_col_ready[bf_stage], get_phasebit<0>(slice_col_ready_phasebits, bf_stage));
+                                            }
+                                            if constexpr (G::SKIP_GLOBAL_COL_MATERIALIZATION) {
+                                                if constexpr (ROWONLY_COMBO_DC_DEBUG_CUT == 111) {
+                                                    if (block_idx > cluster_id && combo_do_dc && is_col_quantizer_wg && epi == 0) {
+                                                        if (warpgroup::warpid() == 0 && quant_lane == 0) {
+                                                            printf(
+                                                                "rowonly combo dc cut 111 cta=%d wg=%d block=%d row=%d col=%d epi=%d roles=%d%d%d%d\n",
+                                                                cta_id, warpgroup_id, block_idx, row_block_idx, col_block_idx, epi,
+                                                                is_row_quantizer_wg ? 1 : 0,
+                                                                is_col_quantizer_wg ? 1 : 0,
+                                                                is_de_consumer_wg ? 1 : 0,
+                                                                is_dc_consumer_wg ? 1 : 0);
+                                                        }
+                                                        return;
+                                                    }
+                                                }
+                                            }
+                                        } else {
+                                            wait(slice_col_ready[bf_stage], get_phasebit<0>(slice_phasebits, bf_stage));
+                                        }
                                     }
                                 }
                             }
@@ -9268,7 +11560,12 @@ __device__ inline void backward_kernel_v3_streaming_3wg_impl(const globals_3wg<C
                             if constexpr (!G::COL_READY_PER_ROW16) {
                                 if constexpr (!G::DEBUG_SKIP_COL_READY_WAIT) {
                                     if constexpr (G::USE_COL_PAIR_STAGE || (DO_ROW && C::ROW_QUANT_FROM_REGS && C::CONSUMER_DO_ROW && !C::EARLY_COL_READY)) {
-                                        wait(slice_col_ready[bf_stage], get_phasebit<0>(slice_col_ready_phasebits, bf_stage));
+                                        // Dedicated row-only combo-dC still reuses the frontend
+                                        // col quantizer WG, but it does not consume the generic
+                                        // slice_col_ready contract in this path.
+                                        if (!(DEDICATED_ROWONLY_ROUTE && combo_do_dc)) {
+                                            wait(slice_col_ready[bf_stage], get_phasebit<0>(slice_col_ready_phasebits, bf_stage));
+                                        }
                                     } else {
                                         wait(slice_col_ready[bf_stage], get_phasebit<0>(slice_phasebits, bf_stage));
                                     }
@@ -9279,6 +11576,24 @@ __device__ inline void backward_kernel_v3_streaming_3wg_impl(const globals_3wg<C
                 }
                 if constexpr (COL_IN_QUANTIZER && (G::USE_COL_PLAIN_STAGE || G::USE_COL_PAIR_STAGE || C::EARLY_COL_READY || C::ROW_QUANT_FROM_REGS) && !G::COL_READY_PER_ROW16) {
                     asm volatile("fence.proxy.async.shared::cta;\n" ::: "memory");
+                }
+                if constexpr (G::SKIP_GLOBAL_COL_MATERIALIZATION && DEDICATED_ROWONLY_DEBUG_STAGE == 22) {
+                    if (block_idx == cluster_id && combo_do_dc && is_dc_consumer_wg && combo_stage_publish_epi &&
+                        warpgroup::warpid() == 0 && quant_lane == 0) {
+                        printf(
+                            "dedicated rowonly stage 22 cta=%d wg=%d block=%d row=%d col=%d epi=%d\n",
+                            cta_id, warpgroup_id, block_idx, row_block_idx, col_block_idx, epi);
+                        return;
+                    }
+                }
+                if constexpr (G::SKIP_GLOBAL_COL_MATERIALIZATION && DEDICATED_ROWONLY_DEBUG_STAGE == 30) {
+                    if (block_idx == cluster_id && combo_do_dc && is_col_quantizer_wg && combo_stage_publish_epi &&
+                        warpgroup::warpid() == 0 && quant_lane == 0) {
+                        printf(
+                            "dedicated rowonly stage 30 cta=%d wg=%d block=%d row=%d col=%d epi=%d\n",
+                            cta_id, warpgroup_id, block_idx, row_block_idx, col_block_idx, epi);
+                        return;
+                    }
                 }
 
                 const uint32_t d_base = static_cast<uint32_t>(__cvta_generic_to_shared(&bf16_epi_stage[bf_stage].D.data[0]));
@@ -9296,6 +11611,22 @@ __device__ inline void backward_kernel_v3_streaming_3wg_impl(const globals_3wg<C
                         move<bf16>::lds(value, G::D_tile::idx(d_col_base, {local_row, local_col}));
                     }
                 };
+                if constexpr (G::SKIP_GLOBAL_COL_MATERIALIZATION) {
+                    if constexpr (ROWONLY_COMBO_DC_DEBUG_CUT == 92) {
+                        if (block_idx > cluster_id && combo_do_dc && is_dc_consumer_wg && epi == 0) {
+                            if (warpgroup::warpid() == 0 && quant_lane == 0) {
+                                printf(
+                                    "rowonly combo dc cut 92 cta=%d wg=%d block=%d row=%d col=%d epi=%d roles=%d%d%d%d\n",
+                                    cta_id, warpgroup_id, block_idx, row_block_idx, col_block_idx, epi,
+                                    is_row_quantizer_wg ? 1 : 0,
+                                    is_col_quantizer_wg ? 1 : 0,
+                                    is_de_consumer_wg ? 1 : 0,
+                                    is_dc_consumer_wg ? 1 : 0);
+                            }
+                            return;
+                        }
+                    }
+                }
 
                 if constexpr (ROW_IN_QUANTIZER) {
                     if constexpr (!G::DEBUG_DISABLE_ROW_QUANT_WORK) {
@@ -9307,6 +11638,7 @@ __device__ inline void backward_kernel_v3_streaming_3wg_impl(const globals_3wg<C
                         G::ROW_PAIR_STAGE_FLOATCACHE &&
                         G::ROW_PAIR_STAGE_LANEPAIR_LAYOUT;
                     if constexpr (SINGLE_ROW_ONLY_LANEPAIR_FLOATCACHE) {
+                        if (run_single_frontend_quantizer_wg) {
                         const int quant_row = quant_thread;
                         if (quant_row < C::Mb / 2) {
                             const int global_row = tile_row_base + quant_row;
@@ -9377,9 +11709,10 @@ __device__ inline void backward_kernel_v3_streaming_3wg_impl(const globals_3wg<C
                                 }
                             }
                         }
+                        }
                     } else if constexpr (G::FRONTEND_SINGLE_QUANTIZER_WG) {
                         constexpr int ROW_THREADS = QUANTIZER_WG_THREADS / 2;
-                        if (quant_thread < ROW_THREADS) {
+                        if (run_single_frontend_quantizer_wg && quant_thread < ROW_THREADS) {
                             const int quant_row = quant_thread;
                             if (quant_row < C::Mb / 2) {
                                 const int global_row = tile_row_base + quant_row;
@@ -9548,29 +11881,306 @@ __device__ inline void backward_kernel_v3_streaming_3wg_impl(const globals_3wg<C
                     }
                 }
 
+                if constexpr (G::SKIP_GLOBAL_COL_MATERIALIZATION) {
+                    if constexpr (ROWONLY_COMBO_DC_DEBUG_CUT == 93) {
+                        if (block_idx > cluster_id && combo_do_dc && is_dc_consumer_wg && epi == 0) {
+                            if (warpgroup::warpid() == 0 && quant_lane == 0) {
+                                printf(
+                                    "rowonly combo dc cut 93 cta=%d wg=%d block=%d row=%d col=%d epi=%d roles=%d%d%d%d\n",
+                                    cta_id, warpgroup_id, block_idx, row_block_idx, col_block_idx, epi,
+                                    is_row_quantizer_wg ? 1 : 0,
+                                    is_col_quantizer_wg ? 1 : 0,
+                                    is_de_consumer_wg ? 1 : 0,
+                                    is_dc_consumer_wg ? 1 : 0);
+                            }
+                            return;
+                        }
+                    }
+                }
                 if constexpr (COL_IN_QUANTIZER) {
                     if constexpr (!G::DEBUG_DISABLE_COL_QUANT_WORK) {
-                    if constexpr (G::FRONTEND_SINGLE_QUANTIZER_WG) {
-                        constexpr int ROW_THREADS = ROW_IN_QUANTIZER ? (QUANTIZER_WG_THREADS / 2) : 0;
-                        constexpr int COL_THREADS = QUANTIZER_WG_THREADS - ROW_THREADS;
-                        constexpr int COL_ROW16_BLOCKS_PER_PASS = COL_THREADS / SUBTILE_COLS;
-                        static_assert(COL_ROW16_BLOCKS_PER_PASS > 0);
-                        const int col_thread = quant_thread - ROW_THREADS;
-                        if (col_thread >= 0) {
+                    if constexpr (G::SKIP_GLOBAL_COL_MATERIALIZATION) {
+                        if constexpr (ROWONLY_COMBO_DC_DEBUG_CUT == 95) {
+                            if (block_idx > cluster_id && combo_do_dc && is_dc_consumer_wg && epi == 0) {
+                                if (warpgroup::warpid() == 0 && quant_lane == 0) {
+                                    printf(
+                                        "rowonly combo dc cut 95 cta=%d wg=%d block=%d row=%d col=%d epi=%d roles=%d%d%d%d\n",
+                                        cta_id, warpgroup_id, block_idx, row_block_idx, col_block_idx, epi,
+                                        is_row_quantizer_wg ? 1 : 0,
+                                        is_col_quantizer_wg ? 1 : 0,
+                                        is_de_consumer_wg ? 1 : 0,
+                                        is_dc_consumer_wg ? 1 : 0);
+                                }
+                                return;
+                            }
+                        }
+                    }
+                    if constexpr (G::FUSED_SOFTMAX_QUANT && G::FUSED_COL_IN_QUANTIZER) {
+                        if constexpr (G::FRONTEND_SINGLE_QUANTIZER_WG) {
+                            constexpr int ROW_THREADS = ROW_IN_QUANTIZER ? (QUANTIZER_WG_THREADS / 2) : 0;
+                            constexpr int COL_THREADS = QUANTIZER_WG_THREADS - ROW_THREADS;
+                            constexpr int COL_ROW16_BLOCKS_PER_PASS = COL_THREADS / SUBTILE_COLS;
+                            static_assert(COL_ROW16_BLOCKS_PER_PASS > 0);
+                            const int col_thread = quant_thread - ROW_THREADS;
+                            const bool fused_diag_timing_leader =
+                                G::SAFUSED_DIAG_TIMING_ENABLED &&
+                                g.diag_stage_cycles != nullptr &&
+                                block_idx == 0 &&
+                                col_thread == 0;
+                            if (run_single_frontend_quantizer_wg && col_thread >= 0) {
+                                const int col_in_epi = col_thread % SUBTILE_COLS;
+                                const int row16_block_base = col_thread / SUBTILE_COLS;
+                                #pragma unroll
+                                for (int row16_pass = 0; row16_pass < (ROW16_BLOCKS + COL_ROW16_BLOCKS_PER_PASS - 1) / COL_ROW16_BLOCKS_PER_PASS; ++row16_pass) {
+                                    const int row16_block = row16_block_base + row16_pass * COL_ROW16_BLOCKS_PER_PASS;
+                                    const int global_col = col_start + col_in_epi;
+                                    if (row16_block < ROW16_BLOCKS && (full_tile_cols || global_col < g.N)) {
+                                        uint64_t fused_diag_col_t0 = 0;
+                                        if constexpr (G::SAFUSED_DIAG_TIMING_ENABLED) {
+                                            if (fused_diag_timing_leader && row16_pass == 0) fused_diag_col_t0 = clock64();
+                                        }
+                                        wait(slice_col_ready_row16[bf_stage][row16_block], get_phasebit<0>(slice_col_ready_phasebits, bf_stage));
+                                        asm volatile("fence.proxy.async.shared::cta;\n" ::: "memory");
+                                        if constexpr (SAFUSED_SPLIT_STAGE_DEBUG) {
+                                            if (row16_pass == 0 && row16_block == 0 && col_thread == 0) {
+                                                safused_split_request_abort(3);
+                                            }
+                                            if (safused_split_should_abort()) return;
+                                        }
+                                        const int local_row_base = row16_block * 16;
+                                        const int global_row_base = tile_row_base + local_row_base;
+                                        const int local_row_pair_base = local_row_base / 2;
+                                        const int global_row_pair_base = global_row_base / 2;
+                                        const int local_col = epi * SUBTILE_COLS + col_in_epi;
+                                        const int depth = global_col / 128;
+                                        const int sr = global_col % 32;
+                                        const int rr = (global_col / 32) % 4;
+                                        const int m_kgroup = global_row_base / 64;
+                                        const int m_16_in_64 = (global_row_base / 16) % 4;
+                                        const int chunk = depth * col_sc_kgroups + m_kgroup;
+                                        const int byte_idx = sr * 16 + rr * 4 + m_16_in_64;
+                                        const int local_m_kgroup = local_row_base / 64;
+                                        const int local_byte_idx =
+                                            local_m_kgroup * 512 + sr * 16 + rr * 4 + m_16_in_64;
+
+                                        float cached_vals[16];
+                                        float col_amax = 0.0f;
+                                        #pragma unroll
+                                        for (int r = 0; r < 16; ++r) {
+                                            float v = fused_quant_stage->col_values[bf_stage][row16_block][col_in_epi][r];
+                                            const int global_row = global_row_base + r;
+                                            if (!full_tile_rows && global_row >= g.M) v = 0.0f;
+                                            cached_vals[r] = v;
+                                            col_amax = fmaxf(col_amax, fabsf(v));
+                                        }
+
+                                        fp4_scale_contract scale_contract{};
+                                        if constexpr (G::SAFUSED_FIXED_COL_SCALE) {
+                                            scale_contract = make_fp4_scale_contract(1.0f, g_sg_rcp, g_sg, encode_centric);
+                                        } else {
+                                            scale_contract = make_fp4_scale_contract(col_amax, g_sg_rcp, g_sg, encode_centric);
+                                        }
+
+                                        uint64_t packed_fp4 = 0;
+                                        if constexpr (!G::SAFUSED_SKIP_COL_PACK) {
+                                            #pragma unroll
+                                            for (int pair = 0; pair < 8; ++pair) {
+                                                packed_fp4 |= static_cast<uint64_t>(quantize_fp4_pair(
+                                                    cached_vals[pair * 2],
+                                                    cached_vals[pair * 2 + 1],
+                                                    scale_contract.quant_rcp_scale)) << (pair * 8);
+                                            }
+                                            store_global_u64(
+                                                fused_col_fp4_stage + local_col * (C::Mb / 4) + local_row_pair_base,
+                                                packed_fp4);
+                                            if (combo_do_dc) {
+                                                store_combo_col_stage_u64<G>(
+                                                    combo_col_stage_slot,
+                                                    local_col,
+                                                    local_row_pair_base,
+                                                    packed_fp4);
+                                            }
+                                        }
+                                        fused_col_sc_stage[local_byte_idx] = scale_contract.scale_byte;
+                                        if (combo_do_dc) {
+                                            store_combo_col_stage_scale<G>(
+                                                combo_col_stage_slot,
+                                                local_col,
+                                                local_row_base,
+                                                scale_contract.scale_byte);
+                                        }
+                                        if constexpr (SAFUSED_SPLIT_STAGE_DEBUG) {
+                                            if (row16_pass == 0 && row16_block == 0 && col_thread == 0) {
+                                                safused_split_request_abort(4);
+                                            }
+                                            if (safused_split_should_abort()) return;
+                                        }
+                                        if constexpr (DO_ROW && G::ROW_WAITS_FOR_COL_DONE_ROW16) {
+                                            __syncwarp();
+                                            if (col_in_epi == 0) {
+                                                __threadfence_block();
+                                                slice_col_done_row16[bf_stage][row16_block] = 1;
+                                            }
+                                        }
+                                        if constexpr (G::SAFUSED_DIAG_TIMING_ENABLED) {
+                                            if (fused_diag_timing_leader && row16_pass == 0) {
+                                                fused_diag_quant_col_cycles += clock64() - fused_diag_col_t0;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        } else if (is_col_quantizer_wg) {
+                            constexpr int COL_THREADS = QUANTIZER_WG_THREADS * C::COL_QUANTIZER_WARPGROUPS;
+                            constexpr int COL_ROW16_BLOCKS_PER_PASS = COL_THREADS / SUBTILE_COLS;
+                            static_assert(COL_ROW16_BLOCKS_PER_PASS > 0);
+                            const int col_quantizer_rank = warpgroup_id - first_col_quantizer_wg;
+                            const int col_thread = col_quantizer_rank * QUANTIZER_WG_THREADS + quant_thread;
+                            const bool fused_diag_timing_leader =
+                                G::SAFUSED_DIAG_TIMING_ENABLED &&
+                                g.diag_stage_cycles != nullptr &&
+                                block_idx == 0 &&
+                                col_thread == 0;
                             const int col_in_epi = col_thread % SUBTILE_COLS;
                             const int row16_block_base = col_thread / SUBTILE_COLS;
                             #pragma unroll
                             for (int row16_pass = 0; row16_pass < (ROW16_BLOCKS + COL_ROW16_BLOCKS_PER_PASS - 1) / COL_ROW16_BLOCKS_PER_PASS; ++row16_pass) {
                                 const int row16_block = row16_block_base + row16_pass * COL_ROW16_BLOCKS_PER_PASS;
                                 const int global_col = col_start + col_in_epi;
-                                    if (row16_block < ROW16_BLOCKS && global_col < g.N) {
-                                        if constexpr (G::COL_READY_PER_ROW16) {
-                                            wait(slice_col_ready_row16[bf_stage][row16_block], get_phasebit<0>(slice_col_ready_phasebits, bf_stage));
-                                            asm volatile("fence.proxy.async.shared::cta;\n" ::: "memory");
-                                        }
+                                if (row16_block < ROW16_BLOCKS && (full_tile_cols || global_col < g.N)) {
+                                    uint64_t fused_diag_col_t0 = 0;
+                                    if constexpr (G::SAFUSED_DIAG_TIMING_ENABLED) {
+                                        if (fused_diag_timing_leader && row16_pass == 0) fused_diag_col_t0 = clock64();
+                                    }
+                                    wait(slice_col_ready_row16[bf_stage][row16_block], get_phasebit<0>(slice_col_ready_phasebits, bf_stage));
+                                    asm volatile("fence.proxy.async.shared::cta;\n" ::: "memory");
                                     const int local_row_base = row16_block * 16;
                                     const int global_row_base = tile_row_base + local_row_base;
+                                    const int local_row_pair_base = local_row_base / 2;
+                                    const int local_col = epi * SUBTILE_COLS + col_in_epi;
+                                    const int sr = global_col % 32;
+                                    const int rr = (global_col / 32) % 4;
+                                    const int local_m_kgroup = local_row_base / 64;
+                                    const int local_byte_idx =
+                                        local_m_kgroup * 512 + sr * 16 + rr * 4 + ((local_row_base / 16) % 4);
+                                    float cached_vals[16];
+                                    float col_amax = 0.0f;
+                                    #pragma unroll
+                                    for (int r = 0; r < 16; ++r) {
+                                        float v = fused_quant_stage->col_values[bf_stage][row16_block][col_in_epi][r];
+                                        const int global_row = global_row_base + r;
+                                        if (!full_tile_rows && global_row >= g.M) v = 0.0f;
+                                        cached_vals[r] = v;
+                                        col_amax = fmaxf(col_amax, fabsf(v));
+                                    }
+                                    fp4_scale_contract scale_contract{};
+                                    if constexpr (G::SAFUSED_FIXED_COL_SCALE) {
+                                        scale_contract = make_fp4_scale_contract(1.0f, g_sg_rcp, g_sg, encode_centric);
+                                    } else {
+                                        scale_contract = make_fp4_scale_contract(col_amax, g_sg_rcp, g_sg, encode_centric);
+                                    }
+                                    uint64_t packed_fp4 = 0;
+                                    if constexpr (!G::SAFUSED_SKIP_COL_PACK) {
+                                        #pragma unroll
+                                        for (int pair = 0; pair < 8; ++pair) {
+                                            packed_fp4 |= static_cast<uint64_t>(quantize_fp4_pair(
+                                                cached_vals[pair * 2],
+                                                cached_vals[pair * 2 + 1],
+                                                scale_contract.quant_rcp_scale)) << (pair * 8);
+                                        }
+                                        store_global_u64(
+                                            fused_col_fp4_stage + local_col * (C::Mb / 4) + local_row_pair_base,
+                                            packed_fp4);
+                                    }
+                                    fused_col_sc_stage[local_byte_idx] = scale_contract.scale_byte;
+                                    if constexpr (DO_ROW && G::ROW_WAITS_FOR_COL_DONE_ROW16) {
+                                        __syncwarp();
+                                        if (col_in_epi == 0) {
+                                            __threadfence_block();
+                                            slice_col_done_row16[bf_stage][row16_block] = 1;
+                                        }
+                                    }
+                                    if constexpr (G::SAFUSED_DIAG_TIMING_ENABLED) {
+                                        if (fused_diag_timing_leader && row16_pass == 0) {
+                                            fused_diag_quant_col_cycles += clock64() - fused_diag_col_t0;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    } else if constexpr (G::FRONTEND_SINGLE_QUANTIZER_WG) {
+                        if constexpr (G::SKIP_GLOBAL_COL_MATERIALIZATION) {
+                            if constexpr (ROWONLY_COMBO_DC_DEBUG_CUT == 96) {
+                                if (block_idx > cluster_id && combo_do_dc && is_col_quantizer_wg && epi == 0) {
+                                    if (warpgroup::warpid() == 0 && quant_lane == 0) {
+                                        printf(
+                                            "rowonly combo dc cut 96 cta=%d wg=%d block=%d row=%d col=%d epi=%d roles=%d%d%d%d\n",
+                                            cta_id, warpgroup_id, block_idx, row_block_idx, col_block_idx, epi,
+                                            is_row_quantizer_wg ? 1 : 0,
+                                            is_col_quantizer_wg ? 1 : 0,
+                                            is_de_consumer_wg ? 1 : 0,
+                                            is_dc_consumer_wg ? 1 : 0);
+                                    }
+                                    return;
+                                }
+                            }
+                        }
+                        constexpr int ROW_THREADS = ROW_IN_QUANTIZER ? (QUANTIZER_WG_THREADS / 2) : 0;
+                        constexpr int COL_THREADS = QUANTIZER_WG_THREADS - ROW_THREADS;
+                        constexpr int COL_ROW16_BLOCKS_PER_PASS = COL_THREADS / SUBTILE_COLS;
+                        static_assert(COL_ROW16_BLOCKS_PER_PASS > 0);
+                        const int col_thread = quant_thread - ROW_THREADS;
+                        if (run_single_frontend_quantizer_wg && col_thread >= 0) {
+                            const int col_in_epi = col_thread % SUBTILE_COLS;
+                            const int row16_block_base = col_thread / SUBTILE_COLS;
+                            #pragma unroll
+                            for (int row16_pass = 0; row16_pass < (ROW16_BLOCKS + COL_ROW16_BLOCKS_PER_PASS - 1) / COL_ROW16_BLOCKS_PER_PASS; ++row16_pass) {
+                                const int row16_block = row16_block_base + row16_pass * COL_ROW16_BLOCKS_PER_PASS;
+                                const int global_col = col_start + col_in_epi;
+	                                    if (row16_block < ROW16_BLOCKS && global_col < g.N) {
+	                                        if constexpr (G::COL_READY_PER_ROW16) {
+	                                            if constexpr (!(G::SKIP_GLOBAL_COL_MATERIALIZATION && ROWONLY_COMBO_DC_SKIP_ROW16_READY_WAIT)) {
+	                                                wait(slice_col_ready_row16[bf_stage][row16_block], get_phasebit<0>(slice_col_ready_phasebits, bf_stage));
+	                                                asm volatile("fence.proxy.async.shared::cta;\n" ::: "memory");
+	                                            }
+                                                if constexpr (G::SKIP_GLOBAL_COL_MATERIALIZATION) {
+                                                    if constexpr (ROWONLY_COMBO_DC_DEBUG_CUT == 97) {
+                                                        if (block_idx > cluster_id && combo_do_dc && is_dc_consumer_wg && epi == 0 && row16_pass == 0) {
+                                                            if (warpgroup::warpid() == 0 && quant_lane == 0) {
+                                                                printf(
+                                                                    "rowonly combo dc cut 97 cta=%d wg=%d block=%d row=%d col=%d epi=%d row16=%d roles=%d%d%d%d\n",
+                                                                    cta_id, warpgroup_id, block_idx, row_block_idx, col_block_idx, epi, row16_block,
+                                                                    is_row_quantizer_wg ? 1 : 0,
+                                                                    is_col_quantizer_wg ? 1 : 0,
+                                                                    is_de_consumer_wg ? 1 : 0,
+                                                                    is_dc_consumer_wg ? 1 : 0);
+                                                            }
+                                                            return;
+                                                        }
+	                                                    }
+	                                                }
+	                                        }
+                                            if constexpr (G::SKIP_GLOBAL_COL_MATERIALIZATION &&
+                                                          ROWONLY_COMBO_DC_DEBUG_CUT == 200) {
+                                                if (block_idx == cluster_id && combo_do_dc && is_col_quantizer_wg &&
+                                                    combo_stage_publish_epi && row16_pass == 0 &&
+                                                    warpgroup::warpid() == 0 && quant_lane == 0) {
+                                                    printf(
+                                                        "rowonly combo dc cut 200 cta=%d wg=%d block=%d row=%d col=%d epi=%d row16=%d roles=%d%d%d%d\n",
+                                                        cta_id, warpgroup_id, block_idx, row_block_idx, col_block_idx, epi,
+                                                        row16_block,
+                                                        is_row_quantizer_wg ? 1 : 0,
+                                                        is_col_quantizer_wg ? 1 : 0,
+                                                        is_de_consumer_wg ? 1 : 0,
+                                                        is_dc_consumer_wg ? 1 : 0);
+                                                    return;
+                                                }
+                                            }
+	                                    const int local_row_base = row16_block * 16;
+                                    const int global_row_base = tile_row_base + local_row_base;
+                                    const int local_row_pair_base = local_row_base / 2;
                                     const int global_row_pair_base = global_row_base / 2;
+                                    const int local_col = epi * SUBTILE_COLS + col_in_epi;
                                     const int depth = global_col / 128;
                                     const int sr = global_col % 32;
                                     const int rr = (global_col / 32) % 4;
@@ -9578,7 +12188,8 @@ __device__ inline void backward_kernel_v3_streaming_3wg_impl(const globals_3wg<C
                                     const int m_16_in_64 = (global_row_base / 16) % 4;
                                     const int chunk = depth * col_sc_kgroups + m_kgroup;
                                     const int byte_idx = sr * 16 + rr * 4 + m_16_in_64;
-                                    if constexpr (G::USE_COL_PAIR_STAGE) {
+                                    if constexpr (G::USE_COL_PAIR_STAGE &&
+                                                  !(DEDICATED_ROWONLY_ROUTE && combo_do_dc)) {
                                         const int col_pair_idx = col_in_epi / 2;
                                         const int col_pair_lane = col_in_epi % 2;
                                         float col_amax = 0.0f;
@@ -9596,22 +12207,42 @@ __device__ inline void backward_kernel_v3_streaming_3wg_impl(const globals_3wg<C
                                                 col_amax = fmaxf(col_amax, fabsf(v0));
                                                 col_amax = fmaxf(col_amax, fabsf(v1));
                                             }
-                                            const float col_scale = col_amax * (1.0f / FP4_MAX);
-                                            const float col_rcp = (col_amax > 0.0f) ? (FP4_MAX / col_amax) : 0.0f;
+                                            const fp4_scale_contract scale_contract =
+                                                make_fp4_scale_contract(col_amax, g_sg_rcp, g_sg, encode_centric);
+                                            if constexpr (G::SKIP_GLOBAL_COL_MATERIALIZATION &&
+                                                          ROWONLY_COMBO_DC_DEBUG_CUT == 201) {
+                                                if (block_idx == cluster_id && combo_do_dc && is_col_quantizer_wg &&
+                                                    combo_stage_publish_epi && row16_pass == 0 &&
+                                                    warpgroup::warpid() == 0 && quant_lane == 0) {
+                                                    printf(
+                                                        "rowonly combo dc cut 201 cta=%d wg=%d block=%d row=%d col=%d epi=%d row16=%d amax=%f roles=%d%d%d%d\n",
+                                                        cta_id, warpgroup_id, block_idx, row_block_idx, col_block_idx, epi,
+                                                        row16_block, col_amax,
+                                                        is_row_quantizer_wg ? 1 : 0,
+                                                        is_col_quantizer_wg ? 1 : 0,
+                                                        is_de_consumer_wg ? 1 : 0,
+                                                        is_dc_consumer_wg ? 1 : 0);
+                                                    return;
+                                                }
+                                            }
                                             #pragma unroll
                                             for (int pair = 0; pair < 8; ++pair) {
                                                 packed_fp4 |= static_cast<uint64_t>(quantize_fp4_pair(
                                                     cached_pairs[pair].x,
                                                     cached_pairs[pair].y,
-                                                    col_rcp)) << (pair * 8);
+                                                    scale_contract.quant_rcp_scale)) << (pair * 8);
                                             }
                                             if constexpr (G::PACK_COL_FP4_U64) {
-                                                store_global_u64(col_fp4_ptr + global_col * col_fp4_stride + global_row_pair_base, packed_fp4);
+                                                maybe_store_global_col_u64<G>(
+                                                    col_fp4_ptr, col_fp4_stride,
+                                                    global_col, global_row_pair_base, packed_fp4);
                                             } else {
                                                 #pragma unroll
                                                 for (int pair = 0; pair < 8; ++pair) {
-                                                    col_fp4_ptr[global_col * col_fp4_stride + global_row_pair_base + pair] =
-                                                        static_cast<uint8_t>(packed_fp4 >> (pair * 8));
+                                                    maybe_store_global_col_byte<G>(
+                                                        col_fp4_ptr, col_fp4_stride,
+                                                        global_col, global_row_pair_base + pair,
+                                                        static_cast<uint8_t>(packed_fp4 >> (pair * 8)));
                                                 }
                                             }
                                             if (combo_do_dc) {
@@ -9623,21 +12254,32 @@ __device__ inline void backward_kernel_v3_streaming_3wg_impl(const globals_3wg<C
                                                     local_row_pair_base,
                                                     packed_fp4);
                                             }
-                                            float stored_scale = col_scale * g_sg_rcp;
-                                            if (encode_centric) {
-                                                stored_scale = fminf(col_rcp * g_sg, E4M3_MAX);
+                                            maybe_store_global_col_scale<G>(
+                                                col_sc_ptr, chunk, byte_idx, scale_contract.scale_byte);
+                                            if (combo_do_dc) {
+                                                const int local_col = epi * SUBTILE_COLS + col_in_epi;
+                                                store_combo_col_stage_scale<G>(
+                                                    combo_col_stage_slot,
+                                                    local_col,
+                                                    local_row_base,
+                                                    scale_contract.scale_byte);
                                             }
-                                            const __nv_fp8_e4m3 csc = __nv_fp8_e4m3(stored_scale);
-                                                const uint8_t csc_byte = *reinterpret_cast<const uint8_t*>(&csc);
-                                                col_sc_ptr[chunk * 512 + byte_idx] = csc_byte;
-                                                if (combo_do_dc) {
-                                                    const int local_col = epi * SUBTILE_COLS + col_in_epi;
-                                                    store_combo_col_stage_scale<G>(
-                                                        combo_col_stage_slot,
-                                                        local_col,
-                                                        local_row_base,
-                                                        csc_byte);
+                                            if constexpr (G::SKIP_GLOBAL_COL_MATERIALIZATION &&
+                                                          ROWONLY_COMBO_DC_DEBUG_CUT == 202) {
+                                                if (block_idx == cluster_id && combo_do_dc && is_col_quantizer_wg &&
+                                                    combo_stage_publish_epi && row16_pass == 0 &&
+                                                    warpgroup::warpid() == 0 && quant_lane == 0) {
+                                                    printf(
+                                                        "rowonly combo dc cut 202 cta=%d wg=%d block=%d row=%d col=%d epi=%d row16=%d roles=%d%d%d%d\n",
+                                                        cta_id, warpgroup_id, block_idx, row_block_idx, col_block_idx, epi,
+                                                        row16_block,
+                                                        is_row_quantizer_wg ? 1 : 0,
+                                                        is_col_quantizer_wg ? 1 : 0,
+                                                        is_de_consumer_wg ? 1 : 0,
+                                                        is_dc_consumer_wg ? 1 : 0);
+                                                    return;
                                                 }
+                                            }
                                         } else {
                                             bf16_2 cached_pairs[8];
                                             #pragma unroll
@@ -9649,22 +12291,27 @@ __device__ inline void backward_kernel_v3_streaming_3wg_impl(const globals_3wg<C
                                                 col_amax = fmaxf(col_amax, fabsf(v0));
                                                 col_amax = fmaxf(col_amax, fabsf(v1));
                                             }
-                                            const float col_scale = col_amax * (1.0f / FP4_MAX);
-                                            const float col_rcp = (col_amax > 0.0f) ? (FP4_MAX / col_amax) : 0.0f;
+                                            const fp4_scale_contract scale_contract =
+                                                make_fp4_scale_contract(col_amax, g_sg_rcp, g_sg, encode_centric);
                                             #pragma unroll
                                             for (int pair = 0; pair < 8; ++pair) {
                                                 const int global_row = global_row_base + pair * 2;
                                                 const float v0 = (global_row < g.M) ? __bfloat162float(cached_pairs[pair].x) : 0.0f;
                                                 const float v1 = (global_row + 1 < g.M) ? __bfloat162float(cached_pairs[pair].y) : 0.0f;
-                                                packed_fp4 |= static_cast<uint64_t>(quantize_fp4_pair(v0, v1, col_rcp)) << (pair * 8);
+                                                packed_fp4 |= static_cast<uint64_t>(
+                                                    quantize_fp4_pair(v0, v1, scale_contract.quant_rcp_scale)) << (pair * 8);
                                             }
                                             if constexpr (G::PACK_COL_FP4_U64) {
-                                                store_global_u64(col_fp4_ptr + global_col * col_fp4_stride + global_row_pair_base, packed_fp4);
+                                                maybe_store_global_col_u64<G>(
+                                                    col_fp4_ptr, col_fp4_stride,
+                                                    global_col, global_row_pair_base, packed_fp4);
                                             } else {
                                                 #pragma unroll
                                                 for (int pair = 0; pair < 8; ++pair) {
-                                                    col_fp4_ptr[global_col * col_fp4_stride + global_row_pair_base + pair] =
-                                                        static_cast<uint8_t>(packed_fp4 >> (pair * 8));
+                                                    maybe_store_global_col_byte<G>(
+                                                        col_fp4_ptr, col_fp4_stride,
+                                                        global_col, global_row_pair_base + pair,
+                                                        static_cast<uint8_t>(packed_fp4 >> (pair * 8)));
                                                 }
                                             }
                                             if (combo_do_dc) {
@@ -9676,21 +12323,32 @@ __device__ inline void backward_kernel_v3_streaming_3wg_impl(const globals_3wg<C
                                                     local_row_pair_base,
                                                     packed_fp4);
                                             }
-                                            float stored_scale = col_scale * g_sg_rcp;
-                                            if (encode_centric) {
-                                                stored_scale = fminf(col_rcp * g_sg, E4M3_MAX);
+                                            maybe_store_global_col_scale<G>(
+                                                col_sc_ptr, chunk, byte_idx, scale_contract.scale_byte);
+                                            if (combo_do_dc) {
+                                                const int local_col = epi * SUBTILE_COLS + col_in_epi;
+                                                store_combo_col_stage_scale<G>(
+                                                    combo_col_stage_slot,
+                                                    local_col,
+                                                    local_row_base,
+                                                    scale_contract.scale_byte);
                                             }
-                                            const __nv_fp8_e4m3 csc = __nv_fp8_e4m3(stored_scale);
-                                                const uint8_t csc_byte = *reinterpret_cast<const uint8_t*>(&csc);
-                                                col_sc_ptr[chunk * 512 + byte_idx] = csc_byte;
-                                                if (combo_do_dc) {
-                                                    const int local_col = epi * SUBTILE_COLS + col_in_epi;
-                                                    store_combo_col_stage_scale<G>(
-                                                        combo_col_stage_slot,
-                                                        local_col,
-                                                        local_row_base,
-                                                        csc_byte);
+                                            if constexpr (G::SKIP_GLOBAL_COL_MATERIALIZATION &&
+                                                          ROWONLY_COMBO_DC_DEBUG_CUT == 202) {
+                                                if (block_idx == cluster_id && combo_do_dc && is_col_quantizer_wg &&
+                                                    combo_stage_publish_epi && row16_pass == 0 &&
+                                                    warpgroup::warpid() == 0 && quant_lane == 0) {
+                                                    printf(
+                                                        "rowonly combo dc cut 202 cta=%d wg=%d block=%d row=%d col=%d epi=%d row16=%d roles=%d%d%d%d\n",
+                                                        cta_id, warpgroup_id, block_idx, row_block_idx, col_block_idx, epi,
+                                                        row16_block,
+                                                        is_row_quantizer_wg ? 1 : 0,
+                                                        is_col_quantizer_wg ? 1 : 0,
+                                                        is_de_consumer_wg ? 1 : 0,
+                                                        is_dc_consumer_wg ? 1 : 0);
+                                                    return;
                                                 }
+                                            }
                                         }
                                         if constexpr (DO_ROW && G::ROW_WAITS_FOR_COL_DONE_ROW16) {
                                             __syncwarp();
@@ -9745,39 +12403,59 @@ __device__ inline void backward_kernel_v3_streaming_3wg_impl(const globals_3wg<C
                                                 col_amax = fmaxf(col_amax, fabsf(fv));
                                             }
                                         }
-                                        const float col_scale = col_amax * (1.0f / FP4_MAX);
-                                        const float col_rcp = (col_amax > 0.0f) ? (FP4_MAX / col_amax) : 0.0f;
+                                        const fp4_scale_contract scale_contract =
+                                            make_fp4_scale_contract(col_amax, g_sg_rcp, g_sg, encode_centric);
                                         if constexpr (C::FAST_ALIGNED_QUANT) {
                                             if (full_row16) {
+                                                uint64_t packed_fp4 = 0;
                                                 #pragma unroll
                                                 for (int pair = 0; pair < 8; ++pair) {
                                                     bf16 value0_bf;
                                                     bf16 value1_bf;
                                                     load_col_value(value0_bf, local_row_base + pair * 2, col_in_epi);
                                                     load_col_value(value1_bf, local_row_base + pair * 2 + 1, col_in_epi);
-                                                    col_fp4_ptr[global_col * col_fp4_stride + global_row_pair_base + pair] =
-                                                        quantize_fp4_pair(__bfloat162float(value0_bf),
-                                                                          __bfloat162float(value1_bf),
-                                                                          col_rcp);
+                                                    const uint8_t packed_pair = quantize_fp4_pair(
+                                                        __bfloat162float(value0_bf),
+                                                        __bfloat162float(value1_bf),
+                                                        scale_contract.quant_rcp_scale);
+                                                    packed_fp4 |= static_cast<uint64_t>(packed_pair) << (pair * 8);
+                                                    maybe_store_global_col_byte<G>(
+                                                        col_fp4_ptr, col_fp4_stride,
+                                                        global_col, global_row_pair_base + pair,
+                                                        packed_pair);
                                                 }
-                                                float stored_scale = col_scale * g_sg_rcp;
-                                                if (encode_centric) {
-                                                    stored_scale = fminf(col_rcp * g_sg, E4M3_MAX);
+                                                maybe_store_global_col_scale<G>(
+                                                    col_sc_ptr, chunk, byte_idx, scale_contract.scale_byte);
+                                                if (combo_do_dc) {
+                                                    store_combo_col_stage_u64<G>(
+                                                        combo_col_stage_slot,
+                                                        local_col,
+                                                        local_row_pair_base,
+                                                        packed_fp4);
+                                                    store_combo_col_stage_scale<G>(
+                                                        combo_col_stage_slot,
+                                                        local_col,
+                                                        local_row_base,
+                                                        scale_contract.scale_byte);
                                                 }
-                                                const __nv_fp8_e4m3 csc = __nv_fp8_e4m3(stored_scale);
-                                                col_sc_ptr[chunk * 512 + byte_idx] = *reinterpret_cast<const uint8_t*>(&csc);
                                                 continue;
                                             }
                                         }
+                                        uint64_t packed_fp4 = 0;
                                         #pragma unroll
                                         for (int pair = 0; pair < 8; ++pair) {
                                             const int global_row = global_row_base + pair * 2;
                                             if constexpr (C::CACHE_COL_VALUES_BF16_PAIRS) {
                                                 if (full_row16) {
-                                                    col_fp4_ptr[global_col * col_fp4_stride + global_row_pair_base + pair] =
-                                                        quantize_fp4_pair(__bfloat162float(cached_pairs[pair].x),
-                                                                          __bfloat162float(cached_pairs[pair].y),
-                                                                          col_rcp);
+                                                    const uint8_t packed_pair = quantize_fp4_pair(
+                                                        __bfloat162float(cached_pairs[pair].x),
+                                                        __bfloat162float(cached_pairs[pair].y),
+                                                        scale_contract.quant_rcp_scale);
+                                                    packed_fp4 |= static_cast<uint64_t>(packed_pair) << (pair * 8);
+                                                    maybe_store_global_col_byte<G>(
+                                                        col_fp4_ptr, col_fp4_stride,
+                                                        global_col, global_row_pair_base + pair,
+                                                        packed_pair);
                                                     continue;
                                                 }
                                             }
@@ -9800,16 +12478,29 @@ __device__ inline void backward_kernel_v3_streaming_3wg_impl(const globals_3wg<C
                                                         v1 = __bfloat162float(value1_bf);
                                                     }
                                                 }
-                                                col_fp4_ptr[global_col * col_fp4_stride + global_row_pair_base + pair] =
-                                                    quantize_fp4_pair(v0, v1, col_rcp);
+                                                const uint8_t packed_pair = quantize_fp4_pair(
+                                                    v0, v1, scale_contract.quant_rcp_scale);
+                                                packed_fp4 |= static_cast<uint64_t>(packed_pair) << (pair * 8);
+                                                maybe_store_global_col_byte<G>(
+                                                    col_fp4_ptr, col_fp4_stride,
+                                                    global_col, global_row_pair_base + pair,
+                                                    packed_pair);
                                             }
                                         }
-                                        float stored_scale = col_scale * g_sg_rcp;
-                                        if (encode_centric) {
-                                            stored_scale = fminf(col_rcp * g_sg, E4M3_MAX);
+                                        maybe_store_global_col_scale<G>(
+                                            col_sc_ptr, chunk, byte_idx, scale_contract.scale_byte);
+                                        if (combo_do_dc) {
+                                            store_combo_col_stage_u64<G>(
+                                                combo_col_stage_slot,
+                                                local_col,
+                                                local_row_pair_base,
+                                                packed_fp4);
+                                            store_combo_col_stage_scale<G>(
+                                                combo_col_stage_slot,
+                                                local_col,
+                                                local_row_base,
+                                                scale_contract.scale_byte);
                                         }
-                                        const __nv_fp8_e4m3 csc = __nv_fp8_e4m3(stored_scale);
-                                        col_sc_ptr[chunk * 512 + byte_idx] = *reinterpret_cast<const uint8_t*>(&csc);
                                     }
                                     if constexpr (DO_ROW && G::ROW_WAITS_FOR_COL_DONE_ROW16) {
                                         __syncwarp();
@@ -9817,9 +12508,24 @@ __device__ inline void backward_kernel_v3_streaming_3wg_impl(const globals_3wg<C
                                             __threadfence_block();
                                             slice_col_done_row16[bf_stage][row16_block] = 1;
                                         }
+                                        }
                                     }
                                 }
-                            }
+                                if constexpr (G::SKIP_GLOBAL_COL_MATERIALIZATION &&
+                                              ROWONLY_COMBO_DC_DEBUG_CUT == 203) {
+                                    if (block_idx == cluster_id && combo_do_dc && is_col_quantizer_wg &&
+                                        combo_stage_publish_epi &&
+                                        warpgroup::warpid() == 0 && quant_lane == 0) {
+                                        printf(
+                                            "rowonly combo dc cut 203 cta=%d wg=%d block=%d row=%d col=%d epi=%d roles=%d%d%d%d\n",
+                                            cta_id, warpgroup_id, block_idx, row_block_idx, col_block_idx, epi,
+                                            is_row_quantizer_wg ? 1 : 0,
+                                            is_col_quantizer_wg ? 1 : 0,
+                                            is_de_consumer_wg ? 1 : 0,
+                                            is_dc_consumer_wg ? 1 : 0);
+                                        return;
+                                    }
+                                }
                         }
                     } else if (is_col_quantizer_wg) {
                         constexpr int COL_THREADS = QUANTIZER_WG_THREADS * C::COL_QUANTIZER_WARPGROUPS;
@@ -9835,8 +12541,26 @@ __device__ inline void backward_kernel_v3_streaming_3wg_impl(const globals_3wg<C
                             const int global_col = col_start + col_in_epi;
                             if (row16_block < ROW16_BLOCKS && global_col < g.N) {
                                 if constexpr (G::COL_READY_PER_ROW16) {
-                                    wait(slice_col_ready_row16[bf_stage][row16_block], get_phasebit<0>(slice_col_ready_phasebits, bf_stage));
-                                    asm volatile("fence.proxy.async.shared::cta;\n" ::: "memory");
+                                    if constexpr (!(G::SKIP_GLOBAL_COL_MATERIALIZATION && ROWONLY_COMBO_DC_SKIP_ROW16_READY_WAIT)) {
+                                        wait(slice_col_ready_row16[bf_stage][row16_block], get_phasebit<0>(slice_col_ready_phasebits, bf_stage));
+                                        asm volatile("fence.proxy.async.shared::cta;\n" ::: "memory");
+                                    }
+                                }
+                                if constexpr (G::SKIP_GLOBAL_COL_MATERIALIZATION &&
+                                              ROWONLY_COMBO_DC_DEBUG_CUT == 198) {
+                                    if (block_idx == cluster_id && combo_do_dc && is_col_quantizer_wg &&
+                                        combo_stage_publish_epi && row16_pass == 0 &&
+                                        warpgroup::warpid() == 0 && quant_lane == 0) {
+                                        printf(
+                                            "rowonly combo dc cut 198 cta=%d wg=%d block=%d row=%d col=%d epi=%d row16=%d roles=%d%d%d%d\n",
+                                            cta_id, warpgroup_id, block_idx, row_block_idx, col_block_idx, epi,
+                                            row16_block,
+                                            is_row_quantizer_wg ? 1 : 0,
+                                            is_col_quantizer_wg ? 1 : 0,
+                                            is_de_consumer_wg ? 1 : 0,
+                                            is_dc_consumer_wg ? 1 : 0);
+                                        return;
+                                    }
                                 }
                                 const int local_row_base = row16_block * 16;
                                 const int global_row_base = tile_row_base + local_row_base;
@@ -9882,8 +12606,24 @@ __device__ inline void backward_kernel_v3_streaming_3wg_impl(const globals_3wg<C
                                         col_amax = fmaxf(col_amax, fabsf(fv));
                                     }
                                 }
-                                const float col_scale = col_amax * (1.0f / FP4_MAX);
-                                const float col_rcp = (col_amax > 0.0f) ? (FP4_MAX / col_amax) : 0.0f;
+                                const fp4_scale_contract scale_contract =
+                                    make_fp4_scale_contract(col_amax, g_sg_rcp, g_sg, encode_centric);
+                                if constexpr (G::SKIP_GLOBAL_COL_MATERIALIZATION &&
+                                              ROWONLY_COMBO_DC_DEBUG_CUT == 199) {
+                                    if (block_idx == cluster_id && combo_do_dc && is_col_quantizer_wg &&
+                                        combo_stage_publish_epi && row16_pass == 0 &&
+                                        warpgroup::warpid() == 0 && quant_lane == 0) {
+                                        printf(
+                                            "rowonly combo dc cut 199 cta=%d wg=%d block=%d row=%d col=%d epi=%d row16=%d amax=%f roles=%d%d%d%d\n",
+                                            cta_id, warpgroup_id, block_idx, row_block_idx, col_block_idx, epi,
+                                            row16_block, col_amax,
+                                            is_row_quantizer_wg ? 1 : 0,
+                                            is_col_quantizer_wg ? 1 : 0,
+                                            is_de_consumer_wg ? 1 : 0,
+                                            is_dc_consumer_wg ? 1 : 0);
+                                        return;
+                                    }
+                                }
                                 #pragma unroll
                                 for (int pair = 0; pair < 8; ++pair) {
                                     const int global_row = global_row_base + pair * 2;
@@ -9906,16 +12646,19 @@ __device__ inline void backward_kernel_v3_streaming_3wg_impl(const globals_3wg<C
                                                 v1 = __bfloat162float(value1_bf);
                                             }
                                         }
-                                        col_fp4_ptr[global_col * col_fp4_stride + global_row_pair_base + pair] =
-                                            quantize_fp4_pair(v0, v1, col_rcp);
+                                        maybe_store_global_col_byte<G>(
+                                            col_fp4_ptr,
+                                            col_fp4_stride,
+                                            global_col,
+                                            global_row_pair_base + pair,
+                                            quantize_fp4_pair(v0, v1, scale_contract.quant_rcp_scale));
                                     }
                                 }
-                                float stored_scale = col_scale * g_sg_rcp;
-                                if (encode_centric) {
-                                    stored_scale = fminf(col_rcp * g_sg, E4M3_MAX);
-                                }
-                                const __nv_fp8_e4m3 csc = __nv_fp8_e4m3(stored_scale);
-                                col_sc_ptr[chunk * 512 + byte_idx] = *reinterpret_cast<const uint8_t*>(&csc);
+                                maybe_store_global_col_scale<G>(
+                                    col_sc_ptr,
+                                    chunk,
+                                    byte_idx,
+                                    scale_contract.scale_byte);
                             }
                             if constexpr (DO_ROW && G::ROW_WAITS_FOR_COL_DONE_ROW16) {
                                 __syncwarp();
@@ -9929,7 +12672,185 @@ __device__ inline void backward_kernel_v3_streaming_3wg_impl(const globals_3wg<C
                     }
                 }
 
+                if constexpr (G::SKIP_GLOBAL_COL_MATERIALIZATION) {
+                    if constexpr (ROWONLY_COMBO_DC_DEBUG_CUT == 193) {
+                        if (block_idx > cluster_id && combo_do_dc && is_dc_consumer_wg && combo_stage_publish_epi &&
+                            warpgroup::warpid() == 0 && quant_lane == 0) {
+                            printf(
+                                "rowonly combo dc cut 193 cta=%d wg=%d block=%d row=%d col=%d epi=%d roles=%d%d%d%d\n",
+                                cta_id, warpgroup_id, block_idx, row_block_idx, col_block_idx, epi,
+                                is_row_quantizer_wg ? 1 : 0,
+                                is_col_quantizer_wg ? 1 : 0,
+                                is_de_consumer_wg ? 1 : 0,
+                                is_dc_consumer_wg ? 1 : 0);
+                            return;
+                        }
+                    }
+                    if constexpr (ROWONLY_COMBO_DC_TRACE_BLOCK1 == 1) {
+                        if (block_idx > cluster_id && combo_do_dc && is_dc_consumer_wg && combo_stage_publish_epi &&
+                            warpgroup::warpid() == 0 && quant_lane == 0) {
+                            printf(
+                                "rowonly combo dc trace 1705 cta=%d wg=%d block=%d row=%d col=%d epi=%d roles=%d%d%d%d\n",
+                                cta_id, warpgroup_id, block_idx, row_block_idx, col_block_idx, epi,
+                                is_row_quantizer_wg ? 1 : 0,
+                                is_col_quantizer_wg ? 1 : 0,
+                                is_de_consumer_wg ? 1 : 0,
+                                is_dc_consumer_wg ? 1 : 0);
+                        }
+                    }
+                    if constexpr (ROWONLY_COMBO_DC_DEBUG_CUT == 94) {
+                        if (block_idx > cluster_id && combo_do_dc && is_dc_consumer_wg && epi == 0) {
+                            if (warpgroup::warpid() == 0 && quant_lane == 0) {
+                                printf(
+                                    "rowonly combo dc cut 94 cta=%d wg=%d block=%d row=%d col=%d epi=%d roles=%d%d%d%d\n",
+                                    cta_id, warpgroup_id, block_idx, row_block_idx, col_block_idx, epi,
+                                    is_row_quantizer_wg ? 1 : 0,
+                                    is_col_quantizer_wg ? 1 : 0,
+                                    is_de_consumer_wg ? 1 : 0,
+                                    is_dc_consumer_wg ? 1 : 0);
+                            }
+                            return;
+                        }
+                    }
+                }
+                if constexpr (G::SKIP_GLOBAL_COL_MATERIALIZATION && DEDICATED_ROWONLY_DEBUG_STAGE == 23) {
+                    if (block_idx == cluster_id && combo_do_dc && is_dc_consumer_wg && combo_stage_publish_epi &&
+                        warpgroup::warpid() == 0 && quant_lane == 0) {
+                        printf(
+                            "dedicated rowonly stage 23 cta=%d wg=%d block=%d row=%d col=%d epi=%d\n",
+                            cta_id, warpgroup_id, block_idx, row_block_idx, col_block_idx, epi);
+                        return;
+                    }
+                }
                 if constexpr (EFFECTIVE_ENABLE_STOREADD_COMBO && EFFECTIVE_SEPARATE_BACKHALF_CONSUMERS) {
+                    if constexpr (G::SKIP_GLOBAL_COL_MATERIALIZATION && DEDICATED_ROWONLY_DEBUG_STAGE == 25) {
+                        if (block_idx == cluster_id && combo_do_dc && is_dc_consumer_wg && combo_stage_publish_epi) {
+                            if (warpgroup::warpid() == 0 && quant_lane == 0) {
+                                printf(
+                                    "dedicated rowonly stage 25 cta=%d wg=%d block=%d row=%d col=%d epi=%d\n",
+                                    cta_id, warpgroup_id, block_idx, row_block_idx, col_block_idx, epi);
+                            }
+                            return;
+                        }
+                    }
+                    if constexpr (G::SKIP_GLOBAL_COL_MATERIALIZATION) {
+                        if constexpr (ROWONLY_COMBO_DC_DEBUG_CUT == 85) {
+                            if (block_idx > cluster_id && combo_do_dc && is_dc_consumer_wg && epi == 0) {
+                                if (warpgroup::warpid() == 0 && quant_lane == 0) {
+                                    printf(
+                                        "rowonly combo dc cut 85 cta=%d wg=%d block=%d row=%d col=%d epi=%d roles=%d%d%d%d\n",
+                                        cta_id, warpgroup_id, block_idx, row_block_idx, col_block_idx, epi,
+                                        is_row_quantizer_wg ? 1 : 0,
+                                        is_col_quantizer_wg ? 1 : 0,
+                                        is_de_consumer_wg ? 1 : 0,
+                                        is_dc_consumer_wg ? 1 : 0);
+                                }
+                                return;
+                            }
+                        }
+                    }
+                    if constexpr (G::SKIP_GLOBAL_COL_MATERIALIZATION) {
+                        if constexpr (ROWONLY_COMBO_DC_DEBUG_CUT == 163) {
+                            if (block_idx > cluster_id && combo_do_dc && is_col_quantizer_wg &&
+                                combo_stage_publish_epi) {
+                                if (warpgroup::warpid() == 0 && quant_lane == 0) {
+                                    printf(
+                                        "rowonly combo dc cut 163 cta=%d wg=%d block=%d row=%d col=%d epi=%d roles=%d%d%d%d\n",
+                                        cta_id, warpgroup_id, block_idx, row_block_idx, col_block_idx, epi,
+                                        is_row_quantizer_wg ? 1 : 0,
+                                        is_col_quantizer_wg ? 1 : 0,
+                                        is_de_consumer_wg ? 1 : 0,
+                                        is_dc_consumer_wg ? 1 : 0);
+                                }
+                                return;
+                            }
+                        }
+                    }
+                    if constexpr (G::SKIP_GLOBAL_COL_MATERIALIZATION) {
+                        if constexpr (ROWONLY_COMBO_DC_DEBUG_CUT == 164) {
+                            if (block_idx > cluster_id && combo_do_dc && is_col_quantizer_wg &&
+                                combo_stage_publish_epi) {
+                                if (warpgroup::warpid() == 0 && quant_lane == 0) {
+                                    printf(
+                                        "rowonly combo dc cut 164 cta=%d wg=%d block=%d row=%d col=%d epi=%d roles=%d%d%d%d\n",
+                                        cta_id, warpgroup_id, block_idx, row_block_idx, col_block_idx, epi,
+                                        is_row_quantizer_wg ? 1 : 0,
+                                        is_col_quantizer_wg ? 1 : 0,
+                                        is_de_consumer_wg ? 1 : 0,
+                                        is_dc_consumer_wg ? 1 : 0);
+                                }
+                                return;
+                            }
+                        }
+                    }
+                    if (DEDICATED_ROWONLY_ROUTE &&
+                        combo_stage_publish_epi && combo_do_dc && is_col_quantizer_wg) {
+                        if constexpr (ROWONLY_COMBO_DC_DEBUG_CUT == 160) {
+                            if (block_idx > cluster_id && warpgroup::warpid() == 0 && quant_lane == 0) {
+                                printf("rowonly combo dc cut 160 cta=%d wg=%d block=%d row=%d col=%d epi=%d roles=0100\n",
+                                       cta_id, warpgroup_id, block_idx, row_block_idx, col_block_idx, epi);
+                            }
+                        }
+                        if constexpr (ROWONLY_COMBO_DC_DEBUG_CUT == 132) {
+                            if (block_idx > cluster_id && warpgroup::warpid() == 0 && quant_lane == 0) {
+                                printf("rowonly combo dc cut 132 cta=%d wg=%d block=%d row=%d col=%d epi=%d roles=0100\n",
+                                       cta_id, warpgroup_id, block_idx, row_block_idx, col_block_idx, epi);
+                            }
+                            if (block_idx > cluster_id) return;
+                        }
+                        if constexpr (ROWONLY_COMBO_DC_DEBUG_CUT == 166) {
+                            if (block_idx > cluster_id && warpgroup::warpid() == 0 && quant_lane == 0) {
+                                printf("rowonly combo dc cut 166 cta=%d wg=%d block=%d row=%d col=%d epi=%d roles=0100 publish_phase=%d\n",
+                                       cta_id, warpgroup_id, block_idx, row_block_idx, col_block_idx, epi,
+                                       combo_rowonly_output_reuse_publish_phase);
+                            }
+                            if (block_idx > cluster_id) return;
+                        }
+                        warpgroup::tma::cluster::arrive(combo_rowonly_output_recycled, 0, 1);
+                        combo_rowonly_output_reuse_publish_phase ^= 1;
+                    }
+                    if constexpr (G::SKIP_GLOBAL_COL_MATERIALIZATION &&
+                                  ROWONLY_COMBO_DC_DEBUG_CUT == 194) {
+                        if (block_idx > cluster_id && combo_do_dc && is_dc_consumer_wg && combo_stage_publish_epi &&
+                            warpgroup::warpid() == 0 && quant_lane == 0) {
+                            printf(
+                                "rowonly combo dc cut 194 cta=%d wg=%d block=%d row=%d col=%d epi=%d roles=%d%d%d%d\n",
+                                cta_id, warpgroup_id, block_idx, row_block_idx, col_block_idx, epi,
+                                is_row_quantizer_wg ? 1 : 0,
+                                is_col_quantizer_wg ? 1 : 0,
+                                is_de_consumer_wg ? 1 : 0,
+                                is_dc_consumer_wg ? 1 : 0);
+                            return;
+                        }
+                    }
+                    {
+                        if constexpr (G::SKIP_GLOBAL_COL_MATERIALIZATION && ROWONLY_COMBO_DC_TRACE_BLOCK1 == 1) {
+                            if (block_idx > cluster_id &&
+                                warpgroup::warpid() == 0 && quant_lane == 0) {
+                                printf(
+                                    "rowonly combo dc trace 1711 cta=%d wg=%d block=%d row=%d col=%d epi=%d roles=%d%d%d%d\n",
+                                    cta_id, warpgroup_id, block_idx, row_block_idx, col_block_idx, epi,
+                                    is_row_quantizer_wg ? 1 : 0,
+                                    is_col_quantizer_wg ? 1 : 0,
+                                    is_de_consumer_wg ? 1 : 0,
+                                    is_dc_consumer_wg ? 1 : 0);
+                            }
+                        }
+                    if constexpr (G::SKIP_GLOBAL_COL_MATERIALIZATION &&
+                                  ROWONLY_COMBO_DC_DEBUG_CUT == 204) {
+                        if (block_idx == cluster_id && combo_do_dc && is_col_quantizer_wg &&
+                            combo_stage_publish_epi &&
+                            warpgroup::warpid() == 0 && quant_lane == 0) {
+                            printf(
+                                "rowonly combo dc cut 204 cta=%d wg=%d block=%d row=%d col=%d epi=%d roles=%d%d%d%d\n",
+                                cta_id, warpgroup_id, block_idx, row_block_idx, col_block_idx, epi,
+                                is_row_quantizer_wg ? 1 : 0,
+                                is_col_quantizer_wg ? 1 : 0,
+                                is_de_consumer_wg ? 1 : 0,
+                                is_dc_consumer_wg ? 1 : 0);
+                            return;
+                        }
+                    }
                     constexpr int combo_de_a_scale_chunks = C::Nb / 64;
                     constexpr int combo_de_b_scale_chunks = C::Nb / 128;
                     constexpr int combo_dc_a_scale_chunks = C::Nb / 64;
@@ -9939,20 +12860,88 @@ __device__ inline void backward_kernel_v3_streaming_3wg_impl(const globals_3wg<C
                     using combo_dc_rt = rt_fl<C::Nb / 4, C::Nb / C::EPI_PIPE_DEPTH>;
                     using combo_dc_rt_bf = rt_bf<C::Nb / 4, C::Nb / C::EPI_PIPE_DEPTH>;
                     const bool combo_issue_leader = (warpgroup::warpid() == 0) && (quant_lane == 0);
-                    auto combo_de_tm = tm_allocator.template allocate<full_tt_fl<C::Nb>>(256);
-                    auto combo_dc_tm = tm_allocator.template allocate<full_tt_fl<C::Nb>>(384);
-                    auto combo_de_a_sc_tm =
-                        tm_allocator.template allocate<full_tt_fp8e4m3<16 * combo_de_a_scale_chunks>>(512);
-                    auto combo_de_b_sc_tm =
-                        tm_allocator.template allocate<full_tt_fp8e4m3<32 * combo_de_b_scale_chunks>>(
-                            512 + 4 * combo_de_a_scale_chunks);
-                    auto combo_dc_a_sc_tm =
-                        tm_allocator.template allocate<full_tt_fp8e4m3<16 * combo_dc_a_scale_chunks>>(640);
-                    auto combo_dc_b_sc_tm =
-                        tm_allocator.template allocate<full_tt_fp8e4m3<32 * combo_dc_b_scale_chunks>>(
-                            640 + 4 * combo_dc_a_scale_chunks);
+                    const int combo_de_tm_offset = 256;
+                    const int combo_dc_tm_offset = combo_do_de ? 384 : 256;
+                    const int combo_de_sc_offset = 512;
+                    // In the row-only dConly path we only need one dedicated back-half
+                    // output tile, so its scale region can start immediately after that
+                    // tile at 384. Starting at 512 walks off the end of the 512-column
+                    // TMEM allocator and makes the first scale preload illegal.
+                    const int combo_dc_sc_offset = combo_do_de ? 640 : 384;
+                    if constexpr (G::SKIP_GLOBAL_COL_MATERIALIZATION && ROWONLY_COMBO_DC_TRACE_BLOCK1 == 1) {
+                        if (block_idx > cluster_id && combo_do_dc && is_dc_consumer_wg &&
+                            warpgroup::warpid() == 0 && quant_lane == 0) {
+                            printf(
+                                "rowonly combo dc trace 17115 cta=%d wg=%d block=%d row=%d col=%d epi=%d tm_off=%d sc_off=%d\n",
+                                cta_id, warpgroup_id, block_idx, row_block_idx, col_block_idx, epi,
+                                combo_dc_tm_offset, combo_dc_sc_offset);
+                        }
+                    }
+                    if constexpr (G::SKIP_GLOBAL_COL_MATERIALIZATION &&
+                                  ROWONLY_COMBO_DC_DEBUG_CUT == 196) {
+                        if (block_idx > cluster_id && combo_do_dc && is_dc_consumer_wg &&
+                            warpgroup::warpid() == 0 && quant_lane == 0) {
+                            printf(
+                                "rowonly combo dc cut 196a cta=%d wg=%d block=%d row=%d col=%d epi=%d\n",
+                                cta_id, warpgroup_id, block_idx, row_block_idx, col_block_idx, epi);
+                        }
+                    }
+                    if constexpr (G::SKIP_GLOBAL_COL_MATERIALIZATION && ROWONLY_COMBO_DC_DEBUG_CUT == 175) {
+                        if (block_idx > cluster_id && combo_do_dc && is_dc_consumer_wg &&
+                            warpgroup::warpid() == 0 && quant_lane == 0) {
+                            printf(
+                                "rowonly combo dc cut 175 cta=%d wg=%d block=%d row=%d col=%d epi=%d tm_off=%d sc_off=%d\n",
+                                cta_id, warpgroup_id, block_idx, row_block_idx, col_block_idx, epi,
+                                combo_dc_tm_offset, combo_dc_sc_offset);
+                        }
+                        if (block_idx > cluster_id && combo_do_dc && is_dc_consumer_wg) return;
+                    }
+                    if constexpr (G::SKIP_GLOBAL_COL_MATERIALIZATION) {
+                            if constexpr (ROWONLY_COMBO_DC_DEBUG_CUT == 86) {
+                            if (block_idx > cluster_id && combo_do_dc && is_dc_consumer_wg && epi == 0) {
+                                if (warpgroup::warpid() == 0 && quant_lane == 0) {
+                                    printf(
+                                        "rowonly combo dc cut 86 cta=%d wg=%d block=%d row=%d col=%d epi=%d roles=%d%d%d%d\n",
+                                        cta_id, warpgroup_id, block_idx, row_block_idx, col_block_idx, epi,
+                                        is_row_quantizer_wg ? 1 : 0,
+                                        is_col_quantizer_wg ? 1 : 0,
+                                        is_de_consumer_wg ? 1 : 0,
+                                        is_dc_consumer_wg ? 1 : 0);
+                                }
+                                return;
+                            }
+                        }
+                    }
 
+                    if constexpr (G::SKIP_GLOBAL_COL_MATERIALIZATION && DEDICATED_ROWONLY_DEBUG_STAGE == 27) {
+                        if (block_idx == cluster_id && combo_do_dc && is_dc_consumer_wg && combo_stage_publish_epi) {
+                            if (warpgroup::warpid() == 0 && quant_lane == 0) {
+                                printf(
+                                    "dedicated rowonly stage 27 cta=%d wg=%d block=%d row=%d col=%d epi=%d\n",
+                                    cta_id, warpgroup_id, block_idx, row_block_idx, col_block_idx, epi);
+                            }
+                            return;
+                        }
+                    }
+
+                    if constexpr (!DEDICATED_ROWONLY_ROUTE) {
+                    if constexpr (G::SKIP_GLOBAL_COL_MATERIALIZATION && DEDICATED_ROWONLY_DEBUG_STAGE == 28) {
+                        if (block_idx == cluster_id && combo_do_dc && is_dc_consumer_wg && combo_stage_publish_epi) {
+                            if (warpgroup::warpid() == 0 && quant_lane == 0) {
+                                printf(
+                                    "dedicated rowonly stage 28 cta=%d wg=%d block=%d row=%d col=%d epi=%d\n",
+                                    cta_id, warpgroup_id, block_idx, row_block_idx, col_block_idx, epi);
+                            }
+                            return;
+                        }
+                    }
                     if (combo_stage_publish_epi && is_de_consumer_wg && combo_do_de) {
+                        auto combo_de_tm = tm_allocator.template allocate<full_tt_fl<C::Nb>>(combo_de_tm_offset);
+                        auto combo_de_a_sc_tm =
+                            tm_allocator.template allocate<full_tt_fp8e4m3<16 * combo_de_a_scale_chunks>>(combo_de_sc_offset);
+                        auto combo_de_b_sc_tm =
+                            tm_allocator.template allocate<full_tt_fp8e4m3<32 * combo_de_b_scale_chunks>>(
+                                combo_de_sc_offset + 4 * combo_de_a_scale_chunks);
                         const float combo_de_scale = g_sg * g.C_col_sc_global[{0}];
                         if constexpr (!combo_debug_skip_sep_de_row_sc_preload) {
                             #pragma unroll
@@ -10065,6 +13054,7 @@ __device__ inline void backward_kernel_v3_streaming_3wg_impl(const globals_3wg<C
                             prev_k_block_idx = k_block_idx;
                         }
 
+                        if constexpr (!DEDICATED_ROWONLY_ROUTE) {
                         if (prev_k_block_idx >= 0) {
                             if constexpr (!combo_debug_skip_sep_de_drain) {
                                 if constexpr (!combo_debug_skip_sep_de_output_wait) {
@@ -10104,22 +13094,251 @@ __device__ inline void backward_kernel_v3_streaming_3wg_impl(const globals_3wg<C
                             }
                         }
                     }
+                    }
+                    }
 
+                    if constexpr (G::SKIP_GLOBAL_COL_MATERIALIZATION && DEDICATED_ROWONLY_DEBUG_STAGE == 26) {
+                        if (block_idx == cluster_id && combo_do_dc && is_dc_consumer_wg && combo_stage_publish_epi) {
+                            if (warpgroup::warpid() == 0 && quant_lane == 0) {
+                                printf(
+                                    "dedicated rowonly stage 26 cta=%d wg=%d block=%d row=%d col=%d epi=%d\n",
+                                    cta_id, warpgroup_id, block_idx, row_block_idx, col_block_idx, epi);
+                            }
+                            return;
+                        }
+                    }
+                    if constexpr (G::SKIP_GLOBAL_COL_MATERIALIZATION && ROWONLY_COMBO_DC_TRACE_BLOCK1 == 1) {
+                        if (block_idx > cluster_id && combo_do_dc && is_dc_consumer_wg && combo_stage_publish_epi &&
+                            warpgroup::warpid() == 0 && quant_lane == 0) {
+                            printf(
+                                "rowonly combo dc trace 17117 cta=%d wg=%d block=%d row=%d col=%d epi=%d\n",
+                                cta_id, warpgroup_id, block_idx, row_block_idx, col_block_idx, epi);
+                        }
+                    }
+                    if constexpr (G::SKIP_GLOBAL_COL_MATERIALIZATION &&
+                                  ROWONLY_COMBO_DC_DEBUG_CUT == 195) {
+                        if (block_idx > cluster_id && combo_do_dc && is_dc_consumer_wg && combo_stage_publish_epi &&
+                            warpgroup::warpid() == 0 && quant_lane == 0) {
+                            printf(
+                                "rowonly combo dc cut 195 cta=%d wg=%d block=%d row=%d col=%d epi=%d roles=%d%d%d%d\n",
+                                cta_id, warpgroup_id, block_idx, row_block_idx, col_block_idx, epi,
+                                is_row_quantizer_wg ? 1 : 0,
+                                is_col_quantizer_wg ? 1 : 0,
+                                is_de_consumer_wg ? 1 : 0,
+                                is_dc_consumer_wg ? 1 : 0);
+                            return;
+                        }
+                    }
+                    if constexpr (G::SKIP_GLOBAL_COL_MATERIALIZATION &&
+                                  ROWONLY_COMBO_DC_DEBUG_CUT == 196) {
+                        if (block_idx > cluster_id && combo_do_dc && is_dc_consumer_wg && combo_stage_publish_epi &&
+                            warpgroup::warpid() == 0 && quant_lane == 0) {
+                            printf(
+                                "rowonly combo dc cut 196b cta=%d wg=%d block=%d row=%d col=%d epi=%d\n",
+                                cta_id, warpgroup_id, block_idx, row_block_idx, col_block_idx, epi);
+                        }
+                    }
+                    if constexpr (G::SKIP_GLOBAL_COL_MATERIALIZATION &&
+                                  ROWONLY_COMBO_DC_DEBUG_CUT == 205) {
+                        if (block_idx == cluster_id && combo_do_dc && is_col_quantizer_wg &&
+                            combo_stage_publish_epi &&
+                            warpgroup::warpid() == 0 && quant_lane == 0) {
+                            printf(
+                                "rowonly combo dc cut 205 cta=%d wg=%d block=%d row=%d col=%d epi=%d roles=%d%d%d%d\n",
+                                cta_id, warpgroup_id, block_idx, row_block_idx, col_block_idx, epi,
+                                is_row_quantizer_wg ? 1 : 0,
+                                is_col_quantizer_wg ? 1 : 0,
+                                is_de_consumer_wg ? 1 : 0,
+                                is_dc_consumer_wg ? 1 : 0);
+                            return;
+                        }
+                    }
                     if (combo_stage_publish_epi && is_dc_consumer_wg && combo_do_dc) {
+                        if constexpr (G::SKIP_GLOBAL_COL_MATERIALIZATION && ROWONLY_COMBO_DC_TRACE_BLOCK1 == 1) {
+                            if (block_idx > cluster_id && warpgroup::warpid() == 0 && quant_lane == 0) {
+                            printf(
+                                "rowonly combo dc trace 17118 cta=%d wg=%d block=%d row=%d col=%d epi=%d\n",
+                                cta_id, warpgroup_id, block_idx, row_block_idx, col_block_idx, epi);
+                        }
+                    }
+                        if constexpr (G::SKIP_GLOBAL_COL_MATERIALIZATION &&
+                                      ROWONLY_COMBO_DC_DEBUG_CUT == 196) {
+                            if (block_idx > cluster_id && warpgroup::warpid() == 0 && quant_lane == 0) {
+                                printf(
+                                    "rowonly combo dc cut 196c cta=%d wg=%d block=%d row=%d col=%d epi=%d\n",
+                                    cta_id, warpgroup_id, block_idx, row_block_idx, col_block_idx, epi);
+                            }
+                        }
+                        if constexpr (G::SKIP_GLOBAL_COL_MATERIALIZATION && DEDICATED_ROWONLY_DEBUG_STAGE == 3) {
+                            if (warpgroup::warpid() == 0 && quant_lane == 0) {
+                                printf(
+                                    "dedicated rowonly stage 3 cta=%d wg=%d row=%d col=%d epi=%d\n",
+                                    cta_id, warpgroup_id, row_block_idx, col_block_idx, epi);
+                            }
+                            return;
+                        }
+                        if constexpr (G::SKIP_GLOBAL_COL_MATERIALIZATION && ROWONLY_COMBO_DC_DEBUG_CUT == 176) {
+                            if (block_idx > cluster_id && warpgroup::warpid() == 0 && quant_lane == 0) {
+                                printf(
+                                    "rowonly combo dc cut 176 cta=%d wg=%d block=%d row=%d col=%d epi=%d\n",
+                                    cta_id, warpgroup_id, block_idx, row_block_idx, col_block_idx, epi);
+                            }
+                            if (block_idx > cluster_id) return;
+                        }
+                        if constexpr (G::SKIP_GLOBAL_COL_MATERIALIZATION && ROWONLY_COMBO_DC_TRACE_BLOCK1 == 1) {
+                            if (block_idx > cluster_id && warpgroup::warpid() == 0 && quant_lane == 0) {
+                                printf(
+                                    "rowonly combo dc trace 17116 cta=%d wg=%d block=%d row=%d col=%d epi=%d\n",
+                                    cta_id, warpgroup_id, block_idx, row_block_idx, col_block_idx, epi);
+                            }
+                        }
+#define rowonly_combo_dc_debug_cut(CUT, KDBG, PREVDBG, ...)                                      \
+    rowonly_combo_dc_debug_cut_helper<G::SKIP_GLOBAL_COL_MATERIALIZATION>(                       \
+        (CUT), cta_id, row_block_idx, col_block_idx, warpgroup::warpid(), quant_lane,            \
+        (KDBG), (PREVDBG), ##__VA_ARGS__)
+                        auto combo_dc_tm = DEDICATED_ROWONLY_ROUTE
+                            ? dedicated_rowonly_combo_dc_tm
+                            : tm_allocator.template allocate<full_tt_fl<C::Nb>>(combo_dc_tm_offset);
+                        if constexpr (G::SKIP_GLOBAL_COL_MATERIALIZATION && ROWONLY_COMBO_DC_DEBUG_CUT == 172) {
+                            if (block_idx > cluster_id && warpgroup::warpid() == 0 && quant_lane == 0) {
+                                printf(
+                                    "rowonly combo dc cut 172 cta=%d wg=%d block=%d row=%d col=%d epi=%d tm_off=%d sc_off=%d\n",
+                                    cta_id, warpgroup_id, block_idx, row_block_idx, col_block_idx, epi,
+                                    combo_dc_tm_offset, combo_dc_sc_offset);
+                            }
+                            if (block_idx > cluster_id) return;
+                        }
+                        if constexpr (G::SKIP_GLOBAL_COL_MATERIALIZATION && ROWONLY_COMBO_DC_TRACE_BLOCK1 == 1) {
+                            if (block_idx > cluster_id && warpgroup::warpid() == 0 && quant_lane == 0) {
+                                printf(
+                                    "rowonly combo dc trace 1712 cta=%d wg=%d block=%d row=%d col=%d epi=%d tm_off=%d sc_off=%d\n",
+                                    cta_id, warpgroup_id, block_idx, row_block_idx, col_block_idx, epi,
+                                    combo_dc_tm_offset, combo_dc_sc_offset);
+                            }
+                        }
+                        auto combo_dc_a_sc_tm = DEDICATED_ROWONLY_ROUTE
+                            ? dedicated_rowonly_combo_dc_a_sc_tm
+                            : tm_allocator.template allocate<full_tt_fp8e4m3<16 * combo_dc_a_scale_chunks>>(combo_dc_sc_offset);
+                        if constexpr (G::SKIP_GLOBAL_COL_MATERIALIZATION && ROWONLY_COMBO_DC_DEBUG_CUT == 173) {
+                            if (block_idx > cluster_id && warpgroup::warpid() == 0 && quant_lane == 0) {
+                                printf(
+                                    "rowonly combo dc cut 173 cta=%d wg=%d block=%d row=%d col=%d epi=%d tm_off=%d sc_off=%d\n",
+                                    cta_id, warpgroup_id, block_idx, row_block_idx, col_block_idx, epi,
+                                    combo_dc_tm_offset, combo_dc_sc_offset);
+                            }
+                            if (block_idx > cluster_id) return;
+                        }
+                        if constexpr (G::SKIP_GLOBAL_COL_MATERIALIZATION && ROWONLY_COMBO_DC_TRACE_BLOCK1 == 1) {
+                            if (block_idx > cluster_id && warpgroup::warpid() == 0 && quant_lane == 0) {
+                                printf(
+                                    "rowonly combo dc trace 1713 cta=%d wg=%d block=%d row=%d col=%d epi=%d tm_off=%d sc_off=%d\n",
+                                    cta_id, warpgroup_id, block_idx, row_block_idx, col_block_idx, epi,
+                                    combo_dc_tm_offset, combo_dc_sc_offset);
+                            }
+                        }
+                        auto combo_dc_b_sc_tm = DEDICATED_ROWONLY_ROUTE
+                            ? dedicated_rowonly_combo_dc_b_sc_tm
+                            : tm_allocator.template allocate<full_tt_fp8e4m3<32 * combo_dc_b_scale_chunks>>(
+                                  combo_dc_sc_offset + 4 * combo_dc_a_scale_chunks);
+                        if constexpr (G::SKIP_GLOBAL_COL_MATERIALIZATION && ROWONLY_COMBO_DC_DEBUG_CUT == 174) {
+                            if (block_idx > cluster_id && warpgroup::warpid() == 0 && quant_lane == 0) {
+                                printf(
+                                    "rowonly combo dc cut 174 cta=%d wg=%d block=%d row=%d col=%d epi=%d tm_off=%d sc_off=%d\n",
+                                    cta_id, warpgroup_id, block_idx, row_block_idx, col_block_idx, epi,
+                                    combo_dc_tm_offset, combo_dc_sc_offset);
+                            }
+                            if (block_idx > cluster_id) return;
+                        }
+                        if constexpr (G::SKIP_GLOBAL_COL_MATERIALIZATION && ROWONLY_COMBO_DC_TRACE_BLOCK1 == 1) {
+                            if (block_idx > cluster_id && warpgroup::warpid() == 0 && quant_lane == 0) {
+                                printf(
+                                    "rowonly combo dc trace 1714 cta=%d wg=%d block=%d row=%d col=%d epi=%d tm_off=%d sc_off=%d\n",
+                                    cta_id, warpgroup_id, block_idx, row_block_idx, col_block_idx, epi,
+                                    combo_dc_tm_offset, combo_dc_sc_offset);
+                            }
+                        }
+                        if constexpr (G::SKIP_GLOBAL_COL_MATERIALIZATION) {
+                            if constexpr (ROWONLY_COMBO_DC_TRACE_BLOCK1 == 1) {
+                                if (block_idx > cluster_id) {
+                                    rowonly_combo_dc_debug_cut(1710, -1, -1, epi);
+                                }
+                            }
+                            if constexpr (ROWONLY_COMBO_DC_DEBUG_CUT == 171) {
+                                if (block_idx > cluster_id) {
+                                    rowonly_combo_dc_debug_cut(171, -1, -1, epi);
+                                    return;
+                                }
+                            }
+                        }
+                        if constexpr (G::SKIP_GLOBAL_COL_MATERIALIZATION) {
+                            if constexpr (ROWONLY_COMBO_DC_DEBUG_CUT == 1) {
+                                rowonly_combo_dc_debug_cut(1, -1, -1);
+                                return;
+                            }
+                        }
                         if (combo_do_de) {
                             wait(combo_backhalf_de_done, combo_backhalf_de_done_phase);
                             combo_backhalf_de_done_phase ^= 1;
                             asm volatile("fence.proxy.async.shared::cta;\n" ::: "memory");
                         }
+                        if constexpr (G::SKIP_GLOBAL_COL_MATERIALIZATION) {
+                            if constexpr (ROWONLY_COMBO_DC_DEBUG_CUT == 15) {
+                                rowonly_combo_dc_debug_cut(15, -1, -1);
+                                return;
+                            }
+                        }
                         const float combo_dc_scale = g_sg * g.E_col_sc_global[{0}];
-                        #pragma unroll
-                        for (int ii = 0; ii < combo_dc_a_scale_chunks; ++ii) {
-                            auto combo_a_sc_sub =
-                                combo_dc_a_sc_tm.template subtile<full_tt_fp8e4m3<16>>(ii * 16);
-                            auto &combo_gt_sc_sm_sub =
-                                *reinterpret_cast<st_fp8e4m3<32, 16, false> *>(
-                                    reinterpret_cast<uint64_t>(&combo_col_stage->Gt_row_sc.data[0]) + 16 * 32 * ii);
-                            load_mxnv_scale_async2(combo_a_sc_sub, combo_gt_sc_sm_sub);
+                        if constexpr (G::SKIP_GLOBAL_COL_MATERIALIZATION) {
+                            if constexpr (ROWONLY_COMBO_DC_DEBUG_CUT == 18) {
+                                rowonly_combo_dc_debug_cut(18, -1, -1);
+                                return;
+                            }
+                        }
+                        if constexpr (G::SKIP_GLOBAL_COL_MATERIALIZATION) {
+                            if constexpr (ROWONLY_COMBO_DC_DEBUG_CUT == 19) {
+                                rowonly_combo_dc_debug_cut(19, -1, -1);
+                                return;
+                            }
+                        }
+                        if constexpr (!(G::SKIP_GLOBAL_COL_MATERIALIZATION && ROWONLY_COMBO_DC_DEBUG_CUT == 16)) {
+                            #pragma unroll
+                            for (int ii = 0; ii < combo_dc_a_scale_chunks; ++ii) {
+                                auto combo_a_sc_sub =
+                                    combo_dc_a_sc_tm.template subtile<full_tt_fp8e4m3<16>>(ii * 16);
+                                auto &combo_gt_sc_sm_sub =
+                                    *reinterpret_cast<st_fp8e4m3<32, 16, false> *>(
+                                        reinterpret_cast<uint64_t>(&combo_col_stage->Gt_row_sc.data[0]) + 16 * 32 * ii);
+                                load_mxnv_scale_async2(combo_a_sc_sub, combo_gt_sc_sm_sub);
+                            }
+                        }
+                        if constexpr (G::SKIP_GLOBAL_COL_MATERIALIZATION) {
+                            if constexpr (ROWONLY_COMBO_DC_DEBUG_CUT == 20) {
+                                rowonly_combo_dc_debug_cut(20, -1, -1);
+                                return;
+                            }
+                            if constexpr (ROWONLY_COMBO_DC_TRACE_BLOCK1 == 1) {
+                                if (block_idx > cluster_id) {
+                                    rowonly_combo_dc_debug_cut(1680, -1, -1);
+                                }
+                            }
+                            if constexpr (ROWONLY_COMBO_DC_DEBUG_CUT == 168) {
+                                if (block_idx > cluster_id) {
+                                    rowonly_combo_dc_debug_cut(168, -1, -1);
+                                    return;
+                                }
+                            }
+                        }
+                        if constexpr (G::SKIP_GLOBAL_COL_MATERIALIZATION) {
+                            if constexpr (ROWONLY_COMBO_DC_DEBUG_CUT == 17) {
+                                rowonly_combo_dc_debug_cut(17, -1, -1);
+                                return;
+                            }
+                        }
+                        if constexpr (G::SKIP_GLOBAL_COL_MATERIALIZATION) {
+                            if constexpr (ROWONLY_COMBO_DC_DEBUG_CUT == 2) {
+                                rowonly_combo_dc_debug_cut(2, -1, -1);
+                                return;
+                            }
                         }
 
                         int combo_dc_e_tiles_phase = 0;
@@ -10131,9 +13350,350 @@ __device__ inline void backward_kernel_v3_streaming_3wg_impl(const globals_3wg<C
 
                         #pragma unroll 1
                         for (int k_block_idx = 0; k_block_idx < combo_num_k_blocks; ++k_block_idx) {
+                            if constexpr (G::SKIP_GLOBAL_COL_MATERIALIZATION) {
+                                if constexpr (ROWONLY_COMBO_DC_DEBUG_CUT == 169) {
+                                    if (block_idx > cluster_id && k_block_idx == 0) {
+                                        rowonly_combo_dc_debug_cut(169, k_block_idx, prev_k_block_idx);
+                                        return;
+                                    }
+                                }
+                                if constexpr (ROWONLY_COMBO_DC_DEBUG_CUT == 159) {
+                                    if (k_block_idx >= 2) {
+                                        rowonly_combo_dc_debug_cut(159, k_block_idx, prev_k_block_idx);
+                                        return;
+                                    }
+                                }
+                            }
+                            if constexpr (!DEDICATED_ROWONLY_ROUTE) {
                             if (prev_k_block_idx >= 0) {
+                                if constexpr (!(G::SKIP_GLOBAL_COL_MATERIALIZATION &&
+                                                ROWONLY_COMBO_DC_SKIP_LOOP_OUTPUT_WAIT == 1)) {
+                                    wait(combo_dc_p3_outputs_arrived, combo_dc_outputs_phase);
+                                    if constexpr (!G::SKIP_GLOBAL_COL_MATERIALIZATION ||
+                                                  (G::SKIP_GLOBAL_COL_MATERIALIZATION &&
+                                                   ROWONLY_COMBO_DC_OUTPUT_PHASE_MODE != 0)) {
+                                        combo_dc_outputs_phase ^= 1;
+                                    }
+                                }
+                                if constexpr (G::SKIP_GLOBAL_COL_MATERIALIZATION) {
+                                    if constexpr (ROWONLY_COMBO_DC_DEBUG_CUT == 27) {
+                                        rowonly_combo_dc_debug_cut(27, k_block_idx, prev_k_block_idx);
+                                        return;
+                                    }
+                                    if constexpr (ROWONLY_COMBO_DC_DEBUG_CUT == 157) {
+                                        if (k_block_idx >= 2) {
+                                            rowonly_combo_dc_debug_cut(157, k_block_idx, prev_k_block_idx);
+                                            return;
+                                        }
+                                    }
+                                }
+                                #pragma unroll
+                                for (int combo_epi = 0; combo_epi < C::EPI_PIPE_DEPTH; ++combo_epi) {
+                                    combo_dc_rt D_reg_fl;
+                                    combo_dc_rt_bf D_reg_bf;
+                                    warpgroup::tma::store_async_read_wait<0>();
+                                    warpgroup::sync(quantizer_sync_id);
+                                    warpgroup::load_async(
+                                        D_reg_fl,
+                                        combo_dc_tm.template subtile<full_tt_fl<C::Nb / C::EPI_PIPE_DEPTH>>(
+                                            0,
+                                            combo_epi * (C::Nb / C::EPI_PIPE_DEPTH)));
+                                    tensor_load_wait();
+                                    tensor_before_thread_sync();
+                                    warpgroup::sync(quantizer_sync_id);
+                                    if constexpr (G::SKIP_GLOBAL_COL_MATERIALIZATION) {
+                                        if constexpr (ROWONLY_COMBO_DC_DEBUG_CUT == 28) {
+                                            rowonly_combo_dc_debug_cut(28, k_block_idx, prev_k_block_idx);
+                                            return;
+                                        }
+                                    }
+                                    warp::mul(D_reg_fl, D_reg_fl, combo_dc_scale);
+                                    warp::copy(D_reg_bf, D_reg_fl);
+                                    warpgroup::store(combo_dc_output_stage->dC, D_reg_bf);
+                                    if constexpr (G::SKIP_GLOBAL_COL_MATERIALIZATION) {
+                                        if constexpr (ROWONLY_COMBO_DC_DEBUG_CUT == 31) {
+                                            rowonly_combo_dc_debug_cut(31, k_block_idx, prev_k_block_idx, combo_epi);
+                                            return;
+                                        }
+                                    }
+                                    warpgroup::sync(quantizer_sync_id);
+                                    if constexpr (G::SKIP_GLOBAL_COL_MATERIALIZATION) {
+                                        if constexpr (ROWONLY_COMBO_DC_DEBUG_CUT == 32) {
+                                            rowonly_combo_dc_debug_cut(32, k_block_idx, prev_k_block_idx, combo_epi);
+                                            return;
+                                        }
+                                    }
+                                    if constexpr (G::SKIP_GLOBAL_COL_MATERIALIZATION && ROWONLY_COMBO_DC_STORE_MODE == 1) {
+                                        if (prev_k_block_idx == 0 && combo_epi == 0) {
+                                            warpgroup::tma::store_async(
+                                                g.dC_out, combo_dc_output_stage->dC,
+                                                {col_block_idx, prev_k_block_idx * C::EPI_PIPE_DEPTH + combo_epi});
+                                        } else {
+                                            warpgroup::tma::store_add_async(
+                                                g.dC_out, combo_dc_output_stage->dC,
+                                                {col_block_idx, prev_k_block_idx * C::EPI_PIPE_DEPTH + combo_epi});
+                                        }
+                                    } else if constexpr (G::SKIP_GLOBAL_COL_MATERIALIZATION && ROWONLY_COMBO_DC_STORE_MODE == 2) {
+                                        if (!(prev_k_block_idx == 0 && combo_epi == 0)) {
+                                            warpgroup::tma::store_add_async(
+                                                g.dC_out, combo_dc_output_stage->dC,
+                                                {col_block_idx, prev_k_block_idx * C::EPI_PIPE_DEPTH + combo_epi});
+                                        }
+                                    } else {
+                                        warpgroup::tma::store_add_async(
+                                            g.dC_out, combo_dc_output_stage->dC,
+                                            {col_block_idx, prev_k_block_idx * C::EPI_PIPE_DEPTH + combo_epi});
+                                    }
+                                    if constexpr (G::SKIP_GLOBAL_COL_MATERIALIZATION) {
+                                        if constexpr (ROWONLY_COMBO_DC_DEBUG_CUT == 29) {
+                                            rowonly_combo_dc_debug_cut(29, k_block_idx, prev_k_block_idx, combo_epi);
+                                            return;
+                                        }
+                                    }
+                                    tensor_after_thread_sync();
+                                }
+                            warpgroup::tma::store_async_read_wait<0>();
+                            if constexpr (G::SKIP_GLOBAL_COL_MATERIALIZATION) {
+                                if constexpr (ROWONLY_COMBO_DC_DEBUG_CUT == 30) {
+                                    rowonly_combo_dc_debug_cut(30, k_block_idx, prev_k_block_idx);
+                                    return;
+                                }
+                            }
+                        }
+                        if constexpr (G::SKIP_GLOBAL_COL_MATERIALIZATION) {
+                                if constexpr (ROWONLY_COMBO_DC_DEBUG_CUT == 33) {
+                                    rowonly_combo_dc_debug_cut(33, k_block_idx, prev_k_block_idx);
+                                    return;
+                                }
+                            }
+                            }
+
+                            if (combo_issue_leader) {
+                                if constexpr (G::SKIP_GLOBAL_COL_MATERIALIZATION &&
+                                              ROWONLY_COMBO_DC_DEBUG_CUT == 187) {
+                                    if (DEDICATED_ROWONLY_ROUTE && block_idx > cluster_id && k_block_idx == 0) {
+                                        rowonly_combo_dc_debug_cut(187, k_block_idx, prev_k_block_idx);
+                                        return;
+                                    }
+                                }
+                                // The dedicated row-only route still reuses the combo dC input
+                                // stages across k-blocks, even though it skips global G_col writes.
+                                if constexpr (G::SKIP_GLOBAL_COL_MATERIALIZATION &&
+                                              ROWONLY_COMBO_DC_DEBUG_CUT == 177) {
+                                    if (DEDICATED_ROWONLY_ROUTE && k_block_idx >= 1) {
+                                        rowonly_combo_dc_debug_cut(177, k_block_idx, prev_k_block_idx);
+                                        return;
+                                    }
+                                }
+                                if constexpr (DEDICATED_ROWONLY_ROUTE ||
+                                              !G::SKIP_GLOBAL_COL_MATERIALIZATION) {
+                                    if constexpr (!(G::SKIP_GLOBAL_COL_MATERIALIZATION &&
+                                                    ROWONLY_COMBO_DC_SKIP_INPUTS_FINISHED_WAIT == 1)) {
+                                        wait(combo_dc_p3_inputs_finished, combo_dc_inputs_phase);
+                                        combo_dc_inputs_phase ^= 1;
+                                    }
+                                }
+                                tma::expect_bytes(combo_dc_p3_e_tiles_arrived, sizeof(typename G::combo_p3_E_tile));
+                                tma::load_async(
+                                    combo_dc_tile_stage->E_operand, g.E_col,
+                                    {k_block_idx * 2 + cta_id, row_block_idx},
+                                    combo_dc_p3_e_tiles_arrived);
+                                tma::load_async(
+                                    combo_dc_scales_stage->E_sc, g.E_col_sc,
+                                    {k_block_idx, row_block_idx, 0},
+                                    combo_dc_p3_e_scales_arrived);
+                                if constexpr (G::SKIP_GLOBAL_COL_MATERIALIZATION &&
+                                              ROWONLY_COMBO_DC_DEBUG_CUT == 178) {
+                                    if (DEDICATED_ROWONLY_ROUTE && k_block_idx >= 1) {
+                                        rowonly_combo_dc_debug_cut(178, k_block_idx, prev_k_block_idx);
+                                        return;
+                                    }
+                                }
+                                if constexpr (G::SKIP_GLOBAL_COL_MATERIALIZATION) {
+                                    if constexpr (ROWONLY_COMBO_DC_DEBUG_CUT == 170) {
+                                        if (block_idx > cluster_id && prev_k_block_idx >= 0) {
+                                            rowonly_combo_dc_debug_cut(170, k_block_idx, prev_k_block_idx);
+                                            return;
+                                        }
+                                    }
+                                }
+                            }
+                            warpgroup::sync(quantizer_sync_id);
+                            if constexpr (G::SKIP_GLOBAL_COL_MATERIALIZATION) {
+                                if constexpr (ROWONLY_COMBO_DC_DEBUG_CUT == 34) {
+                                    if (prev_k_block_idx >= 0) {
+                                        rowonly_combo_dc_debug_cut(34, k_block_idx, prev_k_block_idx);
+                                        return;
+                                    }
+                                }
+                                if constexpr (ROWONLY_COMBO_DC_DEBUG_CUT == 73) {
+                                    if (block_idx > cluster_id) {
+                                        rowonly_combo_dc_debug_cut(73, k_block_idx, prev_k_block_idx);
+                                        return;
+                                    }
+                                }
+                                if constexpr (ROWONLY_COMBO_DC_DEBUG_CUT == 21) {
+                                    rowonly_combo_dc_debug_cut(21, k_block_idx, prev_k_block_idx);
+                                    return;
+                                }
+                                if constexpr (ROWONLY_COMBO_DC_DEBUG_CUT == 3) {
+                                    rowonly_combo_dc_debug_cut(3, k_block_idx, prev_k_block_idx);
+                                    return;
+                                }
+                            }
+
+                            if (combo_issue_leader) {
+                                tma::expect_bytes(combo_dc_p3_e_scales_arrived, sizeof(typename G::combo_p3_E_sc_tile));
+                                wait(combo_dc_p3_e_scales_arrived, combo_dc_e_scales_phase);
+                                combo_dc_e_scales_phase ^= 1;
+                            }
+                            if constexpr (DEDICATED_ROWONLY_ROUTE) {
+                                asm volatile("fence.proxy.async.shared::cta;\n" ::: "memory");
+                            }
+                            if constexpr (G::SKIP_GLOBAL_COL_MATERIALIZATION &&
+                                          ROWONLY_COMBO_DC_DEBUG_CUT == 188) {
+                                if (DEDICATED_ROWONLY_ROUTE && block_idx > cluster_id && k_block_idx == 0) {
+                                    rowonly_combo_dc_debug_cut(188, k_block_idx, prev_k_block_idx);
+                                    return;
+                                }
+                            }
+                            if constexpr (G::SKIP_GLOBAL_COL_MATERIALIZATION &&
+                                          ROWONLY_COMBO_DC_DEBUG_CUT == 179) {
+                                if (DEDICATED_ROWONLY_ROUTE && k_block_idx >= 1) {
+                                    rowonly_combo_dc_debug_cut(179, k_block_idx, prev_k_block_idx);
+                                    return;
+                                }
+                            }
+                            warpgroup::sync(quantizer_sync_id);
+                            if constexpr (G::SKIP_GLOBAL_COL_MATERIALIZATION) {
+                                if constexpr (ROWONLY_COMBO_DC_DEBUG_CUT == 35) {
+                                    if (prev_k_block_idx >= 0) {
+                                        rowonly_combo_dc_debug_cut(35, k_block_idx, prev_k_block_idx);
+                                        return;
+                                    }
+                                }
+                                if constexpr (ROWONLY_COMBO_DC_DEBUG_CUT == 22) {
+                                    rowonly_combo_dc_debug_cut(22, k_block_idx, prev_k_block_idx);
+                                    return;
+                                }
+                            }
+
+                            #pragma unroll
+                            for (int ii = 0; ii < combo_dc_b_scale_chunks; ++ii) {
+                                auto combo_b_sc_sub =
+                                    combo_dc_b_sc_tm.template subtile<full_tt_fp8e4m3<16>>(ii * 16);
+                                auto &combo_e_sc_sm_sub =
+                                    *reinterpret_cast<st_fp8e4m3<32, 16, false> *>(
+                                        reinterpret_cast<uint64_t>(&combo_dc_scales_stage->E_sc.data[0]) + 16 * 32 * ii);
+                                load_mxnv_scale_async2(combo_b_sc_sub, combo_e_sc_sm_sub);
+                            }
+                            if constexpr (G::SKIP_GLOBAL_COL_MATERIALIZATION &&
+                                          ROWONLY_COMBO_DC_DEBUG_CUT == 189) {
+                                if (DEDICATED_ROWONLY_ROUTE && block_idx > cluster_id && k_block_idx == 0) {
+                                    rowonly_combo_dc_debug_cut(189, k_block_idx, prev_k_block_idx);
+                                    return;
+                                }
+                            }
+                            if constexpr (G::SKIP_GLOBAL_COL_MATERIALIZATION) {
+                                if constexpr (ROWONLY_COMBO_DC_DEBUG_CUT == 36) {
+                                    if (prev_k_block_idx >= 0) {
+                                        rowonly_combo_dc_debug_cut(36, k_block_idx, prev_k_block_idx);
+                                        return;
+                                    }
+                                }
+                                if constexpr (ROWONLY_COMBO_DC_DEBUG_CUT == 23) {
+                                    rowonly_combo_dc_debug_cut(23, k_block_idx, prev_k_block_idx);
+                                    return;
+                                }
+                            }
+
+                            if (combo_issue_leader) {
+                                wait(combo_dc_p3_e_tiles_arrived, combo_dc_e_tiles_phase);
+                                combo_dc_e_tiles_phase ^= 1;
+                            }
+                            if constexpr (DEDICATED_ROWONLY_ROUTE) {
+                                asm volatile("fence.proxy.async.shared::cta;\n" ::: "memory");
+                            }
+                            if constexpr (G::SKIP_GLOBAL_COL_MATERIALIZATION &&
+                                          ROWONLY_COMBO_DC_DEBUG_CUT == 190) {
+                                if (DEDICATED_ROWONLY_ROUTE && block_idx > cluster_id && k_block_idx == 0) {
+                                    rowonly_combo_dc_debug_cut(190, k_block_idx, prev_k_block_idx);
+                                    return;
+                                }
+                            }
+                            if constexpr (G::SKIP_GLOBAL_COL_MATERIALIZATION &&
+                                          ROWONLY_COMBO_DC_DEBUG_CUT == 180) {
+                                if (DEDICATED_ROWONLY_ROUTE && k_block_idx >= 1) {
+                                    rowonly_combo_dc_debug_cut(180, k_block_idx, prev_k_block_idx);
+                                    return;
+                                }
+                            }
+                            warpgroup::sync(quantizer_sync_id);
+                            if constexpr (G::SKIP_GLOBAL_COL_MATERIALIZATION) {
+                                if constexpr (ROWONLY_COMBO_DC_DEBUG_CUT == 37) {
+                                    if (prev_k_block_idx >= 0) {
+                                        rowonly_combo_dc_debug_cut(37, k_block_idx, prev_k_block_idx);
+                                        return;
+                                    }
+                                }
+                                if constexpr (ROWONLY_COMBO_DC_DEBUG_CUT == 24) {
+                                    rowonly_combo_dc_debug_cut(24, k_block_idx, prev_k_block_idx);
+                                    return;
+                                }
+                            }
+
+                            mm2_ABt(
+                                combo_dc_tm, combo_col_stage->Gt_row, combo_dc_tile_stage->E_operand,
+                                combo_dc_a_sc_tm.template subtile<full_tt_fp8e4m3<16 * combo_dc_a_scale_chunks>>(0),
+                                combo_dc_b_sc_tm.template subtile<full_tt_fp8e4m3<32 * combo_dc_b_scale_chunks>>(0),
+                                combo_dc_p3_inputs_finished);
+                            if constexpr (G::SKIP_GLOBAL_COL_MATERIALIZATION &&
+                                          ROWONLY_COMBO_DC_DEBUG_CUT == 181) {
+                                if (DEDICATED_ROWONLY_ROUTE && k_block_idx >= 1) {
+                                    rowonly_combo_dc_debug_cut(181, k_block_idx, prev_k_block_idx);
+                                    return;
+                                }
+                            }
+                            if constexpr (G::SKIP_GLOBAL_COL_MATERIALIZATION) {
+                                if constexpr (ROWONLY_COMBO_DC_DEBUG_CUT == 38) {
+                                    if (prev_k_block_idx >= 0) {
+                                        rowonly_combo_dc_debug_cut(38, k_block_idx, prev_k_block_idx);
+                                        return;
+                                    }
+                                }
+                                if constexpr (ROWONLY_COMBO_DC_DEBUG_CUT == 25) {
+                                    rowonly_combo_dc_debug_cut(25, k_block_idx, prev_k_block_idx);
+                                    return;
+                                }
+                            }
+                            tensor_commit<2>(combo_dc_p3_outputs_arrived);
+                            tensor_after_thread_sync();
+                            asm volatile("fence.proxy.async.shared::cluster;\n" ::: "memory");
+                            warpgroup::sync(quantizer_sync_id);
+                            if constexpr (DEDICATED_ROWONLY_ROUTE) {
+                                if constexpr (G::SKIP_GLOBAL_COL_MATERIALIZATION &&
+                                              ROWONLY_COMBO_DC_DEBUG_CUT == 182) {
+                                    if (k_block_idx >= 1) {
+                                        rowonly_combo_dc_debug_cut(182, k_block_idx, prev_k_block_idx);
+                                        return;
+                                    }
+                                }
+                                if constexpr (G::SKIP_GLOBAL_COL_MATERIALIZATION &&
+                                              ROWONLY_COMBO_DC_DEBUG_CUT == 183) {
+                                    if (k_block_idx == 0) {
+                                        rowonly_combo_dc_debug_cut(183, k_block_idx, prev_k_block_idx);
+                                        return;
+                                    }
+                                }
                                 wait(combo_dc_p3_outputs_arrived, combo_dc_outputs_phase);
                                 combo_dc_outputs_phase ^= 1;
+                                if constexpr (G::SKIP_GLOBAL_COL_MATERIALIZATION &&
+                                              ROWONLY_COMBO_DC_DEBUG_CUT == 184) {
+                                    if (k_block_idx == 0) {
+                                        rowonly_combo_dc_debug_cut(184, k_block_idx, prev_k_block_idx);
+                                        return;
+                                    }
+                                }
                                 #pragma unroll
                                 for (int combo_epi = 0; combo_epi < C::EPI_PIPE_DEPTH; ++combo_epi) {
                                     combo_dc_rt D_reg_fl;
@@ -10154,65 +13714,92 @@ __device__ inline void backward_kernel_v3_streaming_3wg_impl(const globals_3wg<C
                                     warpgroup::sync(quantizer_sync_id);
                                     warpgroup::tma::store_add_async(
                                         g.dC_out, combo_dc_output_stage->dC,
-                                        {col_block_idx, prev_k_block_idx * C::EPI_PIPE_DEPTH + combo_epi});
+                                        {col_block_idx, k_block_idx * C::EPI_PIPE_DEPTH + combo_epi});
                                     tensor_after_thread_sync();
+                                    if constexpr (G::SKIP_GLOBAL_COL_MATERIALIZATION &&
+                                                  ROWONLY_COMBO_DC_DEBUG_CUT == 185) {
+                                        if (k_block_idx == 0) {
+                                            rowonly_combo_dc_debug_cut(185, k_block_idx, prev_k_block_idx, combo_epi);
+                                            return;
+                                        }
+                                    }
                                 }
                                 warpgroup::tma::store_async_read_wait<0>();
+                                if constexpr (G::SKIP_GLOBAL_COL_MATERIALIZATION &&
+                                              ROWONLY_COMBO_DC_DEBUG_CUT == 186) {
+                                    if (k_block_idx == 0) {
+                                        rowonly_combo_dc_debug_cut(186, k_block_idx, prev_k_block_idx);
+                                        return;
+                                    }
+                                }
+                            } else {
+                                if constexpr (G::SKIP_GLOBAL_COL_MATERIALIZATION &&
+                                              ROWONLY_COMBO_DC_OUTPUT_PHASE_MODE == 0) {
+                                    combo_dc_outputs_phase ^= 1;
+                                }
+                                if constexpr (G::SKIP_GLOBAL_COL_MATERIALIZATION) {
+                                    if constexpr (ROWONLY_COMBO_DC_DEBUG_CUT == 39) {
+                                        if (prev_k_block_idx >= 0) {
+                                            rowonly_combo_dc_debug_cut(39, k_block_idx, prev_k_block_idx);
+                                            return;
+                                        }
+                                    }
+                                    if constexpr (ROWONLY_COMBO_DC_DEBUG_CUT == 158) {
+                                        if (k_block_idx >= 2) {
+                                            rowonly_combo_dc_debug_cut(158, k_block_idx, prev_k_block_idx);
+                                            return;
+                                        }
+                                    }
+                                    if constexpr (ROWONLY_COMBO_DC_DEBUG_CUT == 74) {
+                                        if (block_idx > cluster_id) {
+                                            rowonly_combo_dc_debug_cut(74, k_block_idx, prev_k_block_idx);
+                                            return;
+                                        }
+                                    }
+                                    if constexpr (ROWONLY_COMBO_DC_DEBUG_CUT == 26) {
+                                        rowonly_combo_dc_debug_cut(26, k_block_idx, prev_k_block_idx);
+                                        return;
+                                    }
+                                    if constexpr (ROWONLY_COMBO_DC_DEBUG_CUT == 4) {
+                                        rowonly_combo_dc_debug_cut(4, k_block_idx, prev_k_block_idx);
+                                        return;
+                                    }
+                                }
+                                prev_k_block_idx = k_block_idx;
                             }
-
-                            if (combo_issue_leader) {
-                                wait(combo_dc_p3_inputs_finished, combo_dc_inputs_phase);
-                                combo_dc_inputs_phase ^= 1;
-                                tma::expect_bytes(combo_dc_p3_e_tiles_arrived, sizeof(typename G::combo_p3_E_tile));
-                                tma::load_async(
-                                    combo_dc_tile_stage->E_operand, g.E_col,
-                                    {k_block_idx * 2 + cta_id, row_block_idx},
-                                    combo_dc_p3_e_tiles_arrived);
-                                tma::load_async(
-                                    combo_dc_scales_stage->E_sc, g.E_col_sc,
-                                    {k_block_idx, row_block_idx, 0},
-                                    combo_dc_p3_e_scales_arrived);
-                            }
-                            warpgroup::sync(quantizer_sync_id);
-
-                            if (combo_issue_leader) {
-                                tma::expect_bytes(combo_dc_p3_e_scales_arrived, sizeof(typename G::combo_p3_E_sc_tile));
-                                wait(combo_dc_p3_e_scales_arrived, combo_dc_e_scales_phase);
-                                combo_dc_e_scales_phase ^= 1;
-                            }
-                            warpgroup::sync(quantizer_sync_id);
-
-                            #pragma unroll
-                            for (int ii = 0; ii < combo_dc_b_scale_chunks; ++ii) {
-                                auto combo_b_sc_sub =
-                                    combo_dc_b_sc_tm.template subtile<full_tt_fp8e4m3<16>>(ii * 16);
-                                auto &combo_e_sc_sm_sub =
-                                    *reinterpret_cast<st_fp8e4m3<32, 16, false> *>(
-                                        reinterpret_cast<uint64_t>(&combo_dc_scales_stage->E_sc.data[0]) + 16 * 32 * ii);
-                                load_mxnv_scale_async2(combo_b_sc_sub, combo_e_sc_sm_sub);
-                            }
-
-                            if (combo_issue_leader) {
-                                wait(combo_dc_p3_e_tiles_arrived, combo_dc_e_tiles_phase);
-                                combo_dc_e_tiles_phase ^= 1;
-                            }
-                            warpgroup::sync(quantizer_sync_id);
-
-                            mm2_ABt(
-                                combo_dc_tm, combo_col_stage->Gt_row, combo_dc_tile_stage->E_operand,
-                                combo_dc_a_sc_tm.template subtile<full_tt_fp8e4m3<16 * combo_dc_a_scale_chunks>>(0),
-                                combo_dc_b_sc_tm.template subtile<full_tt_fp8e4m3<32 * combo_dc_b_scale_chunks>>(0),
-                                combo_dc_p3_inputs_finished);
-                            tensor_commit<2>(combo_dc_p3_outputs_arrived);
-                            tensor_after_thread_sync();
-                            asm volatile("fence.proxy.async.shared::cluster;\n" ::: "memory");
-                            warpgroup::sync(quantizer_sync_id);
-                            prev_k_block_idx = k_block_idx;
                         }
 
                         if (prev_k_block_idx >= 0) {
-                            wait(combo_dc_p3_outputs_arrived, combo_dc_outputs_phase);
-                            combo_dc_outputs_phase ^= 1;
+                            if constexpr (!(DEDICATED_ROWONLY_ROUTE ||
+                                            (G::SKIP_GLOBAL_COL_MATERIALIZATION &&
+                                             ROWONLY_COMBO_DC_FINAL_WAIT_MODE == 1))) {
+                                const int combo_dc_final_wait_phase =
+                                    combo_dc_outputs_phase ^
+                                    ((G::SKIP_GLOBAL_COL_MATERIALIZATION &&
+                                      ROWONLY_COMBO_DC_FINAL_WAIT_PHASE_XOR == 1) ? 1 : 0);
+                                wait(combo_dc_p3_outputs_arrived, combo_dc_final_wait_phase);
+                                if constexpr (!G::SKIP_GLOBAL_COL_MATERIALIZATION ||
+                                              (G::SKIP_GLOBAL_COL_MATERIALIZATION &&
+                                               ROWONLY_COMBO_DC_OUTPUT_PHASE_MODE != 0)) {
+                                    combo_dc_outputs_phase ^= 1;
+                                }
+                            }
+                            if constexpr (G::SKIP_GLOBAL_COL_MATERIALIZATION) {
+                                if constexpr (ROWONLY_COMBO_DC_DEBUG_CUT == 40) {
+                                    rowonly_combo_dc_debug_cut(40, combo_num_k_blocks, prev_k_block_idx);
+                                    return;
+                                }
+                                if constexpr (ROWONLY_COMBO_DC_DEBUG_CUT == 75) {
+                                    if (block_idx > cluster_id) {
+                                        rowonly_combo_dc_debug_cut(75, combo_num_k_blocks, prev_k_block_idx);
+                                        return;
+                                    }
+                                }
+                                if constexpr (ROWONLY_COMBO_DC_DEBUG_CUT == 27) {
+                                    rowonly_combo_dc_debug_cut(27, combo_num_k_blocks, prev_k_block_idx);
+                                    return;
+                                }
+                            }
                             #pragma unroll
                             for (int combo_epi = 0; combo_epi < C::EPI_PIPE_DEPTH; ++combo_epi) {
                                 combo_dc_rt D_reg_fl;
@@ -10227,24 +13814,446 @@ __device__ inline void backward_kernel_v3_streaming_3wg_impl(const globals_3wg<C
                                 tensor_load_wait();
                                 tensor_before_thread_sync();
                                 warpgroup::sync(quantizer_sync_id);
+                                if constexpr (G::SKIP_GLOBAL_COL_MATERIALIZATION) {
+                                    if constexpr (ROWONLY_COMBO_DC_DEBUG_CUT == 41) {
+                                        rowonly_combo_dc_debug_cut(41, combo_num_k_blocks, prev_k_block_idx, combo_epi);
+                                        return;
+                                    }
+                                    if constexpr (ROWONLY_COMBO_DC_DEBUG_CUT == 28) {
+                                        rowonly_combo_dc_debug_cut(28, combo_num_k_blocks, prev_k_block_idx);
+                                        return;
+                                    }
+                                }
                                 warp::mul(D_reg_fl, D_reg_fl, combo_dc_scale);
                                 warp::copy(D_reg_bf, D_reg_fl);
                                 warpgroup::store(combo_dc_output_stage->dC, D_reg_bf);
+                                if constexpr (G::SKIP_GLOBAL_COL_MATERIALIZATION) {
+                                    if constexpr (ROWONLY_COMBO_DC_DEBUG_CUT == 31) {
+                                        rowonly_combo_dc_debug_cut(31, combo_num_k_blocks, prev_k_block_idx, combo_epi);
+                                        return;
+                                    }
+                                }
                                 warpgroup::sync(quantizer_sync_id);
-                                warpgroup::tma::store_add_async(
-                                    g.dC_out, combo_dc_output_stage->dC,
-                                    {col_block_idx, prev_k_block_idx * C::EPI_PIPE_DEPTH + combo_epi});
+                                if constexpr (G::SKIP_GLOBAL_COL_MATERIALIZATION) {
+                                    if constexpr (ROWONLY_COMBO_DC_DEBUG_CUT == 32) {
+                                        rowonly_combo_dc_debug_cut(32, combo_num_k_blocks, prev_k_block_idx, combo_epi);
+                                        return;
+                                    }
+                                }
+                                if constexpr (G::SKIP_GLOBAL_COL_MATERIALIZATION && ROWONLY_COMBO_DC_STORE_MODE == 1) {
+                                    if (prev_k_block_idx == 0 && combo_epi == 0) {
+                                        warpgroup::tma::store_async(
+                                            g.dC_out, combo_dc_output_stage->dC,
+                                            {col_block_idx, prev_k_block_idx * C::EPI_PIPE_DEPTH + combo_epi});
+                                    } else {
+                                        warpgroup::tma::store_add_async(
+                                            g.dC_out, combo_dc_output_stage->dC,
+                                            {col_block_idx, prev_k_block_idx * C::EPI_PIPE_DEPTH + combo_epi});
+                                    }
+                                } else if constexpr (G::SKIP_GLOBAL_COL_MATERIALIZATION && ROWONLY_COMBO_DC_STORE_MODE == 2) {
+                                    if (!(prev_k_block_idx == 0 && combo_epi == 0)) {
+                                        warpgroup::tma::store_add_async(
+                                            g.dC_out, combo_dc_output_stage->dC,
+                                            {col_block_idx, prev_k_block_idx * C::EPI_PIPE_DEPTH + combo_epi});
+                                    }
+                                } else {
+                                    warpgroup::tma::store_add_async(
+                                        g.dC_out, combo_dc_output_stage->dC,
+                                        {col_block_idx, prev_k_block_idx * C::EPI_PIPE_DEPTH + combo_epi});
+                                }
+                                if constexpr (G::SKIP_GLOBAL_COL_MATERIALIZATION) {
+                                    if constexpr (ROWONLY_COMBO_DC_DEBUG_CUT == 29) {
+                                        rowonly_combo_dc_debug_cut(29, combo_num_k_blocks, prev_k_block_idx, combo_epi);
+                                        return;
+                                    }
+                                    if constexpr (ROWONLY_COMBO_DC_DEBUG_CUT == 42) {
+                                        if (prev_k_block_idx == combo_num_k_blocks - 1) {
+                                        rowonly_combo_dc_debug_cut(42, combo_num_k_blocks, prev_k_block_idx, combo_epi);
+                                        return;
+                                        }
+                                    }
+                                }
                                 tensor_after_thread_sync();
                             }
                             warpgroup::tma::store_async_read_wait<0>();
+                            if constexpr (G::SKIP_GLOBAL_COL_MATERIALIZATION) {
+                                if constexpr (ROWONLY_COMBO_DC_DEBUG_CUT == 30) {
+                                    rowonly_combo_dc_debug_cut(30, combo_num_k_blocks, prev_k_block_idx);
+                                    return;
+                                }
+                                if constexpr (ROWONLY_COMBO_DC_DEBUG_CUT == 43) {
+                                    if (prev_k_block_idx == combo_num_k_blocks - 1) {
+                                    rowonly_combo_dc_debug_cut(43, combo_num_k_blocks, prev_k_block_idx);
+                                    return;
+                                    }
+                                }
+                            }
+                        }
+                            if constexpr (G::SKIP_GLOBAL_COL_MATERIALIZATION) {
+                                if constexpr (ROWONLY_COMBO_DC_DEBUG_CUT == 5) {
+                                    rowonly_combo_dc_debug_cut(5, combo_num_k_blocks, prev_k_block_idx);
+                                    return;
+                                }
+                                if constexpr (ROWONLY_COMBO_DC_DEBUG_CUT == 54) {
+                                    if (prev_k_block_idx == combo_num_k_blocks - 1 && quant_lane == 0) {
+                                        printf(
+                                            "rowonly combo dc cut 54 cta=%d wg=%d warp=%d row=%d col=%d prev=%d\n",
+                                            cta_id, warpgroup_id, warpgroup::warpid(), row_block_idx, col_block_idx,
+                                            prev_k_block_idx);
+                                    }
+                                    return;
+                                }
+                                if constexpr (ROWONLY_COMBO_DC_DEBUG_CUT == 44) {
+                                    if (prev_k_block_idx == combo_num_k_blocks - 1) {
+                                    rowonly_combo_dc_debug_cut(44, combo_num_k_blocks, prev_k_block_idx);
+                                    return;
+                                    }
+                                }
+                                if constexpr (ROWONLY_COMBO_DC_DEBUG_CUT == 76) {
+                                    if (block_idx > cluster_id &&
+                                        prev_k_block_idx == combo_num_k_blocks - 1) {
+                                        rowonly_combo_dc_debug_cut(76, combo_num_k_blocks, prev_k_block_idx);
+                                        return;
+                                    }
+                                }
+                            }
+                        }
+                        }
+                    }
+                if constexpr (G::SKIP_GLOBAL_COL_MATERIALIZATION) {
+                    if constexpr (ROWONLY_COMBO_DC_DEBUG_CUT == 84) {
+                        if (block_idx > cluster_id && combo_do_dc && is_dc_consumer_wg && epi == 0) {
+                            if (warpgroup::warpid() == 0 && quant_lane == 0) {
+                                printf(
+                                    "rowonly combo dc cut 84 cta=%d wg=%d block=%d row=%d col=%d epi=%d roles=%d%d%d%d\n",
+                                    cta_id, warpgroup_id, block_idx, row_block_idx, col_block_idx, epi,
+                                    is_row_quantizer_wg ? 1 : 0,
+                                    is_col_quantizer_wg ? 1 : 0,
+                                    is_de_consumer_wg ? 1 : 0,
+                                    is_dc_consumer_wg ? 1 : 0);
+                            }
+                            return;
+                        }
+                    }
+                    if constexpr (ROWONLY_COMBO_DC_DEBUG_CUT == 52) {
+                        if (combo_do_dc && is_dc_consumer_wg && combo_stage_publish_epi) {
+                            if (warpgroup::warpid() == 0 && quant_lane == 0) {
+                                printf(
+                                    "rowonly combo dc cut 52 cta=%d wg=%d row=%d col=%d epi=%d\n",
+                                    cta_id, warpgroup_id, row_block_idx, col_block_idx, epi);
+                            }
+                            return;
+                        }
+                    }
+                    if constexpr (ROWONLY_COMBO_DC_DEBUG_CUT == 55) {
+                        if (combo_do_dc && is_dc_consumer_wg && combo_stage_publish_epi) {
+                            if (quant_lane == 0) {
+                                printf(
+                                    "rowonly combo dc cut 55 cta=%d wg=%d warp=%d row=%d col=%d epi=%d\n",
+                                    cta_id, warpgroup_id, warpgroup::warpid(), row_block_idx, col_block_idx, epi);
+                            }
+                            return;
                         }
                     }
                 }
-
-                warpgroup::sync(quantizer_sync_id);
+                if constexpr (G::FUSED_SOFTMAX_QUANT && G::FUSED_COL_IN_QUANTIZER &&
+                              COL_IN_QUANTIZER) {
+                    if (epi == C::EPI_PIPE_DEPTH - 1) {
+                        int col_flush_thread = -1;
+                        int col_flush_threads = 0;
+                        if constexpr (G::FRONTEND_SINGLE_QUANTIZER_WG) {
+                            constexpr int ROW_THREADS = ROW_IN_QUANTIZER ? (QUANTIZER_WG_THREADS / 2) : 0;
+                            col_flush_thread = quant_thread - ROW_THREADS;
+                            col_flush_threads = QUANTIZER_WG_THREADS - ROW_THREADS;
+                        } else if (is_col_quantizer_wg) {
+                            const int col_quantizer_rank = warpgroup_id - first_col_quantizer_wg;
+                            col_flush_thread = col_quantizer_rank * QUANTIZER_WG_THREADS + quant_thread;
+                            col_flush_threads = QUANTIZER_WG_THREADS * C::COL_QUANTIZER_WARPGROUPS;
+                        }
+                        const bool col_flush_participant = col_flush_thread >= 0;
+                        const bool col_flush_leader = col_flush_thread == 0;
+                        if (col_flush_leader) {
+                            if constexpr (!(G::SKIP_GLOBAL_COL_MATERIALIZATION &&
+                                            ROWONLY_COMBO_DC_FILTER_WAIT_MODE == 1)) {
+                                wait(fused_col_filter_ready, fused_col_filter_phase);
+                                fused_col_filter_phase ^= 1;
+                            }
+                            asm volatile("fence.proxy.async.shared::cta;\n" ::: "memory");
+                            if constexpr (SAFUSED_SPLIT_STAGE_DEBUG) {
+                                safused_split_request_abort(8);
+                            }
+                        }
+                        if constexpr (SAFUSED_SPLIT_STAGE_DEBUG) {
+                            if (safused_split_should_abort()) return;
+                        }
+                        if constexpr (G::SKIP_GLOBAL_COL_MATERIALIZATION) {
+                            if constexpr (ROWONLY_COMBO_DC_DEBUG_CUT == 57) {
+                                if (combo_do_dc && is_dc_consumer_wg) {
+                                    if (quant_lane == 0) {
+                                        printf(
+                                            "rowonly combo dc cut 57 cta=%d wg=%d warp=%d row=%d col=%d epi=%d\n",
+                                            cta_id, warpgroup_id, warpgroup::warpid(), row_block_idx, col_block_idx, epi);
+                                    }
+                                    return;
+                                }
+                            }
+                        }
+                        if constexpr (G::SKIP_GLOBAL_COL_MATERIALIZATION) {
+                            if constexpr (ROWONLY_COMBO_DC_DEBUG_CUT == 50) {
+                                if (combo_do_dc) {
+                                    if (warpgroup::warpid() == 0 && quant_lane == 0) {
+                                        printf(
+                                            "rowonly combo dc cut 50 cta=%d wg=%d row=%d col=%d epi=%d roles=%d%d%d%d\n",
+                                            cta_id, warpgroup_id, row_block_idx, col_block_idx, epi,
+                                            is_row_quantizer_wg ? 1 : 0,
+                                            is_col_quantizer_wg ? 1 : 0,
+                                            is_de_consumer_wg ? 1 : 0,
+                                            is_dc_consumer_wg ? 1 : 0);
+                                    }
+                                    return;
+                                }
+                            }
+                        }
+                        if (!(DEDICATED_ROWONLY_ROUTE && combo_do_dc && combo_stage_publish_epi)) {
+                            warpgroup::sync(quantizer_sync_id);
+                        }
+                        if constexpr (G::SKIP_GLOBAL_COL_MATERIALIZATION) {
+                            if constexpr (ROWONLY_COMBO_DC_DEBUG_CUT == 58) {
+                                if (combo_do_dc && is_dc_consumer_wg) {
+                                    if (quant_lane == 0) {
+                                        printf(
+                                            "rowonly combo dc cut 58 cta=%d wg=%d warp=%d row=%d col=%d epi=%d\n",
+                                            cta_id, warpgroup_id, warpgroup::warpid(), row_block_idx, col_block_idx, epi);
+                                    }
+                                    return;
+                                }
+                            }
+                        }
+                        if constexpr (G::SKIP_GLOBAL_COL_MATERIALIZATION) {
+                            if constexpr (ROWONLY_COMBO_DC_DEBUG_CUT == 51) {
+                                if (combo_do_dc) {
+                                    if (warpgroup::warpid() == 0 && quant_lane == 0) {
+                                        printf(
+                                            "rowonly combo dc cut 51 cta=%d wg=%d row=%d col=%d epi=%d roles=%d%d%d%d\n",
+                                            cta_id, warpgroup_id, row_block_idx, col_block_idx, epi,
+                                            is_row_quantizer_wg ? 1 : 0,
+                                            is_col_quantizer_wg ? 1 : 0,
+                                            is_de_consumer_wg ? 1 : 0,
+                                            is_dc_consumer_wg ? 1 : 0);
+                                    }
+                                    return;
+                                }
+                            }
+                        }
+                        if (col_flush_participant) {
+                            uint64_t fused_diag_flush_t0 = 0;
+                            const bool fused_diag_timing_leader =
+                                G::SAFUSED_DIAG_TIMING_ENABLED &&
+                                g.diag_stage_cycles != nullptr &&
+                                block_idx == 0 &&
+                                col_flush_thread == 0;
+                            if constexpr (G::SAFUSED_DIAG_TIMING_ENABLED) {
+                                if (fused_diag_timing_leader) fused_diag_flush_t0 = clock64();
+                            }
+                            if (!G::SAFUSED_SKIP_COL_FLUSH && fused_col_keep_tile != 0) {
+                                constexpr int fused_local_row16_blocks = (C::Mb / 2) / 16;
+                                for (int idx = col_flush_thread;
+                                     idx < C::Nb * fused_local_row16_blocks;
+                                     idx += col_flush_threads) {
+                                    const int local_col = idx / fused_local_row16_blocks;
+                                    const int row16_block = idx % fused_local_row16_blocks;
+                                    const int global_col = col_block_idx * C::Nb + local_col;
+                                    if (full_tile_cols || global_col < g.N) {
+                                        const int local_row_base = row16_block * 16;
+                                        const int global_row_base = tile_row_base + local_row_base;
+                                        const int local_row_pair_base = local_row_base / 2;
+                                        const int global_row_pair_base = global_row_base / 2;
+                                        const uint64_t packed_fp4 =
+                                            *reinterpret_cast<const uint64_t*>(
+                                                &fused_col_fp4_stage[local_col * (C::Mb / 4) + local_row_pair_base]);
+                                        maybe_store_global_col_u64<G>(
+                                            col_fp4_ptr,
+                                            col_fp4_stride,
+                                            global_col,
+                                            global_row_pair_base,
+                                            packed_fp4);
+                                        const int depth = global_col / 128;
+                                        const int sr = global_col % 32;
+                                        const int rr = (global_col / 32) % 4;
+                                        const int m_kgroup = global_row_base / 64;
+                                        const int m_16_in_64 = (global_row_base / 16) % 4;
+                                        const int chunk = depth * col_sc_kgroups + m_kgroup;
+                                        const int byte_idx = sr * 16 + rr * 4 + m_16_in_64;
+                                        const int local_m_kgroup = local_row_base / 64;
+                                        const int local_byte_idx =
+                                            local_m_kgroup * 512 + sr * 16 + rr * 4 + m_16_in_64;
+                                        maybe_store_global_col_scale<G>(
+                                            col_sc_ptr,
+                                            chunk,
+                                            byte_idx,
+                                            fused_col_sc_stage[local_byte_idx]);
+                                        if constexpr (SAFUSED_SPLIT_STAGE_DEBUG) {
+                                            if (idx == col_flush_thread && col_flush_thread == 0) {
+                                                safused_split_request_abort(9);
+                                            }
+                                            if (safused_split_should_abort()) return;
+                                        }
+                                    }
+                                }
+                            }
+                            if constexpr (G::SAFUSED_DIAG_TIMING_ENABLED) {
+                                if (fused_diag_timing_leader) {
+                                    fused_diag_quant_flush_cycles += clock64() - fused_diag_flush_t0;
+                                    g.diag_stage_cycles[1] = fused_diag_quant_col_cycles;
+                                    g.diag_stage_cycles[2] = 0;
+                                    g.diag_stage_cycles[3] = fused_diag_quant_flush_cycles;
+                                }
+                            }
+                        }
+                        if (!(DEDICATED_ROWONLY_ROUTE && combo_do_dc && combo_stage_publish_epi)) {
+                            warpgroup::sync(quantizer_sync_id);
+                        }
+                        if constexpr (G::SKIP_GLOBAL_COL_MATERIALIZATION) {
+                            if constexpr (ROWONLY_COMBO_DC_DEBUG_CUT == 59) {
+                                if (combo_do_dc && is_dc_consumer_wg) {
+                                    if (quant_lane == 0) {
+                                        printf(
+                                            "rowonly combo dc cut 59 cta=%d wg=%d warp=%d row=%d col=%d epi=%d\n",
+                                            cta_id, warpgroup_id, warpgroup::warpid(), row_block_idx, col_block_idx, epi);
+                                    }
+                                    return;
+                                }
+                            }
+                        }
+#undef rowonly_combo_dc_debug_cut
+                    }
+                if constexpr (G::SKIP_GLOBAL_COL_MATERIALIZATION) {
+                    if constexpr (ROWONLY_COMBO_DC_DEBUG_CUT == 56) {
+                        if (combo_do_dc && is_dc_consumer_wg && combo_stage_publish_epi) {
+                            if (quant_lane == 0) {
+                                printf(
+                                    "rowonly combo dc cut 56 cta=%d wg=%d warp=%d row=%d col=%d epi=%d\n",
+                                    cta_id, warpgroup_id, warpgroup::warpid(), row_block_idx, col_block_idx, epi);
+                            }
+                            return;
+                        }
+                    }
+                }
+                if constexpr (G::SKIP_GLOBAL_COL_MATERIALIZATION &&
+                              ROWONLY_COMBO_DC_SKIP_POST_EPI_FINAL_CLEANUP == 1) {
+                    if (combo_do_dc && combo_stage_publish_epi &&
+                        block_idx == quantizer_num_blocks - 1) {
+                        return;
+                    }
+                }
+                if constexpr (G::SKIP_GLOBAL_COL_MATERIALIZATION) {
+                    if constexpr (ROWONLY_COMBO_DC_DEBUG_CUT == 48) {
+                        if (combo_do_dc && combo_stage_publish_epi) {
+                            if (warpgroup::warpid() == 0 && quant_lane == 0) {
+                                printf(
+                                    "rowonly combo dc cut 48 cta=%d wg=%d row=%d col=%d epi=%d roles=%d%d%d%d\n",
+                                    cta_id, warpgroup_id, row_block_idx, col_block_idx, epi,
+                                    is_row_quantizer_wg ? 1 : 0,
+                                    is_col_quantizer_wg ? 1 : 0,
+                                    is_de_consumer_wg ? 1 : 0,
+                                    is_dc_consumer_wg ? 1 : 0);
+                            }
+                            return;
+                        }
+                    }
+                    if constexpr (ROWONLY_COMBO_DC_DEBUG_CUT == 60) {
+                        if (combo_do_dc && combo_stage_publish_epi &&
+                            (is_col_quantizer_wg || is_dc_consumer_wg)) {
+                            if (warpgroup::warpid() == 0 && quant_lane == 0) {
+                                printf(
+                                    "rowonly combo dc cut 60 cta=%d wg=%d row=%d col=%d epi=%d roles=%d%d%d%d\n",
+                                    cta_id, warpgroup_id, row_block_idx, col_block_idx, epi,
+                                    is_row_quantizer_wg ? 1 : 0,
+                                    is_col_quantizer_wg ? 1 : 0,
+                                    is_de_consumer_wg ? 1 : 0,
+                                    is_dc_consumer_wg ? 1 : 0);
+                            }
+                            return;
+                        }
+                    }
+                }
+                if constexpr (G::SKIP_GLOBAL_COL_MATERIALIZATION) {
+                    if constexpr (ROWONLY_COMBO_DC_DEBUG_CUT == 90) {
+                        if (combo_do_dc &&
+                            (is_col_quantizer_wg || is_dc_consumer_wg)) {
+                            if (warpgroup::warpid() == 0 && quant_lane == 0) {
+                                printf(
+                                    "rowonly combo dc cut 90 cta=%d wg=%d roles=%d%d%d%d\n",
+                                    cta_id, warpgroup_id,
+                                    is_row_quantizer_wg ? 1 : 0,
+                                    is_col_quantizer_wg ? 1 : 0,
+                                    is_de_consumer_wg ? 1 : 0,
+                                    is_dc_consumer_wg ? 1 : 0);
+                            }
+                            return;
+                        }
+                    }
+                }
+                if constexpr (!(G::SKIP_GLOBAL_COL_MATERIALIZATION &&
+                                ROWONLY_COMBO_DC_SKIP_POST_DCEPILOGUE_SYNC)) {
+                    if (!(DEDICATED_ROWONLY_ROUTE && combo_do_dc && combo_stage_publish_epi)) {
+                        warpgroup::sync(quantizer_sync_id);
+                    }
+                }
+                if constexpr (G::SKIP_GLOBAL_COL_MATERIALIZATION) {
+                    if constexpr (ROWONLY_COMBO_DC_DEBUG_CUT == 49) {
+                        if (combo_do_dc && combo_stage_publish_epi) {
+                            if (warpgroup::warpid() == 0 && quant_lane == 0) {
+                                printf(
+                                    "rowonly combo dc cut 49 cta=%d wg=%d row=%d col=%d epi=%d roles=%d%d%d%d\n",
+                                    cta_id, warpgroup_id, row_block_idx, col_block_idx, epi,
+                                    is_row_quantizer_wg ? 1 : 0,
+                                    is_col_quantizer_wg ? 1 : 0,
+                                    is_de_consumer_wg ? 1 : 0,
+                                    is_dc_consumer_wg ? 1 : 0);
+                            }
+                            return;
+                        }
+                    }
+                    if constexpr (ROWONLY_COMBO_DC_DEBUG_CUT == 61) {
+                        if (combo_do_dc && combo_stage_publish_epi &&
+                            (is_col_quantizer_wg || is_dc_consumer_wg)) {
+                            if (warpgroup::warpid() == 0 && quant_lane == 0) {
+                                printf(
+                                    "rowonly combo dc cut 61 cta=%d wg=%d row=%d col=%d epi=%d roles=%d%d%d%d\n",
+                                    cta_id, warpgroup_id, row_block_idx, col_block_idx, epi,
+                                    is_row_quantizer_wg ? 1 : 0,
+                                    is_col_quantizer_wg ? 1 : 0,
+                                    is_de_consumer_wg ? 1 : 0,
+                                    is_dc_consumer_wg ? 1 : 0);
+                            }
+                            return;
+                        }
+                    }
+                }
+                if constexpr (G::SKIP_GLOBAL_COL_MATERIALIZATION) {
+                    if constexpr (ROWONLY_COMBO_DC_DEBUG_CUT == 45) {
+                        if (combo_do_dc && is_dc_consumer_wg && combo_stage_publish_epi &&
+                            epi == C::EPI_PIPE_DEPTH - 1) {
+                            if (warpgroup::warpid() == 0 && quant_lane == 0) {
+                                printf("rowonly combo dc cut 45 cta=%d row=%d col=%d epi=%d\n",
+                                       block_idx, row_block_idx, col_block_idx, epi);
+                            }
+                            return;
+                        }
+                    }
+                }
                 if constexpr (EFFECTIVE_ENABLE_STOREADD_COMBO && EFFECTIVE_SEPARATE_BACKHALF_CONSUMERS) {
                     if (warpgroup::warpid() == 0 && quant_lane == 0) {
                         if (is_col_quantizer_wg && combo_do_dc && combo_stage_publish_epi) {
+                            if constexpr (G::SKIP_GLOBAL_COL_MATERIALIZATION && DEDICATED_ROWONLY_DEBUG_STAGE == 29) {
+                                if (block_idx == cluster_id) {
+                                    printf(
+                                        "dedicated rowonly stage 29 cta=%d wg=%d block=%d row=%d col=%d epi=%d\n",
+                                        cta_id, warpgroup_id, block_idx, row_block_idx, col_block_idx, epi);
+                                    return;
+                                }
+                            }
                             __threadfence_block();
                             asm volatile("fence.proxy.async.shared::cta;\n" ::: "memory");
                             arrive(combo_g_col_ready[0]);
@@ -10254,6 +14263,33 @@ __device__ inline void backward_kernel_v3_streaming_3wg_impl(const globals_3wg<C
                         }
                         if (is_dc_consumer_wg && combo_do_dc && combo_stage_publish_epi) {
                             arrive(combo_g_col_recycled[0]);
+                        }
+                    }
+                }
+                if constexpr (G::SKIP_GLOBAL_COL_MATERIALIZATION) {
+                    if constexpr (ROWONLY_COMBO_DC_DEBUG_CUT == 46) {
+                        if (combo_do_dc && is_dc_consumer_wg && combo_stage_publish_epi &&
+                            epi == C::EPI_PIPE_DEPTH - 1) {
+                            if (warpgroup::warpid() == 0 && quant_lane == 0) {
+                                printf("rowonly combo dc cut 46 cta=%d row=%d col=%d epi=%d\n",
+                                       block_idx, row_block_idx, col_block_idx, epi);
+                            }
+                            return;
+                        }
+                    }
+                    if constexpr (ROWONLY_COMBO_DC_DEBUG_CUT == 62) {
+                        if (combo_do_dc && combo_stage_publish_epi &&
+                            (is_col_quantizer_wg || is_dc_consumer_wg)) {
+                            if (warpgroup::warpid() == 0 && quant_lane == 0) {
+                                printf(
+                                    "rowonly combo dc cut 62 cta=%d wg=%d row=%d col=%d epi=%d roles=%d%d%d%d\n",
+                                    cta_id, warpgroup_id, row_block_idx, col_block_idx, epi,
+                                    is_row_quantizer_wg ? 1 : 0,
+                                    is_col_quantizer_wg ? 1 : 0,
+                                    is_de_consumer_wg ? 1 : 0,
+                                    is_dc_consumer_wg ? 1 : 0);
+                            }
+                            return;
                         }
                     }
                 }
@@ -10278,6 +14314,31 @@ __device__ inline void backward_kernel_v3_streaming_3wg_impl(const globals_3wg<C
                         }
                     }
                 }
+                if constexpr (G::SKIP_GLOBAL_COL_MATERIALIZATION) {
+                    if constexpr (ROWONLY_COMBO_DC_DEBUG_CUT == 63) {
+                        if (combo_do_dc && combo_stage_publish_epi &&
+                            (is_col_quantizer_wg || is_dc_consumer_wg)) {
+                            if (warpgroup::warpid() == 0 && quant_lane == 0) {
+                                printf(
+                                    "rowonly combo dc cut 63 cta=%d wg=%d row=%d col=%d epi=%d roles=%d%d%d%d\n",
+                                    cta_id, warpgroup_id, row_block_idx, col_block_idx, epi,
+                                    is_row_quantizer_wg ? 1 : 0,
+                                    is_col_quantizer_wg ? 1 : 0,
+                                    is_de_consumer_wg ? 1 : 0,
+                                    is_dc_consumer_wg ? 1 : 0);
+                            }
+                            return;
+                        }
+                    }
+                }
+                if constexpr (SAFUSED_SPLIT_STAGE_DEBUG) {
+                    if constexpr (COL_IN_QUANTIZER && G::FUSED_COL_IN_QUANTIZER) {
+                        if (epi == 0 && bf_stage == 0 && warpgroup::warpid() == 0 && quant_lane == 0) {
+                            safused_split_request_abort(5);
+                        }
+                        if (safused_split_should_abort()) return;
+                    }
+                }
                 if constexpr (ROW_IN_QUANTIZER) {
                     if constexpr (G::FRONTEND_SINGLE_QUANTIZER_WG) {
                         if constexpr (G::DEBUG_ROW_WAIT_ON_COL_READY && DO_COL) {
@@ -10295,14 +14356,22 @@ __device__ inline void backward_kernel_v3_streaming_3wg_impl(const globals_3wg<C
                 }
                 if constexpr (COL_IN_QUANTIZER) {
                     if constexpr (G::FRONTEND_SINGLE_QUANTIZER_WG) {
-                        if constexpr (G::USE_COL_PAIR_STAGE || (DO_ROW && C::ROW_QUANT_FROM_REGS && C::CONSUMER_DO_ROW && !C::EARLY_COL_READY)) {
+                        if constexpr (G::FUSED_COL_IN_QUANTIZER && G::COL_READY_PER_ROW16) {
                             update_phasebit<0>(slice_col_ready_phasebits, bf_stage);
+                        } else if constexpr (G::USE_COL_PAIR_STAGE || (DO_ROW && C::ROW_QUANT_FROM_REGS && C::CONSUMER_DO_ROW && !C::EARLY_COL_READY)) {
+                            if (!(DEDICATED_ROWONLY_ROUTE && combo_do_dc && !G::COL_READY_PER_ROW16)) {
+                                update_phasebit<0>(slice_col_ready_phasebits, bf_stage);
+                            }
                         } else {
                             update_phasebit<0>(slice_phasebits, bf_stage);
                         }
                     } else if (is_col_quantizer_wg) {
-                        if constexpr (G::USE_COL_PAIR_STAGE || (DO_ROW && C::ROW_QUANT_FROM_REGS && C::CONSUMER_DO_ROW && !C::EARLY_COL_READY)) {
+                        if constexpr (G::FUSED_COL_IN_QUANTIZER && G::COL_READY_PER_ROW16) {
                             update_phasebit<0>(slice_col_ready_phasebits, bf_stage);
+                        } else if constexpr (G::USE_COL_PAIR_STAGE || (DO_ROW && C::ROW_QUANT_FROM_REGS && C::CONSUMER_DO_ROW && !C::EARLY_COL_READY)) {
+                            if (!(DEDICATED_ROWONLY_ROUTE && combo_do_dc && !G::COL_READY_PER_ROW16)) {
+                                update_phasebit<0>(slice_col_ready_phasebits, bf_stage);
+                            }
                         } else {
                             update_phasebit<0>(slice_phasebits, bf_stage);
                         }
@@ -10319,9 +14388,136 @@ __device__ inline void backward_kernel_v3_streaming_3wg_impl(const globals_3wg<C
                         update_phasebit<0>(combo_col_ready_phasebits, 0);
                     }
                 }
+                if constexpr (G::SKIP_GLOBAL_COL_MATERIALIZATION) {
+                    if constexpr (ROWONLY_COMBO_DC_DEBUG_CUT == 64) {
+                        if (combo_do_dc && combo_stage_publish_epi &&
+                            (is_col_quantizer_wg || is_dc_consumer_wg)) {
+                            if (warpgroup::warpid() == 0 && quant_lane == 0) {
+                                printf(
+                                    "rowonly combo dc cut 64 cta=%d wg=%d row=%d col=%d epi=%d roles=%d%d%d%d\n",
+                                    cta_id, warpgroup_id, row_block_idx, col_block_idx, epi,
+                                    is_row_quantizer_wg ? 1 : 0,
+                                    is_col_quantizer_wg ? 1 : 0,
+                                    is_de_consumer_wg ? 1 : 0,
+                                    is_dc_consumer_wg ? 1 : 0);
+                            }
+                            return;
+                        }
+                    }
+                }
+                if constexpr (G::SKIP_GLOBAL_COL_MATERIALIZATION) {
+                    if constexpr (ROWONLY_COMBO_DC_DEBUG_CUT == 47) {
+                        if (combo_do_dc && is_dc_consumer_wg && combo_stage_publish_epi &&
+                            epi == C::EPI_PIPE_DEPTH - 1) {
+                            if (warpgroup::warpid() == 0 && quant_lane == 0) {
+                                printf("rowonly combo dc cut 47 cta=%d wg=%d row=%d col=%d epi=%d\n",
+                                       cta_id, warpgroup_id, row_block_idx, col_block_idx, epi);
+                            }
+                            return;
+                        }
+                    }
+                }
+                if constexpr (G::SKIP_GLOBAL_COL_MATERIALIZATION) {
+                    if constexpr (ROWONLY_COMBO_DC_DEBUG_CUT == 69) {
+                        if (combo_do_dc && combo_stage_publish_epi &&
+                            (is_col_quantizer_wg || is_dc_consumer_wg)) {
+                            if (warpgroup::warpid() == 0 && quant_lane == 0) {
+                                printf(
+                                    "rowonly combo dc cut 69 cta=%d wg=%d row=%d col=%d epi=%d roles=%d%d%d%d\n",
+                                    cta_id, warpgroup_id, row_block_idx, col_block_idx, epi,
+                                    is_row_quantizer_wg ? 1 : 0,
+                                    is_col_quantizer_wg ? 1 : 0,
+                                    is_de_consumer_wg ? 1 : 0,
+                                    is_dc_consumer_wg ? 1 : 0);
+                            }
+                            return;
+                        }
+                    }
+                    if constexpr (ROWONLY_COMBO_DC_DEBUG_CUT == 72) {
+                        if (block_idx > cluster_id &&
+                            combo_do_dc && combo_stage_publish_epi &&
+                            (is_col_quantizer_wg || is_dc_consumer_wg)) {
+                            if (warpgroup::warpid() == 0 && quant_lane == 0) {
+                                printf(
+                                    "rowonly combo dc cut 72 cta=%d wg=%d block=%d row=%d col=%d epi=%d roles=%d%d%d%d\n",
+                                    cta_id, warpgroup_id, block_idx, row_block_idx, col_block_idx, epi,
+                                    is_row_quantizer_wg ? 1 : 0,
+                                    is_col_quantizer_wg ? 1 : 0,
+                                    is_de_consumer_wg ? 1 : 0,
+                                    is_dc_consumer_wg ? 1 : 0);
+                            }
+                            return;
+                        }
+                    }
+                }
+            }
+
+            if constexpr (G::SKIP_GLOBAL_COL_MATERIALIZATION) {
+                if constexpr (ROWONLY_COMBO_DC_DEBUG_CUT == 108) {
+                    if (combo_do_dc &&
+                        (is_col_quantizer_wg || is_dc_consumer_wg)) {
+                        if (warpgroup::warpid() == 0 && quant_lane == 0) {
+                            printf(
+                                "rowonly combo dc cut 108 cta=%d wg=%d block=%d row=%d col=%d roles=%d%d%d%d\n",
+                                cta_id, warpgroup_id, block_idx, row_block_idx, col_block_idx,
+                                is_row_quantizer_wg ? 1 : 0,
+                                is_col_quantizer_wg ? 1 : 0,
+                                is_de_consumer_wg ? 1 : 0,
+                                is_dc_consumer_wg ? 1 : 0);
+                        }
+                        return;
+                    }
+                }
+                if constexpr (ROWONLY_COMBO_DC_DEBUG_CUT == 106) {
+                    if (combo_do_dc &&
+                        (is_col_quantizer_wg || is_dc_consumer_wg)) {
+                        if (warpgroup::warpid() == 0 && quant_lane == 0) {
+                            printf(
+                                "rowonly combo dc cut 106 cta=%d wg=%d row=%d col=%d roles=%d%d%d%d\n",
+                                cta_id, warpgroup_id, row_block_idx, col_block_idx,
+                                is_row_quantizer_wg ? 1 : 0,
+                                is_col_quantizer_wg ? 1 : 0,
+                                is_de_consumer_wg ? 1 : 0,
+                                is_dc_consumer_wg ? 1 : 0);
+                        }
+                        return;
+                    }
+                }
+                if constexpr (ROWONLY_COMBO_DC_DEBUG_CUT == 113) {
+                    if (combo_do_dc &&
+                        (is_col_quantizer_wg || is_dc_consumer_wg)) {
+                        if (warpgroup::warpid() == 0 && quant_lane == 0) {
+                            printf(
+                                "rowonly combo dc cut 113 cta=%d wg=%d block=%d row=%d col=%d roles=%d%d%d%d\n",
+                                cta_id, warpgroup_id, block_idx, row_block_idx, col_block_idx,
+                                is_row_quantizer_wg ? 1 : 0,
+                                is_col_quantizer_wg ? 1 : 0,
+                                is_de_consumer_wg ? 1 : 0,
+                                is_dc_consumer_wg ? 1 : 0);
+                        }
+                        return;
+                    }
+                }
             }
 
             if constexpr (EFFECTIVE_ENABLE_STOREADD_COMBO && !EFFECTIVE_SEPARATE_BACKHALF_CONSUMERS) {
+                if constexpr (G::SKIP_GLOBAL_COL_MATERIALIZATION) {
+                    if constexpr (ROWONLY_COMBO_DC_DEBUG_CUT == 114) {
+                        if (combo_do_dc &&
+                            (is_col_quantizer_wg || is_dc_consumer_wg)) {
+                            if (warpgroup::warpid() == 0 && quant_lane == 0) {
+                                printf(
+                                    "rowonly combo dc cut 114 cta=%d wg=%d block=%d row=%d col=%d roles=%d%d%d%d\n",
+                                    cta_id, warpgroup_id, block_idx, row_block_idx, col_block_idx,
+                                    is_row_quantizer_wg ? 1 : 0,
+                                    is_col_quantizer_wg ? 1 : 0,
+                                    is_de_consumer_wg ? 1 : 0,
+                                    is_dc_consumer_wg ? 1 : 0);
+                            }
+                            return;
+                        }
+                    }
+                }
                 static_assert(C::QUANTIZER_WARPGROUPS == 1,
                               "store-add combo currently requires the stable single-quantizer public v3 seam");
                 static_assert(C::CONSUMER_DO_ROW,
@@ -10611,22 +14807,186 @@ __device__ inline void backward_kernel_v3_streaming_3wg_impl(const globals_3wg<C
                             warpgroup::sync(quantizer_sync_id);
                             tensor_after_thread_sync();
                         }
+                        if constexpr (G::SKIP_GLOBAL_COL_MATERIALIZATION) {
+                            if constexpr (ROWONLY_COMBO_DC_DEBUG_CUT == 68) {
+                                if (is_col_quantizer_wg || is_dc_consumer_wg) {
+                                    if (warpgroup::warpid() == 0 && quant_lane == 0) {
+                                        printf(
+                                            "rowonly combo dc cut 68 cta=%d wg=%d roles=%d%d%d%d\n",
+                                            cta_id, warpgroup_id,
+                                            is_row_quantizer_wg ? 1 : 0,
+                                            is_col_quantizer_wg ? 1 : 0,
+                                            is_de_consumer_wg ? 1 : 0,
+                                            is_dc_consumer_wg ? 1 : 0);
+                                    }
+                                    return;
+                                }
+                            }
+                        }
                     }
                 }
 
-                warpgroup::sync(quantizer_sync_id);
-                warpgroup::tma::cluster::arrive(outputs_finished, 0, 1);
+                if constexpr (G::SKIP_GLOBAL_COL_MATERIALIZATION) {
+                    if constexpr (ROWONLY_COMBO_DC_DEBUG_CUT == 99) {
+                        if (combo_do_dc &&
+                            (is_col_quantizer_wg || is_dc_consumer_wg)) {
+                            if (warpgroup::warpid() == 0 && quant_lane == 0) {
+                                printf(
+                                    "rowonly combo dc cut 99 cta=%d wg=%d roles=%d%d%d%d\n",
+                                    cta_id, warpgroup_id,
+                                    is_row_quantizer_wg ? 1 : 0,
+                                    is_col_quantizer_wg ? 1 : 0,
+                                    is_de_consumer_wg ? 1 : 0,
+                                    is_dc_consumer_wg ? 1 : 0);
+                            }
+                            return;
+                        }
+                    }
+                }
+                if constexpr (!(G::SKIP_GLOBAL_COL_MATERIALIZATION &&
+                                ROWONLY_COMBO_DC_SKIP_POST_PUBLISH_SYNC)) {
+                    warpgroup::sync(quantizer_sync_id);
+                }
+                if constexpr (G::SKIP_GLOBAL_COL_MATERIALIZATION) {
+                    if constexpr (ROWONLY_COMBO_DC_DEBUG_CUT == 65) {
+                        if (combo_do_dc &&
+                            (is_col_quantizer_wg || is_dc_consumer_wg)) {
+                            if (warpgroup::warpid() == 0 && quant_lane == 0) {
+                                printf(
+                                    "rowonly combo dc cut 65 cta=%d wg=%d roles=%d%d%d%d\n",
+                                    cta_id, warpgroup_id,
+                                    is_row_quantizer_wg ? 1 : 0,
+                                    is_col_quantizer_wg ? 1 : 0,
+                                    is_de_consumer_wg ? 1 : 0,
+                                    is_dc_consumer_wg ? 1 : 0);
+                            }
+                            return;
+                        }
+                    }
+                }
+                if (!(DEDICATED_ROWONLY_ROUTE && combo_do_dc)) {
+                    warpgroup::tma::cluster::arrive(outputs_finished, 0, 1);
+                }
+                if constexpr (G::SKIP_GLOBAL_COL_MATERIALIZATION) {
+                    if constexpr (ROWONLY_COMBO_DC_DEBUG_CUT == 66) {
+                        if (combo_do_dc &&
+                            (is_col_quantizer_wg || is_dc_consumer_wg)) {
+                            if (warpgroup::warpid() == 0 && quant_lane == 0) {
+                                printf(
+                                    "rowonly combo dc cut 66 cta=%d wg=%d roles=%d%d%d%d\n",
+                                    cta_id, warpgroup_id,
+                                    is_row_quantizer_wg ? 1 : 0,
+                                    is_col_quantizer_wg ? 1 : 0,
+                                    is_de_consumer_wg ? 1 : 0,
+                                    is_dc_consumer_wg ? 1 : 0);
+                            }
+                            return;
+                        }
+                    }
+                }
             }
         }
-        warpgroup::sync(quantizer_sync_id);
+        }
+        if constexpr (G::SKIP_GLOBAL_COL_MATERIALIZATION) {
+            if constexpr (ROWONLY_COMBO_DC_DEBUG_CUT == 107) {
+                if (combo_do_dc && (is_col_quantizer_wg || is_dc_consumer_wg)) {
+                    if (warpgroup::warpid() == 0 && quant_lane == 0) {
+                        printf(
+                            "rowonly combo dc cut 107 cta=%d wg=%d roles=%d%d%d%d\n",
+                            cta_id, warpgroup_id,
+                            is_row_quantizer_wg ? 1 : 0,
+                            is_col_quantizer_wg ? 1 : 0,
+                            is_de_consumer_wg ? 1 : 0,
+                            is_dc_consumer_wg ? 1 : 0);
+                    }
+                    return;
+                }
+            }
+            if constexpr (ROWONLY_COMBO_DC_DEBUG_CUT == 70) {
+                if (combo_do_dc && (is_col_quantizer_wg || is_dc_consumer_wg) && quant_lane == 0) {
+                    printf(
+                        "rowonly combo dc cut 70 cta=%d wg=%d warp=%d roles=%d%d%d%d\n",
+                        cta_id, warpgroup_id, warpgroup::warpid(),
+                        is_row_quantizer_wg ? 1 : 0,
+                        is_col_quantizer_wg ? 1 : 0,
+                        is_de_consumer_wg ? 1 : 0,
+                        is_dc_consumer_wg ? 1 : 0);
+                    return;
+                }
+            }
+        }
+        if constexpr (!(G::SKIP_GLOBAL_COL_MATERIALIZATION &&
+                        ROWONLY_COMBO_DC_SKIP_FINAL_QUANTIZER_SYNC == 1)) {
+            warpgroup::sync(quantizer_sync_id);
+        }
+        if constexpr (G::SKIP_GLOBAL_COL_MATERIALIZATION) {
+            if constexpr (ROWONLY_COMBO_DC_DEBUG_CUT == 67) {
+                if (combo_do_dc && (is_col_quantizer_wg || is_dc_consumer_wg)) {
+                    if (warpgroup::warpid() == 0 && quant_lane == 0) {
+                        printf(
+                            "rowonly combo dc cut 67 cta=%d wg=%d roles=%d%d%d%d\n",
+                            cta_id, warpgroup_id,
+                            is_row_quantizer_wg ? 1 : 0,
+                            is_col_quantizer_wg ? 1 : 0,
+                            is_de_consumer_wg ? 1 : 0,
+                            is_dc_consumer_wg ? 1 : 0);
+                    }
+                    return;
+                }
+            }
+        }
+        if constexpr (DEDICATED_ROWONLY_ROUTE) {
+            if (combo_do_dc && (is_col_quantizer_wg || is_dc_consumer_wg)) {
+                if constexpr (ROWONLY_COMBO_DC_DEBUG_CUT == 133) {
+                    if (warpgroup::warpid() == 0 && quant_lane == 0) {
+                        printf(
+                            "rowonly combo dc cut 133 cta=%d wg=%d roles=%d%d%d%d\n",
+                            cta_id, warpgroup_id,
+                            is_row_quantizer_wg ? 1 : 0,
+                            is_col_quantizer_wg ? 1 : 0,
+                            is_de_consumer_wg ? 1 : 0,
+                            is_dc_consumer_wg ? 1 : 0);
+                    }
+                    return;
+                }
+                if (warpgroup::warpid() == 0 && quant_lane == 0) {
+                    arrive(combo_rowonly_tail_done);
+                }
+            }
+        }
         if constexpr (EFFECTIVE_ENABLE_STOREADD_COMBO) {
             if constexpr (EFFECTIVE_SEPARATE_BACKHALF_CONSUMERS) {
-                const bool combo_deprovision_owner =
-                    combo_do_dc ? is_dc_consumer_wg :
-                    (combo_do_de ? is_de_consumer_wg : is_col_quantizer_wg);
-                if (combo_deprovision_owner && warpgroup::warpid() == 0) tm_allocator.deprovision();
+                if (!(DEDICATED_ROWONLY_ROUTE && combo_do_dc)) {
+                    const bool combo_deprovision_owner =
+                        combo_do_dc ? is_dc_consumer_wg :
+                        (combo_do_de ? is_de_consumer_wg : is_col_quantizer_wg);
+                    if (combo_deprovision_owner && warpgroup::warpid() == 0) {
+                        if constexpr (!(G::SKIP_GLOBAL_COL_MATERIALIZATION &&
+                                        ROWONLY_COMBO_DC_SKIP_DEPROVISION == 1)) {
+                            tm_allocator.deprovision();
+                        }
+                    }
+                }
             } else {
                 if (warpgroup::warpid() == 0) tm_allocator.deprovision();
+            }
+        }
+    }
+    if constexpr (G::SKIP_GLOBAL_COL_MATERIALIZATION &&
+                  DO_ROW && !DO_COL &&
+                  EFFECTIVE_ENABLE_STOREADD_COMBO &&
+                  EFFECTIVE_SEPARATE_BACKHALF_CONSUMERS &&
+                  (STATIC_COMBO_MODE == G::COMBO_MODE_DCONLY)) {
+        asm volatile("tcgen05.fence::before_thread_sync;\n");
+        asm volatile("bar.sync 0;\n");
+        asm volatile("tcgen05.fence::after_thread_sync;\n");
+        if (warpgroup_id == 0 && warpgroup::warpid() == 0) {
+            if constexpr (!(ROWONLY_COMBO_DC_SKIP_DEPROVISION == 1)) {
+                if constexpr (C::CLUSTER_SIZE == 2) {
+                    asm volatile ("barrier.cluster.arrive.release.aligned;\n");
+                    asm volatile ("barrier.cluster.wait.acquire.aligned;\n");
+                }
+                tm_allocator.deprovision();
             }
         }
     }
@@ -10810,6 +15170,18 @@ __device__ inline void backward_kernel_v3_streaming_5wg_mode(const globals_5wg<C
     } else {
         backward_kernel_v3_streaming_3wg_impl<C, true, true, STATIC_COMBO_MODE>(g);
     }
+}
+
+template <typename C>
+__device__ inline void backward_kernel_v3_streaming_dedicated_rowonly_combo_gonly(
+    const globals_5wg<C>& g) {
+    backward_kernel_v3_streaming_3wg_impl<C, true, false, globals_5wg<C>::COMBO_MODE_GONLY>(g);
+}
+
+template <typename C>
+__device__ inline void backward_kernel_v3_streaming_dedicated_rowonly_combo_dconly(
+    const globals_5wg<C>& g) {
+    backward_kernel_v3_streaming_3wg_impl<C, true, false, globals_5wg<C>::COMBO_MODE_DCONLY>(g);
 }
 
 } // namespace nvfp4_cce_backward_v3

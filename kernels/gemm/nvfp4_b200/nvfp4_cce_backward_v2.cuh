@@ -52,6 +52,30 @@ struct config {
     static constexpr bool USE_BF16_ACCUM = _USE_BF16_ACCUM;
 };
 
+template <int _LOAD_PIPE_DEPTH, int _SUPERGROUP_SIZE, bool _USE_BF16_ACCUM = true, bool _PINGPONG = true>
+struct experimental_config_epipipe {
+    using base = config<_LOAD_PIPE_DEPTH, _SUPERGROUP_SIZE, _USE_BF16_ACCUM, _PINGPONG>;
+    static constexpr int CLUSTER_SIZE = base::CLUSTER_SIZE;
+    static constexpr bool USE_PDL = base::USE_PDL;
+    static constexpr int CONSUMER_WARPGROUPS = base::CONSUMER_WARPGROUPS;
+    static constexpr int PRODUCER_WARPGROUPS = base::PRODUCER_WARPGROUPS;
+    static constexpr int NUM_WARPGROUPS = base::NUM_WARPGROUPS;
+    static constexpr int NUM_WARPS = base::NUM_WARPS;
+    static constexpr int NUM_THREADS = base::NUM_THREADS;
+    static constexpr int LOAD_PIPE_DEPTH = base::LOAD_PIPE_DEPTH;
+    static constexpr int EPI_PIPE_DEPTH = base::EPI_PIPE_DEPTH;
+    static constexpr bool OVERLAP_EPI = true;
+    static constexpr bool PINGPONG = base::PINGPONG;
+    static constexpr int SUPERGROUP_SIZE = base::SUPERGROUP_SIZE;
+    static constexpr int Mb = base::Mb;
+    static constexpr int Nb = base::Nb;
+    static constexpr int Kb = base::Kb;
+    static constexpr int B_SC_SIZE = base::B_SC_SIZE;
+    static constexpr int MMA_PER_TILE = base::MMA_PER_TILE;
+    static constexpr int NUM_D_TILES = base::NUM_D_TILES;
+    static constexpr bool USE_BF16_ACCUM = base::USE_BF16_ACCUM;
+};
+
 // =========================================================================
 // FP4 quantization helpers
 // =========================================================================
@@ -360,19 +384,6 @@ __device__ inline void backward_kernel_v2(const globals<C>& g) {
             int tile_row_base = row_block_idx * C::Mb + cta_id * (C::Mb / 2);
             int warp_row_base = tile_row_base + warpgroup::warpid() * (C::Mb / 8);
 
-            // ---- Step 1: Load logits from TMEM ----
-            subtile_rt D_regs_fl[C::EPI_PIPE_DEPTH];
-            subtile_rt_bf D_regs_bf[C::EPI_PIPE_DEPTH];
-
-            auto load_from_accum = [&](auto& accum) {
-                #pragma unroll
-                for (int epi = 0; epi < C::EPI_PIPE_DEPTH; epi++) {
-                    warpgroup::load_async(D_regs_fl[epi], accum.template subtile<full_tt_fl<SUBTILE_COLS>>(0, SUBTILE_COLS * epi));
-                }
-            };
-            if (phase == 0) load_from_accum(out_tm_0);
-            else            load_from_accum(out_tm_1);
-
             // Precompute per-lane target and LSE
             int my_targets_x[subtile_rt::height];
             int my_targets_y[subtile_rt::height];
@@ -388,16 +399,8 @@ __device__ inline void backward_kernel_v2(const globals<C>& g) {
                 my_lse_y[i] = (global_row_y < g.M) ? g.lse[global_row_y] : INFINITY;
             }
 
-            tensor_load_wait();
-            tensor_before_thread_sync();
-            warpgroup::sync(1);
-
-            // ---- Step 2: Compute softmax gradient ----
-            #pragma unroll
-            for (int epi = 0; epi < C::EPI_PIPE_DEPTH; epi++) {
-                subtile_rt& D_fl = D_regs_fl[epi];
+            auto compute_subtile = [&](subtile_rt& D_fl, int col_start) {
                 warp::mul(D_fl, D_fl, global_scale);
-                int col_start = col_block_idx * C::Nb + epi * SUBTILE_COLS;
 
                 #pragma unroll
                 for (int i = 0; i < subtile_rt::height; i++) {
@@ -462,187 +465,199 @@ __device__ inline void backward_kernel_v2(const globals<C>& g) {
                     }
                 }
                 warp::mul(D_fl, D_fl, g.grad_scale);
-                warp::copy(D_regs_bf[epi], D_fl);
-            }
+            };
 
-            // Free TMEM — MMA can start next block
-            warpgroup::tma::cluster::arrive(outputs_finished, 0, 1);
-
-            // ---- Step 3: CUT filtering ----
-            bool tile_is_filtered = false;
-            if (g.filter_eps > 0.0f) {
-                float local_max = 0.0f;
+            auto quantize_fp4_subtile = [&](subtile_rt& D_fl, int col_start) {
                 #pragma unroll
-                for (int epi = 0; epi < C::EPI_PIPE_DEPTH; epi++) {
+                for (int i = 0; i < subtile_rt::height; i++) {
+                    int global_row_x = warp_row_base + i * 16 + lane_id / 4;
+                    int global_row_y = warp_row_base + i * 16 + 8 + lane_id / 4;
+
                     #pragma unroll
-                    for (int i = 0; i < subtile_rt::height; i++) {
+                    for (int j = 0; j < subtile_rt::width; j++) {
+                        float vals_x[4], vals_y[4];
+                        vals_x[0] = D_fl.tiles[i][j].data[0].x;
+                        vals_x[1] = D_fl.tiles[i][j].data[0].y;
+                        vals_x[2] = D_fl.tiles[i][j].data[2].x;
+                        vals_x[3] = D_fl.tiles[i][j].data[2].y;
+                        vals_y[0] = D_fl.tiles[i][j].data[1].x;
+                        vals_y[1] = D_fl.tiles[i][j].data[1].y;
+                        vals_y[2] = D_fl.tiles[i][j].data[3].x;
+                        vals_y[3] = D_fl.tiles[i][j].data[3].y;
+
+                        float amax_x = 0.0f, amax_y = 0.0f;
                         #pragma unroll
-                        for (int j = 0; j < subtile_rt::width; j++) {
-                            #pragma unroll
-                            for (int k = 0; k < 4; k++) {
-                                local_max = fmaxf(local_max, fabsf(D_regs_fl[epi].tiles[i][j].data[k].x));
-                                local_max = fmaxf(local_max, fabsf(D_regs_fl[epi].tiles[i][j].data[k].y));
+                        for (int v = 0; v < 4; v++) {
+                            amax_x = fmaxf(amax_x, fabsf(vals_x[v]));
+                            amax_y = fmaxf(amax_y, fabsf(vals_y[v]));
+                        }
+                        #pragma unroll
+                        for (int offset = 1; offset < 4; offset <<= 1) {
+                            amax_x = fmaxf(amax_x, __shfl_xor_sync(0xFFFFFFFF, amax_x, offset));
+                            amax_y = fmaxf(amax_y, __shfl_xor_sync(0xFFFFFFFF, amax_y, offset));
+                        }
+
+                        constexpr float FP4_MAX = 6.0f;
+                        float scale_x = fmaxf(amax_x / FP4_MAX, 1.0f / 65536.0f);
+                        float scale_y = fmaxf(amax_y / FP4_MAX, 1.0f / 65536.0f);
+                        float rcp_scale_x = 1.0f / scale_x;
+                        float rcp_scale_y = 1.0f / scale_y;
+
+                        uint8_t fp4_x_lo = quantize_fp4_pair(vals_x[0], vals_x[1], rcp_scale_x);
+                        uint8_t fp4_x_hi = quantize_fp4_pair(vals_x[2], vals_x[3], rcp_scale_x);
+                        uint8_t fp4_y_lo = quantize_fp4_pair(vals_y[0], vals_y[1], rcp_scale_y);
+                        uint8_t fp4_y_hi = quantize_fp4_pair(vals_y[2], vals_y[3], rcp_scale_y);
+
+                        if (global_row_x < g.M) {
+                            uint8_t* fp4_ptr = reinterpret_cast<uint8_t*>(
+                                &g.G_fp4_row[{global_row_x / (C::Mb/2), col_start / (C::Nb / 2)}]);
+                            int local_row = global_row_x % (C::Mb/2);
+                            int local_col_lo = (lane_id % 4) * 2 + j * 16;
+                            int local_col_hi = local_col_lo + 8;
+                            fp4_ptr[local_row * (C::Nb/2) + local_col_lo/2] = fp4_x_lo;
+                            fp4_ptr[local_row * (C::Nb/2) + local_col_hi/2] = fp4_x_hi;
+                        }
+                        if (global_row_y < g.M) {
+                            uint8_t* fp4_ptr = reinterpret_cast<uint8_t*>(
+                                &g.G_fp4_row[{global_row_y / (C::Mb/2), col_start / (C::Nb / 2)}]);
+                            int local_row = global_row_y % (C::Mb/2);
+                            int local_col_lo = (lane_id % 4) * 2 + j * 16;
+                            int local_col_hi = local_col_lo + 8;
+                            fp4_ptr[local_row * (C::Nb/2) + local_col_lo/2] = fp4_y_lo;
+                            fp4_ptr[local_row * (C::Nb/2) + local_col_hi/2] = fp4_y_hi;
+                        }
+
+                        if ((lane_id % 4) == 0) {
+                            __nv_fp8_e4m3 sc_x = __nv_fp8_e4m3(scale_x);
+                            __nv_fp8_e4m3 sc_y = __nv_fp8_e4m3(scale_y);
+                            int sc_col_block = (col_start + j * 16) / 16;
+                            if (global_row_x < g.M) {
+                                reinterpret_cast<__nv_fp8_e4m3*>(
+                                    &g.G_sc_row[{global_row_x / 128, sc_col_block, 0, 0}]
+                                )[global_row_x % 128] = sc_x;
+                            }
+                            if (global_row_y < g.M) {
+                                reinterpret_cast<__nv_fp8_e4m3*>(
+                                    &g.G_sc_row[{global_row_y / 128, sc_col_block, 0, 0}]
+                                )[global_row_y % 128] = sc_y;
                             }
                         }
                     }
                 }
-                #pragma unroll
-                for (int offset = 16; offset > 0; offset >>= 1)
-                    local_max = fmaxf(local_max, __shfl_xor_sync(0xFFFFFFFF, local_max, offset));
-                __shared__ float filter_max_smem[WARPGROUP_WARPS];
-                if (lane_id == 0) filter_max_smem[warpgroup::warpid()] = local_max;
-                warpgroup::sync(1);
-                float global_max = 0.0f;
-                for (int w = 0; w < WARPGROUP_WARPS; w++)
-                    global_max = fmaxf(global_max, filter_max_smem[w]);
-                tile_is_filtered = (global_max < g.filter_eps);
-            }
+            };
 
-            // ---- Step 4: Store output ----
-            if (!tile_is_filtered) {
-                if constexpr (C::USE_BF16_ACCUM) {
-                    // ═══════════ BF16 PATH: store G as BF16 (same as v1) ═══════════
+            auto run_serial_epilogue = [&](auto& accum) {
+                subtile_rt D_regs_fl[C::EPI_PIPE_DEPTH];
+                subtile_rt_bf D_regs_bf[C::EPI_PIPE_DEPTH];
+
+                #pragma unroll
+                for (int epi = 0; epi < C::EPI_PIPE_DEPTH; epi++) {
+                    warpgroup::load_async(D_regs_fl[epi], accum.template subtile<full_tt_fl<SUBTILE_COLS>>(0, SUBTILE_COLS * epi));
+                }
+
+                tensor_load_wait();
+                tensor_before_thread_sync();
+                warpgroup::sync(1);
+
+                #pragma unroll
+                for (int epi = 0; epi < C::EPI_PIPE_DEPTH; epi++) {
+                    int col_start = col_block_idx * C::Nb + epi * SUBTILE_COLS;
+                    compute_subtile(D_regs_fl[epi], col_start);
+                    warp::copy(D_regs_bf[epi], D_regs_fl[epi]);
+                }
+
+                warpgroup::tma::cluster::arrive(outputs_finished, 0, 1);
+
+                bool tile_is_filtered = false;
+                if (g.filter_eps > 0.0f) {
+                    float local_max = 0.0f;
                     #pragma unroll
                     for (int epi = 0; epi < C::EPI_PIPE_DEPTH; epi++) {
+                        #pragma unroll
+                        for (int i = 0; i < subtile_rt::height; i++) {
+                            #pragma unroll
+                            for (int j = 0; j < subtile_rt::width; j++) {
+                                #pragma unroll
+                                for (int k = 0; k < 4; k++) {
+                                    local_max = fmaxf(local_max, fabsf(D_regs_fl[epi].tiles[i][j].data[k].x));
+                                    local_max = fmaxf(local_max, fabsf(D_regs_fl[epi].tiles[i][j].data[k].y));
+                                }
+                            }
+                        }
+                    }
+                    #pragma unroll
+                    for (int offset = 16; offset > 0; offset >>= 1)
+                        local_max = fmaxf(local_max, __shfl_xor_sync(0xFFFFFFFF, local_max, offset));
+                    __shared__ float filter_max_smem[WARPGROUP_WARPS];
+                    if (lane_id == 0) filter_max_smem[warpgroup::warpid()] = local_max;
+                    warpgroup::sync(1);
+                    float global_max = 0.0f;
+                    for (int w = 0; w < WARPGROUP_WARPS; w++)
+                        global_max = fmaxf(global_max, filter_max_smem[w]);
+                    tile_is_filtered = (global_max < g.filter_eps);
+                }
+
+                if (!tile_is_filtered) {
+                    if constexpr (C::USE_BF16_ACCUM) {
+                        #pragma unroll
+                        for (int epi = 0; epi < C::EPI_PIPE_DEPTH; epi++) {
+                            warpgroup::tma::store_async_read_wait<C::NUM_D_TILES-1>();
+                            warpgroup::sync(1);
+                            warpgroup::store(output_tiles.D[epi % C::NUM_D_TILES], D_regs_bf[epi]);
+                            warpgroup::sync(1);
+                            warpgroup::tma::store_async<dim::ROW, cache_policy::EVICT_FIRST>(
+                                g.D_out, output_tiles.D[epi % C::NUM_D_TILES],
+                                {row_block_idx*2 + cta_id, C::EPI_PIPE_DEPTH*col_block_idx + epi});
+                        }
+                    } else {
+                        #pragma unroll
+                        for (int epi = 0; epi < C::EPI_PIPE_DEPTH; epi++) {
+                            int col_start = col_block_idx * C::Nb + epi * SUBTILE_COLS;
+                            quantize_fp4_subtile(D_regs_fl[epi], col_start);
+                        }
+                    }
+                }
+            };
+
+            auto run_overlap_epilogue = [&](auto& accum) {
+                #pragma unroll
+                for (int epi = 0; epi < C::EPI_PIPE_DEPTH; ++epi) {
+                    subtile_rt D_fl;
+                    int col_start = col_block_idx * C::Nb + epi * SUBTILE_COLS;
+
+                    warpgroup::load_async(D_fl, accum.template subtile<full_tt_fl<SUBTILE_COLS>>(0, SUBTILE_COLS * epi));
+                    tensor_load_wait();
+                    tensor_before_thread_sync();
+                    warpgroup::sync(1);
+
+                    compute_subtile(D_fl, col_start);
+
+                    if (epi == C::EPI_PIPE_DEPTH - 1) {
+                        warpgroup::tma::cluster::arrive(outputs_finished, 0, 1);
+                    }
+
+                    if constexpr (C::USE_BF16_ACCUM) {
+                        subtile_rt_bf D_bf;
+                        warp::copy(D_bf, D_fl);
                         warpgroup::tma::store_async_read_wait<C::NUM_D_TILES-1>();
                         warpgroup::sync(1);
-                        warpgroup::store(output_tiles.D[epi % C::NUM_D_TILES], D_regs_bf[epi]);
+                        warpgroup::store(output_tiles.D[epi % C::NUM_D_TILES], D_bf);
                         warpgroup::sync(1);
                         warpgroup::tma::store_async<dim::ROW, cache_policy::EVICT_FIRST>(
                             g.D_out, output_tiles.D[epi % C::NUM_D_TILES],
                             {row_block_idx*2 + cta_id, C::EPI_PIPE_DEPTH*col_block_idx + epi});
-                    }
-                } else {
-                    // ═══════ FP4 PATH: quantize G to NVFP4 on-the-fly ════════
-                    // Softmax grad is bounded in [-1, 1] after grad_scale
-                    // Use fixed global scale = 1.0 (amax ≤ 1 guaranteed)
-                    // Per-16-element FP8 micro scales computed from register values
-                    //
-                    // Each thread holds 8 float values per (i,j,k) iteration
-                    // in the register tile:
-                    //   data[k].x and data[k].y are two float values
-                    //   k=0: rows x, cols v0..v1
-                    //   k=1: rows y, cols v0..v1
-                    //   k=2: rows x, cols v0+8..v1+8
-                    //   k=3: rows y, cols v0+8..v1+8
-                    //
-                    // For row-wise quantization:
-                    //   Group 16 consecutive col values per row → compute amax → scale
-                    //   Each warp tile (i,j) covers 16 cols - exactly one scale group!
-
-                    // Quantize each subtile and write FP4 data to global memory
-                    // via thread-level stores (no TMA for FP4 output)
-                    #pragma unroll
-                    for (int epi = 0; epi < C::EPI_PIPE_DEPTH; epi++) {
-                        subtile_rt& D_fl = D_regs_fl[epi];
-                        int col_start = col_block_idx * C::Nb + epi * SUBTILE_COLS;
-
-                        #pragma unroll
-                        for (int i = 0; i < subtile_rt::height; i++) {
-                            int global_row_x = warp_row_base + i * 16 + lane_id / 4;
-                            int global_row_y = warp_row_base + i * 16 + 8 + lane_id / 4;
-
-                            #pragma unroll
-                            for (int j = 0; j < subtile_rt::width; j++) {
-                                // Each (i,j) tile covers 16 cols — one scale group
-                                // Collect all 8 values for this thread's two rows
-                                float vals_x[4], vals_y[4];
-                                vals_x[0] = D_fl.tiles[i][j].data[0].x;
-                                vals_x[1] = D_fl.tiles[i][j].data[0].y;
-                                vals_x[2] = D_fl.tiles[i][j].data[2].x;
-                                vals_x[3] = D_fl.tiles[i][j].data[2].y;
-                                vals_y[0] = D_fl.tiles[i][j].data[1].x;
-                                vals_y[1] = D_fl.tiles[i][j].data[1].y;
-                                vals_y[2] = D_fl.tiles[i][j].data[3].x;
-                                vals_y[3] = D_fl.tiles[i][j].data[3].y;
-
-                                // Compute per-row, per-16-col-block amax
-                                // (all 4 lanes in a group of 4 participate)
-                                float amax_x = 0.0f, amax_y = 0.0f;
-                                #pragma unroll
-                                for (int v = 0; v < 4; v++) {
-                                    amax_x = fmaxf(amax_x, fabsf(vals_x[v]));
-                                    amax_y = fmaxf(amax_y, fabsf(vals_y[v]));
-                                }
-                                // Reduce across 4 threads that share a row
-                                // lane_id % 4 gives position within group
-                                #pragma unroll
-                                for (int offset = 1; offset < 4; offset <<= 1) {
-                                    amax_x = fmaxf(amax_x, __shfl_xor_sync(0xFFFFFFFF, amax_x, offset));
-                                    amax_y = fmaxf(amax_y, __shfl_xor_sync(0xFFFFFFFF, amax_y, offset));
-                                }
-
-                                // Compute per-block FP4 scale and quantization coefficient
-                                const float FP4_MAX = 6.0f;
-                                float rcp_scale_x, rcp_scale_y;
-                                float scale_x, scale_y;
-                                // Decode-centric: scale = amax/FP4_MAX, coeff = 1/scale
-                                scale_x = fmaxf(amax_x / FP4_MAX, 1.0f / 65536.0f);
-                                scale_y = fmaxf(amax_y / FP4_MAX, 1.0f / 65536.0f);
-                                rcp_scale_x = 1.0f / scale_x;
-                                rcp_scale_y = 1.0f / scale_y;
-
-                                // Quantize each pair of values to fp4x2
-                                // Thread holds 2 col values per k position
-                                // Pack as fp4x2 bytes
-                                int v_base = col_start + j * 16 + (lane_id % 4) * 2;
-
-                                // Row x: 4 values at cols v_base, v_base+1, v_base+8, v_base+8+1
-                                uint8_t fp4_x_lo = quantize_fp4_pair(vals_x[0], vals_x[1], rcp_scale_x);
-                                uint8_t fp4_x_hi = quantize_fp4_pair(vals_x[2], vals_x[3], rcp_scale_x);
-
-                                // Row y: same
-                                uint8_t fp4_y_lo = quantize_fp4_pair(vals_y[0], vals_y[1], rcp_scale_y);
-                                uint8_t fp4_y_hi = quantize_fp4_pair(vals_y[2], vals_y[3], rcp_scale_y);
-
-                                // Write FP4 data to global memory
-                                // Global offset: g_fp4_row[row, col/2]
-                                if (global_row_x < g.M) {
-                                    uint8_t* fp4_ptr = reinterpret_cast<uint8_t*>(
-                                        &g.G_fp4_row[{global_row_x / (C::Mb/2), col_start / (C::Nb / 2)}]);
-                                    // Local offset within tile
-                                    int local_row = global_row_x % (C::Mb/2);
-                                    int local_col_lo = (lane_id % 4) * 2 + j * 16;
-                                    int local_col_hi = local_col_lo + 8;
-                                    fp4_ptr[local_row * (C::Nb/2) + local_col_lo/2] = fp4_x_lo;
-                                    fp4_ptr[local_row * (C::Nb/2) + local_col_hi/2] = fp4_x_hi;
-                                }
-                                if (global_row_y < g.M) {
-                                    uint8_t* fp4_ptr = reinterpret_cast<uint8_t*>(
-                                        &g.G_fp4_row[{global_row_y / (C::Mb/2), col_start / (C::Nb / 2)}]);
-                                    int local_row = global_row_y % (C::Mb/2);
-                                    int local_col_lo = (lane_id % 4) * 2 + j * 16;
-                                    int local_col_hi = local_col_lo + 8;
-                                    fp4_ptr[local_row * (C::Nb/2) + local_col_lo/2] = fp4_y_lo;
-                                    fp4_ptr[local_row * (C::Nb/2) + local_col_hi/2] = fp4_y_hi;
-                                }
-
-                                // Write FP8 E4M3 scale for this block
-                                // Scale layout: [row/128, col/64, 512] fp8
-                                // One scale per 16-col block per row
-                                if ((lane_id % 4) == 0) {
-                                    __nv_fp8_e4m3 sc_x = __nv_fp8_e4m3(scale_x);
-                                    __nv_fp8_e4m3 sc_y = __nv_fp8_e4m3(scale_y);
-                                    // Scale index within the tile
-                                    int sc_col_block = (col_start + j * 16) / 16;  // Which 16-col block
-                                    // Write to global scale array
-                                    // TODO: proper scale layout matching NVFP4 format
-                                    // For now, use raw FP8 pointer
-                                    if (global_row_x < g.M) {
-                                        reinterpret_cast<__nv_fp8_e4m3*>(
-                                            &g.G_sc_row[{global_row_x / 128, sc_col_block, 0, 0}]
-                                        )[global_row_x % 128] = sc_x;
-                                    }
-                                    if (global_row_y < g.M) {
-                                        reinterpret_cast<__nv_fp8_e4m3*>(
-                                            &g.G_sc_row[{global_row_y / 128, sc_col_block, 0, 0}]
-                                        )[global_row_y % 128] = sc_y;
-                                    }
-                                }
-                            }
-                        }
+                    } else {
+                        quantize_fp4_subtile(D_fl, col_start);
                     }
                 }
+            };
+
+            auto& accum = (phase == 0) ? out_tm_0 : out_tm_1;
+            if constexpr (C::OVERLAP_EPI) {
+                if (g.filter_eps > 0.0f) run_serial_epilogue(accum);
+                else                     run_overlap_epilogue(accum);
+            } else {
+                run_serial_epilogue(accum);
             }
 
             update_phasebit<0>(phasebits, 0);

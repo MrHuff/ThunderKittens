@@ -503,81 +503,87 @@ static void run_gemm_with_config(
     kittens::py::launch_kernel<C, G, nvfp4_gemm::kernel<C>>(g);
 }
 
+#define NVFP4_GEMM_CONFIG_CASES(X) \
+    X(0,  256, 4, 16,  1, 2, false) \
+    X(1,  256, 4, 16,  4, 2, false) \
+    X(2,  256, 4, 16, 12, 2, false) \
+    X(3,  256, 5,  8,  4, 2, true ) \
+    X(4,  256, 5,  8, 12, 2, true ) \
+    X(5,  256, 5,  8,  4, 2, false) \
+    X(6,  256, 4,  8, 12, 2, false) \
+    X(7,  128, 5,  4, 12, 2, true ) \
+    X(8,  128, 4,  4, 12, 2, false) \
+    X(9,  128, 5,  4,  4, 2, true ) \
+    X(10, 256, 5, 16,  4, 2, true ) \
+    X(11, 256, 5, 16, 12, 2, true ) \
+    X(12, 256, 5,  8,  1, 2, false) \
+    X(13, 256, 5,  8,  2, 2, false) \
+    X(14, 256, 5,  8,  8, 2, false) \
+    X(15, 256, 5,  8, 12, 2, false) \
+    X(16, 256, 5,  8,  1, 2, true ) \
+    X(17, 256, 5,  8,  2, 2, true ) \
+    X(18, 256, 5,  8,  8, 2, true ) \
+    X(19, 256, 5, 16,  1, 2, false) \
+    X(20, 256, 5, 16,  2, 2, false) \
+    X(21, 256, 5, 16,  8, 2, false) \
+    X(22, 256, 5, 16,  1, 2, true ) \
+    X(23, 256, 5, 16,  2, 2, true ) \
+    X(24, 256, 5, 16,  8, 2, true ) \
+    X(25, 256, 4,  8,  1, 2, false) \
+    X(26, 256, 4,  8,  4, 2, false) \
+    X(27, 256, 4,  8,  2, 2, false) \
+    X(28, 256, 4,  8,  8, 2, false) \
+    X(29, 256, 3,  8,  4, 2, false) \
+    X(30, 256, 3, 16,  4, 2, false) \
+    X(31, 256, 4, 16,  2, 2, false) \
+    X(32, 256, 4, 16,  8, 2, false) \
+    X(33, 256, 4, 16,  1, 2, true ) \
+    X(34, 256, 4, 16,  4, 2, true ) \
+    X(35, 128, 5,  8,  4, 2, false) \
+    X(36, 128, 5,  8, 12, 2, false) \
+    X(37, 128, 5,  8,  1, 2, false) \
+    X(38, 128, 5,  8,  4, 2, true ) \
+    X(39, 128, 5,  8, 12, 2, true ) \
+    X(40, 128, 4,  8,  4, 2, false) \
+    X(41, 128, 4,  8, 12, 2, false) \
+    X(42, 128, 5,  4,  1, 2, false) \
+    X(43, 128, 5,  4,  2, 2, false) \
+    X(44, 128, 5,  4,  1, 2, true ) \
+    X(45, 128, 4,  4,  4, 2, false) \
+    X(46, 128, 4,  4,  1, 2, false)
+
+#define NVFP4_GEMM_DISPATCH_CASE(ID, NB, LP, EP, SG, DT, OVERLAP) \
+    case ID: run_gemm_with_config<nvfp4_gemm::config<NB, LP, EP, SG, DT, OVERLAP>>(A, A_sc, A_sc_global, B, B_sc, B_sc_global, D); break;
+
+#define NVFP4_GEMM_DISPATCH_NOPDL_CASE(ID, NB, LP, EP, SG, DT, OVERLAP) \
+    case ID: run_gemm_with_config<nvfp4_gemm::config<NB, LP, EP, SG, DT, OVERLAP, 256, false, 2>>(A, A_sc, A_sc_global, B, B_sc, B_sc_global, D); break;
+
 void nvfp4_gemm_config_entrypoint(
     const at::Tensor &A, const at::Tensor &A_sc, const at::Tensor &A_sc_global,
     const at::Tensor &B, const at::Tensor &B_sc, const at::Tensor &B_sc_global,
     at::Tensor &D, int config_id
 ) {
-    //                     Nb   LOAD EPI  SG  DT  OVERLAP  Mb   PDL
     switch (config_id) {
-    // ── Original 12 configs (0-11) ──────────────────────────────
-    case 0:  run_gemm_with_config<nvfp4_gemm::config<256, 4, 16,  1, 2, false>>(A, A_sc, A_sc_global, B, B_sc, B_sc_global, D); break;
-    case 1:  run_gemm_with_config<nvfp4_gemm::config<256, 4, 16,  4, 2, false>>(A, A_sc, A_sc_global, B, B_sc, B_sc_global, D); break;
-    case 2:  run_gemm_with_config<nvfp4_gemm::config<256, 4, 16, 12, 2, false>>(A, A_sc, A_sc_global, B, B_sc, B_sc_global, D); break;
-    case 3:  run_gemm_with_config<nvfp4_gemm::config<256, 5,  8,  4, 2, true >>(A, A_sc, A_sc_global, B, B_sc, B_sc_global, D); break;
-    case 4:  run_gemm_with_config<nvfp4_gemm::config<256, 5,  8, 12, 2, true >>(A, A_sc, A_sc_global, B, B_sc, B_sc_global, D); break;
-    case 5:  run_gemm_with_config<nvfp4_gemm::config<256, 5,  8,  4, 2, false>>(A, A_sc, A_sc_global, B, B_sc, B_sc_global, D); break;
-    case 6:  run_gemm_with_config<nvfp4_gemm::config<256, 4,  8, 12, 2, false>>(A, A_sc, A_sc_global, B, B_sc, B_sc_global, D); break;
-    case 7:  run_gemm_with_config<nvfp4_gemm::config<128, 5,  4, 12, 2, true >>(A, A_sc, A_sc_global, B, B_sc, B_sc_global, D); break;
-    case 8:  run_gemm_with_config<nvfp4_gemm::config<128, 4,  4, 12, 2, false>>(A, A_sc, A_sc_global, B, B_sc, B_sc_global, D); break;
-    case 9:  run_gemm_with_config<nvfp4_gemm::config<128, 5,  4,  4, 2, true >>(A, A_sc, A_sc_global, B, B_sc, B_sc_global, D); break;
-    case 10: run_gemm_with_config<nvfp4_gemm::config<256, 5, 16,  4, 2, true >>(A, A_sc, A_sc_global, B, B_sc, B_sc_global, D); break;
-    case 11: run_gemm_with_config<nvfp4_gemm::config<256, 5, 16, 12, 2, true >>(A, A_sc, A_sc_global, B, B_sc, B_sc_global, D); break;
-
-    // ── Nb=256: SG sweep with EP=8, LP=5 (best base) ───────────
-    case 12: run_gemm_with_config<nvfp4_gemm::config<256, 5,  8,  1, 2, false>>(A, A_sc, A_sc_global, B, B_sc, B_sc_global, D); break;
-    case 13: run_gemm_with_config<nvfp4_gemm::config<256, 5,  8,  2, 2, false>>(A, A_sc, A_sc_global, B, B_sc, B_sc_global, D); break;
-    case 14: run_gemm_with_config<nvfp4_gemm::config<256, 5,  8,  8, 2, false>>(A, A_sc, A_sc_global, B, B_sc, B_sc_global, D); break;
-    case 15: run_gemm_with_config<nvfp4_gemm::config<256, 5,  8, 12, 2, false>>(A, A_sc, A_sc_global, B, B_sc, B_sc_global, D); break;
-    case 16: run_gemm_with_config<nvfp4_gemm::config<256, 5,  8,  1, 2, true >>(A, A_sc, A_sc_global, B, B_sc, B_sc_global, D); break;
-    case 17: run_gemm_with_config<nvfp4_gemm::config<256, 5,  8,  2, 2, true >>(A, A_sc, A_sc_global, B, B_sc, B_sc_global, D); break;
-    case 18: run_gemm_with_config<nvfp4_gemm::config<256, 5,  8,  8, 2, true >>(A, A_sc, A_sc_global, B, B_sc, B_sc_global, D); break;
-
-    // ── Nb=256: SG sweep with EP=16, LP=5 ──────────────────────
-    case 19: run_gemm_with_config<nvfp4_gemm::config<256, 5, 16,  1, 2, false>>(A, A_sc, A_sc_global, B, B_sc, B_sc_global, D); break;
-    case 20: run_gemm_with_config<nvfp4_gemm::config<256, 5, 16,  2, 2, false>>(A, A_sc, A_sc_global, B, B_sc, B_sc_global, D); break;
-    case 21: run_gemm_with_config<nvfp4_gemm::config<256, 5, 16,  8, 2, false>>(A, A_sc, A_sc_global, B, B_sc, B_sc_global, D); break;
-    case 22: run_gemm_with_config<nvfp4_gemm::config<256, 5, 16,  1, 2, true >>(A, A_sc, A_sc_global, B, B_sc, B_sc_global, D); break;
-    case 23: run_gemm_with_config<nvfp4_gemm::config<256, 5, 16,  2, 2, true >>(A, A_sc, A_sc_global, B, B_sc, B_sc_global, D); break;
-    case 24: run_gemm_with_config<nvfp4_gemm::config<256, 5, 16,  8, 2, true >>(A, A_sc, A_sc_global, B, B_sc, B_sc_global, D); break;
-
-    // ── Nb=256: LP=4 with EP=8, SG sweep ────────────────────────
-    case 25: run_gemm_with_config<nvfp4_gemm::config<256, 4,  8,  1, 2, false>>(A, A_sc, A_sc_global, B, B_sc, B_sc_global, D); break;
-    case 26: run_gemm_with_config<nvfp4_gemm::config<256, 4,  8,  4, 2, false>>(A, A_sc, A_sc_global, B, B_sc, B_sc_global, D); break;
-    case 27: run_gemm_with_config<nvfp4_gemm::config<256, 4,  8,  2, 2, false>>(A, A_sc, A_sc_global, B, B_sc, B_sc_global, D); break;
-    case 28: run_gemm_with_config<nvfp4_gemm::config<256, 4,  8,  8, 2, false>>(A, A_sc, A_sc_global, B, B_sc, B_sc_global, D); break;
-
-    // ── Nb=256: LP=3 exploration ────────────────────────────────
-    case 29: run_gemm_with_config<nvfp4_gemm::config<256, 3,  8,  4, 2, false>>(A, A_sc, A_sc_global, B, B_sc, B_sc_global, D); break;
-    case 30: run_gemm_with_config<nvfp4_gemm::config<256, 3, 16,  4, 2, false>>(A, A_sc, A_sc_global, B, B_sc, B_sc_global, D); break;
-
-    // ── Nb=256: SG sweep with EP=16, LP=4 ──────────────────────
-    case 31: run_gemm_with_config<nvfp4_gemm::config<256, 4, 16,  2, 2, false>>(A, A_sc, A_sc_global, B, B_sc, B_sc_global, D); break;
-    case 32: run_gemm_with_config<nvfp4_gemm::config<256, 4, 16,  8, 2, false>>(A, A_sc, A_sc_global, B, B_sc, B_sc_global, D); break;
-    case 33: run_gemm_with_config<nvfp4_gemm::config<256, 4, 16,  1, 2, true >>(A, A_sc, A_sc_global, B, B_sc, B_sc_global, D); break;
-    case 34: run_gemm_with_config<nvfp4_gemm::config<256, 4, 16,  4, 2, true >>(A, A_sc, A_sc_global, B, B_sc, B_sc_global, D); break;
-
-    // ── Nb=128: EP=8 sweep (gap in original) ────────────────────
-    case 35: run_gemm_with_config<nvfp4_gemm::config<128, 5,  8,  4, 2, false>>(A, A_sc, A_sc_global, B, B_sc, B_sc_global, D); break;
-    case 36: run_gemm_with_config<nvfp4_gemm::config<128, 5,  8, 12, 2, false>>(A, A_sc, A_sc_global, B, B_sc, B_sc_global, D); break;
-    case 37: run_gemm_with_config<nvfp4_gemm::config<128, 5,  8,  1, 2, false>>(A, A_sc, A_sc_global, B, B_sc, B_sc_global, D); break;
-    case 38: run_gemm_with_config<nvfp4_gemm::config<128, 5,  8,  4, 2, true >>(A, A_sc, A_sc_global, B, B_sc, B_sc_global, D); break;
-    case 39: run_gemm_with_config<nvfp4_gemm::config<128, 5,  8, 12, 2, true >>(A, A_sc, A_sc_global, B, B_sc, B_sc_global, D); break;
-    case 40: run_gemm_with_config<nvfp4_gemm::config<128, 4,  8,  4, 2, false>>(A, A_sc, A_sc_global, B, B_sc, B_sc_global, D); break;
-    case 41: run_gemm_with_config<nvfp4_gemm::config<128, 4,  8, 12, 2, false>>(A, A_sc, A_sc_global, B, B_sc, B_sc_global, D); break;
-
-    // ── Nb=128: EP=4, SG=1 and SG=2 (gap in original) ──────────
-    case 42: run_gemm_with_config<nvfp4_gemm::config<128, 5,  4,  1, 2, false>>(A, A_sc, A_sc_global, B, B_sc, B_sc_global, D); break;
-    case 43: run_gemm_with_config<nvfp4_gemm::config<128, 5,  4,  2, 2, false>>(A, A_sc, A_sc_global, B, B_sc, B_sc_global, D); break;
-    case 44: run_gemm_with_config<nvfp4_gemm::config<128, 5,  4,  1, 2, true >>(A, A_sc, A_sc_global, B, B_sc, B_sc_global, D); break;
-    case 45: run_gemm_with_config<nvfp4_gemm::config<128, 4,  4,  4, 2, false>>(A, A_sc, A_sc_global, B, B_sc, B_sc_global, D); break;
-    case 46: run_gemm_with_config<nvfp4_gemm::config<128, 4,  4,  1, 2, false>>(A, A_sc, A_sc_global, B, B_sc, B_sc_global, D); break;
-
-    // NOTE: Nb=128 + EP=16 is INVALID (D_tile cols = 128/16 = 8 < 16 minimum)
-
-    default: TORCH_CHECK(false, "Invalid config_id: ", config_id, " (valid: 0-46)");
+        NVFP4_GEMM_CONFIG_CASES(NVFP4_GEMM_DISPATCH_CASE)
+        // NOTE: Nb=128 + EP=16 is INVALID (D_tile cols = 128/16 = 8 < 16 minimum)
+        default: TORCH_CHECK(false, "Invalid config_id: ", config_id, " (valid: 0-46)");
     }
 }
+
+void nvfp4_gemm_config_nopdl_entrypoint(
+    const at::Tensor &A, const at::Tensor &A_sc, const at::Tensor &A_sc_global,
+    const at::Tensor &B, const at::Tensor &B_sc, const at::Tensor &B_sc_global,
+    at::Tensor &D, int config_id
+) {
+    switch (config_id) {
+        NVFP4_GEMM_CONFIG_CASES(NVFP4_GEMM_DISPATCH_NOPDL_CASE)
+        default: TORCH_CHECK(false, "Invalid config_id: ", config_id, " (valid: 0-46)");
+    }
+}
+
+#undef NVFP4_GEMM_DISPATCH_NOPDL_CASE
+#undef NVFP4_GEMM_DISPATCH_CASE
+#undef NVFP4_GEMM_CONFIG_CASES
 
 // ================================================================
 // Batched GEMM entrypoint (z-dim parallel): D_i = A_i × B_i^T
@@ -1720,6 +1726,11 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           "Non-PDL GEMM for CUDA graph capture (CLUSTER_SIZE=1, USE_PDL=false)");
     m.def("nvfp4_gemm_config", &nvfp4_gemm_config_entrypoint,
           "GEMM with selectable tile config (for sweeping)",
+          pybind11::arg("A"), pybind11::arg("A_sc"), pybind11::arg("A_sc_global"),
+          pybind11::arg("B"), pybind11::arg("B_sc"), pybind11::arg("B_sc_global"),
+          pybind11::arg("D"), pybind11::arg("config_id"));
+    m.def("nvfp4_gemm_config_nopdl", &nvfp4_gemm_config_nopdl_entrypoint,
+          "Non-PDL GEMM with selectable tile config (for sweeping side-stream tails)",
           pybind11::arg("A"), pybind11::arg("A_sc"), pybind11::arg("A_sc_global"),
           pybind11::arg("B"), pybind11::arg("B_sc"), pybind11::arg("B_sc_global"),
           pybind11::arg("D"), pybind11::arg("config_id"));

@@ -15,6 +15,8 @@ static void launch_backward_v2_bf16(
     float grad_scale, int M, int N, float filter_eps = 0.0f)
 {
     using G = mxfp4_cce_backward_v2::globals<C>;
+    const auto padded_M = A.size(0);
+    const auto padded_N = B.size(0);
     G g {
         .A = kittens::py::tensor_to_gl<typename G::A_fp4x2_gl>(A),
         .A_sc = kittens::py::tensor_to_gl<typename G::A_sc_gl>(A_sc),
@@ -22,7 +24,7 @@ static void launch_backward_v2_bf16(
         .B_sc = kittens::py::tensor_to_gl<typename G::B_sc_gl>(B_sc),
         .D_out = kittens::py::tensor_to_gl<typename G::D_gl>(grad_out),
         .G_fp4_row = kittens::py::tensor_to_gl<typename G::G_fp4x2_gl>(
-            A.new_empty({1, 1}, A.options().dtype(c10::kByte))),
+            A.new_empty({padded_M, padded_N / 2}, A.options().dtype(c10::kFloat4_e2m1fn_x2))),
         .G_sc_row = nullptr,
         .lse = lse.data_ptr<float>(),
         .targets = targets.data_ptr<int64_t>(),

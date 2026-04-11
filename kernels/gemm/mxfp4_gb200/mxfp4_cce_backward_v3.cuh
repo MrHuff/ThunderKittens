@@ -620,7 +620,6 @@ __device__ inline void backward_kernel_v3(const globals<C>& g) {
                             // Quantize and pack FP4 pairs
                             #pragma unroll
                             for (int j = 0; j < subtile_rt::width; j++) {
-                                int base_col = col_start + j * 16 + (lane_id % 4) * 2;
                                 // Low cols: data[0].x/y (cols base_col, base_col+1)
                                 uint8_t fp4_x_lo = quantize_fp4_pair(
                                     D_fl.tiles[i][j].data[0].x, D_fl.tiles[i][j].data[0].y, coeff_x);
@@ -632,23 +631,17 @@ __device__ inline void backward_kernel_v3(const globals<C>& g) {
                                     D_fl.tiles[i][j].data[3].x, D_fl.tiles[i][j].data[3].y, coeff_y);
 
                                 // Write FP4 data to global
+                                uint8_t* row_fp4_ptr = reinterpret_cast<uint8_t*>(g.G_fp4_row.raw_ptr);
+                                int row_fp4_stride = g.G_fp4_row.cols();
+                                int global_byte_lo = col_start / 2 + (lane_id % 4) + j * 8;
+                                int global_byte_hi = global_byte_lo + 4;
                                 if (global_row_x < g.M) {
-                                    uint8_t* fp4_ptr = reinterpret_cast<uint8_t*>(
-                                        &g.G_fp4_row[{global_row_x / (C::Mb/2), col_start / (C::Nb / 2)}]);
-                                    int local_row = global_row_x % (C::Mb/2);
-                                    int local_col_lo = (lane_id % 4) * 2 + j * 16;
-                                    int local_col_hi = local_col_lo + 8;
-                                    fp4_ptr[local_row * (C::Nb/2) + local_col_lo/2] = fp4_x_lo;
-                                    fp4_ptr[local_row * (C::Nb/2) + local_col_hi/2] = fp4_x_hi;
+                                    row_fp4_ptr[global_row_x * row_fp4_stride + global_byte_lo] = fp4_x_lo;
+                                    row_fp4_ptr[global_row_x * row_fp4_stride + global_byte_hi] = fp4_x_hi;
                                 }
                                 if (global_row_y < g.M) {
-                                    uint8_t* fp4_ptr = reinterpret_cast<uint8_t*>(
-                                        &g.G_fp4_row[{global_row_y / (C::Mb/2), col_start / (C::Nb / 2)}]);
-                                    int local_row = global_row_y % (C::Mb/2);
-                                    int local_col_lo = (lane_id % 4) * 2 + j * 16;
-                                    int local_col_hi = local_col_lo + 8;
-                                    fp4_ptr[local_row * (C::Nb/2) + local_col_lo/2] = fp4_y_lo;
-                                    fp4_ptr[local_row * (C::Nb/2) + local_col_hi/2] = fp4_y_hi;
+                                    row_fp4_ptr[global_row_y * row_fp4_stride + global_byte_lo] = fp4_y_lo;
+                                    row_fp4_ptr[global_row_y * row_fp4_stride + global_byte_hi] = fp4_y_hi;
                                 }
                             }
 
@@ -744,36 +737,75 @@ __device__ inline void backward_kernel_v3(const globals<C>& g) {
                             }
 
                             // Quantize and write transposed FP4: G_col[col, row/2]
-                            int col_fp4_stride = g.M / 2;  // stride along M/2
+                            int col_fp4_stride = g.A.rows() / 2;  // stride along padded M/2
                             #pragma unroll
                             for (int i = 0; i < subtile_rt::height; i++) {
-                                int global_row_x = warp_row_base + i * 16 + lane_id / 4;
-                                int global_row_y = warp_row_base + i * 16 + 8 + lane_id / 4;
-                                // row_pair = min(row_x, row_y) for fp4x2 packing
-                                int global_row_pair = global_row_x;  // x < y always
+                                int row_pair_idx = lane_id / 4;
+                                int global_row_pair_lo = warp_row_base + i * 16 + row_pair_idx;
+                                int global_row_pair_hi = global_row_pair_lo + 8;
 
-                                // Pack x-row (low nibble) and y-row (high nibble) for each col
-                                if (global_row_x < g.M && global_row_y < g.M) {
-                                    // gc0: val_x = data[0].x, val_y = data[1].x
-                                    uint8_t cfp4_0 = float_to_fp4(D_fl.tiles[i][j].data[0].x * col_coeff[0])
-                                                   | (float_to_fp4(D_fl.tiles[i][j].data[1].x * col_coeff[0]) << 4);
-                                    // gc1: val_x = data[0].y, val_y = data[1].y
-                                    uint8_t cfp4_1 = float_to_fp4(D_fl.tiles[i][j].data[0].y * col_coeff[1])
-                                                   | (float_to_fp4(D_fl.tiles[i][j].data[1].y * col_coeff[1]) << 4);
-                                    // gc8: val_x = data[2].x, val_y = data[3].x
-                                    uint8_t cfp4_2 = float_to_fp4(D_fl.tiles[i][j].data[2].x * col_coeff[2])
-                                                   | (float_to_fp4(D_fl.tiles[i][j].data[3].x * col_coeff[2]) << 4);
-                                    // gc9: val_x = data[2].y, val_y = data[3].y
-                                    uint8_t cfp4_3 = float_to_fp4(D_fl.tiles[i][j].data[2].y * col_coeff[3])
-                                                   | (float_to_fp4(D_fl.tiles[i][j].data[3].y * col_coeff[3]) << 4);
+                                float vals_x[4] = {
+                                    D_fl.tiles[i][j].data[0].x,
+                                    D_fl.tiles[i][j].data[0].y,
+                                    D_fl.tiles[i][j].data[2].x,
+                                    D_fl.tiles[i][j].data[2].y,
+                                };
+                                float vals_y[4] = {
+                                    D_fl.tiles[i][j].data[1].x,
+                                    D_fl.tiles[i][j].data[1].y,
+                                    D_fl.tiles[i][j].data[3].x,
+                                    D_fl.tiles[i][j].data[3].y,
+                                };
 
-                                    if (gc0 < g.N) {
-                                        g.G_fp4_col_ptr[gc0 * col_fp4_stride + global_row_pair / 2] = cfp4_0;
-                                        g.G_fp4_col_ptr[gc1 * col_fp4_stride + global_row_pair / 2] = cfp4_1;
+                                float row_x_pair_hi[4];
+                                float row_y_pair_hi[4];
+                                #pragma unroll
+                                for (int v = 0; v < 4; v++) {
+                                    row_x_pair_hi[v] = __shfl_xor_sync(0xFFFFFFFF, vals_x[v], 4);
+                                    row_y_pair_hi[v] = __shfl_xor_sync(0xFFFFFFFF, vals_y[v], 4);
+                                }
+
+                                if ((row_pair_idx % 2) == 0) {
+                                    if (gc0 < g.N && global_row_pair_lo < g.M) {
+                                        float pair_hi = (global_row_pair_lo + 1 < g.M) ? row_x_pair_hi[0] : 0.0f;
+                                        g.G_fp4_col_ptr[gc0 * col_fp4_stride + global_row_pair_lo / 2] =
+                                            quantize_fp4_pair(vals_x[0], pair_hi, col_coeff[0]);
                                     }
-                                    if (gc8 < g.N) {
-                                        g.G_fp4_col_ptr[gc8 * col_fp4_stride + global_row_pair / 2] = cfp4_2;
-                                        g.G_fp4_col_ptr[gc9 * col_fp4_stride + global_row_pair / 2] = cfp4_3;
+                                    if (gc1 < g.N && global_row_pair_lo < g.M) {
+                                        float pair_hi = (global_row_pair_lo + 1 < g.M) ? row_x_pair_hi[1] : 0.0f;
+                                        g.G_fp4_col_ptr[gc1 * col_fp4_stride + global_row_pair_lo / 2] =
+                                            quantize_fp4_pair(vals_x[1], pair_hi, col_coeff[1]);
+                                    }
+                                    if (gc8 < g.N && global_row_pair_lo < g.M) {
+                                        float pair_hi = (global_row_pair_lo + 1 < g.M) ? row_x_pair_hi[2] : 0.0f;
+                                        g.G_fp4_col_ptr[gc8 * col_fp4_stride + global_row_pair_lo / 2] =
+                                            quantize_fp4_pair(vals_x[2], pair_hi, col_coeff[2]);
+                                    }
+                                    if (gc9 < g.N && global_row_pair_lo < g.M) {
+                                        float pair_hi = (global_row_pair_lo + 1 < g.M) ? row_x_pair_hi[3] : 0.0f;
+                                        g.G_fp4_col_ptr[gc9 * col_fp4_stride + global_row_pair_lo / 2] =
+                                            quantize_fp4_pair(vals_x[3], pair_hi, col_coeff[3]);
+                                    }
+
+                                    if (gc0 < g.N && global_row_pair_hi < g.M) {
+                                        float pair_hi = (global_row_pair_hi + 1 < g.M) ? row_y_pair_hi[0] : 0.0f;
+                                        g.G_fp4_col_ptr[gc0 * col_fp4_stride + global_row_pair_hi / 2] =
+                                            quantize_fp4_pair(vals_y[0], pair_hi, col_coeff[0]);
+                                    }
+                                    if (gc1 < g.N && global_row_pair_hi < g.M) {
+                                        float pair_hi = (global_row_pair_hi + 1 < g.M) ? row_y_pair_hi[1] : 0.0f;
+                                        g.G_fp4_col_ptr[gc1 * col_fp4_stride + global_row_pair_hi / 2] =
+                                            quantize_fp4_pair(vals_y[1], pair_hi, col_coeff[1]);
+                                    }
+                                    if (gc8 < g.N && global_row_pair_hi < g.M) {
+                                        float pair_hi = (global_row_pair_hi + 1 < g.M) ? row_y_pair_hi[2] : 0.0f;
+                                        g.G_fp4_col_ptr[gc8 * col_fp4_stride + global_row_pair_hi / 2] =
+                                            quantize_fp4_pair(vals_y[2], pair_hi, col_coeff[2]);
+                                    }
+                                    if (gc9 < g.N && global_row_pair_hi < g.M) {
+                                        float pair_hi = (global_row_pair_hi + 1 < g.M) ? row_y_pair_hi[3] : 0.0f;
+                                        g.G_fp4_col_ptr[gc9 * col_fp4_stride + global_row_pair_hi / 2] =
+                                            quantize_fp4_pair(vals_y[3], pair_hi, col_coeff[3]);
                                     }
                                 }
                             }

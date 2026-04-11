@@ -16,10 +16,14 @@ static void launch_backward_v2_bf16(
 {
     static_assert(C::USE_BF16_ACCUM, "Must use BF16 config for this function");
     using G = nvfp4_cce_backward_v2::globals<C>;
+    const auto padded_M = A.size(0);
+    const auto padded_N = B.size(0);
 
     // Create dummy tensors for unused FP4 output fields
-    auto dummy_fp4 = A.new_empty({1, 1}, A.options().dtype(c10::kByte));
-    auto dummy_sc  = A.new_empty({1, 1}, A.options().dtype(c10::kHalf));
+    auto dummy_fp4 = A.new_empty({padded_M, padded_N / 2}, A.options().dtype(c10::kFloat4_e2m1fn_x2));
+    auto dummy_sc  = A.new_empty(
+        {std::max<int64_t>(1, padded_M / 128), std::max<int64_t>(1, padded_N / 64), 256},
+        A.options().dtype(c10::kHalf));
     auto dummy_sg  = A.new_empty({1}, A.options().dtype(c10::kFloat));
 
     G g {
@@ -96,11 +100,17 @@ static void launch_backward_v2_fp4(
 // Config instantiations
 using bwd_v2_bf16_L4_SG8 = nvfp4_cce_backward_v2::config<4, 8, true, true>;
 using bwd_v2_fp4_L4_SG8  = nvfp4_cce_backward_v2::config<4, 8, false, true>;
+using bwd_v2_bf16_epipipe_L4_SG8 = nvfp4_cce_backward_v2::experimental_config_epipipe<4, 8, true, true>;
+using bwd_v2_fp4_epipipe_L4_SG8  = nvfp4_cce_backward_v2::experimental_config_epipipe<4, 8, false, true>;
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("backward_v2_bf16_L4_SG8", &launch_backward_v2_bf16<bwd_v2_bf16_L4_SG8>,
           "NVFP4 CCE backward v2 (BF16 output) L4 SG8");
     m.def("backward_v2_fp4_L4_SG8", &launch_backward_v2_fp4<bwd_v2_fp4_L4_SG8>,
           "NVFP4 CCE backward v2 (FP4 output) L4 SG8");
+    m.def("experimental_backward_v2_bf16_epipipe_L4_SG8", &launch_backward_v2_bf16<bwd_v2_bf16_epipipe_L4_SG8>,
+          "NVFP4 CCE backward v2 experimental epipipe (BF16 output) L4 SG8");
+    m.def("experimental_backward_v2_fp4_epipipe_L4_SG8", &launch_backward_v2_fp4<bwd_v2_fp4_epipipe_L4_SG8>,
+          "NVFP4 CCE backward v2 experimental epipipe (FP4 output) L4 SG8");
 }
 #endif

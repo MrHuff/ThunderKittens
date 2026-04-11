@@ -138,7 +138,9 @@ __device__ inline static void load_async(RT &dst, const TM &src) {
         static_assert(TM::cols==RT::cols);
         static_assert(warp_rows==RT::rows);
         if constexpr (GROUP_WARPS == 4) {
-            auto src_subtile = src.template subtile<tt<typename TM::dtype, warp_rows, TM::cols>>(32*warpid(), 0);
+            // `warp_rows` preserves the correct row stride for both full (128-row)
+            // and half (64-row) tensor tiles.
+            auto src_subtile = src.template subtile<tt<typename TM::dtype, warp_rows, TM::cols>>(warp_rows*warpid(), 0);
             ::kittens::group<1>::load_async(dst, src_subtile);
         }
         else {
@@ -314,7 +316,7 @@ __device__ inline static void store_async(TM &dst, const RT &src) {
         static_assert(TM::cols==RT::cols);
         static_assert(warp_rows==RT::rows);
         if constexpr (GROUP_WARPS == 4) {
-            auto dst_subtile = dst.template subtile<tt<typename TM::dtype, warp_rows, TM::cols>>(32*warpid(), 0);
+            auto dst_subtile = dst.template subtile<tt<typename TM::dtype, warp_rows, TM::cols>>(warp_rows*warpid(), 0);
             ::kittens::group<1>::store_async(dst_subtile, src);
         }
         else {
