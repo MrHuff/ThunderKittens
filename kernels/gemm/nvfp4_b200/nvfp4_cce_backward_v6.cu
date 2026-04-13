@@ -561,6 +561,33 @@ static void launch_experimental_backward_v6_combo_publicv3_fp4_bridge(
 {
     (void)K;
 
+    // Keep 3WG gonly/dEonly on the same dedicated row-only frontend that already
+    // proved stable for 5WG. Combo/dConly continue to use the generic bridge.
+    if constexpr (ComboMode == 1 || ComboMode == 2) {
+        (void)G_fp4_col;
+        (void)G_sc_col;
+        constexpr int kRowonlyComboGonly =
+            nvfp4_cce_backward_v3::globals_5wg<exp_bwd_v6_combo_publicv3_fp4_rowonlygonly_L4_SG8>::COMBO_MODE_GONLY;
+        launch_public_v3_fp4_frontend_for_bridge_rowonly_combo_dc<
+            exp_bwd_v6_combo_publicv3_fp4_rowonlygonly_L4_SG8,
+            kRowonlyComboGonly>(
+            A, A_sc, A_sc_global,
+            B, B_sc, B_sc_global,
+            C_col, C_col_sc, C_col_sc_global,
+            E_col, E_col_sc, E_col_sc_global,
+            dE_out, dC_out,
+            G_fp4_row, G_sc_row, G_sg_row,
+            lse, targets, grad_scale, M, N, filter_eps, encode_centric);
+        if constexpr (ComboMode == 2) {
+            auto G_sc_row_fp8 = G_sc_row.view(at::kFloat8_e4m3fn);
+            launch_nvfp4_gemm_bridge_dE_current(
+                G_fp4_row, G_sc_row_fp8, G_sg_row,
+                C_col, C_col_sc, C_col_sc_global,
+                dE_out);
+        }
+        return;
+    }
+
 #if V6_PUBLICV3_USE_ROWONLY_COMBO_DC_FRONTEND
     if constexpr (ComboMode == 0 || ComboMode == 3) {
         constexpr int kRowonlyComboDConly =
@@ -575,22 +602,9 @@ static void launch_experimental_backward_v6_combo_publicv3_fp4_bridge(
             dE_out, dC_out,
             G_fp4_row, G_sc_row, G_sg_row,
             lse, targets, grad_scale, M, N, filter_eps, encode_centric);
-    } else {
-        constexpr int kRowonlyComboGonly =
-            nvfp4_cce_backward_v3::globals_5wg<exp_bwd_v6_combo_publicv3_fp4_rowonlygonly_L4_SG8>::COMBO_MODE_GONLY;
-        launch_public_v3_fp4_frontend_for_bridge_rowonly_combo_dc<
-            exp_bwd_v6_combo_publicv3_fp4_rowonlygonly_L4_SG8,
-            kRowonlyComboGonly>(
-            A, A_sc, A_sc_global,
-            B, B_sc, B_sc_global,
-            C_col, C_col_sc, C_col_sc_global,
-            E_col, E_col_sc, E_col_sc_global,
-            dE_out, dC_out,
-            G_fp4_row, G_sc_row, G_sg_row,
-            lse, targets, grad_scale, M, N, filter_eps, encode_centric);
     }
 
-    if constexpr (ComboMode == 0 || ComboMode == 2) {
+    if constexpr (ComboMode == 0) {
         auto G_sc_row_fp8 = G_sc_row.view(at::kFloat8_e4m3fn);
         launch_nvfp4_gemm_bridge_dE_current(
             G_fp4_row, G_sc_row_fp8, G_sg_row,

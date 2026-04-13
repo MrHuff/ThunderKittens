@@ -2026,3 +2026,58 @@ Interpretation update:
   - `0.535 + 0.772 + 1.375 = 2.682 ms`
   - vs fused `5wg combo = 1.537 ms`
 - so the next optimization pass should target real throughput deltas now that the timing surface is trustworthy, rather than more basic liveness/debugging
+
+## 2026-04-13 localCTA-tail full-backward snapshot
+
+Goal for this pass:
+
+- get an apples-to-apples view of full backward (`G` materialization + `dE` + `dC`) when the tail GEMMs also use the localCTA family
+- for the localCTA-tail variants, pre-quantize `C^T` and `E^T` once outside the timed region, then run:
+  - front-half materialization (`v2` quantized `G`, public `v3`, or `v6 gonly`)
+  - bridge scalar `G_sg` into localCTA chunk-grid form
+  - `nvfp4_localcta_gemm` for `dE`
+  - `nvfp4_localcta_gemm` for `dC`
+
+Wrapper fix that unblocked the comparison:
+
+- `3wg` `gonly` / `dEonly` were still routed through the generic public-v3 bridge, while `5wg` already used the dedicated row-only frontend
+- patched `nvfp4_cce_backward_v6.cu` so `launch_experimental_backward_v6_combo_publicv3_fp4_bridge<ComboMode>` now mirrors `5wg` for `ComboMode == gonly/dEonly`
+- after rebuild:
+  - direct large `experimental_backward_v6_combo_publicv3_fp4_gonly_L4_SG8` now reaches `launching -> launched -> synced`
+  - timed large `3wg gonly` is now `0.535 ms`
+
+Refreshed large-shape localCTA-tail timings on `CUDA_VISIBLE_DEVICES=2`, `4Kx4K->32K`, `warmup=2`, `iters=5`:
+
+- `v2 localCTA full`: `2.779 ms`
+- `v3 localCTA full`: `7.353 ms`
+- `v6 3wg localCTA full`: `2.414 ms`
+- `v6 5wg localCTA full`: `5.548 ms`
+
+Notes on the `v3 localCTA` measurement:
+
+- a naive repeated timing loop still wedges on reused outputs
+- a manual per-iteration sync loop is stable if the setup step scrubs all reused materialization/tail buffers outside the timed region:
+  - `G_sg_row`
+  - `dE_out`
+  - `dC_out`
+  - `G_sc_row`
+  - `G_sc_col`
+  - `G_fp4_col`
+- with that scrub in place, the large standalone timed iterations were stable at:
+  - `7.353 / 7.350 / 7.356 / 7.351 / 7.355 ms`
+  - average `7.353 ms`
+
+Current-path comparison points already established on the same shape / device family:
+
+- `v2 current full`: `~1.05 ms` from the stable benchmark surface before this pass
+- `v3 current full`: `~1.56 ms` from the restored `rowhwfp4` public path checkpoint
+- `v6 3wg current combo`: `1.529 ms`
+- `v6 5wg current combo`: `1.528 ms`
+
+Interpretation:
+
+- the earlier huge localCTA numbers were polluted by process pressure / stale runs and should not be used
+- with the `3wg gonly` wrapper fixed, localCTA-tail full backward is now benchmarkable on both `v2` and `v6 3wg/5wg`
+- `v3` is also benchmarkable now, but only with the explicit reuse scrub above
+- the updated `v2 localCTA` number is much closer to expectations, which supports the suspicion that the first comparison was not trustworthy
+- remaining open question: whether the direct `nvfp4_localcta_gemm` bridge is still leaving `v2` on a slower localCTA GEMM path than a prepared/fast localCTA tail would
