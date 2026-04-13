@@ -654,6 +654,56 @@ static void launch_experimental_backward_v6_combo_publicv3_fp4_bridge(
 #endif
 }
 
+template <int ComboMode>
+static void launch_experimental_backward_v6_combo_publicv3_fp4_bridge_5wg(
+    const at::Tensor &A, const at::Tensor &A_sc, const at::Tensor &A_sc_global,
+    const at::Tensor &B, const at::Tensor &B_sc, const at::Tensor &B_sc_global,
+    const at::Tensor &C_col, const at::Tensor &C_col_sc, const at::Tensor &C_col_sc_global,
+    const at::Tensor &E_col, const at::Tensor &E_col_sc, const at::Tensor &E_col_sc_global,
+    at::Tensor &dE_out, at::Tensor &dC_out,
+    at::Tensor &G_fp4_row, at::Tensor &G_sc_row, at::Tensor &G_sg_row,
+    at::Tensor &G_fp4_col, at::Tensor &G_sc_col,
+    const at::Tensor &lse, const at::Tensor &targets,
+    float grad_scale, int M, int N, int K, float filter_eps = 0.0f,
+    bool encode_centric = false)
+{
+    if constexpr (ComboMode == 1 || ComboMode == 2) {
+        (void)K;
+        (void)G_fp4_col;
+        (void)G_sc_col;
+        constexpr int kRowonlyComboGonly =
+            nvfp4_cce_backward_v3::globals_5wg<exp_bwd_v6_combo_publicv3_fp4_rowonlygonly_L4_SG8>::COMBO_MODE_GONLY;
+        launch_public_v3_fp4_frontend_for_bridge_rowonly_combo_dc<
+            exp_bwd_v6_combo_publicv3_fp4_rowonlygonly_L4_SG8,
+            kRowonlyComboGonly>(
+            A, A_sc, A_sc_global,
+            B, B_sc, B_sc_global,
+            C_col, C_col_sc, C_col_sc_global,
+            E_col, E_col_sc, E_col_sc_global,
+            dE_out, dC_out,
+            G_fp4_row, G_sc_row, G_sg_row,
+            lse, targets, grad_scale, M, N, filter_eps, encode_centric);
+        if constexpr (ComboMode == 2) {
+            auto G_sc_row_fp8 = G_sc_row.view(at::kFloat8_e4m3fn);
+            launch_nvfp4_gemm_bridge_dE_current(
+                G_fp4_row, G_sc_row_fp8, G_sg_row,
+                C_col, C_col_sc, C_col_sc_global,
+                dE_out);
+        }
+        return;
+    }
+
+    launch_experimental_backward_v6_combo_publicv3_fp4_bridge<ComboMode>(
+        A, A_sc, A_sc_global,
+        B, B_sc, B_sc_global,
+        C_col, C_col_sc, C_col_sc_global,
+        E_col, E_col_sc, E_col_sc_global,
+        dE_out, dC_out,
+        G_fp4_row, G_sc_row, G_sg_row,
+        G_fp4_col, G_sc_col,
+        lse, targets, grad_scale, M, N, K, filter_eps, encode_centric);
+}
+
 static void launch_experimental_backward_v6_combo_publicv3_fp4_5wg_gonly_diag(
     const at::Tensor &A, const at::Tensor &A_sc, const at::Tensor &A_sc_global,
     const at::Tensor &B, const at::Tensor &B_sc, const at::Tensor &B_sc_global,
@@ -699,22 +749,22 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
               nvfp4_cce_backward_v3::globals_3wg<exp_bwd_v6_combo_publicv3_fp4_L4_SG8>::COMBO_MODE_DCONLY>,
           "Developer-only NVFP4 v6 combo path using the public-v3 front-half plus a bridged dC GEMM tail");
     m.def("experimental_backward_v6_combo_publicv3_fp4_5wg_L4_SG8",
-          &launch_experimental_backward_v6_combo_publicv3_fp4_bridge<
+          &launch_experimental_backward_v6_combo_publicv3_fp4_bridge_5wg<
               nvfp4_cce_backward_v3::globals_5wg<exp_bwd_v6_combo_publicv3_fp4_5wg_L4_SG8>::COMBO_MODE_FULL>,
           "Developer-only NVFP4 v6 combo path using the public-v3 front-half plus bridged dE/dC GEMM tails");
     m.def("experimental_backward_v6_combo_publicv3_fp4_5wg_gonly_L4_SG8",
-          &launch_experimental_backward_v6_combo_publicv3_fp4_bridge<
+          &launch_experimental_backward_v6_combo_publicv3_fp4_bridge_5wg<
               nvfp4_cce_backward_v3::globals_5wg<exp_bwd_v6_combo_publicv3_fp4_5wg_L4_SG8>::COMBO_MODE_GONLY>,
           "Developer-only NVFP4 v6 5wg combo path using the public-v3 front-half only");
     m.def("experimental_backward_v6_combo_publicv3_fp4_5wg_gonly_diag_L4_SG8",
           &launch_experimental_backward_v6_combo_publicv3_fp4_5wg_gonly_diag,
           "Developer-only NVFP4 v6 5wg combo path using the public-v3 front-half only with diag timing output");
     m.def("experimental_backward_v6_combo_publicv3_fp4_5wg_dEonly_L4_SG8",
-          &launch_experimental_backward_v6_combo_publicv3_fp4_bridge<
+          &launch_experimental_backward_v6_combo_publicv3_fp4_bridge_5wg<
               nvfp4_cce_backward_v3::globals_5wg<exp_bwd_v6_combo_publicv3_fp4_5wg_L4_SG8>::COMBO_MODE_DEONLY>,
           "Developer-only NVFP4 v6 5wg combo path using the public-v3 front-half plus a bridged dE GEMM tail");
     m.def("experimental_backward_v6_combo_publicv3_fp4_5wg_dConly_L4_SG8",
-          &launch_experimental_backward_v6_combo_publicv3_fp4_bridge<
+          &launch_experimental_backward_v6_combo_publicv3_fp4_bridge_5wg<
               nvfp4_cce_backward_v3::globals_5wg<exp_bwd_v6_combo_publicv3_fp4_5wg_L4_SG8>::COMBO_MODE_DCONLY>,
           "Developer-only NVFP4 v6 5wg combo path using the public-v3 front-half plus a bridged dC GEMM tail");
 }

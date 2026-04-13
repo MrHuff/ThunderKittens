@@ -1917,3 +1917,112 @@ Current `v6` state:
 - the `v6` design constraint still holds:
   - no BF16 softmax materialization
   - row and col should go straight to FP4
+
+## 2026-04-13 follow-up: selective `5wg` bridge split fixes large direct liveness; repeated combo timing still needs zeroed accumulate outputs
+
+Source change in `nvfp4_cce_backward_v6.cu`:
+
+- kept the dedicated row-only `5wg` frontend only for:
+  - `experimental_backward_v6_combo_publicv3_fp4_5wg_gonly_L4_SG8`
+  - `experimental_backward_v6_combo_publicv3_fp4_5wg_dEonly_L4_SG8`
+- routed `5wg` full `combo` and `dConly` back through the generic `rowhwfp4` bridge
+- reverted `experimental_rowonly_combo_dc_frontend_enabled` to the compile-flag-backed value instead of hard-coding `True`
+
+Why this split was needed:
+
+- the broad “force all `5wg` modes through dedicated row-only” rewrite was too aggressive
+- tiny direct probes showed:
+  - `gonly`: returned
+  - `dEonly`: returned
+  - `dConly`: hung
+  - full `combo`: hung
+- so the dedicated row-only `5wg` frontend is viable for the pure row path and `dE` bridge, but not for the `dC` side
+
+Large-shape direct status after the selective split (`CUDA_VISIBLE_DEVICES=2`, `4Kx4K->32K`):
+
+- `--v6-publicv3-combo-5wg-direct-mode gonly`
+  - `launching -> launched -> synced`
+- `--v6-publicv3-combo-5wg-direct-mode dEonly`
+  - `launching -> launched -> synced`
+- `--v6-publicv3-combo-5wg-direct-mode dConly`
+  - `launching -> launched -> synced`
+- `--v6-publicv3-combo-5wg-direct-mode combo`
+  - `launching -> launched -> synced`
+
+That means the earlier large-shape `5wg` launch blocker is gone for one-shot runs.
+
+Remaining timing/reuse issue:
+
+- a strict per-iteration `launch -> torch.cuda.synchronize()` loop still wedges on the second launch for:
+  - `5wg dConly`
+  - `5wg combo`
+- the same reuse problem also reproduces on the `3wg` side for:
+  - direct `dConly`
+  - full `combo`
+- in contrast:
+  - `5wg gonly` repeats cleanly on the same buffers
+  - `5wg dEonly` repeats cleanly on the same buffers
+
+Key isolation result:
+
+- the repeat hang is not a general launch bug
+- it goes away if the accumulate outputs are scrubbed between launches
+- for `dConly`, zeroing reused `dC_out` (and resetting `G_sg_row`) before each launch is enough
+- for full `combo`, zeroing reused `dE_out` + `dC_out` (and resetting `G_sg_row`) before each launch is enough
+- zeroing the FP4 materialization buffers was not needed for the passing reuse tests
+
+Interpretation:
+
+- the current combo / `dC` timing surfaces are accumulation-style
+- reusing dirty BF16 destination tensors across launches is not a valid benchmark setup for these paths
+- the earlier `bench_v2_vs_v3.py --v6-publicv3-combo*-mode ...` hangs were therefore mixing a real liveness symptom with a benchmark-harness bug: it was reusing `dE_out` / `dC_out` without clearing them between timed launches
+
+Useful manual steady-state timing observations from the zeroed-output sync loops:
+
+- `5wg gonly`: steady-state around `0.33 ms`
+- `5wg dEonly`: steady-state around `0.55 ms`
+- `5wg dConly`: after zeroing `dC_out`, later iterations were in the low-single-digit-ms band (`~2.2-3.1 ms` in the direct sync loop)
+- `5wg combo`: after zeroing `dE_out` + `dC_out`, later iterations were likewise in the low-single-digit-ms band (`~2.3-3.2 ms` in the direct sync loop)
+- `3wg combo`: with zeroed `dE_out` + `dC_out`, observed steady iterations were about `3.2 ms`
+
+Best next step from here:
+
+- do not treat the remaining repeated-timing hang as a front-half failure anymore
+- either:
+  - patch the benchmark harness to zero `dE_out` / `dC_out` before each `v6` combo / `dConly` timed launch, or
+  - make the wrapper semantics explicit that these accumulate outputs must be zeroed by the caller
+- only after the timing surface is made valid is it worth comparing `3wg` vs `5wg` combo throughput in earnest
+
+Harness follow-up:
+
+- patched `/workspace/codebases/cce/fp4_matmul/fp4_cce_TK/bench_v2_vs_v3.py`
+  - added a `setup_fn` path in the benchmark helper so `dE_out` / `dC_out` can be zeroed outside the timed region for the `v6` combo timing modes
+  - wired that setup path into both:
+    - `--v6-publicv3-combo-mode ...`
+    - `--v6-publicv3-combo-5wg-mode ...`
+- after that harness fix, the previously hanging timed large combo modes now return cleanly on `CUDA_VISIBLE_DEVICES=2`
+
+Current large timed combo snapshot (`4Kx4K->32K`, `warmup=2`, `iters=5`):
+
+- `CUDA_VISIBLE_DEVICES=2 ... bench_v2_vs_v3.py --v6-publicv3-combo-mode combo --config-label '4Kx4K->32K' --warmup 2 --iters 5`
+  - `nv-v6-pv3cmb`: `1.534 ms`
+- `CUDA_VISIBLE_DEVICES=2 ... bench_v2_vs_v3.py --v6-publicv3-combo-5wg-mode combo --config-label '4Kx4K->32K' --warmup 2 --iters 5`
+  - `nv-v6-pv35cmb`: `1.537 ms`
+
+Current large timed `5wg` breakdown snapshot (`4Kx4K->32K`, `warmup=2`, `iters=5`):
+
+- `CUDA_VISIBLE_DEVICES=2 ... bench_v2_vs_v3.py --v6-publicv3-combo-5wg-mode gonly --config-label '4Kx4K->32K' --warmup 2 --iters 5`
+  - `nv-v6-pv35g`: `0.535 ms`
+- `CUDA_VISIBLE_DEVICES=2 ... bench_v2_vs_v3.py --v6-publicv3-combo-5wg-mode dEonly --config-label '4Kx4K->32K' --warmup 2 --iters 5`
+  - `nv-v6-pv35dE`: `0.772 ms`
+- `CUDA_VISIBLE_DEVICES=2 ... bench_v2_vs_v3.py --v6-publicv3-combo-5wg-mode dConly --config-label '4Kx4K->32K' --warmup 2 --iters 5`
+  - `nv-v6-pv35dC`: `1.375 ms`
+
+Interpretation update:
+
+- with a valid timing setup, `5wg combo` is now benchmarkable again
+- on the current source, `5wg combo` is effectively tied with `3wg combo`, not clearly better
+- the fused `5wg combo` path is still meaningfully better than the naive sum of isolated pieces:
+  - `0.535 + 0.772 + 1.375 = 2.682 ms`
+  - vs fused `5wg combo = 1.537 ms`
+- so the next optimization pass should target real throughput deltas now that the timing surface is trustworthy, rather than more basic liveness/debugging
