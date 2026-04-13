@@ -41,7 +41,7 @@ using pub_bwd_v3_fp4_frontend_L4_SG8 =
     nvfp4_cce_backward_v3::experimental_config_colwg_consumerotf_warpbalanced<4, 8, true, 4>;
 #else
 using pub_bwd_v3_fp4_frontend_L4_SG8 =
-    nvfp4_cce_backward_v3::experimental_config_colwg_colpairpad_rowpair_lanepairrecord_rowsync_dualfloatcache_rowhwfp4_row16ready_overlap<4, 8, true>;
+    nvfp4_cce_backward_v3::experimental_config_colwg_colpairpad_rowpair_lanepairrecord_rowsync_dualfloatcache_rowhwfp4_row16ready_overlap<4, 8, true, 4>;
 #endif
 template <typename C>
 static void launch_public_v3_fp4_frontend_for_bridge(
@@ -76,6 +76,10 @@ static void launch_public_v3_fp4_frontend_for_bridge(
     TORCH_CHECK(err == cudaSuccess,
                 "Failed to update v6 public-v3 bridge analytic G_sg_row: ",
                 cudaGetErrorString(err));
+    const int combo_dummy_extent = (M > N) ? M : N;
+    auto unused_combo_out = A.new_empty(
+        {combo_dummy_extent, combo_dummy_extent},
+        A.options().dtype(c10::kBFloat16));
 
     G g {
         .A = kittens::py::tensor_to_gl<typename G::A_fp4x2_gl>(A),
@@ -104,17 +108,22 @@ static void launch_public_v3_fp4_frontend_for_bridge(
         .M = M,
         .N = N,
         .encode_centric = encode_centric,
-        .C_col = kittens::py::tensor_to_gl<typename G::combo_p3_C_gl>(C_col),
+        .C_col = kittens::py::tensor_to_gl<typename G::combo_p3_C_gl>(B),
         .C_col_sc = kittens::py::tensor_to_gl<typename G::combo_p3_C_sc_gl, false>(
-            C_col_sc, 1, C_col_sc.size(0), C_col_sc.size(1), 256),
-        .C_col_sc_global = kittens::py::tensor_to_gl<typename G::combo_p3_C_sc_global_gl>(C_col_sc_global),
-        .E_col = kittens::py::tensor_to_gl<typename G::combo_p3_E_gl>(E_col),
+            B_sc, 1,
+            B_sc.dim() == 2 ? B_sc.size(0) / 128 : B_sc.size(0),
+            B_sc.dim() == 2 ? B_sc.size(1) / 4 : B_sc.size(1), 256),
+        .C_col_sc_global = kittens::py::tensor_to_gl<typename G::combo_p3_C_sc_global_gl>(B_sc_global),
+        .E_col = kittens::py::tensor_to_gl<typename G::combo_p3_E_gl>(A),
         .E_col_sc = kittens::py::tensor_to_gl<typename G::combo_p3_E_sc_gl, false>(
-            E_col_sc, 1, E_col_sc.size(0), E_col_sc.size(1), 256),
-        .E_col_sc_global = kittens::py::tensor_to_gl<typename G::combo_p3_E_sc_global_gl>(E_col_sc_global),
-        .dE_out = kittens::py::tensor_to_gl<typename G::combo_dE_gl>(dE_out),
-        .dC_out = kittens::py::tensor_to_gl<typename G::combo_dC_gl>(dC_out),
+            A_sc, 1,
+            A_sc.dim() == 2 ? A_sc.size(0) / 128 : A_sc.size(0),
+            A_sc.dim() == 2 ? A_sc.size(1) / 4 : A_sc.size(1), 256),
+        .E_col_sc_global = kittens::py::tensor_to_gl<typename G::combo_p3_E_sc_global_gl>(A_sc_global),
+        .dE_out = kittens::py::tensor_to_gl<typename G::combo_dE_gl>(unused_combo_out),
+        .dC_out = kittens::py::tensor_to_gl<typename G::combo_dC_gl>(unused_combo_out),
         .combo_mode = G::COMBO_MODE_GONLY,
+        .diag_stage_cycles = nullptr,
     };
     kittens::py::launch_kernel<C, G, nvfp4_cce_backward_v3::backward_kernel_v3_streaming_3wg<C>>(g);
 }
@@ -252,6 +261,10 @@ static void launch_public_v3_fp4_frontend_for_bridge_diag(
     TORCH_CHECK(err == cudaSuccess,
                 "Failed to clear v6 public-v3 bridge frontend diag buffer: ",
                 cudaGetErrorString(err));
+    const int combo_dummy_extent = (M > N) ? M : N;
+    auto unused_combo_out = A.new_empty(
+        {combo_dummy_extent, combo_dummy_extent},
+        A.options().dtype(c10::kBFloat16));
 
     G g {
         .A = kittens::py::tensor_to_gl<typename G::A_fp4x2_gl>(A),
@@ -280,16 +293,20 @@ static void launch_public_v3_fp4_frontend_for_bridge_diag(
         .M = M,
         .N = N,
         .encode_centric = encode_centric,
-        .C_col = kittens::py::tensor_to_gl<typename G::combo_p3_C_gl>(C_col),
+        .C_col = kittens::py::tensor_to_gl<typename G::combo_p3_C_gl>(B),
         .C_col_sc = kittens::py::tensor_to_gl<typename G::combo_p3_C_sc_gl, false>(
-            C_col_sc, 1, C_col_sc.size(0), C_col_sc.size(1), 256),
-        .C_col_sc_global = kittens::py::tensor_to_gl<typename G::combo_p3_C_sc_global_gl>(C_col_sc_global),
-        .E_col = kittens::py::tensor_to_gl<typename G::combo_p3_E_gl>(E_col),
+            B_sc, 1,
+            B_sc.dim() == 2 ? B_sc.size(0) / 128 : B_sc.size(0),
+            B_sc.dim() == 2 ? B_sc.size(1) / 4 : B_sc.size(1), 256),
+        .C_col_sc_global = kittens::py::tensor_to_gl<typename G::combo_p3_C_sc_global_gl>(B_sc_global),
+        .E_col = kittens::py::tensor_to_gl<typename G::combo_p3_E_gl>(A),
         .E_col_sc = kittens::py::tensor_to_gl<typename G::combo_p3_E_sc_gl, false>(
-            E_col_sc, 1, E_col_sc.size(0), E_col_sc.size(1), 256),
-        .E_col_sc_global = kittens::py::tensor_to_gl<typename G::combo_p3_E_sc_global_gl>(E_col_sc_global),
-        .dE_out = kittens::py::tensor_to_gl<typename G::combo_dE_gl>(dE_out),
-        .dC_out = kittens::py::tensor_to_gl<typename G::combo_dC_gl>(dC_out),
+            A_sc, 1,
+            A_sc.dim() == 2 ? A_sc.size(0) / 128 : A_sc.size(0),
+            A_sc.dim() == 2 ? A_sc.size(1) / 4 : A_sc.size(1), 256),
+        .E_col_sc_global = kittens::py::tensor_to_gl<typename G::combo_p3_E_sc_global_gl>(A_sc_global),
+        .dE_out = kittens::py::tensor_to_gl<typename G::combo_dE_gl>(unused_combo_out),
+        .dC_out = kittens::py::tensor_to_gl<typename G::combo_dC_gl>(unused_combo_out),
         .combo_mode = G::COMBO_MODE_GONLY,
         .diag_stage_cycles = reinterpret_cast<uint64_t*>(diag_stage_cycles.data_ptr<int64_t>())
     };

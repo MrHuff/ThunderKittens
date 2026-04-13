@@ -875,6 +875,14 @@ struct config_traits_3wg {
     static constexpr bool DEBUG_SKIP_ROW_RECYCLE_WAIT = false;
     static constexpr bool DEBUG_SKIP_COL_RECYCLE_WAIT = false;
     static constexpr bool DEBUG_ROW_WAIT_ON_COL_READY = false;
+    static constexpr int DEBUG_PUBLIC_COLONLY_STAGE_CUT = 0;
+    static constexpr bool DEBUG_PUBLIC_COLONLY_LEGACY_STORE = false;
+    static constexpr bool DEBUG_PUBLIC_COLONLY_TRACE = false;
+    static constexpr bool DEBUG_PUBLIC_COLONLY_LATE_TRACE = false;
+    static constexpr int DEBUG_CONSUMER_WG_SYNC_ID_OVERRIDE = -1;
+    static constexpr int DEBUG_QUANTIZER_WG_SYNC_ID_OVERRIDE = -1;
+    static constexpr bool DEBUG_CONSUMER_POST_GENERIC_RECYCLE_SYNC = false;
+    static constexpr bool DEBUG_PUBLIC_COLONLY_POST_GAP1B_SYNC = false;
     static constexpr bool DEBUG_DISABLE_CONSUMER_ROW_STAGE_PRODUCTION = false;
     static constexpr bool DEBUG_DISABLE_CONSUMER_COL_STAGE_PRODUCTION = false;
     static constexpr bool ENABLE_STOREADD_COMBO = false;
@@ -1083,6 +1091,86 @@ struct config_traits_debug_row_wait_on_col_ready {
 template <typename C>
 struct config_traits_debug_row_wait_on_col_ready<C, std::void_t<decltype(config_traits_3wg<C>::DEBUG_ROW_WAIT_ON_COL_READY)>> {
     static constexpr bool value = config_traits_3wg<C>::DEBUG_ROW_WAIT_ON_COL_READY;
+};
+
+template <typename C, typename = void>
+struct config_traits_debug_public_colonly_stage_cut {
+    static constexpr int value = 0;
+};
+
+template <typename C>
+struct config_traits_debug_public_colonly_stage_cut<C, std::void_t<decltype(config_traits_3wg<C>::DEBUG_PUBLIC_COLONLY_STAGE_CUT)>> {
+    static constexpr int value = config_traits_3wg<C>::DEBUG_PUBLIC_COLONLY_STAGE_CUT;
+};
+
+template <typename C, typename = void>
+struct config_traits_debug_public_colonly_legacy_store {
+    static constexpr bool value = false;
+};
+
+template <typename C>
+struct config_traits_debug_public_colonly_legacy_store<C, std::void_t<decltype(config_traits_3wg<C>::DEBUG_PUBLIC_COLONLY_LEGACY_STORE)>> {
+    static constexpr bool value = config_traits_3wg<C>::DEBUG_PUBLIC_COLONLY_LEGACY_STORE;
+};
+
+template <typename C, typename = void>
+struct config_traits_debug_public_colonly_trace {
+    static constexpr bool value = false;
+};
+
+template <typename C>
+struct config_traits_debug_public_colonly_trace<C, std::void_t<decltype(config_traits_3wg<C>::DEBUG_PUBLIC_COLONLY_TRACE)>> {
+    static constexpr bool value = config_traits_3wg<C>::DEBUG_PUBLIC_COLONLY_TRACE;
+};
+
+template <typename C, typename = void>
+struct config_traits_debug_public_colonly_late_trace {
+    static constexpr bool value = false;
+};
+
+template <typename C>
+struct config_traits_debug_public_colonly_late_trace<C, std::void_t<decltype(config_traits_3wg<C>::DEBUG_PUBLIC_COLONLY_LATE_TRACE)>> {
+    static constexpr bool value = config_traits_3wg<C>::DEBUG_PUBLIC_COLONLY_LATE_TRACE;
+};
+
+template <typename C, typename = void>
+struct config_traits_debug_consumer_wg_sync_id_override {
+    static constexpr int value = -1;
+};
+
+template <typename C>
+struct config_traits_debug_consumer_wg_sync_id_override<C, std::void_t<decltype(config_traits_3wg<C>::DEBUG_CONSUMER_WG_SYNC_ID_OVERRIDE)>> {
+    static constexpr int value = config_traits_3wg<C>::DEBUG_CONSUMER_WG_SYNC_ID_OVERRIDE;
+};
+
+template <typename C, typename = void>
+struct config_traits_debug_quantizer_wg_sync_id_override {
+    static constexpr int value = -1;
+};
+
+template <typename C>
+struct config_traits_debug_quantizer_wg_sync_id_override<C, std::void_t<decltype(config_traits_3wg<C>::DEBUG_QUANTIZER_WG_SYNC_ID_OVERRIDE)>> {
+    static constexpr int value = config_traits_3wg<C>::DEBUG_QUANTIZER_WG_SYNC_ID_OVERRIDE;
+};
+
+template <typename C, typename = void>
+struct config_traits_debug_consumer_post_generic_recycle_sync {
+    static constexpr bool value = false;
+};
+
+template <typename C>
+struct config_traits_debug_consumer_post_generic_recycle_sync<C, std::void_t<decltype(config_traits_3wg<C>::DEBUG_CONSUMER_POST_GENERIC_RECYCLE_SYNC)>> {
+    static constexpr bool value = config_traits_3wg<C>::DEBUG_CONSUMER_POST_GENERIC_RECYCLE_SYNC;
+};
+
+template <typename C, typename = void>
+struct config_traits_debug_public_colonly_post_gap1b_sync {
+    static constexpr bool value = false;
+};
+
+template <typename C>
+struct config_traits_debug_public_colonly_post_gap1b_sync<C, std::void_t<decltype(config_traits_3wg<C>::DEBUG_PUBLIC_COLONLY_POST_GAP1B_SYNC)>> {
+    static constexpr bool value = config_traits_3wg<C>::DEBUG_PUBLIC_COLONLY_POST_GAP1B_SYNC;
 };
 
 template <typename C, typename = void>
@@ -2322,6 +2410,376 @@ struct config_traits_col_ready_per_row16<experimental_config_colwg_colpairpad_ro
 };
 
 template <int _LOAD_PIPE_DEPTH, int _SUPERGROUP_SIZE, bool _PINGPONG = true, int _EPI_PIPE_DEPTH = 4>
+struct experimental_config_colwg_colpairpad_rowpair_lanepairrecord_rowsync_dualfloatcache_rowhwfp4_row16ready_overlap_colwaitskip {
+    using base = experimental_config_colwg_colpairpad_rowpair_lanepairrecord_rowsync_dualfloatcache_rowhwfp4_row16ready_overlap<_LOAD_PIPE_DEPTH, _SUPERGROUP_SIZE, _PINGPONG, _EPI_PIPE_DEPTH>;
+    static constexpr int CLUSTER_SIZE = base::CLUSTER_SIZE;
+    static constexpr bool USE_PDL = base::USE_PDL;
+    static constexpr int CONSUMER_WARPGROUPS = base::CONSUMER_WARPGROUPS;
+    static constexpr int QUANTIZER_WARPGROUPS = base::QUANTIZER_WARPGROUPS;
+    static constexpr int ROW_QUANTIZER_WARPGROUPS = base::ROW_QUANTIZER_WARPGROUPS;
+    static constexpr int COL_QUANTIZER_WARPGROUPS = base::COL_QUANTIZER_WARPGROUPS;
+    static constexpr int PRODUCER_WARPGROUPS = base::PRODUCER_WARPGROUPS;
+    static constexpr int NUM_WARPGROUPS = base::NUM_WARPGROUPS;
+    static constexpr int NUM_WARPS = base::NUM_WARPS;
+    static constexpr int NUM_THREADS = base::NUM_THREADS;
+    static constexpr int LOAD_PIPE_DEPTH = base::LOAD_PIPE_DEPTH;
+    static constexpr int EPI_PIPE_DEPTH = base::EPI_PIPE_DEPTH;
+    static constexpr bool OVERLAP_EPI = base::OVERLAP_EPI;
+    static constexpr bool PINGPONG = base::PINGPONG;
+    static constexpr int SUPERGROUP_SIZE = base::SUPERGROUP_SIZE;
+    static constexpr int Mb = base::Mb;
+    static constexpr int Nb = base::Nb;
+    static constexpr int Kb = base::Kb;
+    static constexpr int B_SC_SIZE = base::B_SC_SIZE;
+    static constexpr int MMA_PER_TILE = base::MMA_PER_TILE;
+    static constexpr int BF16_STAGE_COUNT = base::BF16_STAGE_COUNT;
+    static constexpr int NUM_D_TILES = base::NUM_D_TILES;
+    static constexpr bool USE_BF16_ACCUM = base::USE_BF16_ACCUM;
+    static constexpr bool CONSUMER_DO_ROW = base::CONSUMER_DO_ROW;
+    static constexpr bool COL_HELPERS_USE_ALL_QUANTIZER_WGS = base::COL_HELPERS_USE_ALL_QUANTIZER_WGS;
+    static constexpr bool USE_COL_PLAIN_STAGE = base::USE_COL_PLAIN_STAGE;
+    static constexpr bool EARLY_COL_READY = base::EARLY_COL_READY;
+    static constexpr bool CACHE_COL_VALUES = base::CACHE_COL_VALUES;
+    static constexpr bool CACHE_COL_VALUES_BF16 = base::CACHE_COL_VALUES_BF16;
+    static constexpr bool CACHE_COL_VALUES_BF16_PAIRS = base::CACHE_COL_VALUES_BF16_PAIRS;
+    static constexpr bool FAST_ALIGNED_QUANT = base::FAST_ALIGNED_QUANT;
+    static constexpr bool ROW_QUANT_FROM_REGS = base::ROW_QUANT_FROM_REGS;
+};
+
+template <int _LOAD_PIPE_DEPTH, int _SUPERGROUP_SIZE, bool _PINGPONG, int _EPI_PIPE_DEPTH>
+struct config_traits_3wg<experimental_config_colwg_colpairpad_rowpair_lanepairrecord_rowsync_dualfloatcache_rowhwfp4_row16ready_overlap_colwaitskip<_LOAD_PIPE_DEPTH, _SUPERGROUP_SIZE, _PINGPONG, _EPI_PIPE_DEPTH>>
+    : config_traits_3wg<experimental_config_colwg_colpairpad_rowpair_lanepairrecord_rowsync_dualfloatcache_rowhwfp4_row16ready_overlap<_LOAD_PIPE_DEPTH, _SUPERGROUP_SIZE, _PINGPONG, _EPI_PIPE_DEPTH>> {
+    static constexpr bool DEBUG_SKIP_COL_READY_WAIT = true;
+};
+
+template <int _LOAD_PIPE_DEPTH, int _SUPERGROUP_SIZE, bool _PINGPONG, int _EPI_PIPE_DEPTH>
+struct config_traits_col_ready_per_row16<experimental_config_colwg_colpairpad_rowpair_lanepairrecord_rowsync_dualfloatcache_rowhwfp4_row16ready_overlap_colwaitskip<_LOAD_PIPE_DEPTH, _SUPERGROUP_SIZE, _PINGPONG, _EPI_PIPE_DEPTH>> {
+    static constexpr bool value = true;
+};
+
+template <int _LOAD_PIPE_DEPTH, int _SUPERGROUP_SIZE, bool _PINGPONG = true, int _EPI_PIPE_DEPTH = 4>
+struct experimental_config_colwg_colpairpad_rowpair_lanepairrecord_rowsync_dualfloatcache_rowhwfp4_row16ready_overlap_colrecycleskip {
+    using base = experimental_config_colwg_colpairpad_rowpair_lanepairrecord_rowsync_dualfloatcache_rowhwfp4_row16ready_overlap<_LOAD_PIPE_DEPTH, _SUPERGROUP_SIZE, _PINGPONG, _EPI_PIPE_DEPTH>;
+    static constexpr int CLUSTER_SIZE = base::CLUSTER_SIZE;
+    static constexpr bool USE_PDL = base::USE_PDL;
+    static constexpr int CONSUMER_WARPGROUPS = base::CONSUMER_WARPGROUPS;
+    static constexpr int QUANTIZER_WARPGROUPS = base::QUANTIZER_WARPGROUPS;
+    static constexpr int ROW_QUANTIZER_WARPGROUPS = base::ROW_QUANTIZER_WARPGROUPS;
+    static constexpr int COL_QUANTIZER_WARPGROUPS = base::COL_QUANTIZER_WARPGROUPS;
+    static constexpr int PRODUCER_WARPGROUPS = base::PRODUCER_WARPGROUPS;
+    static constexpr int NUM_WARPGROUPS = base::NUM_WARPGROUPS;
+    static constexpr int NUM_WARPS = base::NUM_WARPS;
+    static constexpr int NUM_THREADS = base::NUM_THREADS;
+    static constexpr int LOAD_PIPE_DEPTH = base::LOAD_PIPE_DEPTH;
+    static constexpr int EPI_PIPE_DEPTH = base::EPI_PIPE_DEPTH;
+    static constexpr bool OVERLAP_EPI = base::OVERLAP_EPI;
+    static constexpr bool PINGPONG = base::PINGPONG;
+    static constexpr int SUPERGROUP_SIZE = base::SUPERGROUP_SIZE;
+    static constexpr int Mb = base::Mb;
+    static constexpr int Nb = base::Nb;
+    static constexpr int Kb = base::Kb;
+    static constexpr int B_SC_SIZE = base::B_SC_SIZE;
+    static constexpr int MMA_PER_TILE = base::MMA_PER_TILE;
+    static constexpr int BF16_STAGE_COUNT = base::BF16_STAGE_COUNT;
+    static constexpr int NUM_D_TILES = base::NUM_D_TILES;
+    static constexpr bool USE_BF16_ACCUM = base::USE_BF16_ACCUM;
+    static constexpr bool CONSUMER_DO_ROW = base::CONSUMER_DO_ROW;
+    static constexpr bool COL_HELPERS_USE_ALL_QUANTIZER_WGS = base::COL_HELPERS_USE_ALL_QUANTIZER_WGS;
+    static constexpr bool USE_COL_PLAIN_STAGE = base::USE_COL_PLAIN_STAGE;
+    static constexpr bool EARLY_COL_READY = base::EARLY_COL_READY;
+    static constexpr bool CACHE_COL_VALUES = base::CACHE_COL_VALUES;
+    static constexpr bool CACHE_COL_VALUES_BF16 = base::CACHE_COL_VALUES_BF16;
+    static constexpr bool CACHE_COL_VALUES_BF16_PAIRS = base::CACHE_COL_VALUES_BF16_PAIRS;
+    static constexpr bool FAST_ALIGNED_QUANT = base::FAST_ALIGNED_QUANT;
+    static constexpr bool ROW_QUANT_FROM_REGS = base::ROW_QUANT_FROM_REGS;
+};
+
+template <int _LOAD_PIPE_DEPTH, int _SUPERGROUP_SIZE, bool _PINGPONG, int _EPI_PIPE_DEPTH>
+struct config_traits_3wg<experimental_config_colwg_colpairpad_rowpair_lanepairrecord_rowsync_dualfloatcache_rowhwfp4_row16ready_overlap_colrecycleskip<_LOAD_PIPE_DEPTH, _SUPERGROUP_SIZE, _PINGPONG, _EPI_PIPE_DEPTH>>
+    : config_traits_3wg<experimental_config_colwg_colpairpad_rowpair_lanepairrecord_rowsync_dualfloatcache_rowhwfp4_row16ready_overlap<_LOAD_PIPE_DEPTH, _SUPERGROUP_SIZE, _PINGPONG, _EPI_PIPE_DEPTH>> {
+    static constexpr bool DEBUG_SKIP_COL_RECYCLE_WAIT = true;
+};
+
+template <int _LOAD_PIPE_DEPTH, int _SUPERGROUP_SIZE, bool _PINGPONG, int _EPI_PIPE_DEPTH>
+struct config_traits_col_ready_per_row16<experimental_config_colwg_colpairpad_rowpair_lanepairrecord_rowsync_dualfloatcache_rowhwfp4_row16ready_overlap_colrecycleskip<_LOAD_PIPE_DEPTH, _SUPERGROUP_SIZE, _PINGPONG, _EPI_PIPE_DEPTH>> {
+    static constexpr bool value = true;
+};
+
+template <int _LOAD_PIPE_DEPTH, int _SUPERGROUP_SIZE, bool _PINGPONG = true, int _EPI_PIPE_DEPTH = 4>
+struct experimental_config_colwg_colpairpad_rowpair_lanepairrecord_rowsync_dualfloatcache_rowhwfp4_row16ready_overlap_rowskipboth {
+    using base = experimental_config_colwg_colpairpad_rowpair_lanepairrecord_rowsync_dualfloatcache_rowhwfp4_row16ready_overlap<_LOAD_PIPE_DEPTH, _SUPERGROUP_SIZE, _PINGPONG, _EPI_PIPE_DEPTH>;
+    static constexpr int CLUSTER_SIZE = base::CLUSTER_SIZE;
+    static constexpr bool USE_PDL = base::USE_PDL;
+    static constexpr int CONSUMER_WARPGROUPS = base::CONSUMER_WARPGROUPS;
+    static constexpr int QUANTIZER_WARPGROUPS = base::QUANTIZER_WARPGROUPS;
+    static constexpr int ROW_QUANTIZER_WARPGROUPS = base::ROW_QUANTIZER_WARPGROUPS;
+    static constexpr int COL_QUANTIZER_WARPGROUPS = base::COL_QUANTIZER_WARPGROUPS;
+    static constexpr int PRODUCER_WARPGROUPS = base::PRODUCER_WARPGROUPS;
+    static constexpr int NUM_WARPGROUPS = base::NUM_WARPGROUPS;
+    static constexpr int NUM_WARPS = base::NUM_WARPS;
+    static constexpr int NUM_THREADS = base::NUM_THREADS;
+    static constexpr int LOAD_PIPE_DEPTH = base::LOAD_PIPE_DEPTH;
+    static constexpr int EPI_PIPE_DEPTH = base::EPI_PIPE_DEPTH;
+    static constexpr bool OVERLAP_EPI = base::OVERLAP_EPI;
+    static constexpr bool PINGPONG = base::PINGPONG;
+    static constexpr int SUPERGROUP_SIZE = base::SUPERGROUP_SIZE;
+    static constexpr int Mb = base::Mb;
+    static constexpr int Nb = base::Nb;
+    static constexpr int Kb = base::Kb;
+    static constexpr int B_SC_SIZE = base::B_SC_SIZE;
+    static constexpr int MMA_PER_TILE = base::MMA_PER_TILE;
+    static constexpr int BF16_STAGE_COUNT = base::BF16_STAGE_COUNT;
+    static constexpr int NUM_D_TILES = base::NUM_D_TILES;
+    static constexpr bool USE_BF16_ACCUM = base::USE_BF16_ACCUM;
+    static constexpr bool CONSUMER_DO_ROW = base::CONSUMER_DO_ROW;
+    static constexpr bool COL_HELPERS_USE_ALL_QUANTIZER_WGS = base::COL_HELPERS_USE_ALL_QUANTIZER_WGS;
+    static constexpr bool USE_COL_PLAIN_STAGE = base::USE_COL_PLAIN_STAGE;
+    static constexpr bool EARLY_COL_READY = base::EARLY_COL_READY;
+    static constexpr bool CACHE_COL_VALUES = base::CACHE_COL_VALUES;
+    static constexpr bool CACHE_COL_VALUES_BF16 = base::CACHE_COL_VALUES_BF16;
+    static constexpr bool CACHE_COL_VALUES_BF16_PAIRS = base::CACHE_COL_VALUES_BF16_PAIRS;
+    static constexpr bool FAST_ALIGNED_QUANT = base::FAST_ALIGNED_QUANT;
+    static constexpr bool ROW_QUANT_FROM_REGS = base::ROW_QUANT_FROM_REGS;
+};
+
+template <int _LOAD_PIPE_DEPTH, int _SUPERGROUP_SIZE, bool _PINGPONG, int _EPI_PIPE_DEPTH>
+struct config_traits_3wg<experimental_config_colwg_colpairpad_rowpair_lanepairrecord_rowsync_dualfloatcache_rowhwfp4_row16ready_overlap_rowskipboth<_LOAD_PIPE_DEPTH, _SUPERGROUP_SIZE, _PINGPONG, _EPI_PIPE_DEPTH>>
+    : config_traits_3wg<experimental_config_colwg_colpairpad_rowpair_lanepairrecord_rowsync_dualfloatcache_rowhwfp4_row16ready_overlap<_LOAD_PIPE_DEPTH, _SUPERGROUP_SIZE, _PINGPONG, _EPI_PIPE_DEPTH>> {
+    static constexpr bool DEBUG_SKIP_ROW_READY_WAIT = true;
+    static constexpr bool DEBUG_SKIP_ROW_RECYCLE_WAIT = true;
+};
+
+template <int _LOAD_PIPE_DEPTH, int _SUPERGROUP_SIZE, bool _PINGPONG, int _EPI_PIPE_DEPTH>
+struct config_traits_col_ready_per_row16<experimental_config_colwg_colpairpad_rowpair_lanepairrecord_rowsync_dualfloatcache_rowhwfp4_row16ready_overlap_rowskipboth<_LOAD_PIPE_DEPTH, _SUPERGROUP_SIZE, _PINGPONG, _EPI_PIPE_DEPTH>> {
+    static constexpr bool value = true;
+};
+
+template <int _LOAD_PIPE_DEPTH, int _SUPERGROUP_SIZE, bool _PINGPONG = true, int _EPI_PIPE_DEPTH = 4>
+struct experimental_config_colwg_colpairpad_rowpair_lanepairrecord_rowsync_dualfloatcache_rowhwfp4_row16ready_overlap_colskipboth {
+    using base = experimental_config_colwg_colpairpad_rowpair_lanepairrecord_rowsync_dualfloatcache_rowhwfp4_row16ready_overlap<_LOAD_PIPE_DEPTH, _SUPERGROUP_SIZE, _PINGPONG, _EPI_PIPE_DEPTH>;
+    static constexpr int CLUSTER_SIZE = base::CLUSTER_SIZE;
+    static constexpr bool USE_PDL = base::USE_PDL;
+    static constexpr int CONSUMER_WARPGROUPS = base::CONSUMER_WARPGROUPS;
+    static constexpr int QUANTIZER_WARPGROUPS = base::QUANTIZER_WARPGROUPS;
+    static constexpr int ROW_QUANTIZER_WARPGROUPS = base::ROW_QUANTIZER_WARPGROUPS;
+    static constexpr int COL_QUANTIZER_WARPGROUPS = base::COL_QUANTIZER_WARPGROUPS;
+    static constexpr int PRODUCER_WARPGROUPS = base::PRODUCER_WARPGROUPS;
+    static constexpr int NUM_WARPGROUPS = base::NUM_WARPGROUPS;
+    static constexpr int NUM_WARPS = base::NUM_WARPS;
+    static constexpr int NUM_THREADS = base::NUM_THREADS;
+    static constexpr int LOAD_PIPE_DEPTH = base::LOAD_PIPE_DEPTH;
+    static constexpr int EPI_PIPE_DEPTH = base::EPI_PIPE_DEPTH;
+    static constexpr bool OVERLAP_EPI = base::OVERLAP_EPI;
+    static constexpr bool PINGPONG = base::PINGPONG;
+    static constexpr int SUPERGROUP_SIZE = base::SUPERGROUP_SIZE;
+    static constexpr int Mb = base::Mb;
+    static constexpr int Nb = base::Nb;
+    static constexpr int Kb = base::Kb;
+    static constexpr int B_SC_SIZE = base::B_SC_SIZE;
+    static constexpr int MMA_PER_TILE = base::MMA_PER_TILE;
+    static constexpr int BF16_STAGE_COUNT = base::BF16_STAGE_COUNT;
+    static constexpr int NUM_D_TILES = base::NUM_D_TILES;
+    static constexpr bool USE_BF16_ACCUM = base::USE_BF16_ACCUM;
+    static constexpr bool CONSUMER_DO_ROW = base::CONSUMER_DO_ROW;
+    static constexpr bool COL_HELPERS_USE_ALL_QUANTIZER_WGS = base::COL_HELPERS_USE_ALL_QUANTIZER_WGS;
+    static constexpr bool USE_COL_PLAIN_STAGE = base::USE_COL_PLAIN_STAGE;
+    static constexpr bool EARLY_COL_READY = base::EARLY_COL_READY;
+    static constexpr bool CACHE_COL_VALUES = base::CACHE_COL_VALUES;
+    static constexpr bool CACHE_COL_VALUES_BF16 = base::CACHE_COL_VALUES_BF16;
+    static constexpr bool CACHE_COL_VALUES_BF16_PAIRS = base::CACHE_COL_VALUES_BF16_PAIRS;
+    static constexpr bool FAST_ALIGNED_QUANT = base::FAST_ALIGNED_QUANT;
+    static constexpr bool ROW_QUANT_FROM_REGS = base::ROW_QUANT_FROM_REGS;
+};
+
+template <int _LOAD_PIPE_DEPTH, int _SUPERGROUP_SIZE, bool _PINGPONG, int _EPI_PIPE_DEPTH>
+struct config_traits_3wg<experimental_config_colwg_colpairpad_rowpair_lanepairrecord_rowsync_dualfloatcache_rowhwfp4_row16ready_overlap_colskipboth<_LOAD_PIPE_DEPTH, _SUPERGROUP_SIZE, _PINGPONG, _EPI_PIPE_DEPTH>>
+    : config_traits_3wg<experimental_config_colwg_colpairpad_rowpair_lanepairrecord_rowsync_dualfloatcache_rowhwfp4_row16ready_overlap<_LOAD_PIPE_DEPTH, _SUPERGROUP_SIZE, _PINGPONG, _EPI_PIPE_DEPTH>> {
+    static constexpr bool DEBUG_SKIP_COL_READY_WAIT = true;
+    static constexpr bool DEBUG_SKIP_COL_RECYCLE_WAIT = true;
+};
+
+template <int _LOAD_PIPE_DEPTH, int _SUPERGROUP_SIZE, bool _PINGPONG, int _EPI_PIPE_DEPTH>
+struct config_traits_col_ready_per_row16<experimental_config_colwg_colpairpad_rowpair_lanepairrecord_rowsync_dualfloatcache_rowhwfp4_row16ready_overlap_colskipboth<_LOAD_PIPE_DEPTH, _SUPERGROUP_SIZE, _PINGPONG, _EPI_PIPE_DEPTH>> {
+    static constexpr bool value = true;
+};
+
+template <int _STAGE_CUT, int _LOAD_PIPE_DEPTH, int _SUPERGROUP_SIZE, bool _PINGPONG = true, int _EPI_PIPE_DEPTH = 4>
+struct experimental_config_colwg_colpairpad_rowpair_lanepairrecord_rowsync_dualfloatcache_rowhwfp4_row16ready_overlap_colcut {
+    using base = experimental_config_colwg_colpairpad_rowpair_lanepairrecord_rowsync_dualfloatcache_rowhwfp4_row16ready_overlap<_LOAD_PIPE_DEPTH, _SUPERGROUP_SIZE, _PINGPONG, _EPI_PIPE_DEPTH>;
+    static constexpr int CLUSTER_SIZE = base::CLUSTER_SIZE;
+    static constexpr bool USE_PDL = base::USE_PDL;
+    static constexpr int CONSUMER_WARPGROUPS = base::CONSUMER_WARPGROUPS;
+    static constexpr int QUANTIZER_WARPGROUPS = base::QUANTIZER_WARPGROUPS;
+    static constexpr int ROW_QUANTIZER_WARPGROUPS = base::ROW_QUANTIZER_WARPGROUPS;
+    static constexpr int COL_QUANTIZER_WARPGROUPS = base::COL_QUANTIZER_WARPGROUPS;
+    static constexpr int PRODUCER_WARPGROUPS = base::PRODUCER_WARPGROUPS;
+    static constexpr int NUM_WARPGROUPS = base::NUM_WARPGROUPS;
+    static constexpr int NUM_WARPS = base::NUM_WARPS;
+    static constexpr int NUM_THREADS = base::NUM_THREADS;
+    static constexpr int LOAD_PIPE_DEPTH = base::LOAD_PIPE_DEPTH;
+    static constexpr int EPI_PIPE_DEPTH = base::EPI_PIPE_DEPTH;
+    static constexpr bool OVERLAP_EPI = base::OVERLAP_EPI;
+    static constexpr bool PINGPONG = base::PINGPONG;
+    static constexpr int SUPERGROUP_SIZE = base::SUPERGROUP_SIZE;
+    static constexpr int Mb = base::Mb;
+    static constexpr int Nb = base::Nb;
+    static constexpr int Kb = base::Kb;
+    static constexpr int B_SC_SIZE = base::B_SC_SIZE;
+    static constexpr int MMA_PER_TILE = base::MMA_PER_TILE;
+    static constexpr int BF16_STAGE_COUNT = base::BF16_STAGE_COUNT;
+    static constexpr int NUM_D_TILES = base::NUM_D_TILES;
+    static constexpr bool USE_BF16_ACCUM = base::USE_BF16_ACCUM;
+    static constexpr bool CONSUMER_DO_ROW = base::CONSUMER_DO_ROW;
+    static constexpr bool COL_HELPERS_USE_ALL_QUANTIZER_WGS = base::COL_HELPERS_USE_ALL_QUANTIZER_WGS;
+    static constexpr bool USE_COL_PLAIN_STAGE = base::USE_COL_PLAIN_STAGE;
+    static constexpr bool EARLY_COL_READY = base::EARLY_COL_READY;
+    static constexpr bool CACHE_COL_VALUES = base::CACHE_COL_VALUES;
+    static constexpr bool CACHE_COL_VALUES_BF16 = base::CACHE_COL_VALUES_BF16;
+    static constexpr bool CACHE_COL_VALUES_BF16_PAIRS = base::CACHE_COL_VALUES_BF16_PAIRS;
+    static constexpr bool FAST_ALIGNED_QUANT = base::FAST_ALIGNED_QUANT;
+    static constexpr bool ROW_QUANT_FROM_REGS = base::ROW_QUANT_FROM_REGS;
+};
+
+template <int _STAGE_CUT, int _LOAD_PIPE_DEPTH, int _SUPERGROUP_SIZE, bool _PINGPONG, int _EPI_PIPE_DEPTH>
+struct config_traits_3wg<experimental_config_colwg_colpairpad_rowpair_lanepairrecord_rowsync_dualfloatcache_rowhwfp4_row16ready_overlap_colcut<_STAGE_CUT, _LOAD_PIPE_DEPTH, _SUPERGROUP_SIZE, _PINGPONG, _EPI_PIPE_DEPTH>>
+    : config_traits_3wg<experimental_config_colwg_colpairpad_rowpair_lanepairrecord_rowsync_dualfloatcache_rowhwfp4_row16ready_overlap<_LOAD_PIPE_DEPTH, _SUPERGROUP_SIZE, _PINGPONG, _EPI_PIPE_DEPTH>> {
+    static constexpr int DEBUG_PUBLIC_COLONLY_STAGE_CUT = _STAGE_CUT;
+};
+
+template <int _STAGE_CUT, int _LOAD_PIPE_DEPTH, int _SUPERGROUP_SIZE, bool _PINGPONG, int _EPI_PIPE_DEPTH>
+struct config_traits_col_ready_per_row16<experimental_config_colwg_colpairpad_rowpair_lanepairrecord_rowsync_dualfloatcache_rowhwfp4_row16ready_overlap_colcut<_STAGE_CUT, _LOAD_PIPE_DEPTH, _SUPERGROUP_SIZE, _PINGPONG, _EPI_PIPE_DEPTH>> {
+    static constexpr bool value = true;
+};
+
+template <typename Base>
+struct experimental_config_debug_public_colonly_legacy_store : Base {};
+
+template <typename Base>
+struct config_traits_3wg<experimental_config_debug_public_colonly_legacy_store<Base>>
+    : config_traits_3wg<Base> {
+    static constexpr bool DEBUG_PUBLIC_COLONLY_LEGACY_STORE = true;
+};
+
+template <typename Base>
+struct config_traits_col_ready_per_row16<experimental_config_debug_public_colonly_legacy_store<Base>> {
+    static constexpr bool value = config_traits_col_ready_per_row16<Base>::value;
+};
+
+template <typename Base>
+struct experimental_config_debug_public_colonly_trace : Base {};
+
+template <typename Base>
+struct config_traits_3wg<experimental_config_debug_public_colonly_trace<Base>>
+    : config_traits_3wg<Base> {
+    static constexpr bool DEBUG_PUBLIC_COLONLY_TRACE = true;
+};
+
+template <typename Base>
+struct config_traits_col_ready_per_row16<experimental_config_debug_public_colonly_trace<Base>> {
+    static constexpr bool value = config_traits_col_ready_per_row16<Base>::value;
+};
+
+template <typename Base>
+struct experimental_config_debug_public_colonly_late_trace : Base {};
+
+template <typename Base>
+struct config_traits_3wg<experimental_config_debug_public_colonly_late_trace<Base>>
+    : config_traits_3wg<Base> {
+    static constexpr bool DEBUG_PUBLIC_COLONLY_LATE_TRACE = true;
+};
+
+template <typename Base>
+struct config_traits_col_ready_per_row16<experimental_config_debug_public_colonly_late_trace<Base>> {
+    static constexpr bool value = config_traits_col_ready_per_row16<Base>::value;
+};
+
+template <typename Base, int _SYNC_ID>
+struct experimental_config_debug_consumer_wg_sync_id : Base {};
+
+template <typename Base, int _SYNC_ID>
+struct config_traits_3wg<experimental_config_debug_consumer_wg_sync_id<Base, _SYNC_ID>>
+    : config_traits_3wg<Base> {
+    static constexpr int DEBUG_CONSUMER_WG_SYNC_ID_OVERRIDE = _SYNC_ID;
+};
+
+template <typename Base, int _SYNC_ID>
+struct config_traits_col_ready_per_row16<experimental_config_debug_consumer_wg_sync_id<Base, _SYNC_ID>> {
+    static constexpr bool value = config_traits_col_ready_per_row16<Base>::value;
+};
+
+template <typename Base, int _SYNC_ID>
+struct experimental_config_debug_quantizer_wg_sync_id : Base {};
+
+template <typename Base, int _SYNC_ID>
+struct config_traits_3wg<experimental_config_debug_quantizer_wg_sync_id<Base, _SYNC_ID>>
+    : config_traits_3wg<Base> {
+    static constexpr int DEBUG_QUANTIZER_WG_SYNC_ID_OVERRIDE = _SYNC_ID;
+};
+
+template <typename Base, int _SYNC_ID>
+struct config_traits_col_ready_per_row16<experimental_config_debug_quantizer_wg_sync_id<Base, _SYNC_ID>> {
+    static constexpr bool value = config_traits_col_ready_per_row16<Base>::value;
+};
+
+template <typename Base>
+struct experimental_config_debug_consumer_post_generic_recycle_sync : Base {};
+
+template <typename Base>
+struct config_traits_3wg<experimental_config_debug_consumer_post_generic_recycle_sync<Base>>
+    : config_traits_3wg<Base> {
+    static constexpr bool DEBUG_CONSUMER_POST_GENERIC_RECYCLE_SYNC = true;
+};
+
+template <typename Base>
+struct config_traits_col_ready_per_row16<experimental_config_debug_consumer_post_generic_recycle_sync<Base>> {
+    static constexpr bool value = config_traits_col_ready_per_row16<Base>::value;
+};
+
+template <typename Base>
+struct experimental_config_debug_public_colonly_post_gap1b_sync : Base {};
+
+template <typename Base>
+struct config_traits_3wg<experimental_config_debug_public_colonly_post_gap1b_sync<Base>>
+    : config_traits_3wg<Base> {
+    static constexpr bool DEBUG_PUBLIC_COLONLY_POST_GAP1B_SYNC = true;
+};
+
+template <typename Base>
+struct config_traits_col_ready_per_row16<experimental_config_debug_public_colonly_post_gap1b_sync<Base>> {
+    static constexpr bool value = config_traits_col_ready_per_row16<Base>::value;
+};
+
+template <typename Base>
+struct experimental_config_debug_public_colonly_byte_store : Base {};
+
+template <typename Base>
+struct config_traits_3wg<experimental_config_debug_public_colonly_byte_store<Base>>
+    : config_traits_3wg<Base> {
+    static constexpr bool PACK_COL_FP4_U64 = false;
+};
+
+template <typename Base>
+struct config_traits_col_ready_per_row16<experimental_config_debug_public_colonly_byte_store<Base>> {
+    static constexpr bool value = config_traits_col_ready_per_row16<Base>::value;
+};
+
+template <typename Base>
+struct experimental_config_debug_public_colonly_no_cache : Base {
+    static constexpr bool CACHE_COL_VALUES = false;
+    static constexpr bool CACHE_COL_VALUES_BF16 = false;
+    static constexpr bool CACHE_COL_VALUES_BF16_PAIRS = false;
+};
+
+template <typename Base>
+struct config_traits_3wg<experimental_config_debug_public_colonly_no_cache<Base>>
+    : config_traits_3wg<Base> {};
+
+template <typename Base>
+struct config_traits_col_ready_per_row16<experimental_config_debug_public_colonly_no_cache<Base>> {
+    static constexpr bool value = config_traits_col_ready_per_row16<Base>::value;
+};
+
+template <int _LOAD_PIPE_DEPTH, int _SUPERGROUP_SIZE, bool _PINGPONG = true, int _EPI_PIPE_DEPTH = 4>
 struct experimental_config_colwg_colpairpad_rowpair_lanepairrecord_rowsync_dualfloatcache_rowhwfp4_row16ready_overlap_combo_storeadd {
     using base = experimental_config_colwg_colpairpad_rowpair_lanepairrecord_rowsync_dualfloatcache_rowhwfp4_row16ready_overlap<_LOAD_PIPE_DEPTH, _SUPERGROUP_SIZE, _PINGPONG, _EPI_PIPE_DEPTH>;
     static constexpr int CLUSTER_SIZE = base::CLUSTER_SIZE;
@@ -3389,6 +3847,50 @@ struct config_traits_3wg<experimental_config_colwg_colpairpad_rowpair_lanepairre
     static constexpr bool DEBUG_DISABLE_ROW_QUANT_WORK = true;
     static constexpr bool DEBUG_DISABLE_COL_QUANT_WORK = true;
     static constexpr bool DEBUG_DISABLE_CONSUMER_COL_STAGE_PRODUCTION = true;
+};
+
+template <int _LOAD_PIPE_DEPTH, int _SUPERGROUP_SIZE, bool _PINGPONG = true, int _EPI_PIPE_DEPTH = 4>
+struct experimental_config_colwg_colpairpad_rowpair_lanepairrecord_rowsync_dualfloatcache_4wg_bothstub_nocolprod_rowskipboth {
+    using base = experimental_config_colwg_colpairpad_rowpair_lanepairrecord_rowsync_dualfloatcache_4wg_bothstub_nocolprod<_LOAD_PIPE_DEPTH, _SUPERGROUP_SIZE, _PINGPONG, _EPI_PIPE_DEPTH>;
+    static constexpr int CLUSTER_SIZE = base::CLUSTER_SIZE;
+    static constexpr bool USE_PDL = base::USE_PDL;
+    static constexpr int CONSUMER_WARPGROUPS = base::CONSUMER_WARPGROUPS;
+    static constexpr int ROW_QUANTIZER_WARPGROUPS = base::ROW_QUANTIZER_WARPGROUPS;
+    static constexpr int COL_QUANTIZER_WARPGROUPS = base::COL_QUANTIZER_WARPGROUPS;
+    static constexpr int QUANTIZER_WARPGROUPS = base::QUANTIZER_WARPGROUPS;
+    static constexpr int PRODUCER_WARPGROUPS = base::PRODUCER_WARPGROUPS;
+    static constexpr int NUM_WARPGROUPS = base::NUM_WARPGROUPS;
+    static constexpr int NUM_WARPS = base::NUM_WARPS;
+    static constexpr int NUM_THREADS = base::NUM_THREADS;
+    static constexpr int LOAD_PIPE_DEPTH = base::LOAD_PIPE_DEPTH;
+    static constexpr int EPI_PIPE_DEPTH = base::EPI_PIPE_DEPTH;
+    static constexpr bool OVERLAP_EPI = base::OVERLAP_EPI;
+    static constexpr bool PINGPONG = base::PINGPONG;
+    static constexpr int SUPERGROUP_SIZE = base::SUPERGROUP_SIZE;
+    static constexpr int Mb = base::Mb;
+    static constexpr int Nb = base::Nb;
+    static constexpr int Kb = base::Kb;
+    static constexpr int B_SC_SIZE = base::B_SC_SIZE;
+    static constexpr int MMA_PER_TILE = base::MMA_PER_TILE;
+    static constexpr int BF16_STAGE_COUNT = base::BF16_STAGE_COUNT;
+    static constexpr int NUM_D_TILES = base::NUM_D_TILES;
+    static constexpr bool USE_BF16_ACCUM = base::USE_BF16_ACCUM;
+    static constexpr bool CONSUMER_DO_ROW = base::CONSUMER_DO_ROW;
+    static constexpr bool COL_HELPERS_USE_ALL_QUANTIZER_WGS = base::COL_HELPERS_USE_ALL_QUANTIZER_WGS;
+    static constexpr bool USE_COL_PLAIN_STAGE = base::USE_COL_PLAIN_STAGE;
+    static constexpr bool EARLY_COL_READY = base::EARLY_COL_READY;
+    static constexpr bool CACHE_COL_VALUES = base::CACHE_COL_VALUES;
+    static constexpr bool CACHE_COL_VALUES_BF16 = base::CACHE_COL_VALUES_BF16;
+    static constexpr bool CACHE_COL_VALUES_BF16_PAIRS = base::CACHE_COL_VALUES_BF16_PAIRS;
+    static constexpr bool FAST_ALIGNED_QUANT = base::FAST_ALIGNED_QUANT;
+    static constexpr bool ROW_QUANT_FROM_REGS = base::ROW_QUANT_FROM_REGS;
+};
+
+template <int _LOAD_PIPE_DEPTH, int _SUPERGROUP_SIZE, bool _PINGPONG, int _EPI_PIPE_DEPTH>
+struct config_traits_3wg<experimental_config_colwg_colpairpad_rowpair_lanepairrecord_rowsync_dualfloatcache_4wg_bothstub_nocolprod_rowskipboth<_LOAD_PIPE_DEPTH, _SUPERGROUP_SIZE, _PINGPONG, _EPI_PIPE_DEPTH>>
+    : config_traits_3wg<experimental_config_colwg_colpairpad_rowpair_lanepairrecord_rowsync_dualfloatcache_4wg_bothstub_nocolprod<_LOAD_PIPE_DEPTH, _SUPERGROUP_SIZE, _PINGPONG, _EPI_PIPE_DEPTH>> {
+    static constexpr bool DEBUG_SKIP_ROW_READY_WAIT = true;
+    static constexpr bool DEBUG_SKIP_ROW_RECYCLE_WAIT = true;
 };
 
 template <int _LOAD_PIPE_DEPTH, int _SUPERGROUP_SIZE, bool _PINGPONG = true, int _EPI_PIPE_DEPTH = 4>
@@ -5144,6 +5646,9 @@ struct fused_quant_stage_storage_3wg<C, true> {
 // =========================================================================
 template <typename C>
 struct globals {
+    static constexpr bool COL_QUANT_FROM_DBF_REGS = config_traits_col_quant_from_dbf_regs<C>::value;
+    static constexpr bool ENABLE_STOREADD_COMBO = config_traits_storeadd_combo<C>::value;
+
     // FP4 tiles for logit recomputation (A=E_fp4, B=C_fp4)
     using A_fp4x2_tile = st_fp4e2m1_2<C::Mb/2, C::Kb/2>;
     using A_sc_tile    = st_hf<4, 256, false>;
@@ -5251,6 +5756,8 @@ struct globals {
 template <typename C>
 struct globals_2ctaSdupB {
     using base = globals<C>;
+    static constexpr bool COL_QUANT_FROM_DBF_REGS = config_traits_col_quant_from_dbf_regs<C>::value;
+    static constexpr bool ENABLE_STOREADD_COMBO = config_traits_storeadd_combo<C>::value;
 
     using A_fp4x2_tile = typename base::A_fp4x2_tile;
     using A_sc_tile    = typename base::A_sc_tile;
@@ -5369,6 +5876,21 @@ struct globals_3wg {
     static constexpr bool DEBUG_SKIP_ROW_RECYCLE_WAIT = config_traits_debug_skip_row_recycle_wait<C>::value;
     static constexpr bool DEBUG_SKIP_COL_RECYCLE_WAIT = config_traits_debug_skip_col_recycle_wait<C>::value;
     static constexpr bool DEBUG_ROW_WAIT_ON_COL_READY = config_traits_debug_row_wait_on_col_ready<C>::value;
+    static constexpr int DEBUG_PUBLIC_COLONLY_STAGE_CUT = config_traits_debug_public_colonly_stage_cut<C>::value;
+    static constexpr bool DEBUG_PUBLIC_COLONLY_LEGACY_STORE =
+        config_traits_debug_public_colonly_legacy_store<C>::value;
+    static constexpr bool DEBUG_PUBLIC_COLONLY_TRACE =
+        config_traits_debug_public_colonly_trace<C>::value;
+    static constexpr bool DEBUG_PUBLIC_COLONLY_LATE_TRACE =
+        config_traits_debug_public_colonly_late_trace<C>::value;
+    static constexpr int DEBUG_CONSUMER_WG_SYNC_ID_OVERRIDE =
+        config_traits_debug_consumer_wg_sync_id_override<C>::value;
+    static constexpr int DEBUG_QUANTIZER_WG_SYNC_ID_OVERRIDE =
+        config_traits_debug_quantizer_wg_sync_id_override<C>::value;
+    static constexpr bool DEBUG_CONSUMER_POST_GENERIC_RECYCLE_SYNC =
+        config_traits_debug_consumer_post_generic_recycle_sync<C>::value;
+    static constexpr bool DEBUG_PUBLIC_COLONLY_POST_GAP1B_SYNC =
+        config_traits_debug_public_colonly_post_gap1b_sync<C>::value;
     static constexpr bool DEBUG_DISABLE_CONSUMER_ROW_STAGE_PRODUCTION = config_traits_debug_disable_consumer_row_stage_production<C>::value;
     static constexpr bool DEBUG_DISABLE_CONSUMER_COL_STAGE_PRODUCTION = config_traits_debug_disable_consumer_col_stage_production<C>::value;
     static constexpr bool ENABLE_STOREADD_COMBO = config_traits_storeadd_combo<C>::value;
@@ -6151,7 +6673,25 @@ __device__ inline void backward_kernel_v3_impl(const globals<C>& g) {
         if constexpr (C::USE_BF16_ACCUM) {
             warpgroup::tma::store_async_read_wait<0>();
         }
-        if constexpr (C::USE_PDL) warpgroup::pdl::arrive();
+        if constexpr (C::USE_PDL) {
+            if constexpr (config_traits_debug_public_colonly_trace<C>::value) {
+                if (warpgroup_id < C::CONSUMER_WARPGROUPS &&
+                    warpgroup::warpid() == 0 &&
+                    warp::laneid() == 0) {
+                    printf("public col consumer pre pdl arrive cta=%d wg=%d phase=%d\n",
+                           cta_id, warpgroup_id, phase);
+                }
+            }
+            warpgroup::pdl::arrive();
+            if constexpr (config_traits_debug_public_colonly_trace<C>::value) {
+                if (warpgroup_id < C::CONSUMER_WARPGROUPS &&
+                    warpgroup::warpid() == 0 &&
+                    warp::laneid() == 0) {
+                    printf("public col consumer post pdl arrive cta=%d wg=%d phase=%d\n",
+                           cta_id, warpgroup_id, phase);
+                }
+            }
+        }
         if (warpgroup::warpid() == 0) tm_allocator.deprovision();
     }
 }
@@ -7685,7 +8225,9 @@ __device__ inline void backward_kernel_v3_streaming_3wg_impl(const globals_3wg<C
         constexpr bool combo_debug_force_row_ready_publish = false;
         uint32_t combo_row_recycle_phasebits = 0xFFFF0000;
         constexpr int CONSUMER_WG_SYNC_ID =
-            STATIC_FRONTEND_ONLY_GONLY ? 3 : (G::ROW_QUANT_IMMEDIATE_PER_ROW16 ? 3 : 1);
+            (G::DEBUG_CONSUMER_WG_SYNC_ID_OVERRIDE >= 0)
+                ? G::DEBUG_CONSUMER_WG_SYNC_ID_OVERRIDE
+                : (STATIC_FRONTEND_ONLY_GONLY ? 3 : (G::ROW_QUANT_IMMEDIATE_PER_ROW16 ? 3 : 1));
         constexpr float FP4_MAX = 6.0f;
         constexpr float E4M3_MAX = 448.0f;
         constexpr bool SAFUSED_SPLIT_STAGE_DEBUG =
@@ -7739,6 +8281,15 @@ __device__ inline void backward_kernel_v3_streaming_3wg_impl(const globals_3wg<C
             int row_within_supergroup = idx_within_supergroup % rows_in_supergroup;
             int row_block_idx = supergroup_idx * C::SUPERGROUP_SIZE + row_within_supergroup;
             int col_block_idx = idx_within_supergroup / rows_in_supergroup;
+            if constexpr (G::DEBUG_PUBLIC_COLONLY_LATE_TRACE) {
+                if (block_idx > cluster_id &&
+                    warpgroup_id == 0 &&
+                    warpgroup::warpid() == 0 &&
+                    warp::laneid() == 0) {
+                    printf("public col consumer nextblock enter cta=%d wg=%d block=%d row=%d col=%d phase=%d\n",
+                           cta_id, warpgroup_id, block_idx, row_block_idx, col_block_idx, phase);
+                }
+            }
 
             wait(outputs_arrived, get_phasebit<0>(phasebits, 0));
 
@@ -7818,9 +8369,43 @@ __device__ inline void backward_kernel_v3_streaming_3wg_impl(const globals_3wg<C
                     } else if constexpr (INTERNAL_COMBO_DC_COL_RECYCLE_WAIT ||
                                          G::USE_COL_PAIR_STAGE ||
                                          (DO_ROW && C::ROW_QUANT_FROM_REGS && C::CONSUMER_DO_ROW && !C::EARLY_COL_READY)) {
-                        if constexpr (!G::DEBUG_SKIP_COL_RECYCLE_WAIT) {
-                            wait(slice_col_recycled[bf_stage], get_phasebit<1>(slice_col_recycle_phasebits, bf_stage));
-                        }
+	                        if constexpr (!G::DEBUG_SKIP_COL_RECYCLE_WAIT) {
+	                            if constexpr (G::DEBUG_PUBLIC_COLONLY_TRACE ||
+	                                          G::DEBUG_PUBLIC_COLONLY_LATE_TRACE) {
+	                                if (block_idx == cluster_id &&
+	                                    warpgroup::warpid() == 0 && warp::laneid() == 0) {
+	                                    printf("public col consumer prewait cta=%d wg=%d bf=%d epi=%d\n",
+	                                           cta_id, warpgroup_id, bf_stage, epi_idx);
+	                                }
+	                            }
+	                            if constexpr (G::DEBUG_PUBLIC_COLONLY_LATE_TRACE) {
+	                                if (block_idx > cluster_id &&
+	                                    epi_idx == 0 &&
+	                                    warpgroup::warpid() == 0 &&
+	                                    warp::laneid() == 0) {
+	                                    printf("public col nextblock consumer prewait cta=%d wg=%d block=%d bf=%d epi=%d\n",
+	                                           cta_id, warpgroup_id, block_idx, bf_stage, epi_idx);
+	                                }
+	                            }
+	                            wait(slice_col_recycled[bf_stage], get_phasebit<1>(slice_col_recycle_phasebits, bf_stage));
+	                            if constexpr (G::DEBUG_PUBLIC_COLONLY_TRACE ||
+	                                          G::DEBUG_PUBLIC_COLONLY_LATE_TRACE) {
+	                                if (block_idx == cluster_id &&
+	                                    warpgroup::warpid() == 0 && warp::laneid() == 0) {
+	                                    printf("public col consumer postwait cta=%d wg=%d bf=%d epi=%d\n",
+	                                           cta_id, warpgroup_id, bf_stage, epi_idx);
+	                                }
+	                            }
+	                            if constexpr (G::DEBUG_PUBLIC_COLONLY_LATE_TRACE) {
+	                                if (block_idx > cluster_id &&
+	                                    epi_idx == 0 &&
+	                                    warpgroup::warpid() == 0 &&
+	                                    warp::laneid() == 0) {
+	                                    printf("public col nextblock consumer postwait cta=%d wg=%d block=%d bf=%d epi=%d\n",
+	                                           cta_id, warpgroup_id, block_idx, bf_stage, epi_idx);
+	                                }
+	                            }
+	                        }
                     } else {
                         wait(slice_col_recycled[bf_stage], get_phasebit<1>(slice_phasebits, bf_stage));
                     }
@@ -7832,6 +8417,11 @@ __device__ inline void backward_kernel_v3_streaming_3wg_impl(const globals_3wg<C
                     warpgroup::sync(CONSUMER_WG_SYNC_ID);
                 }
             };
+            const bool public_colonly_late_trace_this_block =
+                (block_idx == cluster_id) ||
+                (G::DEBUG_PUBLIC_COLONLY_LATE_TRACE &&
+                 G::DEBUG_PUBLIC_COLONLY_STAGE_CUT == 105 &&
+                 block_idx == cluster_id + 1);
             #pragma unroll
             for (int epi = 0; epi < C::EPI_PIPE_DEPTH; ++epi) {
                 const int bf_stage = epi % C::BF16_STAGE_COUNT;
@@ -7876,7 +8466,19 @@ __device__ inline void backward_kernel_v3_streaming_3wg_impl(const globals_3wg<C
                     }
                 }
 
+                subtile_rt D_fl;
                 subtile_rt_bf D_bf;
+                if constexpr (G::DEBUG_PUBLIC_COLONLY_LATE_TRACE &&
+                              G::DEBUG_PUBLIC_COLONLY_STAGE_CUT == 105) {
+                    if (public_colonly_late_trace_this_block &&
+                        epi >= C::EPI_PIPE_DEPTH - 2 &&
+                        warpgroup_id == 0 &&
+                        warpgroup::warpid() == 0 &&
+                        warp::laneid() == 0) {
+                        printf("public col epi body enter cta=%d wg=%d block=%d row=%d col=%d bf=%d epi=%d\n",
+                               cta_id, warpgroup_id, block_idx, row_block_idx, col_block_idx, bf_stage, epi);
+                    }
+                }
                 const int col_start = col_block_idx * C::Nb + epi * SUBTILE_COLS;
                 const bool combo_stage_first_epi = (epi == 0);
                 const bool combo_stage_publish_epi = (epi == C::EPI_PIPE_DEPTH - 1);
@@ -7935,12 +8537,78 @@ __device__ inline void backward_kernel_v3_streaming_3wg_impl(const globals_3wg<C
                     }
                 }
                 {
+                    if constexpr (G::DEBUG_PUBLIC_COLONLY_LATE_TRACE &&
+                                  G::DEBUG_PUBLIC_COLONLY_STAGE_CUT == 105) {
+                        if (public_colonly_late_trace_this_block &&
+                            epi >= C::EPI_PIPE_DEPTH - 2 &&
+                            warpgroup_id == 0 &&
+                            warp::laneid() == 0) {
+                            printf("public col pre loadasync cta=%d wg=%d block=%d row=%d col=%d warp=%d bf=%d epi=%d\n",
+                                   cta_id, warpgroup_id, block_idx, row_block_idx, col_block_idx,
+                                   warpgroup::warpid(), bf_stage, epi);
+                        }
+                    }
                     warpgroup::load_async(D_fl, accum.template subtile<full_tt_fl<SUBTILE_COLS>>(0, SUBTILE_COLS * epi));
+                    if constexpr (G::DEBUG_PUBLIC_COLONLY_LATE_TRACE &&
+                                  G::DEBUG_PUBLIC_COLONLY_STAGE_CUT == 105) {
+                        if (public_colonly_late_trace_this_block &&
+                            epi >= C::EPI_PIPE_DEPTH - 2 &&
+                            warpgroup_id == 0 &&
+                            warp::laneid() == 0) {
+                            printf("public col post loadasync cta=%d wg=%d block=%d row=%d col=%d warp=%d bf=%d epi=%d\n",
+                                   cta_id, warpgroup_id, block_idx, row_block_idx, col_block_idx,
+                                   warpgroup::warpid(), bf_stage, epi);
+                        }
+                    }
                     tensor_load_wait();
+                    if constexpr (G::DEBUG_PUBLIC_COLONLY_LATE_TRACE &&
+                                  G::DEBUG_PUBLIC_COLONLY_STAGE_CUT == 105) {
+                        if (public_colonly_late_trace_this_block &&
+                            epi >= C::EPI_PIPE_DEPTH - 2 &&
+                            warpgroup_id == 0 &&
+                            warp::laneid() == 0) {
+                            printf("public col post tensorwait cta=%d wg=%d block=%d row=%d col=%d warp=%d bf=%d epi=%d\n",
+                                   cta_id, warpgroup_id, block_idx, row_block_idx, col_block_idx,
+                                   warpgroup::warpid(), bf_stage, epi);
+                        }
+                    }
                     tensor_before_thread_sync();
+                    if constexpr (G::DEBUG_PUBLIC_COLONLY_LATE_TRACE &&
+                                  G::DEBUG_PUBLIC_COLONLY_STAGE_CUT == 105) {
+                        if (public_colonly_late_trace_this_block &&
+                            epi >= C::EPI_PIPE_DEPTH - 2 &&
+                            warpgroup_id == 0 &&
+                            warp::laneid() == 0) {
+                            printf("public col pre consumersync cta=%d wg=%d block=%d row=%d col=%d warp=%d bf=%d epi=%d\n",
+                                   cta_id, warpgroup_id, block_idx, row_block_idx, col_block_idx,
+                                   warpgroup::warpid(), bf_stage, epi);
+                        }
+                    }
                     warpgroup::sync(CONSUMER_WG_SYNC_ID);
+                    if constexpr (G::DEBUG_PUBLIC_COLONLY_LATE_TRACE &&
+                                  G::DEBUG_PUBLIC_COLONLY_STAGE_CUT == 105) {
+                        if (public_colonly_late_trace_this_block &&
+                            epi >= C::EPI_PIPE_DEPTH - 2 &&
+                            warpgroup_id == 0 &&
+                            warp::laneid() == 0) {
+                            printf("public col post loadsync cta=%d wg=%d block=%d row=%d col=%d warp=%d bf=%d epi=%d\n",
+                                   cta_id, warpgroup_id, block_idx, row_block_idx, col_block_idx,
+                                   warpgroup::warpid(), bf_stage, epi);
+                        }
+                    }
 
                     warp::mul(D_fl, D_fl, global_scale);
+                    if constexpr (G::DEBUG_PUBLIC_COLONLY_LATE_TRACE &&
+                                  G::DEBUG_PUBLIC_COLONLY_STAGE_CUT == 105) {
+                        if (public_colonly_late_trace_this_block &&
+                            epi >= C::EPI_PIPE_DEPTH - 2 &&
+                            warpgroup_id == 0 &&
+                            warpgroup::warpid() == 0 &&
+                            warp::laneid() == 0) {
+                            printf("public col post globalscale cta=%d wg=%d bf=%d epi=%d\n",
+                                   cta_id, warpgroup_id, bf_stage, epi);
+                        }
+                    }
 
                     #pragma unroll
                     for (int i = 0; i < subtile_rt::height; ++i) {
@@ -7954,6 +8622,17 @@ __device__ inline void backward_kernel_v3_streaming_3wg_impl(const globals_3wg<C
                                 D_fl.tiles[i][j].data[k].x = __expf(D_fl.tiles[i][j].data[k].x - lse_val);
                                 D_fl.tiles[i][j].data[k].y = __expf(D_fl.tiles[i][j].data[k].y - lse_val);
                             }
+                        }
+                    }
+                    if constexpr (G::DEBUG_PUBLIC_COLONLY_LATE_TRACE &&
+                                  G::DEBUG_PUBLIC_COLONLY_STAGE_CUT == 105) {
+                        if (public_colonly_late_trace_this_block &&
+                            epi >= C::EPI_PIPE_DEPTH - 2 &&
+                            warpgroup_id == 0 &&
+                            warpgroup::warpid() == 0 &&
+                            warp::laneid() == 0) {
+                            printf("public col post softmaxexp cta=%d wg=%d bf=%d epi=%d\n",
+                                   cta_id, warpgroup_id, bf_stage, epi);
                         }
                     }
                     #pragma unroll
@@ -7985,6 +8664,17 @@ __device__ inline void backward_kernel_v3_streaming_3wg_impl(const globals_3wg<C
                             }
                         }
                     }
+                    if constexpr (G::DEBUG_PUBLIC_COLONLY_LATE_TRACE &&
+                                  G::DEBUG_PUBLIC_COLONLY_STAGE_CUT == 105) {
+                        if (public_colonly_late_trace_this_block &&
+                            epi >= C::EPI_PIPE_DEPTH - 2 &&
+                            warpgroup_id == 0 &&
+                            warpgroup::warpid() == 0 &&
+                            warp::laneid() == 0) {
+                            printf("public col post targets cta=%d wg=%d bf=%d epi=%d\n",
+                                   cta_id, warpgroup_id, bf_stage, epi);
+                        }
+                    }
                     #pragma unroll
                     for (int i = 0; i < subtile_rt::height; ++i) {
                         const int global_row_x = warp_row_base + i * 16 + lane_id / 4;
@@ -8003,8 +8693,30 @@ __device__ inline void backward_kernel_v3_streaming_3wg_impl(const globals_3wg<C
                                 }
                             }
                     }
+                    if constexpr (G::DEBUG_PUBLIC_COLONLY_LATE_TRACE &&
+                                  G::DEBUG_PUBLIC_COLONLY_STAGE_CUT == 105) {
+                        if (public_colonly_late_trace_this_block &&
+                            epi >= C::EPI_PIPE_DEPTH - 2 &&
+                            warpgroup_id == 0 &&
+                            warpgroup::warpid() == 0 &&
+                            warp::laneid() == 0) {
+                            printf("public col post rowmask cta=%d wg=%d bf=%d epi=%d\n",
+                                   cta_id, warpgroup_id, bf_stage, epi);
+                        }
+                    }
                 }
                 warp::mul(D_fl, D_fl, g.grad_scale);
+                if constexpr (G::DEBUG_PUBLIC_COLONLY_LATE_TRACE &&
+                              G::DEBUG_PUBLIC_COLONLY_STAGE_CUT == 105) {
+                    if (public_colonly_late_trace_this_block &&
+                        epi >= C::EPI_PIPE_DEPTH - 2 &&
+                        warpgroup_id == 0 &&
+                        warpgroup::warpid() == 0 &&
+                        warp::laneid() == 0) {
+                        printf("public col post gradscale cta=%d wg=%d bf=%d epi=%d\n",
+                               cta_id, warpgroup_id, bf_stage, epi);
+                    }
+                }
                 if constexpr (G::FUSED_SOFTMAX_QUANT) {
                     #pragma unroll
                     for (int i = 0; i < subtile_rt::height; ++i) {
@@ -8021,6 +8733,17 @@ __device__ inline void backward_kernel_v3_streaming_3wg_impl(const globals_3wg<C
                     }
                 } else {
                     warp::copy(D_bf, D_fl);
+                    if constexpr (G::DEBUG_PUBLIC_COLONLY_LATE_TRACE &&
+                                  G::DEBUG_PUBLIC_COLONLY_STAGE_CUT == 105) {
+                        if (public_colonly_late_trace_this_block &&
+                            epi >= C::EPI_PIPE_DEPTH - 2 &&
+                            warpgroup_id == 0 &&
+                            warpgroup::warpid() == 0 &&
+                            warp::laneid() == 0) {
+                            printf("public col post bfcopy cta=%d wg=%d bf=%d epi=%d\n",
+                                   cta_id, warpgroup_id, bf_stage, epi);
+                        }
+                    }
                 }
                 }
                 if constexpr (G::SKIP_GLOBAL_COL_MATERIALIZATION &&
@@ -8048,10 +8771,47 @@ __device__ inline void backward_kernel_v3_streaming_3wg_impl(const globals_3wg<C
                 }
 
                 if constexpr (C::OVERLAP_EPI) {
+                    if constexpr (G::DEBUG_PUBLIC_COLONLY_LATE_TRACE &&
+                                  G::DEBUG_PUBLIC_COLONLY_STAGE_CUT == 105) {
+                        if (public_colonly_late_trace_this_block &&
+                            epi >= C::EPI_PIPE_DEPTH - 2 &&
+                            warpgroup_id == 0 &&
+                            warpgroup::warpid() == 0 &&
+                            warp::laneid() == 0) {
+                            printf("public col pre wait_for_quant cta=%d wg=%d bf=%d epi=%d\n",
+                                   cta_id, warpgroup_id, bf_stage, epi);
+                        }
+                    }
                     wait_for_quant_stage(bf_stage, epi);
+                    if constexpr (G::DEBUG_PUBLIC_COLONLY_LATE_TRACE &&
+                                  G::DEBUG_PUBLIC_COLONLY_STAGE_CUT == 105) {
+                        if (public_colonly_late_trace_this_block &&
+                            epi >= C::EPI_PIPE_DEPTH - 2 &&
+                            warpgroup_id == 0 &&
+                            warpgroup::warpid() == 0 &&
+                            warp::laneid() == 0) {
+                            printf("public col post wait_for_quant cta=%d wg=%d bf=%d epi=%d\n",
+                                   cta_id, warpgroup_id, bf_stage, epi);
+                        }
+                    }
                 }
 
                 if constexpr (DO_ROW || DO_COL) {
+                    if constexpr (G::DEBUG_PUBLIC_COLONLY_LATE_TRACE &&
+                                  G::DEBUG_PUBLIC_COLONLY_STAGE_CUT == 105) {
+                        if (public_colonly_late_trace_this_block &&
+                            epi >= C::EPI_PIPE_DEPTH - 2 &&
+                            warpgroup_id == 0 &&
+                            warpgroup::warpid() == 0 &&
+                            warp::laneid() == 0) {
+                            printf("public col body branch enter cta=%d wg=%d bf=%d epi=%d flags dbf=%d fused=%d do_row=%d do_col=%d\n",
+                                   cta_id, warpgroup_id, bf_stage, epi,
+                                   G::COL_QUANT_FROM_DBF_REGS ? 1 : 0,
+                                   G::FUSED_SOFTMAX_QUANT ? 1 : 0,
+                                   DO_ROW ? 1 : 0,
+                                   DO_COL ? 1 : 0);
+                        }
+                    }
                     if constexpr (G::SKIP_GLOBAL_COL_MATERIALIZATION &&
                                   DO_ROW && !DO_COL &&
                                   EFFECTIVE_ENABLE_STOREADD_COMBO &&
@@ -8072,6 +8832,17 @@ __device__ inline void backward_kernel_v3_streaming_3wg_impl(const globals_3wg<C
                         }
                     }
                     if constexpr (G::COL_QUANT_FROM_DBF_REGS) {
+                        if constexpr (G::DEBUG_PUBLIC_COLONLY_LATE_TRACE &&
+                                      G::DEBUG_PUBLIC_COLONLY_STAGE_CUT == 105) {
+                            if (block_idx == cluster_id &&
+                                epi >= C::EPI_PIPE_DEPTH - 2 &&
+                                warpgroup_id == 0 &&
+                                warpgroup::warpid() == 0 &&
+                                warp::laneid() == 0) {
+                                printf("public col dbf branch enter cta=%d wg=%d bf=%d epi=%d\n",
+                                       cta_id, warpgroup_id, bf_stage, epi);
+                            }
+                        }
                         if constexpr (!G::FUSED_COL_IN_QUANTIZER) {
                             static_assert(C::QUANTIZER_WARPGROUPS == 0,
                                           "consumer-owned direct OTF epilogue requires zero quantizer warpgroups");
@@ -8249,6 +9020,13 @@ __device__ inline void backward_kernel_v3_streaming_3wg_impl(const globals_3wg<C
                                         __threadfence_block();
                                         asm volatile("fence.proxy.async.shared::cta;\n" ::: "memory");
                                         if (warp::laneid() == 0) {
+                                            if constexpr (G::DEBUG_PUBLIC_COLONLY_TRACE) {
+                                                if (block_idx == cluster_id && epi == 0 && bf_stage == 0) {
+                                                    printf(
+                                                        "public col publish site=A cta=%d wg=%d block=%d row=%d col=%d row16=%d\n",
+                                                        cta_id, warpgroup_id, block_idx, row_block_idx, col_block_idx, row16_block);
+                                                }
+                                            }
                                             if constexpr (G::SKIP_GLOBAL_COL_MATERIALIZATION) {
                                                 if constexpr (ROWONLY_COMBO_DC_DEBUG_CUT == 98) {
                                                     if (block_idx > cluster_id && epi == 0 && row16_block == 0) {
@@ -8411,6 +9189,17 @@ __device__ inline void backward_kernel_v3_streaming_3wg_impl(const globals_3wg<C
 
                             warpgroup::sync(CONSUMER_WG_SYNC_ID);
                         } else {
+                        if constexpr (G::DEBUG_PUBLIC_COLONLY_LATE_TRACE &&
+                                      G::DEBUG_PUBLIC_COLONLY_STAGE_CUT == 105) {
+                            if (block_idx == cluster_id &&
+                                epi >= C::EPI_PIPE_DEPTH - 2 &&
+                                warpgroup_id == 0 &&
+                                warpgroup::warpid() == 0 &&
+                                warp::laneid() == 0) {
+                                printf("public col dbf nonfused enter cta=%d wg=%d bf=%d epi=%d\n",
+                                       cta_id, warpgroup_id, bf_stage, epi);
+                            }
+                        }
                         if constexpr (DO_ROW) {
                             #pragma unroll
                             for (int i = 0; i < subtile_rt_bf::height; ++i) {
@@ -8575,6 +9364,17 @@ __device__ inline void backward_kernel_v3_streaming_3wg_impl(const globals_3wg<C
                         }
 
                         if constexpr (DO_COL) {
+                            if constexpr (G::DEBUG_PUBLIC_COLONLY_LATE_TRACE &&
+                                          G::DEBUG_PUBLIC_COLONLY_STAGE_CUT == 105) {
+                                if (block_idx == cluster_id &&
+                                    epi >= C::EPI_PIPE_DEPTH - 2 &&
+                                    warpgroup_id == 0 &&
+                                    warpgroup::warpid() == 0 &&
+                                    warp::laneid() == 0) {
+                                    printf("public col dbf do_col enter cta=%d wg=%d bf=%d epi=%d\n",
+                                           cta_id, warpgroup_id, bf_stage, epi);
+                                }
+                            }
                             #pragma unroll
                             for (int i = 0; i < subtile_rt_bf::height; ++i) {
                                 const int local_row_base = local_warp_row_base + i * 16;
@@ -8819,6 +9619,18 @@ __device__ inline void backward_kernel_v3_streaming_3wg_impl(const globals_3wg<C
                             }
                         }
 
+                        if constexpr (G::DEBUG_PUBLIC_COLONLY_LATE_TRACE &&
+                                      G::DEBUG_PUBLIC_COLONLY_STAGE_CUT == 105) {
+                            if (block_idx == cluster_id &&
+                                epi >= C::EPI_PIPE_DEPTH - 2 &&
+                                warpgroup_id == 0 &&
+                                warpgroup::warpid() == 0 &&
+                                warp::laneid() == 0) {
+                                printf("public col dbf nonfused done cta=%d wg=%d bf=%d epi=%d\n",
+                                       cta_id, warpgroup_id, bf_stage, epi);
+                            }
+                        }
+
                         warpgroup::sync(1);
                         }
                     } else if constexpr (G::USE_COL_PAIR_STAGE &&
@@ -8832,6 +9644,17 @@ __device__ inline void backward_kernel_v3_streaming_3wg_impl(const globals_3wg<C
                             "col-pair mailbox path requires consumer-owned row quantization or lane-pair rowrecord row-quantizer support");
                         const int lane_row = lane_id / 4;
                         const int lane_pair = lane_id % 4;
+                        if constexpr (G::DEBUG_PUBLIC_COLONLY_LATE_TRACE &&
+                                      G::DEBUG_PUBLIC_COLONLY_STAGE_CUT == 105) {
+                            if (public_colonly_late_trace_this_block &&
+                                epi >= C::EPI_PIPE_DEPTH - 2 &&
+                                warpgroup_id == 0 &&
+                                warpgroup::warpid() == 0 &&
+                                warp::laneid() == 0) {
+                                printf("public col colpair branch enter cta=%d wg=%d bf=%d epi=%d\n",
+                                       cta_id, warpgroup_id, bf_stage, epi);
+                            }
+                        }
                         const int local_warp_row_base = warpgroup::warpid() * (C::Mb / 8);
                         if constexpr (G::SKIP_GLOBAL_COL_MATERIALIZATION) {
                             if constexpr (ROWONLY_COMBO_DC_DEBUG_CUT == 103) {
@@ -9311,6 +10134,17 @@ __device__ inline void backward_kernel_v3_streaming_3wg_impl(const globals_3wg<C
                                         }
                                     }
                                 }
+                                if constexpr (G::DEBUG_PUBLIC_COLONLY_LATE_TRACE &&
+                                              G::DEBUG_PUBLIC_COLONLY_STAGE_CUT == 105) {
+                                    if (block_idx == cluster_id &&
+                                        epi >= C::EPI_PIPE_DEPTH - 2 &&
+                                        warpgroup_id == 0 &&
+                                        warpgroup::warpid() == 0 &&
+                                        warp::laneid() == 0) {
+                                        printf("public col producer loop enter cta=%d wg=%d bf=%d epi=%d lwrb=%d\n",
+                                               cta_id, warpgroup_id, bf_stage, epi, local_warp_row_base);
+                                    }
+                                }
                                 #pragma unroll
                                 for (int i = 0; i < subtile_rt_bf::height; ++i) {
                                     const int row16_block = (local_warp_row_base + i * 16) / 16;
@@ -9397,6 +10231,17 @@ __device__ inline void backward_kernel_v3_streaming_3wg_impl(const globals_3wg<C
                                                         row_bits_hi);
                                                 }
                                             }
+                                        }
+                                    }
+                                    if constexpr (G::DEBUG_PUBLIC_COLONLY_LATE_TRACE &&
+                                                  G::DEBUG_PUBLIC_COLONLY_STAGE_CUT == 105) {
+                                        if (block_idx == cluster_id &&
+                                            epi >= C::EPI_PIPE_DEPTH - 2 &&
+                                            warpgroup_id == 0 &&
+                                            warpgroup::warpid() == 0 &&
+                                            warp::laneid() == 0) {
+                                            printf("public col producer loop i-done cta=%d wg=%d bf=%d epi=%d i=%d row16=%d\n",
+                                                   cta_id, warpgroup_id, bf_stage, epi, i, row16_block);
                                         }
                                     }
                                     if constexpr (C::EARLY_COL_READY &&
@@ -9513,6 +10358,17 @@ __device__ inline void backward_kernel_v3_streaming_3wg_impl(const globals_3wg<C
                                 } else if constexpr (C::EARLY_COL_READY &&
                                               G::COL_READY_PER_ROW16 &&
                                               (!G::ROW_QUANT_IMMEDIATE_PER_ROW16 || !DO_ROW)) {
+                                    if constexpr (G::DEBUG_PUBLIC_COLONLY_LATE_TRACE &&
+                                                  G::DEBUG_PUBLIC_COLONLY_STAGE_CUT == 105) {
+                                        if (public_colonly_late_trace_this_block &&
+                                            epi >= C::EPI_PIPE_DEPTH - 2 &&
+                                            warpgroup_id == 0 &&
+                                            warpgroup::warpid() == 0 &&
+                                            warp::laneid() == 0) {
+                                            printf("public col siteB pre-sync cta=%d wg=%d bf=%d epi=%d lwrb=%d\n",
+                                                   cta_id, warpgroup_id, bf_stage, epi, local_warp_row_base);
+                                        }
+                                    }
                                     if constexpr (G::SKIP_GLOBAL_COL_MATERIALIZATION) {
                                         if constexpr (ROWONLY_COMBO_DC_DEBUG_CUT == 100) {
                                             if (block_idx > cluster_id) {
@@ -9528,10 +10384,28 @@ __device__ inline void backward_kernel_v3_streaming_3wg_impl(const globals_3wg<C
                                     __syncwarp();
                                     __threadfence_block();
                                     asm volatile("fence.proxy.async.shared::cta;\n" ::: "memory");
+                                    if constexpr (G::DEBUG_PUBLIC_COLONLY_LATE_TRACE &&
+                                                  G::DEBUG_PUBLIC_COLONLY_STAGE_CUT == 105) {
+                                        if (public_colonly_late_trace_this_block &&
+                                            epi >= C::EPI_PIPE_DEPTH - 2 &&
+                                            warpgroup_id == 0 &&
+                                            warpgroup::warpid() == 0 &&
+                                            warp::laneid() == 0) {
+                                            printf("public col siteB post-fence cta=%d wg=%d bf=%d epi=%d\n",
+                                                   cta_id, warpgroup_id, bf_stage, epi);
+                                        }
+                                    }
                                     if (warp::laneid() == 0) {
                                         #pragma unroll
                                         for (int local_i = 0; local_i < subtile_rt_bf::height; ++local_i) {
                                             const int published_row16_block = (local_warp_row_base + local_i * 16) / 16;
+                                            if constexpr (G::DEBUG_PUBLIC_COLONLY_TRACE) {
+                                                if (block_idx == cluster_id && epi == 0 && bf_stage == 0) {
+                                                    printf(
+                                                        "public col publish site=B cta=%d wg=%d block=%d row=%d col=%d row16=%d\n",
+                                                        cta_id, warpgroup_id, block_idx, row_block_idx, col_block_idx, published_row16_block);
+                                                }
+                                            }
                                             if constexpr (G::SKIP_GLOBAL_COL_MATERIALIZATION) {
                                                 if constexpr (ROWONLY_COMBO_DC_DEBUG_CUT == 98) {
                                                     if (block_idx > cluster_id && epi == 0 && published_row16_block == 0) {
@@ -9543,6 +10417,39 @@ __device__ inline void backward_kernel_v3_streaming_3wg_impl(const globals_3wg<C
                                                 }
                                             }
                                             arrive(slice_col_ready_row16[bf_stage][published_row16_block]);
+                                            if constexpr (G::DEBUG_PUBLIC_COLONLY_LATE_TRACE &&
+                                                          G::DEBUG_PUBLIC_COLONLY_STAGE_CUT == 105) {
+                                                if (public_colonly_late_trace_this_block &&
+                                                    epi >= C::EPI_PIPE_DEPTH - 2 &&
+                                                    warpgroup_id == 0 &&
+                                                    warpgroup::warpid() == 0) {
+                                                    printf("public col siteB published cta=%d wg=%d bf=%d epi=%d row16=%d li=%d\n",
+                                                           cta_id, warpgroup_id, bf_stage, epi,
+                                                           published_row16_block, local_i);
+                                                }
+                                            }
+                                        }
+                                    }
+                                    if constexpr (G::DEBUG_PUBLIC_COLONLY_TRACE ||
+                                                  G::DEBUG_PUBLIC_COLONLY_LATE_TRACE) {
+                                        if (public_colonly_late_trace_this_block &&
+                                            epi == C::EPI_PIPE_DEPTH - 1 &&
+                                            warpgroup_id == 0 &&
+                                            warpgroup::warpid() == 0 &&
+                                            warp::laneid() == 0) {
+                                            printf("public col consumer after siteB cta=%d wg=%d bf=%d epi=%d\n",
+                                                   cta_id, warpgroup_id, bf_stage, epi);
+                                        }
+                                    }
+                                    if constexpr (G::DEBUG_PUBLIC_COLONLY_LATE_TRACE &&
+                                                  G::DEBUG_PUBLIC_COLONLY_STAGE_CUT == 105) {
+                                        if (public_colonly_late_trace_this_block &&
+                                            epi >= C::EPI_PIPE_DEPTH - 2 &&
+                                            warpgroup_id == 0 &&
+                                            warpgroup::warpid() == 0 &&
+                                            warp::laneid() == 0) {
+                                            printf("public col siteB done cta=%d wg=%d bf=%d epi=%d\n",
+                                                   cta_id, warpgroup_id, bf_stage, epi);
                                         }
                                     }
                                 }
@@ -9602,44 +10509,6 @@ __device__ inline void backward_kernel_v3_streaming_3wg_impl(const globals_3wg<C
                                     produce_col_pair_stage_rowonly();
                                 } else if (combo_use_dc) {
                                     produce_col_pair_stage_rowonly();
-                                }
-                            }
-
-                            if constexpr (C::EARLY_COL_READY &&
-                                          G::COL_READY_PER_ROW16 &&
-                                          DO_COL &&
-                                          !C::ROW_QUANT_FROM_REGS) {
-                                if constexpr (G::SKIP_GLOBAL_COL_MATERIALIZATION) {
-                                    if constexpr (ROWONLY_COMBO_DC_DEBUG_CUT == 100) {
-                                        if (block_idx > cluster_id) {
-                                            if (warpgroup::warpid() == 0 && warp::laneid() == 0) {
-                                                printf(
-                                                    "rowonly combo dc cut 100 cta=%d wg=%d block=%d row=%d col=%d epi=%d site=D\n",
-                                                    cta_id, warpgroup_id, block_idx, row_block_idx, col_block_idx, epi);
-                                            }
-                                            return;
-                                        }
-                                    }
-                                }
-                                __syncwarp();
-                                __threadfence_block();
-                                asm volatile("fence.proxy.async.shared::cta;\n" ::: "memory");
-                                if (warp::laneid() == 0) {
-                                    #pragma unroll
-                                    for (int local_i = 0; local_i < subtile_rt_bf::height; ++local_i) {
-                                        const int published_row16_block = (local_warp_row_base + local_i * 16) / 16;
-                                        if constexpr (G::SKIP_GLOBAL_COL_MATERIALIZATION) {
-                                            if constexpr (ROWONLY_COMBO_DC_DEBUG_CUT == 98) {
-                                                if (block_idx > cluster_id && epi == 0 && published_row16_block == 0) {
-                                                    printf(
-                                                        "rowonly combo dc cut 98 site=D cta=%d wg=%d block=%d row=%d col=%d epi=%d row16=%d\n",
-                                                        cta_id, warpgroup_id, block_idx, row_block_idx, col_block_idx, epi, published_row16_block);
-                                                    return;
-                                                }
-                                            }
-                                        }
-                                        arrive(slice_col_ready_row16[bf_stage][published_row16_block]);
-                                    }
                                 }
                             }
 
@@ -9750,11 +10619,18 @@ __device__ inline void backward_kernel_v3_streaming_3wg_impl(const globals_3wg<C
 
                             if constexpr (DO_COL && C::EARLY_COL_READY) {
                                 if constexpr (G::COL_READY_PER_ROW16) {
-                                    // Split fused col quantizer mode advances the recycle phase once per epi
-                                    // in the common publish block below. Doing it here as well causes the
-                                    // first stage-reuse wait to look for the second-next recycle phase.
                                     if constexpr (!G::FUSED_COL_IN_QUANTIZER) {
                                         update_phasebit<1>(slice_col_recycle_phasebits, bf_stage);
+                                        if constexpr (G::DEBUG_PUBLIC_COLONLY_TRACE ||
+                                                      G::DEBUG_PUBLIC_COLONLY_LATE_TRACE) {
+                                            if (block_idx == cluster_id &&
+                                                epi == C::EPI_PIPE_DEPTH - 1 &&
+                                                warpgroup_id == 0 &&
+                                                warp::laneid() == 0) {
+                                                printf("public col consumer after recycle phasebit cta=%d wg=%d warp=%d bf=%d epi=%d\n",
+                                                       cta_id, warpgroup_id, warpgroup::warpid(), bf_stage, epi);
+                                            }
+                                        }
                                     }
                                 } else {
                                     warpgroup::sync(CONSUMER_WG_SYNC_ID);
@@ -9766,11 +10642,32 @@ __device__ inline void backward_kernel_v3_streaming_3wg_impl(const globals_3wg<C
                                     }
                                     if constexpr (!G::FUSED_COL_IN_QUANTIZER) {
                                         update_phasebit<1>(slice_col_recycle_phasebits, bf_stage);
+                                        if constexpr (G::DEBUG_PUBLIC_COLONLY_LATE_TRACE &&
+                                                      G::DEBUG_PUBLIC_COLONLY_STAGE_CUT == 105) {
+                                            warpgroup::sync(CONSUMER_WG_SYNC_ID);
+                                            if (block_idx == cluster_id &&
+                                                epi >= C::EPI_PIPE_DEPTH - 2 &&
+                                                warpgroup_id == 0 &&
+                                                warpgroup::warpid() == 0 &&
+                                                warp::laneid() == 0) {
+                                                printf("public col post siteB resync cta=%d wg=%d block=%d row=%d col=%d bf=%d epi=%d\n",
+                                                       cta_id, warpgroup_id, block_idx, row_block_idx, col_block_idx, bf_stage, epi);
+                                            }
+                                        }
                                     }
                                 }
                             }
 
                             if constexpr (DO_ROW && C::CONSUMER_DO_ROW) {
+                                if constexpr (G::DEBUG_PUBLIC_COLONLY_TRACE) {
+                                    if (block_idx == cluster_id &&
+                                        epi == C::EPI_PIPE_DEPTH - 1 &&
+                                        warpgroup_id == 0 &&
+                                        warp::laneid() == 0) {
+                                        printf("public col consumer row block enter cta=%d wg=%d warp=%d bf=%d epi=%d\n",
+                                               cta_id, warpgroup_id, warpgroup::warpid(), bf_stage, epi);
+                                    }
+                                }
                                 if constexpr (DO_COL && G::ROW_WAITS_FOR_COL_RECYCLE) {
                                     wait(slice_col_recycled[bf_stage], get_phasebit<1>(slice_col_recycle_phasebits, bf_stage));
                                 }
@@ -10471,6 +11368,18 @@ __device__ inline void backward_kernel_v3_streaming_3wg_impl(const globals_3wg<C
                                     arrive(slice_col_ready[bf_stage]);
                                 }
                                 update_phasebit<1>(slice_col_recycle_phasebits, bf_stage);
+                                if constexpr (G::DEBUG_PUBLIC_COLONLY_LATE_TRACE &&
+                                              G::DEBUG_PUBLIC_COLONLY_STAGE_CUT == 105) {
+                                    warpgroup::sync(CONSUMER_WG_SYNC_ID);
+                                    if (block_idx == cluster_id &&
+                                        epi >= C::EPI_PIPE_DEPTH - 2 &&
+                                        warpgroup_id == 0 &&
+                                        warpgroup::warpid() == 0 &&
+                                        warp::laneid() == 0) {
+                                        printf("public col post siteB resync cta=%d wg=%d block=%d row=%d col=%d bf=%d epi=%d\n",
+                                               cta_id, warpgroup_id, block_idx, row_block_idx, col_block_idx, bf_stage, epi);
+                                    }
+                                }
                             }
                             if constexpr (G::SKIP_GLOBAL_COL_MATERIALIZATION &&
                                           DO_ROW && !DO_COL &&
@@ -10490,6 +11399,16 @@ __device__ inline void backward_kernel_v3_streaming_3wg_impl(const globals_3wg<C
                                         if (consumer_last_block && consumer_last_epi) return;
                                     }
                                 }
+                            }
+                        }
+                        if constexpr (G::DEBUG_PUBLIC_COLONLY_TRACE ||
+                                      G::DEBUG_PUBLIC_COLONLY_LATE_TRACE) {
+                            if (block_idx == cluster_id &&
+                                epi == C::EPI_PIPE_DEPTH - 1 &&
+                                warpgroup_id == 0 &&
+                                warp::laneid() == 0) {
+                                printf("public col consumer colpair branch done cta=%d wg=%d warp=%d bf=%d epi=%d\n",
+                                       cta_id, warpgroup_id, warpgroup::warpid(), bf_stage, epi);
                             }
                         }
                     } else {
@@ -10637,18 +11556,113 @@ __device__ inline void backward_kernel_v3_streaming_3wg_impl(const globals_3wg<C
                             }
                         }
 
+                        if constexpr (G::DEBUG_PUBLIC_COLONLY_TRACE ||
+                                      G::DEBUG_PUBLIC_COLONLY_LATE_TRACE) {
+                            if (block_idx == cluster_id &&
+                                epi == C::EPI_PIPE_DEPTH - 1 &&
+                                warpgroup_id == 0 &&
+                                warpgroup::warpid() == 0 &&
+                                warp::laneid() == 0) {
+                                printf(
+                                    "public col consumer tail enter cta=%d wg=%d bf=%d epi=%d flags plain=%d rowpair=%d early=%d row=%d crow=%d\n",
+                                    cta_id, warpgroup_id, bf_stage, epi,
+                                    G::USE_COL_PLAIN_STAGE ? 1 : 0,
+                                    G::USE_ROW_PAIR_STAGE ? 1 : 0,
+                                    C::EARLY_COL_READY ? 1 : 0,
+                                    DO_ROW ? 1 : 0,
+                                    C::CONSUMER_DO_ROW ? 1 : 0);
+                            }
+                        }
+
                         if constexpr (DO_ROW && C::CONSUMER_DO_ROW && C::ROW_QUANT_FROM_REGS) {
+                            if constexpr (G::DEBUG_PUBLIC_COLONLY_TRACE ||
+                                          G::DEBUG_PUBLIC_COLONLY_LATE_TRACE) {
+                                if (block_idx == cluster_id &&
+                                    epi == C::EPI_PIPE_DEPTH - 1 &&
+                                    warpgroup_id == 0 &&
+                                    warpgroup::warpid() == 0 &&
+                                    warp::laneid() == 0) {
+                                    printf("public col consumer pre rowregs sync cta=%d wg=%d bf=%d epi=%d\n",
+                                           cta_id, warpgroup_id, bf_stage, epi);
+                                }
+                            }
                             warpgroup::sync(CONSUMER_WG_SYNC_ID);
+                            if constexpr (G::DEBUG_PUBLIC_COLONLY_TRACE ||
+                                          G::DEBUG_PUBLIC_COLONLY_LATE_TRACE) {
+                                if (block_idx == cluster_id &&
+                                    epi == C::EPI_PIPE_DEPTH - 1 &&
+                                    warpgroup_id == 0 &&
+                                    warpgroup::warpid() == 0 &&
+                                    warp::laneid() == 0) {
+                                    printf("public col consumer post rowregs sync cta=%d wg=%d bf=%d epi=%d\n",
+                                           cta_id, warpgroup_id, bf_stage, epi);
+                                }
+                            }
                         }
 
                         if constexpr (DO_COL && G::USE_COL_PLAIN_STAGE) {
+                            if constexpr (G::DEBUG_PUBLIC_COLONLY_TRACE ||
+                                          G::DEBUG_PUBLIC_COLONLY_LATE_TRACE) {
+                                if (block_idx == cluster_id &&
+                                    epi == C::EPI_PIPE_DEPTH - 1 &&
+                                    warpgroup_id == 0 &&
+                                    warpgroup::warpid() == 0 &&
+                                    warp::laneid() == 0) {
+                                    printf("public col consumer pre plain sync cta=%d wg=%d bf=%d epi=%d\n",
+                                           cta_id, warpgroup_id, bf_stage, epi);
+                                }
+                            }
                             warpgroup::sync(CONSUMER_WG_SYNC_ID);
+                            if constexpr (G::DEBUG_PUBLIC_COLONLY_TRACE ||
+                                          G::DEBUG_PUBLIC_COLONLY_LATE_TRACE) {
+                                if (block_idx == cluster_id &&
+                                    epi == C::EPI_PIPE_DEPTH - 1 &&
+                                    warpgroup_id == 0 &&
+                                    warpgroup::warpid() == 0 &&
+                                    warp::laneid() == 0) {
+                                    printf("public col consumer post plain sync cta=%d wg=%d bf=%d epi=%d\n",
+                                           cta_id, warpgroup_id, bf_stage, epi);
+                                }
+                            }
                         }
 
                         if constexpr (DO_ROW && !C::CONSUMER_DO_ROW && G::USE_ROW_PAIR_STAGE && !G::ROW_PAIR_STAGE_WARP_SYNC_ONLY) {
+                            if constexpr (G::DEBUG_PUBLIC_COLONLY_TRACE ||
+                                          G::DEBUG_PUBLIC_COLONLY_LATE_TRACE) {
+                                if (block_idx == cluster_id &&
+                                    epi == C::EPI_PIPE_DEPTH - 1 &&
+                                    warpgroup_id == 0 &&
+                                    warpgroup::warpid() == 0 &&
+                                    warp::laneid() == 0) {
+                                    printf("public col consumer pre rowpair sync cta=%d wg=%d bf=%d epi=%d\n",
+                                           cta_id, warpgroup_id, bf_stage, epi);
+                                }
+                            }
                             warpgroup::sync(CONSUMER_WG_SYNC_ID);
+                            if constexpr (G::DEBUG_PUBLIC_COLONLY_TRACE ||
+                                          G::DEBUG_PUBLIC_COLONLY_LATE_TRACE) {
+                                if (block_idx == cluster_id &&
+                                    epi == C::EPI_PIPE_DEPTH - 1 &&
+                                    warpgroup_id == 0 &&
+                                    warpgroup::warpid() == 0 &&
+                                    warp::laneid() == 0) {
+                                    printf("public col consumer post rowpair sync cta=%d wg=%d bf=%d epi=%d\n",
+                                           cta_id, warpgroup_id, bf_stage, epi);
+                                }
+                            }
                         }
 
+                        if constexpr (G::DEBUG_PUBLIC_COLONLY_TRACE ||
+                                      G::DEBUG_PUBLIC_COLONLY_LATE_TRACE) {
+                            if (block_idx == cluster_id &&
+                                epi == C::EPI_PIPE_DEPTH - 1 &&
+                                warpgroup_id == 0 &&
+                                warpgroup::warpid() == 0 &&
+                                warp::laneid() == 0) {
+                                printf("public col consumer pre arrive block cta=%d wg=%d bf=%d epi=%d\n",
+                                       cta_id, warpgroup_id, bf_stage, epi);
+                            }
+                        }
                         if (warpgroup::warpid() == 0 && warp::laneid() == 0) {
                             if constexpr (DO_ROW && !C::CONSUMER_DO_ROW) {
                                 __threadfence_block();
@@ -10663,6 +11677,17 @@ __device__ inline void backward_kernel_v3_streaming_3wg_impl(const globals_3wg<C
                                     }
                                     arrive(slice_col_ready[bf_stage]);
                                 }
+                            }
+                        }
+                        if constexpr (G::DEBUG_PUBLIC_COLONLY_TRACE ||
+                                      G::DEBUG_PUBLIC_COLONLY_LATE_TRACE) {
+                            if (block_idx == cluster_id &&
+                                epi == C::EPI_PIPE_DEPTH - 1 &&
+                                warpgroup_id == 0 &&
+                                warpgroup::warpid() == 0 &&
+                                warp::laneid() == 0) {
+                                printf("public col consumer post arrive block cta=%d wg=%d bf=%d epi=%d\n",
+                                       cta_id, warpgroup_id, bf_stage, epi);
                             }
                         }
                         if constexpr (EFFECTIVE_ENABLE_STOREADD_COMBO && EFFECTIVE_SEPARATE_BACKHALF_CONSUMERS) {
@@ -10680,17 +11705,59 @@ __device__ inline void backward_kernel_v3_streaming_3wg_impl(const globals_3wg<C
                         if constexpr (DO_ROW && !C::CONSUMER_DO_ROW) {
                             update_phasebit<1>(slice_row_recycle_phasebits, bf_stage);
                         }
-                        if constexpr (DO_COL || INTERNAL_COMBO_DC_COL_RECYCLE_WAIT) {
-                            if constexpr (G::FUSED_COL_IN_QUANTIZER) {
-                                update_phasebit<1>(slice_col_recycle_phasebits, bf_stage);
-                            } else if constexpr (G::FRONTEND_MULTI_QUANTIZER_WG &&
+                            if constexpr (DO_COL || INTERNAL_COMBO_DC_COL_RECYCLE_WAIT) {
+                                if constexpr (G::DEBUG_PUBLIC_COLONLY_TRACE ||
+                                              G::DEBUG_PUBLIC_COLONLY_LATE_TRACE) {
+                                    if (block_idx == cluster_id &&
+                                        epi == C::EPI_PIPE_DEPTH - 1 &&
+                                        warpgroup_id == 0 &&
+                                        warpgroup::warpid() == 0 &&
+                                        warp::laneid() == 0) {
+                                        printf("public col consumer pre generic recycle cta=%d wg=%d bf=%d epi=%d\n",
+                                               cta_id, warpgroup_id, bf_stage, epi);
+                                    }
+                                }
+                                if constexpr (G::FUSED_COL_IN_QUANTIZER) {
+                                    update_phasebit<1>(slice_col_recycle_phasebits, bf_stage);
+                                } else if constexpr (G::FRONTEND_MULTI_QUANTIZER_WG &&
                                           C::EARLY_COL_READY &&
                                           G::USE_COL_PAIR_STAGE) {
-                            } else if constexpr (G::USE_COL_PAIR_STAGE ||
+                                } else if constexpr (G::USE_COL_PAIR_STAGE ||
                                           (DO_ROW && C::ROW_QUANT_FROM_REGS && C::CONSUMER_DO_ROW && !C::EARLY_COL_READY)) {
-                                update_phasebit<1>(slice_col_recycle_phasebits, bf_stage);
-                            } else {
-                                update_phasebit<1>(slice_phasebits, bf_stage);
+                                if constexpr (!(!DO_ROW &&
+                                                DO_COL &&
+                                                !G::FUSED_SOFTMAX_QUANT &&
+                                                !G::SKIP_GLOBAL_COL_MATERIALIZATION &&
+                                                G::FRONTEND_SINGLE_QUANTIZER_WG &&
+                                                G::USE_COL_PAIR_STAGE &&
+                                                G::COL_READY_PER_ROW16 &&
+                                                (G::DEBUG_PUBLIC_COLONLY_STAGE_CUT == 103 ||
+                                                 G::DEBUG_PUBLIC_COLONLY_STAGE_CUT == 104))) {
+                                    update_phasebit<1>(slice_col_recycle_phasebits, bf_stage);
+                                    if constexpr (G::DEBUG_CONSUMER_POST_GENERIC_RECYCLE_SYNC) {
+                                        warpgroup::sync(CONSUMER_WG_SYNC_ID);
+                                    }
+                                } else if constexpr (G::DEBUG_PUBLIC_COLONLY_LATE_TRACE) {
+                                    if (block_idx == cluster_id &&
+                                        warpgroup_id == 0 &&
+                                        warpgroup::warpid() == 0 &&
+                                        warp::laneid() == 0) {
+                                        printf("public col skip recycle phase update siteB cta=%d wg=%d bf=%d epi=%d cut=%d\n",
+                                               cta_id, warpgroup_id, bf_stage, epi,
+                                               G::DEBUG_PUBLIC_COLONLY_STAGE_CUT);
+                                    }
+                                }
+                                } else {
+                                    update_phasebit<1>(slice_phasebits, bf_stage);
+                                }
+                            if constexpr (G::DEBUG_PUBLIC_COLONLY_TRACE ||
+                                          G::DEBUG_PUBLIC_COLONLY_LATE_TRACE) {
+                                if (block_idx == cluster_id &&
+                                    warpgroup::warpid() == 0 &&
+                                    warp::laneid() == 0) {
+                                    printf("public col consumer after generic recycle cta=%d wg=%d bf=%d epi=%d\n",
+                                           cta_id, warpgroup_id, bf_stage, epi);
+                                }
                             }
                         }
                         if constexpr (EFFECTIVE_ENABLE_STOREADD_COMBO && EFFECTIVE_SEPARATE_BACKHALF_CONSUMERS) {
@@ -10699,6 +11766,18 @@ __device__ inline void backward_kernel_v3_streaming_3wg_impl(const globals_3wg<C
                                     update_phasebit<1>(combo_row_recycle_phasebits, 0);
                                 }
                             }
+                        }
+                        if constexpr (G::DEBUG_PUBLIC_COLONLY_TRACE ||
+                                      G::DEBUG_PUBLIC_COLONLY_LATE_TRACE) {
+                            if (block_idx == cluster_id &&
+                                warpgroup::warpid() == 0 &&
+                                warp::laneid() == 0) {
+                                printf("public col after consumer section cta=%d wg=%d bf=%d epi=%d\n",
+                                       cta_id, warpgroup_id, bf_stage, epi);
+                            }
+                        }
+                        if constexpr (G::DEBUG_CONSUMER_POST_GENERIC_RECYCLE_SYNC) {
+                            warpgroup::sync(CONSUMER_WG_SYNC_ID);
                         }
                     }
                 }
@@ -10879,6 +11958,15 @@ __device__ inline void backward_kernel_v3_streaming_3wg_impl(const globals_3wg<C
             }
             update_phasebit<0>(phasebits, 0);
             phase ^= 1;
+            if constexpr (G::DEBUG_PUBLIC_COLONLY_TRACE ||
+                          G::DEBUG_PUBLIC_COLONLY_LATE_TRACE) {
+                if (warpgroup_id < C::CONSUMER_WARPGROUPS &&
+                    warpgroup::warpid() == 0 &&
+                    warp::laneid() == 0) {
+                    printf("public col consumer phase flipped cta=%d wg=%d phase=%d\n",
+                           cta_id, warpgroup_id, phase);
+                }
+            }
             if constexpr (G::SKIP_GLOBAL_COL_MATERIALIZATION &&
                           DO_ROW && !DO_COL &&
                           EFFECTIVE_ENABLE_STOREADD_COMBO &&
@@ -10912,7 +12000,34 @@ __device__ inline void backward_kernel_v3_streaming_3wg_impl(const globals_3wg<C
                 }
             }
         }
+        if constexpr (G::DEBUG_PUBLIC_COLONLY_TRACE) {
+            if (warpgroup_id < C::CONSUMER_WARPGROUPS &&
+                warpgroup::warpid() == 0 &&
+                warp::laneid() == 0) {
+                printf("public col consumer final presync cta=%d wg=%d phase=%d\n",
+                       cta_id, warpgroup_id, phase);
+            }
+        }
         warpgroup::sync(CONSUMER_WG_SYNC_ID);
+        if constexpr (G::DEBUG_PUBLIC_COLONLY_TRACE) {
+            if (warpgroup_id < C::CONSUMER_WARPGROUPS &&
+                warpgroup::warpid() == 0 &&
+                warp::laneid() == 0) {
+                printf("public col consumer final postsync cta=%d wg=%d phase=%d\n",
+                       cta_id, warpgroup_id, phase);
+            }
+        }
+        if constexpr (!DO_ROW &&
+                      DO_COL &&
+                      !G::FUSED_SOFTMAX_QUANT &&
+                      !G::SKIP_GLOBAL_COL_MATERIALIZATION &&
+                      G::FRONTEND_SINGLE_QUANTIZER_WG &&
+                      G::USE_COL_PAIR_STAGE &&
+                      G::COL_READY_PER_ROW16 &&
+                      !EFFECTIVE_ENABLE_STOREADD_COMBO &&
+                      (G::DEBUG_PUBLIC_COLONLY_STAGE_CUT == 106)) {
+            return;
+        }
         if constexpr (G::SKIP_GLOBAL_COL_MATERIALIZATION &&
                       DO_ROW && !DO_COL &&
                       EFFECTIVE_ENABLE_STOREADD_COMBO &&
@@ -10952,7 +12067,23 @@ __device__ inline void backward_kernel_v3_streaming_3wg_impl(const globals_3wg<C
             }
         }
         if constexpr (!EFFECTIVE_ENABLE_STOREADD_COMBO) {
-            if (warpgroup::warpid() == 0) tm_allocator.deprovision();
+            if (warpgroup::warpid() == 0) {
+                if constexpr (G::DEBUG_PUBLIC_COLONLY_TRACE) {
+                    if (warpgroup_id < C::CONSUMER_WARPGROUPS &&
+                        warp::laneid() == 0) {
+                        printf("public col consumer pre deprovision cta=%d wg=%d phase=%d\n",
+                               cta_id, warpgroup_id, phase);
+                    }
+                }
+                tm_allocator.deprovision();
+                if constexpr (G::DEBUG_PUBLIC_COLONLY_TRACE) {
+                    if (warpgroup_id < C::CONSUMER_WARPGROUPS &&
+                        warp::laneid() == 0) {
+                        printf("public col consumer post deprovision cta=%d wg=%d phase=%d\n",
+                               cta_id, warpgroup_id, phase);
+                    }
+                }
+            }
         }
     } else if (effective_warpgroup_id < C::CONSUMER_WARPGROUPS + EFFECTIVE_QUANTIZER_WARPGROUPS) {
         constexpr bool ROW_IN_QUANTIZER = DO_ROW && !C::CONSUMER_DO_ROW && (C::QUANTIZER_WARPGROUPS > 0);
@@ -11093,13 +12224,16 @@ __device__ inline void backward_kernel_v3_streaming_3wg_impl(const globals_3wg<C
             EFFECTIVE_SEPARATE_BACKHALF_CONSUMERS &&
             (warpgroup_id >= first_dc_consumer_wg) &&
             (warpgroup_id < C::CONSUMER_WARPGROUPS + C::QUANTIZER_WARPGROUPS);
-        const int quantizer_sync_id = EFFECTIVE_SEPARATE_BACKHALF_CONSUMERS
-            ? (STATIC_FRONTEND_ONLY_DEONLY
-                ? (is_de_consumer_wg ? 4 : 2)
-                : (is_col_quantizer_wg ? 2 : (is_de_consumer_wg ? 3 : 4)))
-            : (G::FRONTEND_MULTI_QUANTIZER_WG
-                ? (is_row_quantizer_wg ? 2 : 3)
-                : (!C::CONSUMER_DO_ROW ? 2 : 1));
+        const int quantizer_sync_id =
+            (G::DEBUG_QUANTIZER_WG_SYNC_ID_OVERRIDE >= 0)
+                ? G::DEBUG_QUANTIZER_WG_SYNC_ID_OVERRIDE
+                : (EFFECTIVE_SEPARATE_BACKHALF_CONSUMERS
+                    ? (STATIC_FRONTEND_ONLY_DEONLY
+                        ? (is_de_consumer_wg ? 4 : 2)
+                        : (is_col_quantizer_wg ? 2 : (is_de_consumer_wg ? 3 : 4)))
+                    : (G::FRONTEND_MULTI_QUANTIZER_WG
+                        ? (is_row_quantizer_wg ? 2 : 3)
+                        : (!C::CONSUMER_DO_ROW ? 2 : 1)));
         constexpr bool SAFUSED_SPLIT_STAGE_DEBUG =
             G::FUSED_SOFTMAX_QUANT &&
             G::FUSED_COL_IN_QUANTIZER &&
@@ -11137,6 +12271,46 @@ __device__ inline void backward_kernel_v3_streaming_3wg_impl(const globals_3wg<C
             if constexpr (SAFUSED_SPLIT_STAGE_DEBUG) {
                 asm volatile("fence.proxy.async.shared::cta;\n" ::: "memory");
                 return safused_split_abort_stage != 0;
+            } else {
+                return false;
+            }
+        };
+        constexpr bool PUBLIC_COLONLY_STAGE_CUTS_ENABLED =
+            !DO_ROW &&
+            DO_COL &&
+            !G::FUSED_SOFTMAX_QUANT &&
+            !G::SKIP_GLOBAL_COL_MATERIALIZATION &&
+            G::FRONTEND_SINGLE_QUANTIZER_WG &&
+            G::USE_COL_PAIR_STAGE &&
+            G::COL_READY_PER_ROW16 &&
+            !EFFECTIVE_ENABLE_STOREADD_COMBO &&
+            (G::DEBUG_PUBLIC_COLONLY_STAGE_CUT > 0);
+        auto public_colonly_release_recycled_and_cut = [&]() {
+            if constexpr (PUBLIC_COLONLY_STAGE_CUTS_ENABLED || G::DEBUG_PUBLIC_COLONLY_TRACE) {
+                if constexpr (G::DEBUG_PUBLIC_COLONLY_TRACE ||
+                              G::DEBUG_PUBLIC_COLONLY_LATE_TRACE) {
+                    if (warpgroup::warpid() == 0 && quant_lane == 0) {
+                        printf("public col cut presync cta=%d wg=%d\n", cta_id, warpgroup_id);
+                    }
+                }
+                warpgroup::sync(quantizer_sync_id);
+                if constexpr (G::DEBUG_PUBLIC_COLONLY_TRACE ||
+                              G::DEBUG_PUBLIC_COLONLY_LATE_TRACE) {
+                    if (warpgroup::warpid() == 0 && quant_lane == 0) {
+                        printf("public col cut postsync cta=%d wg=%d\n", cta_id, warpgroup_id);
+                    }
+                }
+                if (warpgroup::warpid() == 0 && quant_lane == 0) {
+                    __threadfence_block();
+                    asm volatile("fence.proxy.async.shared::cta;\n" ::: "memory");
+                    #pragma unroll
+                    for (int debug_bf_stage = 0; debug_bf_stage < C::BF16_STAGE_COUNT; ++debug_bf_stage) {
+                        arrive(slice_col_recycled[debug_bf_stage]);
+                    }
+                    __threadfence_block();
+                    asm volatile("fence.proxy.async.shared::cta;\n" ::: "memory");
+                }
+                return true;
             } else {
                 return false;
             }
@@ -11181,6 +12355,19 @@ __device__ inline void backward_kernel_v3_streaming_3wg_impl(const globals_3wg<C
             const int tile_row_base = row_block_idx * C::Mb + cta_id * (C::Mb / 2);
             const bool full_tile_rows = tile_row_base + (C::Mb / 2) <= g.M;
             const bool full_tile_cols = (col_block_idx + 1) * C::Nb <= g.N;
+            if constexpr (G::DEBUG_PUBLIC_COLONLY_LATE_TRACE) {
+                if (block_idx > cluster_id &&
+                    warpgroup::warpid() == 0 &&
+                    quant_lane == 0 &&
+                    (warpgroup_id < C::CONSUMER_WARPGROUPS || warpgroup_id == first_quantizer_wg)) {
+                    printf("public col nextblock enter cta=%d wg=%d block=%d row=%d col=%d roles=%d%d%d%d\n",
+                           cta_id, warpgroup_id, block_idx, row_block_idx, col_block_idx,
+                           is_row_quantizer_wg ? 1 : 0,
+                           is_col_quantizer_wg ? 1 : 0,
+                           is_de_consumer_wg ? 1 : 0,
+                           is_dc_consumer_wg ? 1 : 0);
+                }
+            }
             if constexpr (EFFECTIVE_ENABLE_STOREADD_COMBO && EFFECTIVE_SEPARATE_BACKHALF_CONSUMERS) {
                 if ((is_de_consumer_wg && !combo_do_de) ||
                     (is_dc_consumer_wg && !combo_do_dc)) {
@@ -11224,6 +12411,31 @@ __device__ inline void backward_kernel_v3_streaming_3wg_impl(const globals_3wg<C
                 const int col_start = col_block_idx * C::Nb + epi * SUBTILE_COLS;
                 const bool combo_stage_first_epi = (epi == 0);
                 const bool combo_stage_publish_epi = (epi == C::EPI_PIPE_DEPTH - 1);
+                auto public_colonly_trace = [&](int step, int row16_pass_debug, int row16_block_debug, float value) {
+                    if constexpr (G::DEBUG_PUBLIC_COLONLY_TRACE) {
+                        if (block_idx == cluster_id && epi == 0 &&
+                            warpgroup::warpid() == 0 && quant_lane == 0) {
+                            printf("public col trace step=%d cta=%d wg=%d block=%d row=%d col=%d bf=%d row16=%d val=%f\n",
+                                   step, cta_id, warpgroup_id, block_idx, row_block_idx, col_block_idx,
+                                   bf_stage, row16_block_debug, value);
+                        }
+                    }
+                };
+        const bool public_col_trace_leader =
+            block_idx == cluster_id &&
+            (G::FRONTEND_SINGLE_QUANTIZER_WG
+                 ? (warpgroup_id == first_quantizer_wg)
+                 : is_col_quantizer_wg) &&
+            warpgroup::warpid() == 0 &&
+            quant_lane == 0;
+        const bool public_col_trace_wg_leader =
+            block_idx == cluster_id &&
+            warpgroup::warpid() == 0 &&
+            quant_lane == 0;
+        const bool public_col_trace_lane0_leader =
+            block_idx == cluster_id &&
+            warpgroup::warpid() == 0 &&
+            warp::laneid() == 0;
                 if constexpr (G::SKIP_GLOBAL_COL_MATERIALIZATION && DEDICATED_ROWONLY_DEBUG_STAGE == 2) {
                     if (block_idx == cluster_id && combo_do_dc && is_dc_consumer_wg && epi == 0 &&
                         warpgroup::warpid() == 0 && quant_lane == 0) {
@@ -11486,8 +12698,20 @@ __device__ inline void backward_kernel_v3_streaming_3wg_impl(const globals_3wg<C
                         if (run_single_frontend_quantizer_wg) {
                             if constexpr (ROW_IN_QUANTIZER) {
                                 if constexpr (!G::DEBUG_SKIP_ROW_READY_WAIT) {
+                                    if constexpr (G::DEBUG_PUBLIC_COLONLY_TRACE) {
+                                        if (public_col_trace_lane0_leader && epi == 0) {
+                                            printf("public col singlefrontend pre row-ready cta=%d wg=%d bf=%d epi=%d\n",
+                                                   cta_id, warpgroup_id, bf_stage, epi);
+                                        }
+                                    }
                                     wait(slice_row_ready[bf_stage], get_phasebit<0>(slice_row_ready_phasebits, bf_stage));
                                     asm volatile("fence.proxy.async.shared::cta;\n" ::: "memory");
+                                    if constexpr (G::DEBUG_PUBLIC_COLONLY_TRACE) {
+                                        if (public_col_trace_lane0_leader && epi == 0) {
+                                            printf("public col singlefrontend post row-ready cta=%d wg=%d bf=%d epi=%d\n",
+                                                   cta_id, warpgroup_id, bf_stage, epi);
+                                        }
+                                    }
                                 }
                             }
                             if constexpr (COL_IN_QUANTIZER) {
@@ -11711,6 +12935,12 @@ __device__ inline void backward_kernel_v3_streaming_3wg_impl(const globals_3wg<C
                         }
                     } else if constexpr (G::FRONTEND_SINGLE_QUANTIZER_WG) {
                         constexpr int ROW_THREADS = QUANTIZER_WG_THREADS / 2;
+                        if constexpr (G::DEBUG_PUBLIC_COLONLY_TRACE) {
+                            if (public_col_trace_lane0_leader && run_single_frontend_quantizer_wg && epi == 0) {
+                                printf("public col singlefrontend row block enter cta=%d wg=%d bf=%d epi=%d\n",
+                                       cta_id, warpgroup_id, bf_stage, epi);
+                            }
+                        }
                         if (run_single_frontend_quantizer_wg && quant_thread < ROW_THREADS) {
                             const int quant_row = quant_thread;
                             if (quant_row < C::Mb / 2) {
@@ -11874,6 +13104,12 @@ __device__ inline void backward_kernel_v3_streaming_3wg_impl(const globals_3wg<C
                                         row_sc_ptr[chunk * 512 + byte_idx] = *reinterpret_cast<const uint8_t*>(&sc);
                                     }
                                 }
+                            }
+                        }
+                        if constexpr (G::DEBUG_PUBLIC_COLONLY_TRACE) {
+                            if (public_col_trace_lane0_leader && run_single_frontend_quantizer_wg && epi == 0) {
+                                printf("public col singlefrontend row block done cta=%d wg=%d bf=%d epi=%d\n",
+                                       cta_id, warpgroup_id, bf_stage, epi);
                             }
                         }
                     }
@@ -12142,6 +13378,22 @@ __device__ inline void backward_kernel_v3_streaming_3wg_impl(const globals_3wg<C
 	                                                wait(slice_col_ready_row16[bf_stage][row16_block], get_phasebit<0>(slice_col_ready_phasebits, bf_stage));
 	                                                asm volatile("fence.proxy.async.shared::cta;\n" ::: "memory");
 	                                            }
+                                                if constexpr (G::DEBUG_PUBLIC_COLONLY_TRACE) {
+                                                    if (block_idx == cluster_id && epi == 0 && row16_pass == 1 && quant_lane == 0) {
+                                                        printf(
+                                                            "public col enter cta=%d wg=%d qtid=%d qlane=%d row16_pass=%d row16=%d col_in=%d\n",
+                                                            cta_id, warpgroup_id, quant_thread, quant_lane,
+                                                            row16_pass, row16_block, col_in_epi);
+                                                    }
+                                                }
+                                                public_colonly_trace(1, row16_pass, row16_block, 0.0f);
+                                                if constexpr (PUBLIC_COLONLY_STAGE_CUTS_ENABLED) {
+                                                    if constexpr (G::DEBUG_PUBLIC_COLONLY_STAGE_CUT == 1) {
+                                                        if (block_idx == cluster_id && epi == 0 && row16_pass == 0) {
+                                                            if (public_colonly_release_recycled_and_cut()) return;
+                                                        }
+                                                    }
+                                                }
                                                 if constexpr (G::SKIP_GLOBAL_COL_MATERIALIZATION) {
                                                     if constexpr (ROWONLY_COMBO_DC_DEBUG_CUT == 97) {
                                                         if (block_idx > cluster_id && combo_do_dc && is_dc_consumer_wg && epi == 0 && row16_pass == 0) {
@@ -12193,7 +13445,102 @@ __device__ inline void backward_kernel_v3_streaming_3wg_impl(const globals_3wg<C
                                         const int col_pair_lane = col_in_epi % 2;
                                         float col_amax = 0.0f;
                                         uint64_t packed_fp4 = 0;
-                                        if constexpr (C::CACHE_COL_VALUES) {
+                                        if constexpr (G::DEBUG_PUBLIC_COLONLY_LEGACY_STORE &&
+                                                      !G::ENABLE_STOREADD_COMBO &&
+                                                      !G::SKIP_GLOBAL_COL_MATERIALIZATION) {
+                                            if constexpr (C::CACHE_COL_VALUES) {
+                                                float2 cached_pairs[8];
+                                                #pragma unroll
+                                                for (int pair = 0; pair < 8; ++pair) {
+                                                    const int global_row = global_row_base + pair * 2;
+                                                    const bf16_2 bf_pair =
+                                                        load_col_pair_stage_pair<G>(col_pair_stage, bf_stage, row16_block, col_pair_idx, pair, col_pair_lane);
+                                                    const float v0 = (global_row < g.M) ? __bfloat162float(bf_pair.x) : 0.0f;
+                                                    const float v1 = (global_row + 1 < g.M) ? __bfloat162float(bf_pair.y) : 0.0f;
+                                                    cached_pairs[pair] = make_float2(v0, v1);
+                                                    col_amax = fmaxf(col_amax, fabsf(v0));
+                                                    col_amax = fmaxf(col_amax, fabsf(v1));
+                                                }
+                                                const float col_scale = col_amax * (1.0f / FP4_MAX);
+                                                const float col_rcp = (col_amax > 0.0f) ? (FP4_MAX / col_amax) : 0.0f;
+                                                public_colonly_trace(2, row16_pass, row16_block, col_amax);
+                                                #pragma unroll
+                                                for (int pair = 0; pair < 8; ++pair) {
+                                                    packed_fp4 |= static_cast<uint64_t>(quantize_fp4_pair(
+                                                        cached_pairs[pair].x,
+                                                        cached_pairs[pair].y,
+                                                        col_rcp)) << (pair * 8);
+                                                }
+                                                if constexpr (G::PACK_COL_FP4_U64) {
+                                                    store_global_u64(
+                                                        col_fp4_ptr + global_col * col_fp4_stride + global_row_pair_base,
+                                                        packed_fp4);
+                                                } else {
+                                                    #pragma unroll
+                                                    for (int pair = 0; pair < 8; ++pair) {
+                                                        col_fp4_ptr[global_col * col_fp4_stride + global_row_pair_base + pair] =
+                                                            static_cast<uint8_t>(packed_fp4 >> (pair * 8));
+                                                    }
+                                                }
+                                                float stored_scale = col_scale * g_sg_rcp;
+                                                if (encode_centric) {
+                                                    stored_scale = fminf(col_rcp * g_sg, E4M3_MAX);
+                                                }
+                                                const __nv_fp8_e4m3 csc = __nv_fp8_e4m3(stored_scale);
+                                                col_sc_ptr[chunk * 512 + byte_idx] =
+                                                    *reinterpret_cast<const uint8_t*>(&csc);
+                                                public_colonly_trace(3, row16_pass, row16_block, stored_scale);
+                                            } else {
+                                                bf16_2 cached_pairs[8];
+                                                #pragma unroll
+                                                for (int pair = 0; pair < 8; ++pair) {
+                                                    cached_pairs[pair] =
+                                                        load_col_pair_stage_pair<G>(col_pair_stage, bf_stage, row16_block, col_pair_idx, pair, col_pair_lane);
+                                                    const float v0 = __bfloat162float(cached_pairs[pair].x);
+                                                    const float v1 = (global_row_base + pair * 2 + 1 < g.M) ? __bfloat162float(cached_pairs[pair].y) : 0.0f;
+                                                    col_amax = fmaxf(col_amax, fabsf(v0));
+                                                    col_amax = fmaxf(col_amax, fabsf(v1));
+                                                }
+                                                const float col_scale = col_amax * (1.0f / FP4_MAX);
+                                                const float col_rcp = (col_amax > 0.0f) ? (FP4_MAX / col_amax) : 0.0f;
+                                                public_colonly_trace(2, row16_pass, row16_block, col_amax);
+                                                #pragma unroll
+                                                for (int pair = 0; pair < 8; ++pair) {
+                                                    const int global_row = global_row_base + pair * 2;
+                                                    const float v0 = (global_row < g.M) ? __bfloat162float(cached_pairs[pair].x) : 0.0f;
+                                                    const float v1 = (global_row + 1 < g.M) ? __bfloat162float(cached_pairs[pair].y) : 0.0f;
+                                                    packed_fp4 |= static_cast<uint64_t>(
+                                                        quantize_fp4_pair(v0, v1, col_rcp)) << (pair * 8);
+                                                }
+                                                if constexpr (G::PACK_COL_FP4_U64) {
+                                                    store_global_u64(
+                                                        col_fp4_ptr + global_col * col_fp4_stride + global_row_pair_base,
+                                                        packed_fp4);
+                                                } else {
+                                                    #pragma unroll
+                                                    for (int pair = 0; pair < 8; ++pair) {
+                                                        col_fp4_ptr[global_col * col_fp4_stride + global_row_pair_base + pair] =
+                                                            static_cast<uint8_t>(packed_fp4 >> (pair * 8));
+                                                    }
+                                                }
+                                                float stored_scale = col_scale * g_sg_rcp;
+                                                if (encode_centric) {
+                                                    stored_scale = fminf(col_rcp * g_sg, E4M3_MAX);
+                                                }
+                                                const __nv_fp8_e4m3 csc = __nv_fp8_e4m3(stored_scale);
+                                                col_sc_ptr[chunk * 512 + byte_idx] =
+                                                    *reinterpret_cast<const uint8_t*>(&csc);
+                                                public_colonly_trace(3, row16_pass, row16_block, stored_scale);
+                                            }
+                                        } else if constexpr (C::CACHE_COL_VALUES) {
+                                            if constexpr (G::DEBUG_PUBLIC_COLONLY_TRACE) {
+                                                if (block_idx == cluster_id && epi == 0 &&
+                                                    row16_pass == 1 && quant_lane == 0) {
+                                                    printf(
+                                                        "public col lane step=40 cta=%d wg=%d qtid=%d qlane=%d col_thread=%d col_in=%d\n",
+                                                        cta_id, warpgroup_id, quant_thread, quant_lane, col_thread, col_in_epi);
+                                                }
+                                            }
                                             float2 cached_pairs[8];
                                             #pragma unroll
                                             for (int pair = 0; pair < 8; ++pair) {
@@ -12206,8 +13553,24 @@ __device__ inline void backward_kernel_v3_streaming_3wg_impl(const globals_3wg<C
                                                 col_amax = fmaxf(col_amax, fabsf(v0));
                                                 col_amax = fmaxf(col_amax, fabsf(v1));
                                             }
+                                            if constexpr (G::DEBUG_PUBLIC_COLONLY_TRACE) {
+                                                if (block_idx == cluster_id && epi == 0 &&
+                                                    row16_pass == 1 && quant_lane == 0) {
+                                                    printf(
+                                                        "public col lane step=41 cta=%d wg=%d qtid=%d qlane=%d col_thread=%d col_in=%d amax=%f\n",
+                                                        cta_id, warpgroup_id, quant_thread, quant_lane, col_thread, col_in_epi, col_amax);
+                                                }
+                                            }
                                             const fp4_scale_contract scale_contract =
                                                 make_fp4_scale_contract(col_amax, g_sg_rcp, g_sg, encode_centric);
+                                            public_colonly_trace(2, row16_pass, row16_block, col_amax);
+                                            if constexpr (PUBLIC_COLONLY_STAGE_CUTS_ENABLED) {
+                                                if constexpr (G::DEBUG_PUBLIC_COLONLY_STAGE_CUT == 2) {
+                                                    if (block_idx == cluster_id && epi == 0 && row16_pass == 0) {
+                                                        if (public_colonly_release_recycled_and_cut()) return;
+                                                    }
+                                                }
+                                            }
                                             if constexpr (G::SKIP_GLOBAL_COL_MATERIALIZATION &&
                                                           ROWONLY_COMBO_DC_DEBUG_CUT == 201) {
                                                 if (block_idx == cluster_id && combo_do_dc && is_col_quantizer_wg &&
@@ -12231,6 +13594,15 @@ __device__ inline void backward_kernel_v3_streaming_3wg_impl(const globals_3wg<C
                                                     cached_pairs[pair].y,
                                                     scale_contract.quant_rcp_scale)) << (pair * 8);
                                             }
+                                            if constexpr (G::DEBUG_PUBLIC_COLONLY_TRACE) {
+                                                if (block_idx == cluster_id && epi == 0 &&
+                                                    row16_pass == 1 && quant_lane == 0) {
+                                                    printf(
+                                                        "public col lane step=42 cta=%d wg=%d qtid=%d qlane=%d col_thread=%d col_in=%d packed=%016llx\n",
+                                                        cta_id, warpgroup_id, quant_thread, quant_lane, col_thread, col_in_epi,
+                                                        static_cast<unsigned long long>(packed_fp4));
+                                                }
+                                            }
                                             if constexpr (G::PACK_COL_FP4_U64) {
                                                 maybe_store_global_col_u64<G>(
                                                     col_fp4_ptr, col_fp4_stride,
@@ -12244,6 +13616,14 @@ __device__ inline void backward_kernel_v3_streaming_3wg_impl(const globals_3wg<C
                                                         static_cast<uint8_t>(packed_fp4 >> (pair * 8)));
                                                 }
                                             }
+                                            if constexpr (G::DEBUG_PUBLIC_COLONLY_TRACE) {
+                                                if (block_idx == cluster_id && epi == 0 &&
+                                                    row16_pass == 1 && quant_lane == 0) {
+                                                    printf(
+                                                        "public col lane step=43 cta=%d wg=%d qtid=%d qlane=%d col_thread=%d col_in=%d\n",
+                                                        cta_id, warpgroup_id, quant_thread, quant_lane, col_thread, col_in_epi);
+                                                }
+                                            }
                                             if (combo_do_dc) {
                                                 const int local_col = epi * SUBTILE_COLS + col_in_epi;
                                                 const int local_row_pair_base = local_row_base / 2;
@@ -12255,6 +13635,24 @@ __device__ inline void backward_kernel_v3_streaming_3wg_impl(const globals_3wg<C
                                             }
                                             maybe_store_global_col_scale<G>(
                                                 col_sc_ptr, chunk, byte_idx, scale_contract.scale_byte);
+                                            public_colonly_trace(3, row16_pass, row16_block, static_cast<float>(scale_contract.scale_byte));
+                                            if constexpr (G::DEBUG_PUBLIC_COLONLY_TRACE) {
+                                                if (block_idx == cluster_id && epi == 0 && row16_pass == 1 && quant_lane == 0) {
+                                                    printf(
+                                                        "public col pass1 store-done cta=%d wg=%d qtid=%d row16=%d scale=%u\n",
+                                                        cta_id, warpgroup_id, quant_thread, row16_block,
+                                                        static_cast<unsigned>(scale_contract.scale_byte));
+                                                }
+                                            }
+                                            if constexpr (G::DEBUG_PUBLIC_COLONLY_TRACE) {
+                                                if (block_idx == cluster_id && epi == 0 &&
+                                                    row16_pass == 1 && quant_lane == 0) {
+                                                    printf(
+                                                        "public col lane step=44 cta=%d wg=%d qtid=%d qlane=%d col_thread=%d col_in=%d scale=%u\n",
+                                                        cta_id, warpgroup_id, quant_thread, quant_lane, col_thread, col_in_epi,
+                                                        static_cast<unsigned>(scale_contract.scale_byte));
+                                                }
+                                            }
                                             if (combo_do_dc) {
                                                 const int local_col = epi * SUBTILE_COLS + col_in_epi;
                                                 store_combo_col_stage_scale<G>(
@@ -12262,6 +13660,13 @@ __device__ inline void backward_kernel_v3_streaming_3wg_impl(const globals_3wg<C
                                                     local_col,
                                                     local_row_base,
                                                     scale_contract.scale_byte);
+                                            }
+                                            if constexpr (PUBLIC_COLONLY_STAGE_CUTS_ENABLED) {
+                                                if constexpr (G::DEBUG_PUBLIC_COLONLY_STAGE_CUT == 3) {
+                                                    if (block_idx == cluster_id && epi == 0 && row16_pass == 0) {
+                                                        if (public_colonly_release_recycled_and_cut()) return;
+                                                    }
+                                                }
                                             }
                                             if constexpr (G::SKIP_GLOBAL_COL_MATERIALIZATION &&
                                                           ROWONLY_COMBO_DC_DEBUG_CUT == 202) {
@@ -12292,6 +13697,7 @@ __device__ inline void backward_kernel_v3_streaming_3wg_impl(const globals_3wg<C
                                             }
                                             const fp4_scale_contract scale_contract =
                                                 make_fp4_scale_contract(col_amax, g_sg_rcp, g_sg, encode_centric);
+                                            public_colonly_trace(2, row16_pass, row16_block, col_amax);
                                             #pragma unroll
                                             for (int pair = 0; pair < 8; ++pair) {
                                                 const int global_row = global_row_base + pair * 2;
@@ -12324,6 +13730,7 @@ __device__ inline void backward_kernel_v3_streaming_3wg_impl(const globals_3wg<C
                                             }
                                             maybe_store_global_col_scale<G>(
                                                 col_sc_ptr, chunk, byte_idx, scale_contract.scale_byte);
+                                            public_colonly_trace(3, row16_pass, row16_block, static_cast<float>(scale_contract.scale_byte));
                                             if (combo_do_dc) {
                                                 const int local_col = epi * SUBTILE_COLS + col_in_epi;
                                                 store_combo_col_stage_scale<G>(
@@ -12507,9 +13914,41 @@ __device__ inline void backward_kernel_v3_streaming_3wg_impl(const globals_3wg<C
                                             __threadfence_block();
                                             slice_col_done_row16[bf_stage][row16_block] = 1;
                                         }
-                                        }
                                     }
                                 }
+                            }
+                            if constexpr (G::DEBUG_PUBLIC_COLONLY_TRACE ||
+                                          G::DEBUG_PUBLIC_COLONLY_LATE_TRACE) {
+                                if (block_idx == cluster_id &&
+                                    warpgroup::warpid() == 0 && quant_lane == 0) {
+                                    if constexpr (G::DEBUG_PUBLIC_COLONLY_TRACE) {
+                                        printf(
+                                            "public col row16 loop done cta=%d wg=%d qtid=%d bf=%d epi=%d\n",
+                                            cta_id, warpgroup_id, quant_thread, bf_stage, epi);
+                                    }
+                                    printf(
+                                        "public col postloop flags cta=%d wg=%d epi=%d combo_de=%d combo_dc=%d sep=%d fused_sm=%d fused_colq=%d col_in_q=%d dedicated=%d\n",
+                                        cta_id, warpgroup_id, epi,
+                                        combo_do_de ? 1 : 0,
+                                        combo_do_dc ? 1 : 0,
+                                        EFFECTIVE_SEPARATE_BACKHALF_CONSUMERS ? 1 : 0,
+                                        G::FUSED_SOFTMAX_QUANT ? 1 : 0,
+                                        G::FUSED_COL_IN_QUANTIZER ? 1 : 0,
+                                        COL_IN_QUANTIZER ? 1 : 0,
+                                        DEDICATED_ROWONLY_ROUTE ? 1 : 0);
+                                }
+                                if constexpr (G::DEBUG_PUBLIC_COLONLY_LATE_TRACE) {
+                                    if (block_idx == cluster_id &&
+                                        epi >= C::EPI_PIPE_DEPTH - 2 &&
+                                        quant_lane == 0 &&
+                                        (G::FRONTEND_SINGLE_QUANTIZER_WG
+                                             ? (warpgroup_id == first_quantizer_wg)
+                                             : is_col_quantizer_wg)) {
+                                        printf("public col warp row16done cta=%d wg=%d warp=%d bf=%d epi=%d\n",
+                                               cta_id, warpgroup_id, warpgroup::warpid(), bf_stage, epi);
+                                    }
+                                }
+                            }
                                 if constexpr (G::SKIP_GLOBAL_COL_MATERIALIZATION &&
                                               ROWONLY_COMBO_DC_DEBUG_CUT == 203) {
                                     if (block_idx == cluster_id && combo_do_dc && is_col_quantizer_wg &&
@@ -12660,10 +14099,28 @@ __device__ inline void backward_kernel_v3_streaming_3wg_impl(const globals_3wg<C
                                     scale_contract.scale_byte);
                             }
                             if constexpr (DO_ROW && G::ROW_WAITS_FOR_COL_DONE_ROW16) {
+                                public_colonly_trace(31, row16_pass, row16_block, 0.0f);
                                 __syncwarp();
+                                public_colonly_trace(32, row16_pass, row16_block, 0.0f);
                                 if (col_in_epi == 0) {
                                     __threadfence_block();
+                                    public_colonly_trace(33, row16_pass, row16_block, 0.0f);
                                     slice_col_done_row16[bf_stage][row16_block] = 1;
+                                    public_colonly_trace(4, row16_pass, row16_block, 0.0f);
+                                }
+                            }
+                            if constexpr (PUBLIC_COLONLY_STAGE_CUTS_ENABLED) {
+                                if constexpr (G::DEBUG_PUBLIC_COLONLY_STAGE_CUT == 4) {
+                                    if (block_idx == cluster_id && epi == 0 && row16_pass == 0) {
+                                        if (public_colonly_release_recycled_and_cut()) return;
+                                    }
+                                }
+                            }
+                            if constexpr (G::DEBUG_PUBLIC_COLONLY_TRACE) {
+                                if (block_idx == cluster_id && epi == 0 && row16_pass == 1 &&
+                                    warpgroup::warpid() == 0 && quant_lane == 0) {
+                                    printf("public col pass1 complete cta=%d wg=%d row16=%d\n",
+                                           cta_id, warpgroup_id, row16_block);
                                 }
                             }
                         }
@@ -12719,6 +14176,26 @@ __device__ inline void backward_kernel_v3_streaming_3wg_impl(const globals_3wg<C
                             "dedicated rowonly stage 23 cta=%d wg=%d block=%d row=%d col=%d epi=%d\n",
                             cta_id, warpgroup_id, block_idx, row_block_idx, col_block_idx, epi);
                         return;
+                    }
+                }
+                if constexpr (G::DEBUG_PUBLIC_COLONLY_TRACE) {
+                    if (public_col_trace_lane0_leader) {
+                        printf("public col pre shared block cta=%d wg=%d bf=%d epi=%d\n",
+                               cta_id, warpgroup_id, bf_stage, epi);
+                    }
+                }
+                if constexpr (G::DEBUG_PUBLIC_COLONLY_TRACE) {
+                    if (public_col_trace_wg_leader) {
+                        printf("public col shared block wg arrive cta=%d wg=%d bf=%d epi=%d roles=%d%d%d%d\n",
+                               cta_id, warpgroup_id, bf_stage, epi,
+                               is_row_quantizer_wg ? 1 : 0,
+                               is_col_quantizer_wg ? 1 : 0,
+                               is_de_consumer_wg ? 1 : 0,
+                               is_dc_consumer_wg ? 1 : 0);
+                    }
+                    if (public_col_trace_leader) {
+                        printf("public col enter shared block cta=%d wg=%d bf=%d epi=%d\n",
+                               cta_id, warpgroup_id, bf_stage, epi);
                     }
                 }
                 if constexpr (EFFECTIVE_ENABLE_STOREADD_COMBO && EFFECTIVE_SEPARATE_BACKHALF_CONSUMERS) {
@@ -13919,6 +15396,54 @@ __device__ inline void backward_kernel_v3_streaming_3wg_impl(const globals_3wg<C
                         }
                         }
                     }
+                if constexpr (G::DEBUG_PUBLIC_COLONLY_TRACE ||
+                              G::DEBUG_PUBLIC_COLONLY_LATE_TRACE) {
+                    if (public_col_trace_leader) {
+                        printf("public col late shared block cta=%d wg=%d bf=%d epi=%d\n",
+                               cta_id, warpgroup_id, bf_stage, epi);
+                    }
+                }
+                if constexpr (G::DEBUG_PUBLIC_COLONLY_TRACE ||
+                              G::DEBUG_PUBLIC_COLONLY_LATE_TRACE) {
+                    if constexpr (G::DEBUG_PUBLIC_COLONLY_TRACE) {
+                        if (public_col_trace_wg_leader) {
+                            printf("public col post combo wg arrive cta=%d wg=%d bf=%d epi=%d roles=%d%d%d%d\n",
+                                   cta_id, warpgroup_id, bf_stage, epi,
+                                   is_row_quantizer_wg ? 1 : 0,
+                                   is_col_quantizer_wg ? 1 : 0,
+                                   is_de_consumer_wg ? 1 : 0,
+                                   is_dc_consumer_wg ? 1 : 0);
+                        }
+                    }
+                    if (public_col_trace_leader) {
+                        printf("public col post combo block cta=%d wg=%d bf=%d epi=%d\n",
+                               cta_id, warpgroup_id, bf_stage, epi);
+                    }
+                }
+                if constexpr (PUBLIC_COLONLY_STAGE_CUTS_ENABLED) {
+                    if constexpr (G::DEBUG_PUBLIC_COLONLY_STAGE_CUT == 5) {
+                        if (block_idx == cluster_id && epi == 0) {
+                            if constexpr (G::DEBUG_PUBLIC_COLONLY_TRACE) {
+                                if (public_col_trace_wg_leader) {
+                                    printf("public col cut5 wg arrive cta=%d wg=%d bf=%d epi=%d roles=%d%d%d%d\n",
+                                           cta_id, warpgroup_id, bf_stage, epi,
+                                           is_row_quantizer_wg ? 1 : 0,
+                                           is_col_quantizer_wg ? 1 : 0,
+                                           is_de_consumer_wg ? 1 : 0,
+                                           is_dc_consumer_wg ? 1 : 0);
+                                }
+                            }
+                            if (public_colonly_release_recycled_and_cut()) return;
+                        }
+                    }
+                }
+                if constexpr (G::DEBUG_PUBLIC_COLONLY_TRACE ||
+                              G::DEBUG_PUBLIC_COLONLY_LATE_TRACE) {
+                    if (public_col_trace_leader) {
+                        printf("public col after cut5 block cta=%d wg=%d bf=%d epi=%d\n",
+                               cta_id, warpgroup_id, bf_stage, epi);
+                    }
+                }
                 if constexpr (G::SKIP_GLOBAL_COL_MATERIALIZATION) {
                     if constexpr (ROWONLY_COMBO_DC_DEBUG_CUT == 84) {
                         if (block_idx > cluster_id && combo_do_dc && is_dc_consumer_wg && epi == 0) {
@@ -13955,8 +15480,64 @@ __device__ inline void backward_kernel_v3_streaming_3wg_impl(const globals_3wg<C
                         }
                     }
                 }
+                if constexpr (G::DEBUG_PUBLIC_COLONLY_LATE_TRACE) {
+                    if (public_col_trace_wg_leader) {
+                        printf("public col gap1 cta=%d wg=%d bf=%d epi=%d roles=%d%d%d%d\n",
+                               cta_id, warpgroup_id, bf_stage, epi,
+                               is_row_quantizer_wg ? 1 : 0,
+                               is_col_quantizer_wg ? 1 : 0,
+                               is_de_consumer_wg ? 1 : 0,
+                               is_dc_consumer_wg ? 1 : 0);
+                    }
+                }
+                if constexpr (PUBLIC_COLONLY_STAGE_CUTS_ENABLED) {
+                    if constexpr (G::DEBUG_PUBLIC_COLONLY_STAGE_CUT == 51) {
+                        if (block_idx == cluster_id && epi == 0) {
+                            if (public_colonly_release_recycled_and_cut()) return;
+                        }
+                    }
+                }
+                if constexpr (G::DEBUG_PUBLIC_COLONLY_LATE_TRACE) {
+                    if (public_col_trace_wg_leader) {
+                        printf("public col gap1b cta=%d wg=%d bf=%d epi=%d roles=%d%d%d%d\n",
+                               cta_id, warpgroup_id, bf_stage, epi,
+                               is_row_quantizer_wg ? 1 : 0,
+                               is_col_quantizer_wg ? 1 : 0,
+                               is_de_consumer_wg ? 1 : 0,
+                               is_dc_consumer_wg ? 1 : 0);
+                    }
+                    if (block_idx == cluster_id &&
+                        epi >= C::EPI_PIPE_DEPTH - 2 &&
+                        quant_lane == 0 &&
+                        (G::FRONTEND_SINGLE_QUANTIZER_WG
+                             ? (warpgroup_id == first_quantizer_wg)
+                             : is_col_quantizer_wg)) {
+                        printf("public col warp gap1b cta=%d wg=%d warp=%d bf=%d epi=%d\n",
+                               cta_id, warpgroup_id, warpgroup::warpid(), bf_stage, epi);
+                    }
+                    if (cta_id == 0 &&
+                        block_idx == cluster_id &&
+                        epi == C::EPI_PIPE_DEPTH - 2 &&
+                        (quant_lane % 8) == 0 &&
+                        (G::FRONTEND_SINGLE_QUANTIZER_WG
+                             ? (warpgroup_id == first_quantizer_wg)
+                             : is_col_quantizer_wg)) {
+                        printf("public col lane gap1b cta=%d wg=%d warp=%d lane=%d bf=%d epi=%d\n",
+                               cta_id, warpgroup_id, warpgroup::warpid(), quant_lane, bf_stage, epi);
+                    }
+                }
+                if constexpr (G::DEBUG_PUBLIC_COLONLY_POST_GAP1B_SYNC) {
+                    warpgroup::sync(quantizer_sync_id);
+                }
                 if constexpr (G::FUSED_SOFTMAX_QUANT && G::FUSED_COL_IN_QUANTIZER &&
                               COL_IN_QUANTIZER) {
+                    if constexpr (G::DEBUG_PUBLIC_COLONLY_TRACE ||
+                                  G::DEBUG_PUBLIC_COLONLY_LATE_TRACE) {
+                        if (public_col_trace_leader) {
+                            printf("public col pre fused branch cta=%d wg=%d bf=%d epi=%d\n",
+                                   cta_id, warpgroup_id, bf_stage, epi);
+                        }
+                    }
                     if (epi == C::EPI_PIPE_DEPTH - 1) {
                         int col_flush_thread = -1;
                         int col_flush_threads = 0;
@@ -14014,7 +15595,9 @@ __device__ inline void backward_kernel_v3_streaming_3wg_impl(const globals_3wg<C
                             }
                         }
                         if (!(DEDICATED_ROWONLY_ROUTE && combo_do_dc && combo_stage_publish_epi)) {
+                            public_colonly_trace(41, -1, -1, 0.0f);
                             warpgroup::sync(quantizer_sync_id);
+                            public_colonly_trace(42, -1, -1, 0.0f);
                         }
                         if constexpr (G::SKIP_GLOBAL_COL_MATERIALIZATION) {
                             if constexpr (ROWONLY_COMBO_DC_DEBUG_CUT == 58) {
@@ -14126,6 +15709,24 @@ __device__ inline void backward_kernel_v3_streaming_3wg_impl(const globals_3wg<C
                         }
 #undef rowonly_combo_dc_debug_cut
                     }
+                }
+                if constexpr (G::DEBUG_PUBLIC_COLONLY_LATE_TRACE) {
+                    if (public_col_trace_wg_leader) {
+                        printf("public col gap2 cta=%d wg=%d bf=%d epi=%d roles=%d%d%d%d\n",
+                               cta_id, warpgroup_id, bf_stage, epi,
+                               is_row_quantizer_wg ? 1 : 0,
+                               is_col_quantizer_wg ? 1 : 0,
+                               is_de_consumer_wg ? 1 : 0,
+                               is_dc_consumer_wg ? 1 : 0);
+                    }
+                }
+                if constexpr (PUBLIC_COLONLY_STAGE_CUTS_ENABLED) {
+                    if constexpr (G::DEBUG_PUBLIC_COLONLY_STAGE_CUT == 52) {
+                        if (block_idx == cluster_id && epi == 0) {
+                            if (public_colonly_release_recycled_and_cut()) return;
+                        }
+                    }
+                }
                 if constexpr (G::SKIP_GLOBAL_COL_MATERIALIZATION) {
                     if constexpr (ROWONLY_COMBO_DC_DEBUG_CUT == 56) {
                         if (combo_do_dc && is_dc_consumer_wg && combo_stage_publish_epi) {
@@ -14135,6 +15736,23 @@ __device__ inline void backward_kernel_v3_streaming_3wg_impl(const globals_3wg<C
                                     cta_id, warpgroup_id, warpgroup::warpid(), row_block_idx, col_block_idx, epi);
                             }
                             return;
+                        }
+                    }
+                }
+                if constexpr (G::DEBUG_PUBLIC_COLONLY_LATE_TRACE) {
+                    if (public_col_trace_wg_leader) {
+                        printf("public col gap3 cta=%d wg=%d bf=%d epi=%d roles=%d%d%d%d\n",
+                               cta_id, warpgroup_id, bf_stage, epi,
+                               is_row_quantizer_wg ? 1 : 0,
+                               is_col_quantizer_wg ? 1 : 0,
+                               is_de_consumer_wg ? 1 : 0,
+                               is_dc_consumer_wg ? 1 : 0);
+                    }
+                }
+                if constexpr (PUBLIC_COLONLY_STAGE_CUTS_ENABLED) {
+                    if constexpr (G::DEBUG_PUBLIC_COLONLY_STAGE_CUT == 53) {
+                        if (block_idx == cluster_id && epi == 0) {
+                            if (public_colonly_release_recycled_and_cut()) return;
                         }
                     }
                 }
@@ -14176,6 +15794,23 @@ __device__ inline void backward_kernel_v3_streaming_3wg_impl(const globals_3wg<C
                         }
                     }
                 }
+                if constexpr (G::DEBUG_PUBLIC_COLONLY_LATE_TRACE) {
+                    if (public_col_trace_wg_leader) {
+                        printf("public col gap4 cta=%d wg=%d bf=%d epi=%d roles=%d%d%d%d\n",
+                               cta_id, warpgroup_id, bf_stage, epi,
+                               is_row_quantizer_wg ? 1 : 0,
+                               is_col_quantizer_wg ? 1 : 0,
+                               is_de_consumer_wg ? 1 : 0,
+                               is_dc_consumer_wg ? 1 : 0);
+                    }
+                }
+                if constexpr (PUBLIC_COLONLY_STAGE_CUTS_ENABLED) {
+                    if constexpr (G::DEBUG_PUBLIC_COLONLY_STAGE_CUT == 54) {
+                        if (block_idx == cluster_id && epi == 0) {
+                            if (public_colonly_release_recycled_and_cut()) return;
+                        }
+                    }
+                }
                 if constexpr (G::SKIP_GLOBAL_COL_MATERIALIZATION) {
                     if constexpr (ROWONLY_COMBO_DC_DEBUG_CUT == 90) {
                         if (combo_do_dc &&
@@ -14193,10 +15828,70 @@ __device__ inline void backward_kernel_v3_streaming_3wg_impl(const globals_3wg<C
                         }
                     }
                 }
+                if constexpr (G::DEBUG_PUBLIC_COLONLY_LATE_TRACE) {
+                    if (public_col_trace_wg_leader) {
+                        printf("public col gap5 cta=%d wg=%d bf=%d epi=%d roles=%d%d%d%d\n",
+                               cta_id, warpgroup_id, bf_stage, epi,
+                               is_row_quantizer_wg ? 1 : 0,
+                               is_col_quantizer_wg ? 1 : 0,
+                               is_de_consumer_wg ? 1 : 0,
+                               is_dc_consumer_wg ? 1 : 0);
+                    }
+                }
+                if constexpr (PUBLIC_COLONLY_STAGE_CUTS_ENABLED) {
+                    if constexpr (G::DEBUG_PUBLIC_COLONLY_STAGE_CUT == 55) {
+                        if (block_idx == cluster_id && epi == 0) {
+                            if (public_colonly_release_recycled_and_cut()) return;
+                        }
+                    }
+                }
+                if constexpr (G::DEBUG_PUBLIC_COLONLY_TRACE ||
+                              G::DEBUG_PUBLIC_COLONLY_LATE_TRACE) {
+                    if (public_col_trace_leader) {
+                        printf("public col before pre tail gate cta=%d wg=%d bf=%d epi=%d\n",
+                               cta_id, warpgroup_id, bf_stage, epi);
+                    }
+                }
                 if constexpr (!(G::SKIP_GLOBAL_COL_MATERIALIZATION &&
                                 ROWONLY_COMBO_DC_SKIP_POST_DCEPILOGUE_SYNC)) {
+                    if constexpr (G::DEBUG_PUBLIC_COLONLY_TRACE ||
+                                  G::DEBUG_PUBLIC_COLONLY_LATE_TRACE) {
+                        if (public_col_trace_leader) {
+                            printf("public col pre tail cta=%d wg=%d bf=%d epi=%d\n",
+                                   cta_id, warpgroup_id, bf_stage, epi);
+                        }
+                    }
+                    if constexpr (PUBLIC_COLONLY_STAGE_CUTS_ENABLED) {
+                        if constexpr (G::DEBUG_PUBLIC_COLONLY_STAGE_CUT == 6) {
+                            if (block_idx == cluster_id && epi == 0) {
+                                if (public_colonly_release_recycled_and_cut()) return;
+                            }
+                        }
+                    }
                     if (!(DEDICATED_ROWONLY_ROUTE && combo_do_dc && combo_stage_publish_epi)) {
+                        if constexpr (G::DEBUG_PUBLIC_COLONLY_TRACE ||
+                                      G::DEBUG_PUBLIC_COLONLY_LATE_TRACE) {
+                            if (public_col_trace_leader) {
+                                printf("public col tail presync cta=%d wg=%d bf=%d epi=%d\n",
+                                       cta_id, warpgroup_id, bf_stage, epi);
+                            }
+                        }
                         warpgroup::sync(quantizer_sync_id);
+                        if constexpr (G::DEBUG_PUBLIC_COLONLY_TRACE ||
+                                      G::DEBUG_PUBLIC_COLONLY_LATE_TRACE) {
+                            if (public_col_trace_leader) {
+                                printf("public col tail postsync cta=%d wg=%d bf=%d epi=%d\n",
+                                       cta_id, warpgroup_id, bf_stage, epi);
+                            }
+                        }
+                        public_colonly_trace(5, -1, -1, 0.0f);
+                        if constexpr (PUBLIC_COLONLY_STAGE_CUTS_ENABLED) {
+                            if constexpr (G::DEBUG_PUBLIC_COLONLY_STAGE_CUT == 7) {
+                                if (block_idx == cluster_id && epi == 0) {
+                                    if (public_colonly_release_recycled_and_cut()) return;
+                                }
+                            }
+                        }
                     }
                 }
                 if constexpr (G::SKIP_GLOBAL_COL_MATERIALIZATION) {
@@ -14292,6 +15987,53 @@ __device__ inline void backward_kernel_v3_streaming_3wg_impl(const globals_3wg<C
                         }
                     }
                 }
+                if constexpr (G::DEBUG_PUBLIC_COLONLY_LATE_TRACE) {
+                    if (block_idx == cluster_id &&
+                        epi >= C::EPI_PIPE_DEPTH - 2 &&
+                        quant_lane == 0 &&
+                        (G::FRONTEND_SINGLE_QUANTIZER_WG
+                             ? (warpgroup_id == first_quantizer_wg)
+                             : is_col_quantizer_wg)) {
+                        printf("public col common tail presync cta=%d wg=%d warp=%d bf=%d epi=%d\n",
+                               cta_id, warpgroup_id, warpgroup::warpid(), bf_stage, epi);
+                    }
+                    if (cta_id == 0 &&
+                        block_idx == cluster_id &&
+                        epi == C::EPI_PIPE_DEPTH - 2 &&
+                        (quant_lane % 8) == 0 &&
+                        (G::FRONTEND_SINGLE_QUANTIZER_WG
+                             ? (warpgroup_id == first_quantizer_wg)
+                             : is_col_quantizer_wg)) {
+                        printf("public col lane common tail presync cta=%d wg=%d warp=%d lane=%d bf=%d epi=%d\n",
+                               cta_id, warpgroup_id, warpgroup::warpid(), quant_lane, bf_stage, epi);
+                    }
+                }
+                if constexpr (PUBLIC_COLONLY_STAGE_CUTS_ENABLED) {
+                    if constexpr (G::DEBUG_PUBLIC_COLONLY_STAGE_CUT == 109) {
+                        if (block_idx == cluster_id && epi == C::EPI_PIPE_DEPTH - 2) {
+                            if (public_colonly_release_recycled_and_cut()) return;
+                        }
+                    }
+                }
+                warpgroup::sync(quantizer_sync_id);
+                if constexpr (G::DEBUG_PUBLIC_COLONLY_LATE_TRACE) {
+                    if (block_idx == cluster_id &&
+                        epi >= C::EPI_PIPE_DEPTH - 2 &&
+                        quant_lane == 0 &&
+                        (G::FRONTEND_SINGLE_QUANTIZER_WG
+                             ? (warpgroup_id == first_quantizer_wg)
+                             : is_col_quantizer_wg)) {
+                        printf("public col common tail postsync cta=%d wg=%d warp=%d bf=%d epi=%d\n",
+                               cta_id, warpgroup_id, warpgroup::warpid(), bf_stage, epi);
+                    }
+                }
+                if constexpr (PUBLIC_COLONLY_STAGE_CUTS_ENABLED) {
+                    if constexpr (G::DEBUG_PUBLIC_COLONLY_STAGE_CUT == 110) {
+                        if (block_idx == cluster_id && epi == C::EPI_PIPE_DEPTH - 2) {
+                            if (public_colonly_release_recycled_and_cut()) return;
+                        }
+                    }
+                }
                 if (warpgroup::warpid() == 0 && quant_lane == 0) {
                     if constexpr (G::FRONTEND_SINGLE_QUANTIZER_WG) {
                         if constexpr (ROW_IN_QUANTIZER) {
@@ -14299,6 +16041,21 @@ __device__ inline void backward_kernel_v3_streaming_3wg_impl(const globals_3wg<C
                         }
                         if constexpr (COL_IN_QUANTIZER) {
                             arrive(slice_col_recycled[bf_stage]);
+                            if constexpr (G::DEBUG_PUBLIC_COLONLY_TRACE ||
+                                          G::DEBUG_PUBLIC_COLONLY_LATE_TRACE) {
+                                if (public_col_trace_leader) {
+                                    printf("public col recycle arrive cta=%d wg=%d bf=%d epi=%d\n",
+                                           cta_id, warpgroup_id, bf_stage, epi);
+                                }
+                            }
+                            public_colonly_trace(6, -1, -1, 0.0f);
+                            if constexpr (PUBLIC_COLONLY_STAGE_CUTS_ENABLED) {
+                                if constexpr (G::DEBUG_PUBLIC_COLONLY_STAGE_CUT == 8) {
+                                    if (block_idx == cluster_id && epi == 0) {
+                                        return;
+                                    }
+                                }
+                            }
                         }
                     } else {
                         if constexpr (ROW_IN_QUANTIZER) {
@@ -14309,6 +16066,21 @@ __device__ inline void backward_kernel_v3_streaming_3wg_impl(const globals_3wg<C
                         if constexpr (COL_IN_QUANTIZER) {
                             if (is_col_quantizer_wg) {
                                 arrive(slice_col_recycled[bf_stage]);
+                                if constexpr (G::DEBUG_PUBLIC_COLONLY_TRACE ||
+                                              G::DEBUG_PUBLIC_COLONLY_LATE_TRACE) {
+                                    if (public_col_trace_leader) {
+                                        printf("public col recycle arrive cta=%d wg=%d bf=%d epi=%d\n",
+                                               cta_id, warpgroup_id, bf_stage, epi);
+                                    }
+                                }
+                                public_colonly_trace(6, -1, -1, 0.0f);
+                                if constexpr (PUBLIC_COLONLY_STAGE_CUTS_ENABLED) {
+                                    if constexpr (G::DEBUG_PUBLIC_COLONLY_STAGE_CUT == 8) {
+                                        if (block_idx == cluster_id && epi == 0) {
+                                            return;
+                                        }
+                                    }
+                                }
                             }
                         }
                     }
@@ -14449,7 +16221,6 @@ __device__ inline void backward_kernel_v3_streaming_3wg_impl(const globals_3wg<C
                         }
                     }
                 }
-            }
 
             if constexpr (G::SKIP_GLOBAL_COL_MATERIALIZATION) {
                 if constexpr (ROWONLY_COMBO_DC_DEBUG_CUT == 108) {
@@ -14916,7 +16687,37 @@ __device__ inline void backward_kernel_v3_streaming_3wg_impl(const globals_3wg<C
         }
         if constexpr (!(G::SKIP_GLOBAL_COL_MATERIALIZATION &&
                         ROWONLY_COMBO_DC_SKIP_FINAL_QUANTIZER_SYNC == 1)) {
+            if constexpr (!DO_ROW &&
+                          DO_COL &&
+                          !G::FUSED_SOFTMAX_QUANT &&
+                          !G::SKIP_GLOBAL_COL_MATERIALIZATION &&
+                          G::FRONTEND_SINGLE_QUANTIZER_WG &&
+                          G::USE_COL_PAIR_STAGE &&
+                          G::COL_READY_PER_ROW16 &&
+                          !EFFECTIVE_ENABLE_STOREADD_COMBO &&
+                          (G::DEBUG_PUBLIC_COLONLY_TRACE ||
+                           G::DEBUG_PUBLIC_COLONLY_LATE_TRACE)) {
+                if (warpgroup::warpid() == 0 && quant_lane == 0) {
+                    printf("public col quant final presync cta=%d wg=%d\n",
+                           cta_id, warpgroup_id);
+                }
+            }
             warpgroup::sync(quantizer_sync_id);
+            if constexpr (!DO_ROW &&
+                          DO_COL &&
+                          !G::FUSED_SOFTMAX_QUANT &&
+                          !G::SKIP_GLOBAL_COL_MATERIALIZATION &&
+                          G::FRONTEND_SINGLE_QUANTIZER_WG &&
+                          G::USE_COL_PAIR_STAGE &&
+                          G::COL_READY_PER_ROW16 &&
+                          !EFFECTIVE_ENABLE_STOREADD_COMBO &&
+                          (G::DEBUG_PUBLIC_COLONLY_TRACE ||
+                           G::DEBUG_PUBLIC_COLONLY_LATE_TRACE)) {
+                if (warpgroup::warpid() == 0 && quant_lane == 0) {
+                    printf("public col quant final postsync cta=%d wg=%d\n",
+                           cta_id, warpgroup_id);
+                }
+            }
         }
         if constexpr (G::SKIP_GLOBAL_COL_MATERIALIZATION) {
             if constexpr (ROWONLY_COMBO_DC_DEBUG_CUT == 67) {
@@ -14968,6 +16769,21 @@ __device__ inline void backward_kernel_v3_streaming_3wg_impl(const globals_3wg<C
                 }
             } else {
                 if (warpgroup::warpid() == 0) tm_allocator.deprovision();
+            }
+        }
+        if constexpr (!DO_ROW &&
+                      DO_COL &&
+                      !G::FUSED_SOFTMAX_QUANT &&
+                      !G::SKIP_GLOBAL_COL_MATERIALIZATION &&
+                      G::FRONTEND_SINGLE_QUANTIZER_WG &&
+                      G::USE_COL_PAIR_STAGE &&
+                      G::COL_READY_PER_ROW16 &&
+                      !EFFECTIVE_ENABLE_STOREADD_COMBO &&
+                      (G::DEBUG_PUBLIC_COLONLY_TRACE ||
+                       G::DEBUG_PUBLIC_COLONLY_LATE_TRACE)) {
+            if (warpgroup::warpid() == 0 && quant_lane == 0) {
+                printf("public col quant branch end cta=%d wg=%d\n",
+                       cta_id, warpgroup_id);
             }
         }
     }
