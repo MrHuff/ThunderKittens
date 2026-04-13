@@ -250,8 +250,8 @@ __device__ inline void kernel(const globals<C> &g) {
                 wait(tmem_provisioned, 0);
                 tm_allocator.set_addr(tmem_addr);
                 auto out_tm  = tm_allocator.template allocate<full_tt_fl<C::Nb>>(0);
-                auto A_sc_tm = tm_allocator.template allocate<full_tt_fp8e4m3<16*C::MMA_PER_TILE*C::LOAD_PIPE_DEPTH>>(256);
-                auto B_sc_tm = tm_allocator.template allocate<full_tt_fp8e4m3<32*C::MMA_PER_TILE*C::LOAD_PIPE_DEPTH>>(256 + 4*C::MMA_PER_TILE*C::LOAD_PIPE_DEPTH);
+                auto A_sc_tm = tm_allocator.template allocate<full_tt_fp8e8m0<16*C::MMA_PER_TILE*C::LOAD_PIPE_DEPTH>>(256);
+                auto B_sc_tm = tm_allocator.template allocate<full_tt_fp8e8m0<32*C::MMA_PER_TILE*C::LOAD_PIPE_DEPTH>>(256 + 4*C::MMA_PER_TILE*C::LOAD_PIPE_DEPTH);
                 uint32_t tensor_phasebits = 0xFFFF0000;
                 uint32_t prepared_phasebits = 0;
 
@@ -271,19 +271,19 @@ __device__ inline void kernel(const globals<C> &g) {
 
                         #pragma unroll
                         for (int ii = 0; ii < C::MMA_PER_TILE; ++ii) {
-                            auto A_sc_tm_subtile = A_sc_tm.template subtile<full_tt_fp8e4m3<16>>(stage * C::MMA_PER_TILE * 16 + ii * 16);
-                            auto &A_sc_sm_subtile = *reinterpret_cast<st_fp8e4m3<32, 16, false> *>(
+                            auto A_sc_tm_subtile = A_sc_tm.template subtile<full_tt_fp8e8m0<16>>(stage * C::MMA_PER_TILE * 16 + ii * 16);
+                            auto &A_sc_sm_subtile = *reinterpret_cast<st_fp8e8m0<32, 16, false> *>(
                                 reinterpret_cast<uint64_t>(&input_scales[stage].A.data[0]) + 16 * 32 * ii);
                             load_mxnv_scale_async2(A_sc_tm_subtile, A_sc_sm_subtile);
 
-                            auto B_sc_tm_subtile_0 = B_sc_tm.template subtile<full_tt_fp8e4m3<16>>(stage * C::MMA_PER_TILE * 32 + ii * C::B_SC_SIZE * 16);
-                            auto &B_sc_sm_subtile_0 = *reinterpret_cast<st_fp8e4m3<32, 16, false> *>(
+                            auto B_sc_tm_subtile_0 = B_sc_tm.template subtile<full_tt_fp8e8m0<16>>(stage * C::MMA_PER_TILE * 32 + ii * C::B_SC_SIZE * 16);
+                            auto &B_sc_sm_subtile_0 = *reinterpret_cast<st_fp8e8m0<32, 16, false> *>(
                                 reinterpret_cast<uint64_t>(&input_scales[stage].B[0].data[0]) + 16 * 32 * ii);
                             load_mxnv_scale_async2(B_sc_tm_subtile_0, B_sc_sm_subtile_0);
 
                             if constexpr (C::B_SC_SIZE == 2) {
-                                auto B_sc_tm_subtile_1 = B_sc_tm.template subtile<full_tt_fp8e4m3<16>>(stage * C::MMA_PER_TILE * 32 + ii * C::B_SC_SIZE * 16 + 16);
-                                auto &B_sc_sm_subtile_1 = *reinterpret_cast<st_fp8e4m3<32, 16, false> *>(
+                                auto B_sc_tm_subtile_1 = B_sc_tm.template subtile<full_tt_fp8e8m0<16>>(stage * C::MMA_PER_TILE * 32 + ii * C::B_SC_SIZE * 16 + 16);
+                                auto &B_sc_sm_subtile_1 = *reinterpret_cast<st_fp8e8m0<32, 16, false> *>(
                                     reinterpret_cast<uint64_t>(&input_scales[stage].B[1].data[0]) + 16 * 32 * ii);
                                 load_mxnv_scale_async2(B_sc_tm_subtile_1, B_sc_sm_subtile_1);
                             }
@@ -294,13 +294,13 @@ __device__ inline void kernel(const globals<C> &g) {
                         wait(tiles_arrived[stage], get_phasebit<0>(tensor_phasebits, stage));
                         if (i == 0) {
                             mm2_ABt(out_tm, input_tiles[stage].A, input_tiles[stage].B,
-                                    A_sc_tm.template subtile<full_tt_fp8e4m3<C::MMA_PER_TILE * 16>>(stage * C::MMA_PER_TILE * 16),
-                                    B_sc_tm.template subtile<full_tt_fp8e4m3<C::MMA_PER_TILE * 32>>(stage * C::MMA_PER_TILE * 32),
+                                    A_sc_tm.template subtile<full_tt_fp8e8m0<C::MMA_PER_TILE * 16>>(stage * C::MMA_PER_TILE * 16),
+                                    B_sc_tm.template subtile<full_tt_fp8e8m0<C::MMA_PER_TILE * 32>>(stage * C::MMA_PER_TILE * 32),
                                     inputs_finished[stage]);
                         } else {
                             mma2_ABt(out_tm, input_tiles[stage].A, input_tiles[stage].B,
-                                     A_sc_tm.template subtile<full_tt_fp8e4m3<C::MMA_PER_TILE * 16>>(stage * C::MMA_PER_TILE * 16),
-                                     B_sc_tm.template subtile<full_tt_fp8e4m3<C::MMA_PER_TILE * 32>>(stage * C::MMA_PER_TILE * 32),
+                                     A_sc_tm.template subtile<full_tt_fp8e8m0<C::MMA_PER_TILE * 16>>(stage * C::MMA_PER_TILE * 16),
+                                     B_sc_tm.template subtile<full_tt_fp8e8m0<C::MMA_PER_TILE * 32>>(stage * C::MMA_PER_TILE * 32),
                                      inputs_finished[stage]);
                         }
                         update_phasebit<0>(tensor_phasebits, stage);
