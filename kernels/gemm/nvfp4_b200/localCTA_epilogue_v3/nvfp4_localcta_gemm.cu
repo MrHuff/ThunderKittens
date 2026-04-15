@@ -136,13 +136,13 @@ void encode_prepared_scale_tensor_map(CUtensorMap* desc, const at::Tensor& t, co
     TORCH_CHECK(result == CUDA_SUCCESS, name, " TMA creation failed");
 }
 
-void check_outer_scale_vector(const at::Tensor& t, const char* name, int64_t logical_extent) {
+void check_chunk_grid(const at::Tensor& t, const char* name, int64_t rows, int64_t cols) {
     TORCH_CHECK(t.is_cuda(), name, " must be CUDA");
     TORCH_CHECK(t.is_contiguous(), name, " must be contiguous");
-    TORCH_CHECK(t.dim() == 1, name, " must be 1D");
+    TORCH_CHECK(t.dim() == 2, name, " must be 2D");
     TORCH_CHECK(t.scalar_type() == at::kFloat, name, " must be float32");
-    TORCH_CHECK(logical_extent % 256 == 0, name, " logical extent must be a multiple of 256");
-    TORCH_CHECK(t.size(0) == logical_extent / 256, name, " tile-global scale length mismatch");
+    TORCH_CHECK(t.size(0) == rows / 128, name, " first dim mismatch");
+    TORCH_CHECK(t.size(1) == cols / 128, name, " second dim mismatch");
 }
 
 void check_output_matrix(const at::Tensor& t, const char* name, int64_t rows, int64_t cols) {
@@ -196,6 +196,8 @@ void check_gemm_inputs(
     TORCH_CHECK((A.size(1) * 2) % 128 == 0, "K must be a multiple of 128");
     check_scale_tensor(A_sc, "A_sc", A.size(0), A.size(1) * 2);
     check_scale_tensor(B_sc, "B_sc", B.size(0), B.size(1) * 2);
+    check_chunk_grid(A_sg_chunks, "A_sg_chunks", A.size(0), A.size(1) * 2);
+    check_chunk_grid(B_sg_chunks, "B_sg_chunks", B.size(0), B.size(1) * 2);
     kittens::py::device_check(A, A_sc, A_sg_chunks, B, B_sc, B_sg_chunks);
 }
 
@@ -215,12 +217,12 @@ void launch_gemm_with_config(
         .A_sc = kittens::py::tensor_to_gl<typename G::A_sc_gl, false>(
             A_sc, 1, A_sc.size(0), A_sc.size(1), 256),
         .A_sg_chunks = A_sg_chunks.data_ptr<float>(),
-        .A_sg_stride = 0,
+        .A_sg_stride = static_cast<int>(A_sg_chunks.size(1)),
         .B = kittens::py::tensor_to_gl<typename G::B_fp4x2_gl>(B),
         .B_sc = kittens::py::tensor_to_gl<typename G::B_sc_gl, false>(
             B_sc, 1, B_sc.size(0), B_sc.size(1), 256),
         .B_sg_chunks = B_sg_chunks.data_ptr<float>(),
-        .B_sg_stride = 0,
+        .B_sg_stride = static_cast<int>(B_sg_chunks.size(1)),
         .D = kittens::py::tensor_to_gl<typename G::D_gl>(D),
         .D_K = kittens::py::tensor_to_gl<typename G::D_gl>(D),
         .D_V = kittens::py::tensor_to_gl<typename G::D_gl>(D),
@@ -255,12 +257,12 @@ void launch_grouped_gemm_with_config(
         .A_sc = kittens::py::tensor_to_gl<typename G::A_sc_gl, false>(
             A_sc, 1, A_sc.size(0), A_sc.size(1), 256),
         .A_sg_chunks = A_sg_chunks.data_ptr<float>(),
-        .A_sg_stride = 0,
+        .A_sg_stride = static_cast<int>(A_sg_chunks.size(1)),
         .B = kittens::py::tensor_to_gl<typename G::B_fp4x2_gl>(B),
         .B_sc = kittens::py::tensor_to_gl<typename G::B_sc_gl, false>(
             B_sc, 1, B_sc.size(0), B_sc.size(1), 256),
         .B_sg_chunks = B_sg_chunks.data_ptr<float>(),
-        .B_sg_stride = 0,
+        .B_sg_stride = static_cast<int>(B_sg_chunks.size(1)),
         .D = kittens::py::tensor_to_gl<typename G::D_gl>(D),
         .D_K = use_split_D ? kittens::py::tensor_to_gl<typename G::D_gl>(D_K_opt.value())
                            : kittens::py::tensor_to_gl<typename G::D_gl>(D),
@@ -608,9 +610,9 @@ void launch_batched_gemm_with_config(
         memcpy(&g_host.D_tma[i], &d_gl.tma_descs.tma_desc, sizeof(CUtensorMap));
 
         g_host.A_sg_chunks[i] = A_sg_chunks_list[i].data_ptr<float>();
-        g_host.A_sg_stride[i] = 0;
+        g_host.A_sg_stride[i] = static_cast<int>(A_sg_chunks_list[i].size(1));
         g_host.B_sg_chunks[i] = B_sg_chunks_list[i].data_ptr<float>();
-        g_host.B_sg_stride[i] = 0;
+        g_host.B_sg_stride[i] = static_cast<int>(B_sg_chunks_list[i].size(1));
     }
 
     kittens::py::launch_kernel<C, G, nvfp4_localcta_batched_gemm::kernel<C>>(g_host);
