@@ -26,10 +26,10 @@
 namespace {
 
 constexpr int kScaleBytesPerTile = 512;
-using localcta_regular_smalln_config = nvfp4_localcta_gemm::config<256, 5, 2, 12, 2, true, 256, true, 2, 128>;
-using localcta_regular_smallk_config = nvfp4_localcta_gemm::config<256, 5, 2, 12, 2, true, 256, true, 2, 128>;
-using localcta_regular_largek_config = nvfp4_localcta_gemm::config<256, 5, 2, 12, 2, true, 256, true, 2, 128>;
-using localcta_parity_config = nvfp4_localcta_gemm::config<256, 5, 2, 12, 2, true, 256, true, 2, 128>;
+using localcta_regular_smalln_config = nvfp4_localcta_gemm::config<128, 5, 4, 12, 2, true, 256, true, 2, 128>;
+using localcta_regular_smallk_config = nvfp4_localcta_gemm::config<256, 5, 8, 4, 2, false, 256, true, 2, 128>;
+using localcta_regular_largek_config = nvfp4_localcta_gemm::config<256, 5, 8, 12, 2, false, 256, true, 2, 128>;
+using localcta_parity_config = nvfp4_localcta_gemm::config<256, 5, 8, 4, 2, false, 256, true, 2, 128>;
 using localcta_fast_smallk_config = nvfp4_gemm::config<256, 5, 8, 4, 2, false>;
 using localcta_fast_largek_config = nvfp4_gemm::config<256, 5, 8, 12, 2, false>;
 using localcta_fast_grouped_config = nvfp4_gemm::config<256, 5, 8, 4, 2, false>;
@@ -1554,8 +1554,6 @@ void nvfp4_localcta_gemm_entrypoint(
 ) {
     check_gemm_inputs(A, A_sc, A_sg_chunks, B, B_sc, B_sg_chunks);
     check_output_matrix(D, "D", A.size(0), B.size(0));
-    check_outer_scale_vector(A_sg_chunks, "A_sg_chunks", D.size(0));
-    check_outer_scale_vector(B_sg_chunks, "B_sg_chunks", D.size(1));
     launch_regular_gemm(A, A_sc, A_sg_chunks, B, B_sc, B_sg_chunks, D);
 }
 
@@ -1599,8 +1597,6 @@ void nvfp4_localcta_grouped_gemm_entrypoint(
     const int64_t total_n = D.size(1)
         + (D_K_opt.has_value() ? D_K_opt.value().size(1) : 0)
         + (D_V_opt.has_value() ? D_V_opt.value().size(1) : 0);
-    check_outer_scale_vector(A_sg_chunks, "A_sg_chunks", D.size(0));
-    check_outer_scale_vector(B_sg_chunks, "B_sg_chunks", total_n);
 
     launch_grouped_gemm(
         A, A_sc, A_sg_chunks, B, B_sc, B_sg_chunks,
@@ -1672,8 +1668,6 @@ void nvfp4_localcta_batched_gemm_entrypoint(
 
     for (int i = 0; i < n; ++i) {
         check_output_matrix(D_list[i], "D_list[i]", A_list[i].size(0), B_list[i].size(0));
-        check_outer_scale_vector(A_sg_chunks_list[i], "A_sg_chunks_list[i]", D_list[i].size(0));
-        check_outer_scale_vector(B_sg_chunks_list[i], "B_sg_chunks_list[i]", D_list[i].size(1));
     }
     check_batched_shape_compatibility(A_list, B_list, D_list);
 
@@ -1769,10 +1763,6 @@ void nvfp4_localcta_batched_accum_gemm_entrypoint(
     const int n = static_cast<int>(A_list.size());
     TORCH_CHECK(n <= 4, "num_batches must be 1..4");
     check_output_matrix(D_out, "D_out", A_list[0].size(0), B_list[0].size(0));
-    for (int i = 0; i < n; ++i) {
-        check_outer_scale_vector(A_sg_chunks_list[i], "A_sg_chunks_list[i]", D_out.size(0));
-        check_outer_scale_vector(B_sg_chunks_list[i], "B_sg_chunks_list[i]", D_out.size(1));
-    }
 
     if (n == 1) {
         launch_regular_gemm(
