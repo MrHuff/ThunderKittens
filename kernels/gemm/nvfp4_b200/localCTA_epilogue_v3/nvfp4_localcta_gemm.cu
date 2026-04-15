@@ -1611,13 +1611,10 @@ void nvfp4_localcta_v3_regular_gemm_entrypoint(
     const at::Tensor& B_sg_chunks,
     at::Tensor& D
 ) {
-    nvfp4_localcta_grouped_gemm_entrypoint(
+    nvfp4_localcta_gemm_entrypoint(
         A, A_sc, A_sg_chunks,
         B, B_sc, B_sg_chunks,
-        D,
-        std::nullopt,
-        std::nullopt,
-        0
+        D
     );
 }
 
