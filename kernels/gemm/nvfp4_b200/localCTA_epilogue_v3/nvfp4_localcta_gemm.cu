@@ -26,10 +26,10 @@
 namespace {
 
 constexpr int kScaleBytesPerTile = 512;
-using localcta_regular_smalln_config = nvfp4_localcta_gemm::config<128, 5, 4, 12, 2, true, 256, true, 2, 128>;
-using localcta_regular_smallk_config = nvfp4_localcta_gemm::config<256, 5, 8, 4, 2, false, 256, true, 2, 128>;
-using localcta_regular_largek_config = nvfp4_localcta_gemm::config<256, 5, 8, 12, 2, false, 256, true, 2, 128>;
-using localcta_parity_config = nvfp4_localcta_gemm::config<256, 5, 8, 4, 2, false, 256, true, 2, 128>;
+using localcta_regular_smalln_config = nvfp4_localcta_gemm::config<256, 5, 2, 12, 2, true, 256, true, 2, 128>;
+using localcta_regular_smallk_config = nvfp4_localcta_gemm::config<256, 5, 2, 12, 2, true, 256, true, 2, 128>;
+using localcta_regular_largek_config = nvfp4_localcta_gemm::config<256, 5, 2, 12, 2, true, 256, true, 2, 128>;
+using localcta_parity_config = nvfp4_localcta_gemm::config<256, 5, 2, 12, 2, true, 256, true, 2, 128>;
 using localcta_fast_smallk_config = nvfp4_gemm::config<256, 5, 8, 4, 2, false>;
 using localcta_fast_largek_config = nvfp4_gemm::config<256, 5, 8, 12, 2, false>;
 using localcta_fast_grouped_config = nvfp4_gemm::config<256, 5, 8, 4, 2, false>;
@@ -136,13 +136,13 @@ void encode_prepared_scale_tensor_map(CUtensorMap* desc, const at::Tensor& t, co
     TORCH_CHECK(result == CUDA_SUCCESS, name, " TMA creation failed");
 }
 
-void check_chunk_grid(const at::Tensor& t, const char* name, int64_t rows, int64_t cols) {
+void check_outer_scale_vector(const at::Tensor& t, const char* name, int64_t logical_extent) {
     TORCH_CHECK(t.is_cuda(), name, " must be CUDA");
     TORCH_CHECK(t.is_contiguous(), name, " must be contiguous");
-    TORCH_CHECK(t.dim() == 2, name, " must be 2D");
+    TORCH_CHECK(t.dim() == 1, name, " must be 1D");
     TORCH_CHECK(t.scalar_type() == at::kFloat, name, " must be float32");
-    TORCH_CHECK(t.size(0) == rows / 128, name, " first dim mismatch");
-    TORCH_CHECK(t.size(1) == cols / 128, name, " second dim mismatch");
+    TORCH_CHECK(logical_extent % 256 == 0, name, " logical extent must be a multiple of 256");
+    TORCH_CHECK(t.size(0) == logical_extent / 256, name, " tile-global scale length mismatch");
 }
 
 void check_output_matrix(const at::Tensor& t, const char* name, int64_t rows, int64_t cols) {
@@ -196,8 +196,6 @@ void check_gemm_inputs(
     TORCH_CHECK((A.size(1) * 2) % 128 == 0, "K must be a multiple of 128");
     check_scale_tensor(A_sc, "A_sc", A.size(0), A.size(1) * 2);
     check_scale_tensor(B_sc, "B_sc", B.size(0), B.size(1) * 2);
-    check_chunk_grid(A_sg_chunks, "A_sg_chunks", A.size(0), A.size(1) * 2);
-    check_chunk_grid(B_sg_chunks, "B_sg_chunks", B.size(0), B.size(1) * 2);
     kittens::py::device_check(A, A_sc, A_sg_chunks, B, B_sc, B_sg_chunks);
 }
 
@@ -217,12 +215,12 @@ void launch_gemm_with_config(
         .A_sc = kittens::py::tensor_to_gl<typename G::A_sc_gl, false>(
             A_sc, 1, A_sc.size(0), A_sc.size(1), 256),
         .A_sg_chunks = A_sg_chunks.data_ptr<float>(),
-        .A_sg_stride = static_cast<int>(A_sg_chunks.size(1)),
+        .A_sg_stride = 0,
         .B = kittens::py::tensor_to_gl<typename G::B_fp4x2_gl>(B),
         .B_sc = kittens::py::tensor_to_gl<typename G::B_sc_gl, false>(
             B_sc, 1, B_sc.size(0), B_sc.size(1), 256),
         .B_sg_chunks = B_sg_chunks.data_ptr<float>(),
-        .B_sg_stride = static_cast<int>(B_sg_chunks.size(1)),
+        .B_sg_stride = 0,
         .D = kittens::py::tensor_to_gl<typename G::D_gl>(D),
         .D_K = kittens::py::tensor_to_gl<typename G::D_gl>(D),
         .D_V = kittens::py::tensor_to_gl<typename G::D_gl>(D),
@@ -257,12 +255,12 @@ void launch_grouped_gemm_with_config(
         .A_sc = kittens::py::tensor_to_gl<typename G::A_sc_gl, false>(
             A_sc, 1, A_sc.size(0), A_sc.size(1), 256),
         .A_sg_chunks = A_sg_chunks.data_ptr<float>(),
-        .A_sg_stride = static_cast<int>(A_sg_chunks.size(1)),
+        .A_sg_stride = 0,
         .B = kittens::py::tensor_to_gl<typename G::B_fp4x2_gl>(B),
         .B_sc = kittens::py::tensor_to_gl<typename G::B_sc_gl, false>(
             B_sc, 1, B_sc.size(0), B_sc.size(1), 256),
         .B_sg_chunks = B_sg_chunks.data_ptr<float>(),
-        .B_sg_stride = static_cast<int>(B_sg_chunks.size(1)),
+        .B_sg_stride = 0,
         .D = kittens::py::tensor_to_gl<typename G::D_gl>(D),
         .D_K = use_split_D ? kittens::py::tensor_to_gl<typename G::D_gl>(D_K_opt.value())
                            : kittens::py::tensor_to_gl<typename G::D_gl>(D),
@@ -610,9 +608,9 @@ void launch_batched_gemm_with_config(
         memcpy(&g_host.D_tma[i], &d_gl.tma_descs.tma_desc, sizeof(CUtensorMap));
 
         g_host.A_sg_chunks[i] = A_sg_chunks_list[i].data_ptr<float>();
-        g_host.A_sg_stride[i] = static_cast<int>(A_sg_chunks_list[i].size(1));
+        g_host.A_sg_stride[i] = 0;
         g_host.B_sg_chunks[i] = B_sg_chunks_list[i].data_ptr<float>();
-        g_host.B_sg_stride[i] = static_cast<int>(B_sg_chunks_list[i].size(1));
+        g_host.B_sg_stride[i] = 0;
     }
 
     kittens::py::launch_kernel<C, G, nvfp4_localcta_batched_gemm::kernel<C>>(g_host);
@@ -1556,6 +1554,8 @@ void nvfp4_localcta_gemm_entrypoint(
 ) {
     check_gemm_inputs(A, A_sc, A_sg_chunks, B, B_sc, B_sg_chunks);
     check_output_matrix(D, "D", A.size(0), B.size(0));
+    check_outer_scale_vector(A_sg_chunks, "A_sg_chunks", D.size(0));
+    check_outer_scale_vector(B_sg_chunks, "B_sg_chunks", D.size(1));
     launch_regular_gemm(A, A_sc, A_sg_chunks, B, B_sc, B_sg_chunks, D);
 }
 
@@ -1596,6 +1596,11 @@ void nvfp4_localcta_grouped_gemm_entrypoint(
                     D_V_opt.value().scalar_type() == at::kBFloat16,
                     "D_V must be a contiguous CUDA bf16 tensor");
     }
+    const int64_t total_n = D.size(1)
+        + (D_K_opt.has_value() ? D_K_opt.value().size(1) : 0)
+        + (D_V_opt.has_value() ? D_V_opt.value().size(1) : 0);
+    check_outer_scale_vector(A_sg_chunks, "A_sg_chunks", D.size(0));
+    check_outer_scale_vector(B_sg_chunks, "B_sg_chunks", total_n);
 
     launch_grouped_gemm(
         A, A_sc, A_sg_chunks, B, B_sc, B_sg_chunks,
@@ -1667,6 +1672,8 @@ void nvfp4_localcta_batched_gemm_entrypoint(
 
     for (int i = 0; i < n; ++i) {
         check_output_matrix(D_list[i], "D_list[i]", A_list[i].size(0), B_list[i].size(0));
+        check_outer_scale_vector(A_sg_chunks_list[i], "A_sg_chunks_list[i]", D_list[i].size(0));
+        check_outer_scale_vector(B_sg_chunks_list[i], "B_sg_chunks_list[i]", D_list[i].size(1));
     }
     check_batched_shape_compatibility(A_list, B_list, D_list);
 
@@ -1762,6 +1769,10 @@ void nvfp4_localcta_batched_accum_gemm_entrypoint(
     const int n = static_cast<int>(A_list.size());
     TORCH_CHECK(n <= 4, "num_batches must be 1..4");
     check_output_matrix(D_out, "D_out", A_list[0].size(0), B_list[0].size(0));
+    for (int i = 0; i < n; ++i) {
+        check_outer_scale_vector(A_sg_chunks_list[i], "A_sg_chunks_list[i]", D_out.size(0));
+        check_outer_scale_vector(B_sg_chunks_list[i], "B_sg_chunks_list[i]", D_out.size(1));
+    }
 
     if (n == 1) {
         launch_regular_gemm(

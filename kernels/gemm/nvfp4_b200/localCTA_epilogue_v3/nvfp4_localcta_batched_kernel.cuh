@@ -1,7 +1,7 @@
 #pragma once
 // ================================================================
-// NVFP4 Local-CTA True Batched GEMM Kernel
-// D_i = A_i x B_i^T with chunk-grid decode scales consumed in-K.
+// NVFP4 localCTA v3 true batched GEMM kernel
+// D_i = A_i x B_i^T with tile-global outer scales applied once after accumulation.
 // ================================================================
 
 #include "nvfp4_localcta_kernel.cuh"
@@ -208,10 +208,6 @@ __device__ inline void kernel(const globals<C> &g) {
                     int col_block_idx = idx_within_supergroup / rows_in_supergroup;
 
                     for (int i = 0; i < num_red_blocks; ++i) {
-                        const int chunk_base = i * (C::Kb / 128);
-                        const int a_chunk_row = row_block_idx * 2 + cta_id;
-                        const int b_chunk_row_0 = col_block_idx * C::B_SC_SIZE;
-
                         if (cta_id == 0) {
                             if (lane == 0) {
                                 tma::expect_bytes(scales_arrived[stage], 2 * sizeof(G::input_scales_t));
@@ -225,16 +221,6 @@ __device__ inline void kernel(const globals<C> &g) {
                             update_phasebit<0>(ready_phasebits, stage);
                         }
                         __syncwarp();
-
-                        nvfp4_localcta_gemm::apply_chunk_scales_to_stage<C>(
-                            input_scales[stage].A, input_scales[stage].B,
-                            g.A_sg_chunks[batch], g.A_sg_stride[batch],
-                            g.B_sg_chunks[batch], g.B_sg_stride[batch],
-                            a_chunk_row, b_chunk_row_0, chunk_base);
-
-                        __syncwarp();
-                        __threadfence_block();
-                        asm volatile("fence.proxy.async.shared::cta;\n" ::: "memory");
                         if (lane == 0) {
                             if (cta_id == 0) {
                                 arrive(scales_prepared[stage], 1);
@@ -327,6 +313,7 @@ __device__ inline void kernel(const globals<C> &g) {
             int row_within_supergroup = idx_within_supergroup % rows_in_supergroup;
             int row_block_idx = supergroup_idx * C::SUPERGROUP_SIZE + row_within_supergroup;
             int col_block_idx = idx_within_supergroup / rows_in_supergroup;
+            const float gs = g.A_sg_chunks[batch][row_block_idx] * g.B_sg_chunks[batch][col_block_idx];
 
             wait(outputs_arrived, get_phasebit<0>(phasebits, 0));
 
@@ -335,6 +322,7 @@ __device__ inline void kernel(const globals<C> &g) {
             for (int i = 0; i < C::EPI_PIPE_DEPTH; i++) {
                 rt_fl<C::Mb / 8, C::Nb/C::EPI_PIPE_DEPTH> D_reg_fl;
                 warpgroup::load_async(D_reg_fl, out_tm.template subtile<full_tt_fl<C::Nb/C::EPI_PIPE_DEPTH>>(0, C::Nb/C::EPI_PIPE_DEPTH*i));
+                warp::mul(D_reg_fl, D_reg_fl, gs);
                 warp::copy(D_reg[i], D_reg_fl);
             }
             tensor_load_wait();
