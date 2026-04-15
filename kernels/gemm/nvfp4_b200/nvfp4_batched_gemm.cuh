@@ -64,6 +64,8 @@ struct globals {
 
     const float* A_sg[MAX_BATCHES];
     const float* B_sg[MAX_BATCHES];
+    int          A_sg_stride[MAX_BATCHES];
+    int          B_sg_stride[MAX_BATCHES];
 
     int       num_red_blocks;
     int       num_batches;
@@ -256,8 +258,6 @@ __device__ inline void kernel(const globals<C> &g) {
         wait(tmem_provisioned, 0);
         tm_allocator.set_addr(tmem_addr);
         auto out_tm = tm_allocator.template allocate<full_tt_fl<C::Nb>>(0);
-        const float global_scale = *g.A_sg[batch] * *g.B_sg[batch];
-
         for (int block_idx = cluster_id; block_idx < num_blocks; block_idx += gridDim.x / C::CLUSTER_SIZE) {
             int supergroup_idx = block_idx / num_blocks_per_supergroup;
             int idx_within_supergroup = block_idx % num_blocks_per_supergroup;
@@ -274,6 +274,9 @@ __device__ inline void kernel(const globals<C> &g) {
             for (int i = 0; i < C::EPI_PIPE_DEPTH; i++) {
                 rt_fl<C::Mb / 8, C::Nb/C::EPI_PIPE_DEPTH> D_reg_fl;
                 warpgroup::load_async(D_reg_fl, out_tm.template subtile<full_tt_fl<C::Nb/C::EPI_PIPE_DEPTH>>(0, C::Nb/C::EPI_PIPE_DEPTH*i));
+                const float global_scale =
+                    g.A_sg[batch][row_block_idx * g.A_sg_stride[batch]] *
+                    g.B_sg[batch][col_block_idx * g.B_sg_stride[batch]];
                 warp::mul(D_reg_fl, D_reg_fl, global_scale);
                 warp::copy(D_reg[i], D_reg_fl);
             }

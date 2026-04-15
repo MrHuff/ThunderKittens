@@ -78,10 +78,12 @@ struct globals {
     int            v_dim;       // Columns for V
     bool           use_split_D; // Trigger manual splitting logic
 
-    // Per-tile B global scale (raw pointer, not TMA)
-    // nullptr = use B_sc_global[{0}] for all tiles (ungrouped)
-    // non-null = read b_sg_per_tile[col_block_idx] per tile (grouped)
+    // Optional per-row/per-col outer scales (raw pointers, not TMA).
+    // nullptr = use the scalar globals for that operand.
+    const float* a_sg_per_tile;
+    int          a_sg_stride;
     const float* b_sg_per_tile;
+    int          b_sg_stride;
 
     // SiLU epilogue: apply silu(x) = x * sigmoid(x) to output columns [0, silu_dim).
     // 0 = disabled. Used for SwiGLU FFN where W1 output needs SiLU.
@@ -292,9 +294,8 @@ __device__ inline void kernel(const globals<C> &g) {
         wait(tmem_provisioned, 0);
         tm_allocator.set_addr(tmem_addr);
         auto out_tm = tm_allocator.template allocate<full_tt_fl<C::Nb>>(0);
-        const float a_sg = g.A_sc_global[{0}];
+        const float default_a_sg = g.A_sc_global[{0}];
         const float default_b_sg = g.B_sc_global[{0}];
-        const float default_global_scale = a_sg * default_b_sg;
 
         for (int block_idx = cluster_id; block_idx < num_blocks; block_idx += gridDim.x / C::CLUSTER_SIZE) {
             int supergroup_idx = block_idx / num_blocks_per_supergroup;
@@ -320,10 +321,13 @@ __device__ inline void kernel(const globals<C> &g) {
                         warpgroup::tma::cluster::arrive(outputs_finished, 0, 1); // signal CTA 0
                     }
                     {
-                        float gs = default_global_scale;
-                        if (g.b_sg_per_tile != nullptr) {
-                            gs = a_sg * g.b_sg_per_tile[col_block_idx];
-                        }
+                        const float a_sg = g.a_sg_per_tile != nullptr
+                            ? g.a_sg_per_tile[row_block_idx * g.a_sg_stride]
+                            : default_a_sg;
+                        const float b_sg = g.b_sg_per_tile != nullptr
+                            ? g.b_sg_per_tile[col_block_idx * g.b_sg_stride]
+                            : default_b_sg;
+                        const float gs = a_sg * b_sg;
                         warp::mul(D_reg, D_reg, gs);
                     }
                     // SiLU epilogue: apply to tiles in [0, silu_dim) columns
@@ -361,10 +365,13 @@ __device__ inline void kernel(const globals<C> &g) {
                     rt_fl<C::Mb / 8, C::Nb/C::EPI_PIPE_DEPTH> D_reg_fl;
                     warpgroup::load_async(D_reg_fl, out_tm.template subtile<full_tt_fl<C::Nb/C::EPI_PIPE_DEPTH>>(0, C::Nb/C::EPI_PIPE_DEPTH*i));
                     {
-                        float gs = default_global_scale;
-                        if (g.b_sg_per_tile != nullptr) {
-                            gs = a_sg * g.b_sg_per_tile[col_block_idx];
-                        }
+                        const float a_sg = g.a_sg_per_tile != nullptr
+                            ? g.a_sg_per_tile[row_block_idx * g.a_sg_stride]
+                            : default_a_sg;
+                        const float b_sg = g.b_sg_per_tile != nullptr
+                            ? g.b_sg_per_tile[col_block_idx * g.b_sg_stride]
+                            : default_b_sg;
+                        const float gs = a_sg * b_sg;
                         warp::mul(D_reg_fl, D_reg_fl, gs);
                     }
                     // SiLU epilogue: apply to tiles in [0, silu_dim) columns
