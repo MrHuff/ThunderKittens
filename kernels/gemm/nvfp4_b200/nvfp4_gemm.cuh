@@ -304,6 +304,13 @@ __device__ inline void kernel(const globals<C> &g) {
             int row_within_supergroup = idx_within_supergroup % rows_in_supergroup;
             int row_block_idx = supergroup_idx * C::SUPERGROUP_SIZE + row_within_supergroup;
             int col_block_idx = idx_within_supergroup / rows_in_supergroup;
+            const float a_sg = g.a_sg_per_tile != nullptr
+                ? g.a_sg_per_tile[row_block_idx * g.a_sg_stride]
+                : default_a_sg;
+            const float b_sg = g.b_sg_per_tile != nullptr
+                ? g.b_sg_per_tile[col_block_idx * g.b_sg_stride]
+                : default_b_sg;
+            const float gs = a_sg * b_sg;
 
             // Wait for the last matmul to complete
             wait(outputs_arrived, get_phasebit<0>(phasebits, 0));
@@ -320,16 +327,7 @@ __device__ inline void kernel(const globals<C> &g) {
                         warpgroup::sync(1);
                         warpgroup::tma::cluster::arrive(outputs_finished, 0, 1); // signal CTA 0
                     }
-                    {
-                        const float a_sg = g.a_sg_per_tile != nullptr
-                            ? g.a_sg_per_tile[row_block_idx * g.a_sg_stride]
-                            : default_a_sg;
-                        const float b_sg = g.b_sg_per_tile != nullptr
-                            ? g.b_sg_per_tile[col_block_idx * g.b_sg_stride]
-                            : default_b_sg;
-                        const float gs = a_sg * b_sg;
-                        warp::mul(D_reg, D_reg, gs);
-                    }
+                    warp::mul(D_reg, D_reg, gs);
                     // SiLU epilogue: apply to tiles in [0, silu_dim) columns
                     if (g.silu_dim > 0) {
                         int col_offset_elems = (C::EPI_PIPE_DEPTH*col_block_idx + i) * C::Nb/C::EPI_PIPE_DEPTH;
@@ -364,16 +362,7 @@ __device__ inline void kernel(const globals<C> &g) {
                 for (int i = 0; i < C::EPI_PIPE_DEPTH; i++) {
                     rt_fl<C::Mb / 8, C::Nb/C::EPI_PIPE_DEPTH> D_reg_fl;
                     warpgroup::load_async(D_reg_fl, out_tm.template subtile<full_tt_fl<C::Nb/C::EPI_PIPE_DEPTH>>(0, C::Nb/C::EPI_PIPE_DEPTH*i));
-                    {
-                        const float a_sg = g.a_sg_per_tile != nullptr
-                            ? g.a_sg_per_tile[row_block_idx * g.a_sg_stride]
-                            : default_a_sg;
-                        const float b_sg = g.b_sg_per_tile != nullptr
-                            ? g.b_sg_per_tile[col_block_idx * g.b_sg_stride]
-                            : default_b_sg;
-                        const float gs = a_sg * b_sg;
-                        warp::mul(D_reg_fl, D_reg_fl, gs);
-                    }
+                    warp::mul(D_reg_fl, D_reg_fl, gs);
                     // SiLU epilogue: apply to tiles in [0, silu_dim) columns
                     if (g.silu_dim > 0) {
                         int col_offset_elems = (C::EPI_PIPE_DEPTH*col_block_idx + i) * C::Nb/C::EPI_PIPE_DEPTH;
