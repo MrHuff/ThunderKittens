@@ -4971,6 +4971,11 @@ struct fp4_scale_contract {
     uint8_t scale_byte;
 };
 
+__device__ __forceinline__ float fp4_scale_byte_to_float(uint8_t scale_byte)
+{
+    return float(reinterpret_cast<__nv_fp8_e4m3&>(scale_byte));
+}
+
 __device__ __forceinline__ fp4_scale_contract make_fp4_scale_contract(
     float amax,
     float g_sg_rcp,
@@ -4989,7 +4994,32 @@ __device__ __forceinline__ fp4_scale_contract make_fp4_scale_contract(
         stored_scale = exact_scale * g_sg_rcp;
     }
     reinterpret_cast<__nv_fp8_e4m3&>(contract.scale_byte) = __nv_fp8_e4m3(stored_scale);
-    const float rounded_stored_scale = float(reinterpret_cast<__nv_fp8_e4m3&>(contract.scale_byte));
+    const float rounded_stored_scale = fp4_scale_byte_to_float(contract.scale_byte);
+    if (encode_centric) {
+        contract.quant_rcp_scale = rounded_stored_scale * g_sg_rcp;
+    } else {
+        contract.quant_rcp_scale =
+            (rounded_stored_scale > 0.0f) ? (1.0f / (rounded_stored_scale * g_sg)) : 0.0f;
+    }
+    return contract;
+}
+
+__device__ __forceinline__ fp4_scale_contract make_fp4_scale_contract_from_rcp_scale(
+    float rcp_scale,
+    float g_sg_rcp,
+    float g_sg,
+    bool encode_centric)
+{
+    constexpr float k_e4m3_max = 448.0f;
+    fp4_scale_contract contract{};
+    float stored_scale = 0.0f;
+    if (encode_centric) {
+        stored_scale = fminf(rcp_scale * g_sg, k_e4m3_max);
+    } else {
+        stored_scale = (rcp_scale > 0.0f) ? ((1.0f / rcp_scale) * g_sg_rcp) : 0.0f;
+    }
+    reinterpret_cast<__nv_fp8_e4m3&>(contract.scale_byte) = __nv_fp8_e4m3(stored_scale);
+    const float rounded_stored_scale = fp4_scale_byte_to_float(contract.scale_byte);
     if (encode_centric) {
         contract.quant_rcp_scale = rounded_stored_scale * g_sg_rcp;
     } else {
@@ -5007,7 +5037,7 @@ __device__ __forceinline__ fp4_scale_contract decode_fp4_scale_contract(
 {
     fp4_scale_contract contract{};
     contract.scale_byte = scale_byte;
-    const float rounded_stored_scale = float(reinterpret_cast<__nv_fp8_e4m3&>(contract.scale_byte));
+    const float rounded_stored_scale = fp4_scale_byte_to_float(contract.scale_byte);
     if (encode_centric) {
         contract.quant_rcp_scale = rounded_stored_scale * g_sg_rcp;
     } else {
@@ -9805,11 +9835,8 @@ __device__ inline void backward_kernel_v3_streaming_3wg_impl(const globals_3wg<C
                                                                 rcp_scale);
                                                     }
 
-                                                    float stored_scale = scale * g_sg_rcp;
-                                                    if (encode_centric) {
-                                                        stored_scale = fminf(rcp_scale * g_sg, E4M3_MAX);
-                                                    }
-                                                    const __nv_fp8_e4m3 sc = __nv_fp8_e4m3(stored_scale);
+                                                    const fp4_scale_contract row_scale_contract =
+                                                        make_fp4_scale_contract(amax, g_sg_rcp, g_sg, encode_centric);
                                                     const int kgroup = global_col_16 / 64;
                                                     const int col_16_in_64 = (global_col_16 / 16) % 4;
                                                     const int depth = global_row / 128;
@@ -9818,7 +9845,7 @@ __device__ inline void backward_kernel_v3_streaming_3wg_impl(const globals_3wg<C
                                                     const int chunk = depth * row_sc_kgroups + kgroup;
                                                     const int byte_idx = sr * 16 + rr * 4 + col_16_in_64;
                                                     row_sc_ptr[chunk * 512 + byte_idx] =
-                                                        *reinterpret_cast<const uint8_t*>(&sc);
+                                                        row_scale_contract.scale_byte;
                                                 }
                                             } else if constexpr (G::ROW_QUANT_ROWDUAL) {
                                                 const uint32_t vals0_bits = bf16x2_bits(vals0);
@@ -9856,11 +9883,8 @@ __device__ inline void backward_kernel_v3_streaming_3wg_impl(const globals_3wg<C
                                                     }
 
                                                     if (lane_pair == 0) {
-                                                        float stored_scale = scale * g_sg_rcp;
-                                                        if (encode_centric) {
-                                                            stored_scale = fminf(rcp_scale * g_sg, E4M3_MAX);
-                                                        }
-                                                        const __nv_fp8_e4m3 sc = __nv_fp8_e4m3(stored_scale);
+                                                        const fp4_scale_contract row_scale_contract =
+                                                            make_fp4_scale_contract(amax, g_sg_rcp, g_sg, encode_centric);
                                                         const int kgroup = global_col_16 / 64;
                                                         const int col_16_in_64 = (global_col_16 / 16) % 4;
                                                         const int depth = global_row / 128;
@@ -9869,7 +9893,7 @@ __device__ inline void backward_kernel_v3_streaming_3wg_impl(const globals_3wg<C
                                                         const int chunk = depth * row_sc_kgroups + kgroup;
                                                         const int byte_idx = sr * 16 + rr * 4 + col_16_in_64;
                                                         row_sc_ptr[chunk * 512 + byte_idx] =
-                                                            *reinterpret_cast<const uint8_t*>(&sc);
+                                                            row_scale_contract.scale_byte;
                                                     }
                                                 }
                                             } else {
@@ -9898,17 +9922,14 @@ __device__ inline void backward_kernel_v3_streaming_3wg_impl(const globals_3wg<C
                                                         quantize_fp4_pair(v10, v11, rcp_scale);
 
                                                     if (lane_pair == 0) {
-                                                        float stored_scale = scale * g_sg_rcp;
-                                                        if (encode_centric) {
-                                                            stored_scale = fminf(rcp_scale * g_sg, E4M3_MAX);
-                                                        }
-                                                        const __nv_fp8_e4m3 sc = __nv_fp8_e4m3(stored_scale);
+                                                        const fp4_scale_contract row_scale_contract =
+                                                            make_fp4_scale_contract(amax, g_sg_rcp, g_sg, encode_centric);
                                                         const int kgroup = global_col_16 / 64;
                                                         const int col_16_in_64 = (global_col_16 / 16) % 4;
                                                         const int chunk = row_chunk_base + kgroup;
                                                         const int byte_idx = sr * 16 + rr * 4 + col_16_in_64;
                                                         row_sc_ptr[chunk * 512 + byte_idx] =
-                                                            *reinterpret_cast<const uint8_t*>(&sc);
+                                                            row_scale_contract.scale_byte;
                                                     }
                                                 }
                                             }
@@ -10009,11 +10030,8 @@ __device__ inline void backward_kernel_v3_streaming_3wg_impl(const globals_3wg<C
                                                                 rcp_scale);
                                                     }
 
-                                                    float stored_scale = scale * g_sg_rcp;
-                                                    if (encode_centric) {
-                                                        stored_scale = fminf(rcp_scale * g_sg, E4M3_MAX);
-                                                    }
-                                                    const __nv_fp8_e4m3 sc = __nv_fp8_e4m3(stored_scale);
+                                                    const fp4_scale_contract row_scale_contract =
+                                                        make_fp4_scale_contract(amax, g_sg_rcp, g_sg, encode_centric);
                                                     const int kgroup = global_col_16 / 64;
                                                     const int col_16_in_64 = (global_col_16 / 16) % 4;
                                                     const int depth = global_row / 128;
@@ -10022,7 +10040,7 @@ __device__ inline void backward_kernel_v3_streaming_3wg_impl(const globals_3wg<C
                                                     const int chunk = depth * row_sc_kgroups + kgroup;
                                                     const int byte_idx = sr * 16 + rr * 4 + col_16_in_64;
                                                     row_sc_ptr[chunk * 512 + byte_idx] =
-                                                        *reinterpret_cast<const uint8_t*>(&sc);
+                                                        row_scale_contract.scale_byte;
                                                 }
                                             } else if constexpr (G::ROW_QUANT_ROWDUAL) {
                                                 const uint32_t vals0_bits = bf16x2_bits(vals0);
@@ -10060,11 +10078,8 @@ __device__ inline void backward_kernel_v3_streaming_3wg_impl(const globals_3wg<C
                                                     }
 
                                                     if (lane_pair == 0) {
-                                                        float stored_scale = scale * g_sg_rcp;
-                                                        if (encode_centric) {
-                                                            stored_scale = fminf(rcp_scale * g_sg, E4M3_MAX);
-                                                        }
-                                                        const __nv_fp8_e4m3 sc = __nv_fp8_e4m3(stored_scale);
+                                                        const fp4_scale_contract row_scale_contract =
+                                                            make_fp4_scale_contract(amax, g_sg_rcp, g_sg, encode_centric);
                                                         const int kgroup = global_col_16 / 64;
                                                         const int col_16_in_64 = (global_col_16 / 16) % 4;
                                                         const int depth = global_row / 128;
@@ -10073,7 +10088,7 @@ __device__ inline void backward_kernel_v3_streaming_3wg_impl(const globals_3wg<C
                                                         const int chunk = depth * row_sc_kgroups + kgroup;
                                                         const int byte_idx = sr * 16 + rr * 4 + col_16_in_64;
                                                         row_sc_ptr[chunk * 512 + byte_idx] =
-                                                            *reinterpret_cast<const uint8_t*>(&sc);
+                                                            row_scale_contract.scale_byte;
                                                     }
                                                 }
                                             } else {
@@ -10102,17 +10117,14 @@ __device__ inline void backward_kernel_v3_streaming_3wg_impl(const globals_3wg<C
                                                         quantize_fp4_pair(v10, v11, rcp_scale);
 
                                                     if (lane_pair == 0) {
-                                                        float stored_scale = scale * g_sg_rcp;
-                                                        if (encode_centric) {
-                                                            stored_scale = fminf(rcp_scale * g_sg, E4M3_MAX);
-                                                        }
-                                                        const __nv_fp8_e4m3 sc = __nv_fp8_e4m3(stored_scale);
+                                                        const fp4_scale_contract row_scale_contract =
+                                                            make_fp4_scale_contract(amax, g_sg_rcp, g_sg, encode_centric);
                                                         const int kgroup = global_col_16 / 64;
                                                         const int col_16_in_64 = (global_col_16 / 16) % 4;
                                                         const int chunk = row_chunk_base + kgroup;
                                                         const int byte_idx = sr * 16 + rr * 4 + col_16_in_64;
                                                         row_sc_ptr[chunk * 512 + byte_idx] =
-                                                            *reinterpret_cast<const uint8_t*>(&sc);
+                                                            row_scale_contract.scale_byte;
                                                     }
                                                 }
                                             }
@@ -10339,18 +10351,14 @@ __device__ inline void backward_kernel_v3_streaming_3wg_impl(const globals_3wg<C
                                                     store_global_u64(
                                                         &row_fp4_ptr[global_row * row_fp4_stride + fp4x2_col_base],
                                                         packed_fp4);
-                                                    const float scale = rcp_scale > 0.0f ? (1.0f / rcp_scale) : 0.0f;
-                                                    float stored_scale = scale * g_sg_rcp;
-                                                    if (encode_centric) {
-                                                        stored_scale = fminf(rcp_scale * g_sg, E4M3_MAX);
-                                                    }
-                                                    const __nv_fp8_e4m3 sc = __nv_fp8_e4m3(stored_scale);
+                                                    const fp4_scale_contract row_scale_contract =
+                                                        make_fp4_scale_contract(amax, g_sg_rcp, g_sg, encode_centric);
                                                     const int kgroup = global_col_16 / 64;
                                                     const int col_16_in_64 = (global_col_16 / 16) % 4;
                                                     const int chunk = row_chunk_base + kgroup;
                                                     const int byte_idx = sr * 16 + rr * 4 + col_16_in_64;
                                                     row_sc_ptr[chunk * 512 + byte_idx] =
-                                                        *reinterpret_cast<const uint8_t*>(&sc);
+                                                        row_scale_contract.scale_byte;
                                                 }
                                             }
                                         }
@@ -10760,12 +10768,8 @@ __device__ inline void backward_kernel_v3_streaming_3wg_impl(const globals_3wg<C
                                                         row_fp4_ptr[global_row0 * row_fp4_stride + fp4x2_col_base + lane_pair] = row0_lo_fp4;
                                                         row_fp4_ptr[global_row0 * row_fp4_stride + fp4x2_col_base + lane_pair + 4] = row0_hi_fp4;
                                                         if (lane_pair == 0) {
-                                                            const float scale = row0_rcp > 0.0f ? (1.0f / row0_rcp) : 0.0f;
-                                                            float stored_scale = scale * g_sg_rcp;
-                                                            if (encode_centric) {
-                                                                stored_scale = fminf(row0_rcp * g_sg, E4M3_MAX);
-                                                            }
-                                                            const __nv_fp8_e4m3 sc = __nv_fp8_e4m3(stored_scale);
+                                                            const fp4_scale_contract row_scale_contract =
+                                                                make_fp4_scale_contract(row0_amax, g_sg_rcp, g_sg, encode_centric);
                                                             const int depth = global_row0 / 128;
                                                             const int sr = global_row0 % 32;
                                                             const int rr = (global_row0 / 32) % 4;
@@ -10774,19 +10778,15 @@ __device__ inline void backward_kernel_v3_streaming_3wg_impl(const globals_3wg<C
                                                             const int chunk = depth * row_sc_kgroups + kgroup;
                                                             const int byte_idx = sr * 16 + rr * 4 + col_16_in_64;
                                                             row_sc_ptr[chunk * 512 + byte_idx] =
-                                                                *reinterpret_cast<const uint8_t*>(&sc);
+                                                                row_scale_contract.scale_byte;
                                                         }
                                                     }
                                                     if (row1_in_bounds) {
                                                         row_fp4_ptr[global_row1 * row_fp4_stride + fp4x2_col_base + lane_pair] = row1_lo_fp4;
                                                         row_fp4_ptr[global_row1 * row_fp4_stride + fp4x2_col_base + lane_pair + 4] = row1_hi_fp4;
                                                         if (lane_pair == 0) {
-                                                            const float scale = row1_rcp > 0.0f ? (1.0f / row1_rcp) : 0.0f;
-                                                            float stored_scale = scale * g_sg_rcp;
-                                                            if (encode_centric) {
-                                                                stored_scale = fminf(row1_rcp * g_sg, E4M3_MAX);
-                                                            }
-                                                            const __nv_fp8_e4m3 sc = __nv_fp8_e4m3(stored_scale);
+                                                            const fp4_scale_contract row_scale_contract =
+                                                                make_fp4_scale_contract(row1_amax, g_sg_rcp, g_sg, encode_centric);
                                                             const int depth = global_row1 / 128;
                                                             const int sr = global_row1 % 32;
                                                             const int rr = (global_row1 / 32) % 4;
@@ -10795,7 +10795,7 @@ __device__ inline void backward_kernel_v3_streaming_3wg_impl(const globals_3wg<C
                                                             const int chunk = depth * row_sc_kgroups + kgroup;
                                                             const int byte_idx = sr * 16 + rr * 4 + col_16_in_64;
                                                             row_sc_ptr[chunk * 512 + byte_idx] =
-                                                                *reinterpret_cast<const uint8_t*>(&sc);
+                                                                row_scale_contract.scale_byte;
                                                         }
                                                     }
                                                 }
@@ -10950,18 +10950,15 @@ __device__ inline void backward_kernel_v3_streaming_3wg_impl(const globals_3wg<C
                                                             store_global_u64(
                                                                 &row_fp4_ptr[global_row * row_fp4_stride + fp4x2_col_base],
                                                                 packed_fp4);
-                                                            const float scale = rcp_scale > 0.0f ? (1.0f / rcp_scale) : 0.0f;
-                                                            float stored_scale = scale * g_sg_rcp;
-                                                            if (encode_centric) {
-                                                                stored_scale = fminf(rcp_scale * g_sg, E4M3_MAX);
-                                                            }
-                                                            const __nv_fp8_e4m3 sc = __nv_fp8_e4m3(stored_scale);
+                                                            const fp4_scale_contract row_scale_contract =
+                                                                make_fp4_scale_contract_from_rcp_scale(
+                                                                    rcp_scale, g_sg_rcp, g_sg, encode_centric);
                                                             const int kgroup = global_col_16 / 64;
                                                             const int col_16_in_64 = (global_col_16 / 16) % 4;
                                                             const int chunk = row_chunk_base + kgroup;
                                                             const int byte_idx = sr * 16 + rr * 4 + col_16_in_64;
                                                             row_sc_ptr[chunk * 512 + byte_idx] =
-                                                                *reinterpret_cast<const uint8_t*>(&sc);
+                                                                row_scale_contract.scale_byte;
                                                             }
                                                         } else {
                                                             bf16_2 cached_lo[4];
@@ -11000,18 +10997,15 @@ __device__ inline void backward_kernel_v3_streaming_3wg_impl(const globals_3wg<C
                                                             store_global_u64(
                                                                 &row_fp4_ptr[global_row * row_fp4_stride + fp4x2_col_base],
                                                                 packed_fp4);
-                                                            const float scale = rcp_scale > 0.0f ? (1.0f / rcp_scale) : 0.0f;
-                                                            float stored_scale = scale * g_sg_rcp;
-                                                            if (encode_centric) {
-                                                                stored_scale = fminf(rcp_scale * g_sg, E4M3_MAX);
-                                                            }
-                                                            const __nv_fp8_e4m3 sc = __nv_fp8_e4m3(stored_scale);
+                                                            const fp4_scale_contract row_scale_contract =
+                                                                make_fp4_scale_contract_from_rcp_scale(
+                                                                    rcp_scale, g_sg_rcp, g_sg, encode_centric);
                                                             const int kgroup = global_col_16 / 64;
                                                             const int col_16_in_64 = (global_col_16 / 16) % 4;
                                                             const int chunk = row_chunk_base + kgroup;
                                                             const int byte_idx = sr * 16 + rr * 4 + col_16_in_64;
                                                             row_sc_ptr[chunk * 512 + byte_idx] =
-                                                                *reinterpret_cast<const uint8_t*>(&sc);
+                                                                row_scale_contract.scale_byte;
                                                         }
                                                         if constexpr (G::USE_ROW_RCP_STAGE) {
                                                             const int global_col_16 = col_start + group16 * 16;
@@ -11060,18 +11054,15 @@ __device__ inline void backward_kernel_v3_streaming_3wg_impl(const globals_3wg<C
                                                             store_global_u64(
                                                                 &row_fp4_ptr[global_row * row_fp4_stride + fp4x2_col_base],
                                                                 packed_fp4);
-                                                            const float scale = rcp_scale > 0.0f ? (1.0f / rcp_scale) : 0.0f;
-                                                            float stored_scale = scale * g_sg_rcp;
-                                                            if (encode_centric) {
-                                                                stored_scale = fminf(rcp_scale * g_sg, E4M3_MAX);
-                                                            }
-                                                            const __nv_fp8_e4m3 sc = __nv_fp8_e4m3(stored_scale);
+                                                            const fp4_scale_contract row_scale_contract =
+                                                                make_fp4_scale_contract_from_rcp_scale(
+                                                                    rcp_scale, g_sg_rcp, g_sg, encode_centric);
                                                             const int kgroup = global_col_16 / 64;
                                                             const int col_16_in_64 = (global_col_16 / 16) % 4;
                                                             const int chunk = row_chunk_base + kgroup;
                                                             const int byte_idx = sr * 16 + rr * 4 + col_16_in_64;
                                                             row_sc_ptr[chunk * 512 + byte_idx] =
-                                                                *reinterpret_cast<const uint8_t*>(&sc);
+                                                                row_scale_contract.scale_byte;
                                                         }
                                                     }
                                                 } else {
@@ -11113,18 +11104,14 @@ __device__ inline void backward_kernel_v3_streaming_3wg_impl(const globals_3wg<C
                                                             store_global_u64(
                                                                 &row_fp4_ptr[global_row * row_fp4_stride + fp4x2_col_base],
                                                                 packed_fp4);
-                                                            const float scale = rcp_scale > 0.0f ? (1.0f / rcp_scale) : 0.0f;
-                                                            float stored_scale = scale * g_sg_rcp;
-                                                            if (encode_centric) {
-                                                                stored_scale = fminf(rcp_scale * g_sg, E4M3_MAX);
-                                                            }
-                                                            const __nv_fp8_e4m3 sc = __nv_fp8_e4m3(stored_scale);
+                                                            const fp4_scale_contract row_scale_contract =
+                                                                make_fp4_scale_contract(amax, g_sg_rcp, g_sg, encode_centric);
                                                             const int kgroup = global_col_16 / 64;
                                                             const int col_16_in_64 = (global_col_16 / 16) % 4;
                                                             const int chunk = row_chunk_base + kgroup;
                                                             const int byte_idx = sr * 16 + rr * 4 + col_16_in_64;
                                                             row_sc_ptr[chunk * 512 + byte_idx] =
-                                                                *reinterpret_cast<const uint8_t*>(&sc);
+                                                                row_scale_contract.scale_byte;
                                                         }
                                                     } else {
                                                         float amax = 0.0f;
@@ -11166,17 +11153,14 @@ __device__ inline void backward_kernel_v3_streaming_3wg_impl(const globals_3wg<C
                                                             store_global_u64(
                                                                 &row_fp4_ptr[global_row * row_fp4_stride + fp4x2_col_base],
                                                                 packed_fp4);
-                                                            float stored_scale = scale * g_sg_rcp;
-                                                            if (encode_centric) {
-                                                                stored_scale = fminf(rcp_scale * g_sg, E4M3_MAX);
-                                                            }
-                                                            const __nv_fp8_e4m3 sc = __nv_fp8_e4m3(stored_scale);
+                                                            const fp4_scale_contract row_scale_contract =
+                                                                make_fp4_scale_contract(amax, g_sg_rcp, g_sg, encode_centric);
                                                             const int kgroup = global_col_16 / 64;
                                                             const int col_16_in_64 = (global_col_16 / 16) % 4;
                                                             const int chunk = row_chunk_base + kgroup;
                                                             const int byte_idx = sr * 16 + rr * 4 + col_16_in_64;
                                                             row_sc_ptr[chunk * 512 + byte_idx] =
-                                                                *reinterpret_cast<const uint8_t*>(&sc);
+                                                                row_scale_contract.scale_byte;
                                                         }
                                                     }
                                                 }
@@ -11306,17 +11290,14 @@ __device__ inline void backward_kernel_v3_streaming_3wg_impl(const globals_3wg<C
                                                         }
                                                     }
 
-                                                    float stored_scale = scale * g_sg_rcp;
-                                                    if (encode_centric) {
-                                                        stored_scale = fminf(rcp_scale * g_sg, E4M3_MAX);
-                                                    }
-                                                    const __nv_fp8_e4m3 sc = __nv_fp8_e4m3(stored_scale);
+                                                    const fp4_scale_contract row_scale_contract =
+                                                        make_fp4_scale_contract(amax, g_sg_rcp, g_sg, encode_centric);
                                                     const int kgroup = global_col_16 / 64;
                                                     const int col_16_in_64 = (global_col_16 / 16) % 4;
                                                     const int chunk = row_chunk_base + kgroup;
                                                     const int byte_idx = sr * 16 + rr * 4 + col_16_in_64;
                                                     row_sc_ptr[chunk * 512 + byte_idx] =
-                                                        *reinterpret_cast<const uint8_t*>(&sc);
+                                                        row_scale_contract.scale_byte;
                                                 }
                                             }
                                         }
@@ -11483,17 +11464,14 @@ __device__ inline void backward_kernel_v3_streaming_3wg_impl(const globals_3wg<C
                                                     quantize_fp4_pair(v10, v11, rcp_scale);
 
                                                 if (lane_pair == 0) {
-                                                    float stored_scale = scale * g_sg_rcp;
-                                                    if (encode_centric) {
-                                                        stored_scale = fminf(rcp_scale * g_sg, E4M3_MAX);
-                                                    }
-                                                    const __nv_fp8_e4m3 sc = __nv_fp8_e4m3(stored_scale);
+                                                    const fp4_scale_contract row_scale_contract =
+                                                        make_fp4_scale_contract(amax, g_sg_rcp, g_sg, encode_centric);
                                                     const int kgroup = global_col_16 / 64;
                                                     const int col_16_in_64 = (global_col_16 / 16) % 4;
                                                     const int chunk = row_chunk_base + kgroup;
                                                     const int byte_idx = sr * 16 + rr * 4 + col_16_in_64;
                                                     row_sc_ptr[chunk * 512 + byte_idx] =
-                                                        *reinterpret_cast<const uint8_t*>(&sc);
+                                                        row_scale_contract.scale_byte;
                                                 }
                                             }
                                         }
@@ -12917,18 +12895,14 @@ __device__ inline void backward_kernel_v3_streaming_3wg_impl(const globals_3wg<C
                                     store_global_u64(
                                         &row_fp4_ptr[global_row * row_fp4_stride + fp4x2_col_base],
                                         packed_fp4);
-                                    const float scale = rcp_scale > 0.0f ? (1.0f / rcp_scale) : 0.0f;
-                                    float stored_scale = scale * g_sg_rcp;
-                                    if (encode_centric) {
-                                        stored_scale = fminf(rcp_scale * g_sg, E4M3_MAX);
-                                    }
-                                    const __nv_fp8_e4m3 sc = __nv_fp8_e4m3(stored_scale);
+                                    const fp4_scale_contract row_scale_contract =
+                                        make_fp4_scale_contract(amax, g_sg_rcp, g_sg, encode_centric);
                                     const int kgroup = global_col_16 / 64;
                                     const int col_16_in_64 = (global_col_16 / 16) % 4;
                                     const int chunk = row_chunk_base + kgroup;
                                     const int byte_idx = sr * 16 + rr * 4 + col_16_in_64;
                                     row_sc_ptr[chunk * 512 + byte_idx] =
-                                        *reinterpret_cast<const uint8_t*>(&sc);
+                                        row_scale_contract.scale_byte;
                                 }
                             }
                         }
@@ -12968,11 +12942,8 @@ __device__ inline void backward_kernel_v3_streaming_3wg_impl(const globals_3wg<C
                                             const int fp4x2_col = (col_start + group16 * 16 + pair * 2) / 2;
                                             row_fp4_ptr[global_row * row_fp4_stride + fp4x2_col] = fp4_pair;
                                         }
-                                        float stored_scale = scale * g_sg_rcp;
-                                        if (encode_centric) {
-                                            stored_scale = fminf(rcp_scale * g_sg, E4M3_MAX);
-                                        }
-                                        const __nv_fp8_e4m3 sc = __nv_fp8_e4m3(stored_scale);
+                                        const fp4_scale_contract row_scale_contract =
+                                            make_fp4_scale_contract(amax, g_sg_rcp, g_sg, encode_centric);
                                         const int global_col_16 = col_start + group16 * 16;
                                         const int kgroup = global_col_16 / 64;
                                         const int col_16_in_64 = (global_col_16 / 16) % 4;
@@ -12981,7 +12952,7 @@ __device__ inline void backward_kernel_v3_streaming_3wg_impl(const globals_3wg<C
                                         const int rr = (global_row / 32) % 4;
                                         const int chunk = depth * row_sc_kgroups + kgroup;
                                         const int byte_idx = sr * 16 + rr * 4 + col_16_in_64;
-                                        row_sc_ptr[chunk * 512 + byte_idx] = *reinterpret_cast<const uint8_t*>(&sc);
+                                        row_sc_ptr[chunk * 512 + byte_idx] = row_scale_contract.scale_byte;
                                     }
                                 }
                             }
@@ -13046,18 +13017,14 @@ __device__ inline void backward_kernel_v3_streaming_3wg_impl(const globals_3wg<C
                                         store_global_u64(
                                             &row_fp4_ptr[global_row * row_fp4_stride + fp4x2_col_base],
                                             packed_fp4);
-                                        const float scale = rcp_scale > 0.0f ? (1.0f / rcp_scale) : 0.0f;
-                                        float stored_scale = scale * g_sg_rcp;
-                                        if (encode_centric) {
-                                            stored_scale = fminf(rcp_scale * g_sg, E4M3_MAX);
-                                        }
-                                        const __nv_fp8_e4m3 sc = __nv_fp8_e4m3(stored_scale);
+                                        const fp4_scale_contract row_scale_contract =
+                                            make_fp4_scale_contract(amax, g_sg_rcp, g_sg, encode_centric);
                                         const int kgroup = global_col_16 / 64;
                                         const int col_16_in_64 = (global_col_16 / 16) % 4;
                                         const int chunk = row_chunk_base + kgroup;
                                         const int byte_idx = sr * 16 + rr * 4 + col_16_in_64;
                                         row_sc_ptr[chunk * 512 + byte_idx] =
-                                            *reinterpret_cast<const uint8_t*>(&sc);
+                                            row_scale_contract.scale_byte;
                                     }
                                 }
                             }
@@ -13088,11 +13055,8 @@ __device__ inline void backward_kernel_v3_streaming_3wg_impl(const globals_3wg<C
                                             const int fp4x2_col = (col_start + group16 * 16 + pair * 2) / 2;
                                             row_fp4_ptr[global_row * row_fp4_stride + fp4x2_col] = fp4_pair;
                                         }
-                                        float stored_scale = scale * g_sg_rcp;
-                                        if (encode_centric) {
-                                            stored_scale = fminf(rcp_scale * g_sg, E4M3_MAX);
-                                        }
-                                        const __nv_fp8_e4m3 sc = __nv_fp8_e4m3(stored_scale);
+                                        const fp4_scale_contract row_scale_contract =
+                                            make_fp4_scale_contract(amax, g_sg_rcp, g_sg, encode_centric);
                                         const int global_col_16 = col_start + group16 * 16;
                                         const int kgroup = global_col_16 / 64;
                                         const int col_16_in_64 = (global_col_16 / 16) % 4;
@@ -13101,7 +13065,7 @@ __device__ inline void backward_kernel_v3_streaming_3wg_impl(const globals_3wg<C
                                         const int rr = (global_row / 32) % 4;
                                         const int chunk = depth * row_sc_kgroups + kgroup;
                                         const int byte_idx = sr * 16 + rr * 4 + col_16_in_64;
-                                        row_sc_ptr[chunk * 512 + byte_idx] = *reinterpret_cast<const uint8_t*>(&sc);
+                                        row_sc_ptr[chunk * 512 + byte_idx] = row_scale_contract.scale_byte;
                                     }
                                 }
                             }
@@ -13482,14 +13446,13 @@ __device__ inline void backward_kernel_v3_streaming_3wg_impl(const globals_3wg<C
                                                             static_cast<uint8_t>(packed_fp4 >> (pair * 8));
                                                     }
                                                 }
-                                                float stored_scale = col_scale * g_sg_rcp;
-                                                if (encode_centric) {
-                                                    stored_scale = fminf(col_rcp * g_sg, E4M3_MAX);
-                                                }
-                                                const __nv_fp8_e4m3 csc = __nv_fp8_e4m3(stored_scale);
+                                                const fp4_scale_contract col_scale_contract =
+                                                    make_fp4_scale_contract(col_amax, g_sg_rcp, g_sg, encode_centric);
                                                 col_sc_ptr[chunk * 512 + byte_idx] =
-                                                    *reinterpret_cast<const uint8_t*>(&csc);
-                                                public_colonly_trace(3, row16_pass, row16_block, stored_scale);
+                                                    col_scale_contract.scale_byte;
+                                                public_colonly_trace(
+                                                    3, row16_pass, row16_block,
+                                                    fp4_scale_byte_to_float(col_scale_contract.scale_byte));
                                             } else {
                                                 bf16_2 cached_pairs[8];
                                                 #pragma unroll
@@ -13523,14 +13486,13 @@ __device__ inline void backward_kernel_v3_streaming_3wg_impl(const globals_3wg<C
                                                             static_cast<uint8_t>(packed_fp4 >> (pair * 8));
                                                     }
                                                 }
-                                                float stored_scale = col_scale * g_sg_rcp;
-                                                if (encode_centric) {
-                                                    stored_scale = fminf(col_rcp * g_sg, E4M3_MAX);
-                                                }
-                                                const __nv_fp8_e4m3 csc = __nv_fp8_e4m3(stored_scale);
+                                                const fp4_scale_contract col_scale_contract =
+                                                    make_fp4_scale_contract(col_amax, g_sg_rcp, g_sg, encode_centric);
                                                 col_sc_ptr[chunk * 512 + byte_idx] =
-                                                    *reinterpret_cast<const uint8_t*>(&csc);
-                                                public_colonly_trace(3, row16_pass, row16_block, stored_scale);
+                                                    col_scale_contract.scale_byte;
+                                                public_colonly_trace(
+                                                    3, row16_pass, row16_block,
+                                                    fp4_scale_byte_to_float(col_scale_contract.scale_byte));
                                             }
                                         } else if constexpr (C::CACHE_COL_VALUES) {
                                             if constexpr (G::DEBUG_PUBLIC_COLONLY_TRACE) {
@@ -16914,11 +16876,8 @@ __global__ void backward_kernel_v3_col2pass_stage2(
             }
         }
 
-        float stored_scale = col_scale * g_sg_rcp;
-        if (encode_centric) {
-            stored_scale = fminf(col_rcp * g_sg, E4M3_MAX);
-        }
-        const __nv_fp8_e4m3 csc = __nv_fp8_e4m3(stored_scale);
+        const fp4_scale_contract col_scale_contract =
+            make_fp4_scale_contract(col_amax, g_sg_rcp, g_sg, encode_centric);
         const int depth = global_col / 128;
         const int sr = global_col % 32;
         const int rr = (global_col / 32) % 4;
@@ -16927,7 +16886,7 @@ __global__ void backward_kernel_v3_col2pass_stage2(
         const int chunk = depth * col_sc_kgroups + m_kgroup;
         const int byte_idx = sr * 16 + rr * 4 + m_16_in_64;
         G_sc_col_ptr[chunk * 512 + byte_idx] =
-            *reinterpret_cast<const uint8_t*>(&csc);
+            col_scale_contract.scale_byte;
     }
 }
 

@@ -104,6 +104,41 @@ __device__ __forceinline__ uint8_t quantize_fp4_pair(float v0, float v1, float r
     return q0 | (q1 << 4);
 }
 
+struct fp4_scale_contract {
+    uint8_t scale_byte;
+    float quant_rcp_scale;
+};
+
+__device__ __forceinline__ fp4_scale_contract make_fp4_scale_contract(
+    float amax,
+    float g_sg_rcp,
+    float g_sg,
+    bool encode_centric)
+{
+    constexpr float kFp4Max = 6.0f;
+    constexpr float kE4M3Max = 448.0f;
+
+    const float exact_scale = fmaxf(amax / kFp4Max, 1.0f / 65536.0f);
+    const float exact_rcp_scale = 1.0f / exact_scale;
+
+    fp4_scale_contract contract{};
+    float stored_scale = 0.0f;
+    if (encode_centric) {
+        stored_scale = fminf(exact_rcp_scale * g_sg, kE4M3Max);
+    } else {
+        stored_scale = exact_scale * g_sg_rcp;
+    }
+    reinterpret_cast<__nv_fp8_e4m3&>(contract.scale_byte) = __nv_fp8_e4m3(stored_scale);
+    const float rounded_stored_scale = float(reinterpret_cast<__nv_fp8_e4m3&>(contract.scale_byte));
+    if (encode_centric) {
+        contract.quant_rcp_scale = rounded_stored_scale * g_sg_rcp;
+    } else {
+        contract.quant_rcp_scale =
+            (rounded_stored_scale > 0.0f) ? (1.0f / (rounded_stored_scale * g_sg)) : 0.0f;
+    }
+    return contract;
+}
+
 // =========================================================================
 // Globals
 // =========================================================================
@@ -163,6 +198,7 @@ struct globals {
     float filter_eps;
     int M;
     int N;    // V (vocab)
+    bool encode_centric;
 
     struct input_tiles_t {
         A_fp4x2_tile A;
@@ -363,6 +399,8 @@ __device__ inline void backward_kernel_v2(const globals<C>& g) {
         const float a_sg = g.A_sc_global[{0}];
         const float b_sg = g.B_sc_global[{0}];
         const float global_scale = a_sg * b_sg;
+        const float g_sg = g.G_sg_row[{0}];
+        const float g_sg_rcp = (g_sg > 0.0f) ? (1.0f / g_sg) : 0.0f;
 
         constexpr int SUBTILE_COLS = C::Nb / C::EPI_PIPE_DEPTH;
         using subtile_rt = rt_fl<C::Mb / 8, SUBTILE_COLS>;
@@ -497,16 +535,15 @@ __device__ inline void backward_kernel_v2(const globals<C>& g) {
                             amax_y = fmaxf(amax_y, __shfl_xor_sync(0xFFFFFFFF, amax_y, offset));
                         }
 
-                        constexpr float FP4_MAX = 6.0f;
-                        float scale_x = fmaxf(amax_x / FP4_MAX, 1.0f / 65536.0f);
-                        float scale_y = fmaxf(amax_y / FP4_MAX, 1.0f / 65536.0f);
-                        float rcp_scale_x = 1.0f / scale_x;
-                        float rcp_scale_y = 1.0f / scale_y;
+                        const fp4_scale_contract contract_x =
+                            make_fp4_scale_contract(amax_x, g_sg_rcp, g_sg, g.encode_centric);
+                        const fp4_scale_contract contract_y =
+                            make_fp4_scale_contract(amax_y, g_sg_rcp, g_sg, g.encode_centric);
 
-                        uint8_t fp4_x_lo = quantize_fp4_pair(vals_x[0], vals_x[1], rcp_scale_x);
-                        uint8_t fp4_x_hi = quantize_fp4_pair(vals_x[2], vals_x[3], rcp_scale_x);
-                        uint8_t fp4_y_lo = quantize_fp4_pair(vals_y[0], vals_y[1], rcp_scale_y);
-                        uint8_t fp4_y_hi = quantize_fp4_pair(vals_y[2], vals_y[3], rcp_scale_y);
+                        uint8_t fp4_x_lo = quantize_fp4_pair(vals_x[0], vals_x[1], contract_x.quant_rcp_scale);
+                        uint8_t fp4_x_hi = quantize_fp4_pair(vals_x[2], vals_x[3], contract_x.quant_rcp_scale);
+                        uint8_t fp4_y_lo = quantize_fp4_pair(vals_y[0], vals_y[1], contract_y.quant_rcp_scale);
+                        uint8_t fp4_y_hi = quantize_fp4_pair(vals_y[2], vals_y[3], contract_y.quant_rcp_scale);
 
                         if (global_row_x < g.M) {
                             uint8_t* fp4_ptr = reinterpret_cast<uint8_t*>(
@@ -528,18 +565,16 @@ __device__ inline void backward_kernel_v2(const globals<C>& g) {
                         }
 
                         if ((lane_id % 4) == 0) {
-                            __nv_fp8_e4m3 sc_x = __nv_fp8_e4m3(scale_x);
-                            __nv_fp8_e4m3 sc_y = __nv_fp8_e4m3(scale_y);
                             int sc_col_block = (col_start + j * 16) / 16;
                             if (global_row_x < g.M) {
-                                reinterpret_cast<__nv_fp8_e4m3*>(
+                                reinterpret_cast<uint8_t*>(
                                     &g.G_sc_row[{global_row_x / 128, sc_col_block, 0, 0}]
-                                )[global_row_x % 128] = sc_x;
+                                )[global_row_x % 128] = contract_x.scale_byte;
                             }
                             if (global_row_y < g.M) {
-                                reinterpret_cast<__nv_fp8_e4m3*>(
+                                reinterpret_cast<uint8_t*>(
                                     &g.G_sc_row[{global_row_y / 128, sc_col_block, 0, 0}]
-                                )[global_row_y % 128] = sc_y;
+                                )[global_row_y % 128] = contract_y.scale_byte;
                             }
                         }
                     }

@@ -6,6 +6,20 @@ int main() { return 0; }
 #else
 #include "pyutils/torchutils.cuh"
 
+static at::Tensor make_unused_bf16_placeholder(const at::Tensor &ref) {
+    // FP4 paths never consume D_out, but the launch still constructs a TMA
+    // descriptor for the BF16 tensor shape. Keep only the minimum tile-sized
+    // placeholder instead of allocating a full MxN buffer every call.
+    return ref.new_empty({128, 32}, ref.options().dtype(c10::kBFloat16));
+}
+
+static at::Tensor make_unused_combo_placeholder(const at::Tensor &ref) {
+    // G-only combo frontends still need a legal BF16 tensor map for the unused
+    // combo dE/dC outputs. A single 128x32 tile is sufficient and matches the
+    // legal minimum already used by the col-only path below.
+    return ref.new_empty({128, 32}, ref.options().dtype(c10::kBFloat16));
+}
+
 // BF16 mode: outputs BF16 grad_logits (identical interface to v1)
 template <typename C>
 static void launch_backward_v3_bf16(
@@ -73,7 +87,7 @@ static void launch_backward_v3_fp4(
     constexpr float kE4M3Max = 448.0f;
 
     // Dummy BF16 output — D_out is unused in FP4 mode but TMA needs valid tensor
-    auto dummy_bf16 = A.new_empty({M, N}, A.options().dtype(c10::kBFloat16));
+    auto dummy_bf16 = make_unused_bf16_placeholder(A);
     TORCH_CHECK(G_sg_row.is_cuda() && G_sg_row.numel() == 1,
                 "Phase 3 G_sg_row must be a CUDA tensor with one float element.");
     const float g_sg = fmaxf(grad_scale / (kFp4Max * kE4M3Max), 1.0e-12f);
@@ -134,7 +148,7 @@ static void launch_experimental_backward_v3_fp4(
     constexpr float kFp4Max = 6.0f;
     constexpr float kE4M3Max = 448.0f;
 
-    auto dummy_bf16 = A.new_empty({M, N}, A.options().dtype(c10::kBFloat16));
+    auto dummy_bf16 = make_unused_bf16_placeholder(A);
     TORCH_CHECK(G_sg_row.is_cuda() && G_sg_row.numel() == 1,
                 "Phase 3 G_sg_row must be a CUDA tensor with one float element.");
     const float g_sg = fmaxf(grad_scale / (kFp4Max * kE4M3Max), 1.0e-12f);
@@ -357,7 +371,7 @@ static void launch_experimental_backward_v3_fp4_replayonly(
     constexpr float kFp4Max = 6.0f;
     constexpr float kE4M3Max = 448.0f;
 
-    auto dummy_bf16 = A.new_empty({M, N}, A.options().dtype(c10::kBFloat16));
+    auto dummy_bf16 = make_unused_bf16_placeholder(A);
     TORCH_CHECK(G_sg_row.is_cuda() && G_sg_row.numel() == 1,
                 "Phase 3 G_sg_row must be a CUDA tensor with one float element.");
     const float g_sg = fmaxf(grad_scale / (kFp4Max * kE4M3Max), 1.0e-12f);
@@ -418,7 +432,7 @@ static void launch_experimental_backward_v3_fp4_2ctaS(
     constexpr float kFp4Max = 6.0f;
     constexpr float kE4M3Max = 448.0f;
 
-    auto dummy_bf16 = A.new_empty({M, N}, A.options().dtype(c10::kBFloat16));
+    auto dummy_bf16 = make_unused_bf16_placeholder(A);
     TORCH_CHECK(G_sg_row.is_cuda() && G_sg_row.numel() == 1,
                 "Phase 3 G_sg_row must be a CUDA tensor with one float element.");
     const float g_sg = fmaxf(grad_scale / (kFp4Max * kE4M3Max), 1.0e-12f);
@@ -479,7 +493,7 @@ static void launch_experimental_backward_v3_fp4_2ctaS_replayonly(
     constexpr float kFp4Max = 6.0f;
     constexpr float kE4M3Max = 448.0f;
 
-    auto dummy_bf16 = A.new_empty({M, N}, A.options().dtype(c10::kBFloat16));
+    auto dummy_bf16 = make_unused_bf16_placeholder(A);
     TORCH_CHECK(G_sg_row.is_cuda() && G_sg_row.numel() == 1,
                 "Phase 3 G_sg_row must be a CUDA tensor with one float element.");
     const float g_sg = fmaxf(grad_scale / (kFp4Max * kE4M3Max), 1.0e-12f);
@@ -540,7 +554,7 @@ static void launch_experimental_backward_v3_fp4_2ctaSdupB(
     constexpr float kFp4Max = 6.0f;
     constexpr float kE4M3Max = 448.0f;
 
-    auto dummy_bf16 = A.new_empty({M, N}, A.options().dtype(c10::kBFloat16));
+    auto dummy_bf16 = make_unused_bf16_placeholder(A);
     TORCH_CHECK(G_sg_row.is_cuda() && G_sg_row.numel() == 1,
                 "Phase 3 G_sg_row must be a CUDA tensor with one float element.");
     const float g_sg = fmaxf(grad_scale / (kFp4Max * kE4M3Max), 1.0e-12f);
@@ -601,7 +615,7 @@ static void launch_experimental_backward_v3_fp4_2ctaSdupB_replayonly(
     constexpr float kFp4Max = 6.0f;
     constexpr float kE4M3Max = 448.0f;
 
-    auto dummy_bf16 = A.new_empty({M, N}, A.options().dtype(c10::kBFloat16));
+    auto dummy_bf16 = make_unused_bf16_placeholder(A);
     TORCH_CHECK(G_sg_row.is_cuda() && G_sg_row.numel() == 1,
                 "Phase 3 G_sg_row must be a CUDA tensor with one float element.");
     const float g_sg = fmaxf(grad_scale / (kFp4Max * kE4M3Max), 1.0e-12f);
@@ -676,10 +690,7 @@ static void launch_experimental_backward_v3_fp4_3wg(
     TORCH_CHECK(err == cudaSuccess,
                 "Failed to update NVFP4 experimental v3 3WG analytic G_sg_row: ",
                 cudaGetErrorString(err));
-    const int combo_dummy_extent = (M > N) ? M : N;
-    auto unused_combo_out = A.new_empty(
-        {combo_dummy_extent, combo_dummy_extent},
-        A.options().dtype(c10::kBFloat16));
+    auto unused_combo_out = make_unused_combo_placeholder(A);
     G g {
         .A = kittens::py::tensor_to_gl<typename G::A_fp4x2_gl>(A),
         .A_sc = kittens::py::tensor_to_gl<typename G::A_sc_gl, false>(
@@ -770,10 +781,7 @@ static void launch_experimental_backward_v3_fp4_3wg_diag(
     TORCH_CHECK(err == cudaSuccess,
                 "Failed to clear NVFP4 experimental v3 3WG diag buffer: ",
                 cudaGetErrorString(err));
-    const int combo_dummy_extent = (M > N) ? M : N;
-    auto unused_combo_out = A.new_empty(
-        {combo_dummy_extent, combo_dummy_extent},
-        A.options().dtype(c10::kBFloat16));
+    auto unused_combo_out = make_unused_combo_placeholder(A);
 
     G g {
         .A = kittens::py::tensor_to_gl<typename G::A_fp4x2_gl>(A),
@@ -850,10 +858,7 @@ static void launch_experimental_backward_v3_fp4_3wg_replayonly(
     TORCH_CHECK(err == cudaSuccess,
                 "Failed to update NVFP4 experimental v3 3WG replay-only analytic G_sg_row: ",
                 cudaGetErrorString(err));
-    const int combo_dummy_extent = (M > N) ? M : N;
-    auto unused_combo_out = A.new_empty(
-        {combo_dummy_extent, combo_dummy_extent},
-        A.options().dtype(c10::kBFloat16));
+    auto unused_combo_out = make_unused_combo_placeholder(A);
 
     G g {
         .A = kittens::py::tensor_to_gl<typename G::A_fp4x2_gl>(A),
@@ -930,10 +935,7 @@ static void launch_experimental_backward_v3_fp4_3wg_rowonly(
     TORCH_CHECK(err == cudaSuccess,
                 "Failed to update NVFP4 experimental v3 3WG row-only analytic G_sg_row: ",
                 cudaGetErrorString(err));
-    const int combo_dummy_extent = (M > N) ? M : N;
-    auto unused_combo_out = A.new_empty(
-        {combo_dummy_extent, combo_dummy_extent},
-        A.options().dtype(c10::kBFloat16));
+    auto unused_combo_out = make_unused_combo_placeholder(A);
 
     G g {
         .A = kittens::py::tensor_to_gl<typename G::A_fp4x2_gl>(A),
@@ -1076,7 +1078,7 @@ static void launch_experimental_backward_v3_fp4_rowonly(
     constexpr float kFp4Max = 6.0f;
     constexpr float kE4M3Max = 448.0f;
 
-    auto dummy_bf16 = A.new_empty({M, N}, A.options().dtype(c10::kBFloat16));
+    auto dummy_bf16 = make_unused_bf16_placeholder(A);
     TORCH_CHECK(G_sg_row.is_cuda() && G_sg_row.numel() == 1,
                 "Phase 3 G_sg_row must be a CUDA tensor with one float element.");
     const float g_sg = fmaxf(grad_scale / (kFp4Max * kE4M3Max), 1.0e-12f);
@@ -1209,7 +1211,7 @@ static void launch_experimental_backward_v3_fp4_colonly(
     constexpr float kFp4Max = 6.0f;
     constexpr float kE4M3Max = 448.0f;
 
-    auto dummy_bf16 = A.new_empty({M, N}, A.options().dtype(c10::kBFloat16));
+    auto dummy_bf16 = make_unused_bf16_placeholder(A);
     TORCH_CHECK(G_sg_row.is_cuda() && G_sg_row.numel() == 1,
                 "Phase 3 G_sg_row must be a CUDA tensor with one float element.");
     const float g_sg = fmaxf(grad_scale / (kFp4Max * kE4M3Max), 1.0e-12f);
@@ -1370,6 +1372,15 @@ using bwd_v3_fp4_public_colwg_colpairpad_rowpair_lanepairrecord_rowsync_dualfloa
 using bwd_v3_fp4_public_colwg_colpairpad_rowpair_lanepairrecord_rowsync_dualfloatcache_rowhwfp4_row16ready_overlap_colbyte_L4_SG8 = nvfp4_cce_backward_v3::experimental_config_debug_public_colonly_byte_store<bwd_v3_fp4_public_colwg_colpairpad_rowpair_lanepairrecord_rowsync_dualfloatcache_rowhwfp4_row16ready_overlap_L4_SG8>;
 using bwd_v3_fp4_public_colwg_colpairpad_rowpair_lanepairrecord_rowsync_dualfloatcache_rowhwfp4_row16ready_overlap_colbytelegacy_L4_SG8 = nvfp4_cce_backward_v3::experimental_config_debug_public_colonly_legacy_store<bwd_v3_fp4_public_colwg_colpairpad_rowpair_lanepairrecord_rowsync_dualfloatcache_rowhwfp4_row16ready_overlap_colbyte_L4_SG8>;
 using bwd_v3_fp4_public_colwg_colpairpad_rowpair_lanepairrecord_rowsync_dualfloatcache_rowhwfp4_row16ready_overlap_colnocache_L4_SG8 = nvfp4_cce_backward_v3::experimental_config_debug_public_colonly_no_cache<bwd_v3_fp4_public_colwg_colpairpad_rowpair_lanepairrecord_rowsync_dualfloatcache_rowhwfp4_row16ready_overlap_L4_SG8>;
+using bwd_v3_fp4_public_colwg_colpairpad_rowpair_lanepairrecord_rowsync_dualfloatcache_rowhwfp4_row16ready_overlap_consumersync3_L4_SG8 =
+    nvfp4_cce_backward_v3::experimental_config_debug_consumer_wg_sync_id<
+        bwd_v3_fp4_public_colwg_colpairpad_rowpair_lanepairrecord_rowsync_dualfloatcache_rowhwfp4_row16ready_overlap_L4_SG8, 3>;
+using bwd_v3_fp4_public_colwg_colpairpad_rowpair_lanepairrecord_rowsync_dualfloatcache_rowhwfp4_row16ready_overlap_quantizersync2_L4_SG8 =
+    nvfp4_cce_backward_v3::experimental_config_debug_quantizer_wg_sync_id<
+        bwd_v3_fp4_public_colwg_colpairpad_rowpair_lanepairrecord_rowsync_dualfloatcache_rowhwfp4_row16ready_overlap_L4_SG8, 2>;
+using bwd_v3_fp4_public_colwg_colpairpad_rowpair_lanepairrecord_rowsync_dualfloatcache_rowhwfp4_row16ready_overlap_consumersync3_quantizersync2_L4_SG8 =
+    nvfp4_cce_backward_v3::experimental_config_debug_quantizer_wg_sync_id<
+        bwd_v3_fp4_public_colwg_colpairpad_rowpair_lanepairrecord_rowsync_dualfloatcache_rowhwfp4_row16ready_overlap_consumersync3_L4_SG8, 2>;
 using bwd_v3_fp4_public_colwg_colpairpad_rowpair_lanepairrecord_rowsync_dualfloatcache_rowhwfp4_row16ready_overlap_combo_storeadd_rowonlydc_L4_SG8 = nvfp4_cce_backward_v3::experimental_config_colwg_colpairpad_rowpair_lanepairrecord_rowsync_dualfloatcache_rowhwfp4_row16ready_overlap_combo_storeadd_rowonlydc<4, 8, true, 4>;
 using bwd_v3_fp4_public_colwg_colpairpad_rowpair_lanepairrecord_rowsync_dualfloatcache_rowhwfp4_dedicated_rowonly_combo_dc_L4_SG8 = nvfp4_cce_backward_v3::experimental_config_colwg_colpairpad_rowpair_lanepairrecord_rowsync_dualfloatcache_rowhwfp4_dedicated_rowonly_combo_dc<4, 8, true, 4>;
 using bwd_v3_fp4_public_colwg_colpairpad_rowpair_lanepairrecord_rowsync_dualfloatcache_rowrcp_row16ready_overlap_L4_SG8 = nvfp4_cce_backward_v3::experimental_config_colwg_colpairpad_rowpair_lanepairrecord_rowsync_dualfloatcache_rowrcp_row16ready_overlap<4, 8, true>;
@@ -1422,7 +1433,7 @@ static void launch_backward_v3_fp4_public_dispatch_L4_SG8(
     bool encode_centric = false)
 {
     launch_experimental_backward_v3_fp4_3wg<
-        bwd_v3_fp4_public_colwg_colpairpad_rowpair_lanepairrecord_rowsync_dualfloatcache_rowhwfp4_row16ready_overlap_L4_SG8>(
+        bwd_v3_fp4_public_colwg_colpairpad_rowpair_lanepairrecord_rowsync_dualfloatcache_rowhwfp4_row16ready_overlap_consumersync3_quantizersync2_L4_SG8>(
         A, A_sc, A_sc_global,
         B, B_sc, B_sc_global,
         G_fp4_row, G_sc_row, G_sg_row,
@@ -1431,15 +1442,56 @@ static void launch_backward_v3_fp4_public_dispatch_L4_SG8(
         grad_scale, M, N, filter_eps, encode_centric);
 }
 
+static void launch_backward_v3_fp4_public_enc_L4_SG8(
+    const at::Tensor &A, const at::Tensor &A_sc, const at::Tensor &A_sc_global,
+    const at::Tensor &B, const at::Tensor &B_sc, const at::Tensor &B_sc_global,
+    at::Tensor &G_fp4_row, at::Tensor &G_sc_row, at::Tensor &G_sg_row,
+    at::Tensor &G_fp4_col, at::Tensor &G_sc_col,
+    const at::Tensor &lse, const at::Tensor &targets,
+    float grad_scale, int M, int N, float filter_eps = 0.0f)
+{
+    // The public NV GEMM-facing FP4 ABI is fixed: explicit enc/dec modes in the
+    // standalone quantizer produce identical row/col payloads, scale tensors,
+    // and scalar globals. Keep the public v3 enc wrapper on that same contract
+    // so backward_v3_fp4_enc_L4_SG8 matches the benchmarked nv_quant path.
+    launch_backward_v3_fp4_public_dispatch_L4_SG8(
+        A, A_sc, A_sc_global,
+        B, B_sc, B_sc_global,
+        G_fp4_row, G_sc_row, G_sg_row,
+        G_fp4_col, G_sc_col,
+        lse, targets,
+        grad_scale, M, N, filter_eps, false);
+}
+
+static void launch_backward_v3_fp4_public_dec_L4_SG8(
+    const at::Tensor &A, const at::Tensor &A_sc, const at::Tensor &A_sc_global,
+    const at::Tensor &B, const at::Tensor &B_sc, const at::Tensor &B_sc_global,
+    at::Tensor &G_fp4_row, at::Tensor &G_sc_row, at::Tensor &G_sg_row,
+    at::Tensor &G_fp4_col, at::Tensor &G_sc_col,
+    const at::Tensor &lse, const at::Tensor &targets,
+    float grad_scale, int M, int N, float filter_eps = 0.0f)
+{
+    launch_backward_v3_fp4_public_dispatch_L4_SG8(
+        A, A_sc, A_sc_global,
+        B, B_sc, B_sc_global,
+        G_fp4_row, G_sc_row, G_sg_row,
+        G_fp4_col, G_sc_col,
+        lse, targets,
+        grad_scale, M, N, filter_eps, false);
+}
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("backward_v3_bf16_L4_SG8", &launch_backward_v3_bf16<bwd_v3_bf16_L4_SG8>,
           "NVFP4 CCE backward v3 (BF16 output) L4 SG8");
     // Public FP4 v3 stays on the shipped rowhwfp4 frontend until the newer
     // consumer-OTF variants recover both small-shape correctness and large-shape
     // stability from source.
-    m.def("backward_v3_fp4_L4_SG8", &launch_experimental_backward_v3_fp4_3wg<
-          bwd_v3_fp4_public_colwg_colpairpad_rowpair_lanepairrecord_rowsync_dualfloatcache_rowhwfp4_row16ready_overlap_L4_SG8>,
+    m.def("backward_v3_fp4_L4_SG8", &launch_backward_v3_fp4_public_dispatch_L4_SG8,
           "NVFP4 CCE backward v3 (FP4 output, consumer-row/col-WG) L4 SG8");
+    m.def("backward_v3_fp4_enc_L4_SG8", &launch_backward_v3_fp4_public_enc_L4_SG8,
+          "NVFP4 CCE backward v3 (FP4 encode-centric output, consumer-row/col-WG) L4 SG8");
+    m.def("backward_v3_fp4_dec_L4_SG8", &launch_backward_v3_fp4_public_dec_L4_SG8,
+          "NVFP4 CCE backward v3 (FP4 decode-centric output, consumer-row/col-WG) L4 SG8");
     m.def("experimental_backward_v3_fp4_L4_SG8", &launch_experimental_backward_v3_fp4<bwd_v3_fp4_L4_SG8>,
           "NVFP4 CCE backward v3 experimental (FP4 output) L4 SG8");
     m.def("experimental_backward_v3_fp4_replayonly_L4_SG8", &launch_experimental_backward_v3_fp4_replayonly<bwd_v3_fp4_L4_SG8>,
@@ -1626,6 +1678,18 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           "NVFP4 CCE backward v3 experimental public col-WG padded-colpair+rowpair lane-pair-record row hardware-fp4 row16-ready row-only (FP4 output) L4 SG8");
     m.def("experimental_backward_v3_fp4_colwg_colpairpad_rowpair_lanepairrecord_rowsync_dualfloatcache_rowhwfp4_row16ready_overlap_colonly_L4_SG8", &launch_experimental_backward_v3_fp4_3wg_colonly<bwd_v3_fp4_public_colwg_colpairpad_rowpair_lanepairrecord_rowsync_dualfloatcache_rowhwfp4_row16ready_overlap_L4_SG8>,
           "NVFP4 CCE backward v3 experimental public col-WG padded-colpair+rowpair lane-pair-record row hardware-fp4 row16-ready col-only (FP4 output) L4 SG8");
+    m.def("experimental_backward_v3_fp4_colwg_colpairpad_rowpair_lanepairrecord_rowsync_dualfloatcache_rowhwfp4_row16ready_overlap_consumersync3_L4_SG8", &launch_experimental_backward_v3_fp4_3wg<bwd_v3_fp4_public_colwg_colpairpad_rowpair_lanepairrecord_rowsync_dualfloatcache_rowhwfp4_row16ready_overlap_consumersync3_L4_SG8>,
+          "NVFP4 CCE backward v3 experimental public rowhwfp4 with consumer sync id forced to 3 (FP4 output) L4 SG8");
+    m.def("experimental_backward_v3_fp4_colwg_colpairpad_rowpair_lanepairrecord_rowsync_dualfloatcache_rowhwfp4_row16ready_overlap_consumersync3_colonly_L4_SG8", &launch_experimental_backward_v3_fp4_3wg_colonly<bwd_v3_fp4_public_colwg_colpairpad_rowpair_lanepairrecord_rowsync_dualfloatcache_rowhwfp4_row16ready_overlap_consumersync3_L4_SG8>,
+          "NVFP4 CCE backward v3 experimental public rowhwfp4 col-only with consumer sync id forced to 3 (FP4 output) L4 SG8");
+    m.def("experimental_backward_v3_fp4_colwg_colpairpad_rowpair_lanepairrecord_rowsync_dualfloatcache_rowhwfp4_row16ready_overlap_quantizersync2_L4_SG8", &launch_experimental_backward_v3_fp4_3wg<bwd_v3_fp4_public_colwg_colpairpad_rowpair_lanepairrecord_rowsync_dualfloatcache_rowhwfp4_row16ready_overlap_quantizersync2_L4_SG8>,
+          "NVFP4 CCE backward v3 experimental public rowhwfp4 with quantizer sync id forced to 2 (FP4 output) L4 SG8");
+    m.def("experimental_backward_v3_fp4_colwg_colpairpad_rowpair_lanepairrecord_rowsync_dualfloatcache_rowhwfp4_row16ready_overlap_quantizersync2_colonly_L4_SG8", &launch_experimental_backward_v3_fp4_3wg_colonly<bwd_v3_fp4_public_colwg_colpairpad_rowpair_lanepairrecord_rowsync_dualfloatcache_rowhwfp4_row16ready_overlap_quantizersync2_L4_SG8>,
+          "NVFP4 CCE backward v3 experimental public rowhwfp4 col-only with quantizer sync id forced to 2 (FP4 output) L4 SG8");
+    m.def("experimental_backward_v3_fp4_colwg_colpairpad_rowpair_lanepairrecord_rowsync_dualfloatcache_rowhwfp4_row16ready_overlap_consumersync3_quantizersync2_L4_SG8", &launch_experimental_backward_v3_fp4_3wg<bwd_v3_fp4_public_colwg_colpairpad_rowpair_lanepairrecord_rowsync_dualfloatcache_rowhwfp4_row16ready_overlap_consumersync3_quantizersync2_L4_SG8>,
+          "NVFP4 CCE backward v3 experimental public rowhwfp4 with consumer sync id 3 and quantizer sync id 2 (FP4 output) L4 SG8");
+    m.def("experimental_backward_v3_fp4_colwg_colpairpad_rowpair_lanepairrecord_rowsync_dualfloatcache_rowhwfp4_row16ready_overlap_consumersync3_quantizersync2_colonly_L4_SG8", &launch_experimental_backward_v3_fp4_3wg_colonly<bwd_v3_fp4_public_colwg_colpairpad_rowpair_lanepairrecord_rowsync_dualfloatcache_rowhwfp4_row16ready_overlap_consumersync3_quantizersync2_L4_SG8>,
+          "NVFP4 CCE backward v3 experimental public rowhwfp4 col-only with consumer sync id 3 and quantizer sync id 2 (FP4 output) L4 SG8");
     m.def("experimental_backward_v3_fp4_colwg_colpairpad_rowpair_lanepairrecord_rowsync_dualfloatcache_rowhwfp4_row16ready_overlap_colwaitskip_L4_SG8", &launch_experimental_backward_v3_fp4_3wg<bwd_v3_fp4_public_colwg_colpairpad_rowpair_lanepairrecord_rowsync_dualfloatcache_rowhwfp4_row16ready_overlap_colwaitskip_L4_SG8>,
           "NVFP4 CCE backward v3 experimental public col-WG padded-colpair+rowpair lane-pair-record row hardware-fp4 row16-ready overlap with col-ready wait skipped (FP4 output) L4 SG8");
     m.def("experimental_backward_v3_fp4_colwg_colpairpad_rowpair_lanepairrecord_rowsync_dualfloatcache_rowhwfp4_row16ready_overlap_colwaitskip_colonly_L4_SG8", &launch_experimental_backward_v3_fp4_3wg_colonly<bwd_v3_fp4_public_colwg_colpairpad_rowpair_lanepairrecord_rowsync_dualfloatcache_rowhwfp4_row16ready_overlap_colwaitskip_L4_SG8>,

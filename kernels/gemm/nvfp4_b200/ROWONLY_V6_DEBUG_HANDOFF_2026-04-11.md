@@ -2081,3 +2081,222 @@ Interpretation:
 - `v3` is also benchmarkable now, but only with the explicit reuse scrub above
 - the updated `v2 localCTA` number is much closer to expectations, which supports the suspicion that the first comparison was not trustworthy
 - remaining open question: whether the direct `nvfp4_localcta_gemm` bridge is still leaving `v2` on a slower localCTA GEMM path than a prepared/fast localCTA tail would
+
+## 2026-04-13 backward sweep note
+
+Canonical 6-shape backward sweep results are recorded in:
+
+- [BACKWARD_SWEEP_2026-04-13.md](/workspace/codebases/cce/fp4_matmul/ThunderKittens/kernels/gemm/nvfp4_b200/BACKWARD_SWEEP_2026-04-13.md)
+
+Short version:
+
+- `v2-native` / `v3-native` remain numerically healthy.
+- `v3-dec` is healthy.
+- NVFP4 `v3-enc` is still functionally wrong across the sweep.
+- MXFP4 `enc` / `dec` rows are healthy.
+- `v6` localCTA rows are timing-only in the current public ABI because the bridge does not expose the per-chunk localCTA `sg` grids needed for trustworthy full-backward cosine checks.
+
+## 2026-04-14 `v3-enc` contract fix
+
+The 2026-04-13 sweep note above is now stale with respect to NVFP4 `v3-enc`.
+
+Root cause and fix:
+
+- standalone public NV quantization does not expose a distinct raw GEMM-facing encode-vs-decode scale-byte ABI
+- `v3-enc` had drifted into a different raw-output contract
+- fixed `launch_backward_v3_fp4_public_enc_L4_SG8(...)` to use the same public raw-output contract as the standalone quantizer, and collapsed the duplicated scale-byte math in `nvfp4_cce_backward_v3.cuh` onto the shared helper path
+
+Post-fix reruns on `CUDA_VISIBLE_DEVICES=2`:
+
+- `--backward-sweep --shape-set small2 --warmup 0 --iters 1`
+- `--backward-sweep --shape-set large4 --warmup 0 --iters 1`
+
+Representative NVFP4 `v3-enc` results after the fix:
+
+- `256x256->512`: `0.195 ms`, `cos(dE)=0.9930`, `cos(dC)=0.9933`
+- `512x256->512`: `0.291 ms`, `cos(dE)=0.9932`, `cos(dC)=0.9935`
+- `4Kx4K->32K`: `1.588 ms`, `cos(dE)=0.9940`, `cos(dC)=0.9939`
+- `4Kx8K->32K`: `1.990 ms`, `cos(dE)=0.9940`, `cos(dC)=0.9940`
+- `8Kx4K->32K`: `3.012 ms`, `cos(dE)=0.9941`, `cos(dC)=0.9939`
+- `4Kx4K->128K`: `6.048 ms`, `cos(dE)=0.9941`, `cos(dC)=0.9940`
+
+Current interpretation:
+
+- `v3-enc` is no longer functionally broken on the public NVFP4 sweep surface
+- `v3-native`, `v3-enc`, and `v3-dec` are now all numerically healthy
+- the remaining question is performance and footprint, not `v3-enc` correctness
+
+## 2026-04-14 MX family flag + memory footprint
+
+Benchmark harness updates landed in `fp4_cce_TK/bench_v2_vs_v3.py`:
+
+- `--fp4-family {nv,mx,both}`
+- `--report-memory`
+
+Validated behavior:
+
+- NV small2 memory reporting is working.
+- MX small2 and `4Kx4K->32K` memory reporting are working.
+- MX `v3` uses its public FP4 row+col backward ABI.
+- MX `v2` does not have an equivalent public FP4 row+col ABI, so full backward remains:
+  - BF16 backward
+  - mode-matched MX quantization of `G` and `G^T`
+  - MX GEMM tails
+
+Representative MX results on `CUDA_VISIBLE_DEVICES=2`, `warmup=0`, `iters=1`:
+
+- `256x256->512`
+  - `v2-enc`: `0.520 ms`, `cos(dE)=0.9933`, `cos(dC)=0.9932`, `PeakAlloc=1.01 MB`, `Contract=0.76 MB`
+  - `v3-enc`: `0.505 ms`, `cos(dE)=0.9933`, `cos(dC)=0.9932`, `PeakAlloc=0.76 MB`, `Contract=0.51 MB`
+- `512x256->512`
+  - `v2-enc`: `0.403 ms`, `cos(dE)=0.9934`, `cos(dC)=0.9932`, `PeakAlloc=1.77 MB`, `Contract=1.27 MB`
+  - `v3-enc`: `0.225 ms`, `cos(dE)=0.9934`, `cos(dC)=0.9932`, `PeakAlloc=1.27 MB`, `Contract=0.77 MB`
+- `4Kx4K->32K`
+  - `v2-enc`: `1.533 ms`, `cos(dE)=0.9934`, `cos(dC)=0.9934`, `PeakAlloc=914.81 MB`, `Contract=664.81 MB`
+  - `v3-enc`: `3.610 ms`, `cos(dE)=0.9934`, `cos(dC)=0.9934`, `PeakAlloc=665.38 MB`, `Contract=414.81 MB`
+
+Interpretation:
+
+- the old assumption that MX `v2` and MX `v3` were directly comparable through the same public FP4 row+col ABI was wrong
+- `v3` currently carries the better public MXFP4 materialization contract
+- `v2` can still win on time in the hybrid path, but it pays for the extra BF16 `G` plus requantization in memory footprint
+
+## 2026-04-14 xlarge NV + Triton comparison
+
+The benchmark harness now has:
+
+- `xlarge4` shape set
+- `--include-triton-bf16`
+
+where the Triton row uses `cut_cross_entropy.linear_cross_entropy(..., impl="cce")` as the original BF16 CCE baseline.
+
+Completed NV/Triton large-shape comparisons on `CUDA_VISIBLE_DEVICES=2`:
+
+- `4Kx7K->256K`
+  - `v2-native`: `12.298 ms`
+  - `v2-dec`: `11.123 ms`
+  - `v3`: public row+col path OOM (`+122.07 GiB` attempted alloc)
+  - `triton-cce`: `1134.887 ms`
+- `16Kx4K->32K`
+  - `v2-native`: `3.838 ms`
+  - `v2-dec`: `3.823 ms`
+  - `v3-enc`: `5.992 ms`
+  - `v3-dec`: `6.023 ms`
+  - `triton-cce`: `988.593 ms`
+- direct one-shot spot checks:
+  - `8Kx8K->128K`: `v2-enc 13.211 ms`, `triton-cce 1842.606 ms`, `v3-enc` did not return promptly
+  - `16Kx8K->128K`: `v2-enc 60.695 ms`, `triton-cce 1319.789 ms`
+
+What this means:
+
+- `v2` is not just winning the older moderate shapes; it is the only path here that still looks operationally strong on frontier shapes.
+- Triton BF16 CCE is useful as a correctness/backward baseline, but it is nowhere near `v2` on wall-clock backward time in this regime.
+- `v3` large-shape weakness is now clearly a scalability issue in the public row+col materialization path:
+  - stable but slower on `16Kx4K->32K`
+  - OOM or non-returning on the heavier shapes
+
+## 2026-04-14 clean isolated compare
+
+Added a subprocess-based clean compare mode in `bench_v2_vs_v3.py`:
+
+- `--isolated-compare`
+- `--isolated-timeout-s`
+
+This runs `v2-enc`, `v3-enc`, and `triton-cce` from the same raw BF16 inputs in fresh processes and reports:
+
+- `Time (ms)`
+- `Peak>Raw(MB)`
+- `Peak>Quant(MB)`
+
+Clean isolated results on `CUDA_VISIBLE_DEVICES=2`:
+
+- `16Kx4K->32K`
+  - `v2-enc`: `13.036 ms`, `Peak>Raw=2153.19 MB`, `Peak>Quant=1940.50 MB`
+  - `v3-enc`: `TIMEOUT`
+  - `triton-cce`: `196.182 ms`, `Peak>Raw=756.28 MB`, `Peak>Quant=378.09 MB`
+- `4Kx7K->256K`
+  - `v2-enc`: `39.484 ms`, `Peak>Raw=8684.52 MB`, `Peak>Quant=6681.00 MB`
+  - `v3-enc`: `CUDA OOM`, attempted `+122.07 GiB`
+  - `triton-cce`: `654.368 ms`, `Peak>Raw=7112.92 MB`, `Peak>Quant=3556.87 MB`
+
+Interpretation:
+
+- the clean-isolated surface is the current trustworthy one for large-shape decisions
+- the older in-process `v3` rows should no longer be treated as definitive where they conflict with the isolated mode
+- `v3` currently lacks a stable large-shape production comparison surface; `v2` does not
+
+## 2026-04-14 v3 large-shape memory / runtime split
+
+The `+122.07 GiB` `v3` OOM was a real wrapper bug, not the true row+col contract size.
+
+Source fix in `nvfp4_cce_backward_v3.cu`:
+
+- the public `3wg` wrappers were still allocating an unused combo placeholder as `max(M, N) x max(M, N)` BF16
+- on `4Kx7K->256K`, `max(M, N)=256000`, so that dead placeholder tried to allocate `256000 x 256000` BF16, which is about `122.07 GiB`
+- that placeholder is now replaced with the same legal minimum `128x32` BF16 tile already used by the col-only path
+
+After rebuild, the clean isolated `4Kx7K->256K` compare changed from OOM to timeout:
+
+- `v2-enc`: `39.444 ms`, `Peak>Raw=8684.52 MB`, `Peak>Quant=6681.00 MB`, `OK`
+- `v3-enc`: `TIMEOUT`
+- `triton-cce`: `659.113 ms`, `Peak>Raw=7112.92 MB`, `Peak>Quant=3556.87 MB`, `OK`
+
+So the absurd OOM is fixed, but `v3` still has real large-shape runtime failures.
+
+Direct large-shape front-half splits on the rebuilt `v3` binary:
+
+- `16Kx4K->32K`
+  - public full `backward_v3_fp4_enc_L4_SG8`: hangs / times out
+  - `rowonly`: returns cleanly in about `0.257 s`
+  - `colonly`: fails with `CUDA error: unspecified launch failure`
+- `4Kx7K->256K`
+  - public full `backward_v3_fp4_enc_L4_SG8`: hangs / times out
+  - `rowonly`: returns cleanly
+  - `colonly`: returns cleanly
+
+Current interpretation:
+
+- `v3` does not actually need `122 GiB`; that was a dead placeholder bug and is gone
+- there are still two independent large-shape runtime problems in the public row+col path:
+  - large-`M` col-only failure (`16Kx4K->32K`)
+  - large-`V` row+col interaction failure (`4Kx7K->256K`), since both row-only and col-only return by themselves
+
+## 2026-04-15: public `v3` large-shape fix promoted
+
+The remaining public large-shape `v3` failures were fixed by promoting the sync-ID override that
+had already worked as a debug sidecar.
+
+Source change:
+
+- in `nvfp4_cce_backward_v3.cu`, public dispatch now uses
+  `bwd_v3_fp4_public_colwg_colpairpad_rowpair_lanepairrecord_rowsync_dualfloatcache_rowhwfp4_row16ready_overlap_consumersync3_quantizersync2_L4_SG8`
+  instead of the prior plain `...row16ready_overlap_L4_SG8`
+
+Validation after rebuild:
+
+- `--v3-exp-check` passes on both small shapes
+- clean isolated compare, `CUDA_VISIBLE_DEVICES=2`
+  - `4Kx4K->32K`: `v3-enc 1.547 ms`, `Peak>Raw=581.27 MB`, `Peak>Quant=422.63 MB`, `OK`
+  - `16Kx4K->32K`: `v3-enc 248.314 ms`, `Peak>Raw=1153.20 MB`, `Peak>Quant=940.51 MB`, `OK`
+  - `4Kx7K->256K`: `v3-enc 285.110 ms`, `Peak>Raw=6684.52 MB`, `Peak>Quant=4681.01 MB`, `OK`
+  - `8Kx8K->128K`: `v3-enc 286.359 ms`, `Peak>Raw=4450.04 MB`, `Peak>Quant=3253.01 MB`, `OK`
+  - `16Kx8K->128K`: `v3-enc 335.787 ms`, `Peak>Raw=5775.07 MB`, `Peak>Quant=4506.01 MB`, `OK`
+
+Matched reference rows from the same isolated compare:
+
+- `4Kx4K->32K`
+  - `v2-enc 1.043 ms`, `Peak>Raw=831.27 MB`, `Peak>Quant=672.63 MB`
+  - `triton-cce 47.184 ms`, `Peak>Raw=564.12 MB`, `Peak>Quant=282.07 MB`
+- `16Kx4K->32K`
+  - `v2-enc 13.030 ms`, `Peak>Raw=2153.19 MB`, `Peak>Quant=1940.50 MB`
+  - `triton-cce 191.815 ms`, `Peak>Raw=756.28 MB`, `Peak>Quant=378.09 MB`
+- `4Kx7K->256K`
+  - `v2-enc 39.494 ms`, `Peak>Raw=8684.52 MB`, `Peak>Quant=6681.00 MB`
+  - `triton-cce 654.781 ms`, `Peak>Raw=7112.92 MB`, `Peak>Quant=3556.87 MB`
+
+Net state after the fix:
+
+- the earlier `+122.07 GiB` OOM was a separate wrapper bug and remains fixed
+- public `v3` is now operational on the large isolated surface
+- `v3` memory footprint is lower than `v2` on these large shapes, which matches the intended contract
+- `v3` throughput is still poor; the remaining problem is performance, not the earlier memory blow-up

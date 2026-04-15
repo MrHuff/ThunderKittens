@@ -47,7 +47,8 @@ static void launch_backward_v2_bf16(
         .targets = targets.data_ptr<int64_t>(),
         .grad_scale = grad_scale,
         .filter_eps = filter_eps,
-        .M = M, .N = N
+        .M = M, .N = N,
+        .encode_centric = false
     };
     kittens::py::launch_kernel<C, G, nvfp4_cce_backward_v2::backward_kernel_v2<C>>(g);
 }
@@ -59,14 +60,30 @@ static void launch_backward_v2_fp4(
     const at::Tensor &B, const at::Tensor &B_sc, const at::Tensor &B_sc_global,
     at::Tensor &G_fp4_row, at::Tensor &G_sc_row, at::Tensor &G_sg_row,
     const at::Tensor &lse, const at::Tensor &targets,
-    float grad_scale, int M, int N, float filter_eps = 0.0f)
+    float grad_scale, int M, int N, float filter_eps = 0.0f,
+    bool encode_centric = false)
 {
     static_assert(!C::USE_BF16_ACCUM, "Must use FP4 config for this function");
     using G = nvfp4_cce_backward_v2::globals<C>;
+    constexpr float kFp4Max = 6.0f;
+    constexpr float kE4M3Max = 448.0f;
 
     // Dummy BF16 output — must be properly sized for valid TMA descriptors
     // (even though D_out is never written in FP4 mode, the TMA desc is still created)
     auto dummy_bf16 = A.new_empty({M, N}, A.options().dtype(c10::kBFloat16));
+    TORCH_CHECK(G_sg_row.is_cuda() && G_sg_row.numel() == 1,
+                "NVFP4 v2 G_sg_row must be a CUDA tensor with one float element.");
+    const float g_sg = fmaxf(grad_scale / (kFp4Max * kE4M3Max), 1.0e-12f);
+    const auto stream = at::cuda::getCurrentCUDAStream();
+    auto err = cudaMemcpyAsync(
+        G_sg_row.data_ptr<float>(),
+        &g_sg,
+        sizeof(float),
+        cudaMemcpyHostToDevice,
+        stream.stream());
+    TORCH_CHECK(err == cudaSuccess,
+                "Failed to update NVFP4 v2 analytic G_sg_row: ",
+                cudaGetErrorString(err));
 
     G g {
         .A = kittens::py::tensor_to_gl<typename G::A_fp4x2_gl>(A),
@@ -92,9 +109,42 @@ static void launch_backward_v2_fp4(
         .targets = targets.data_ptr<int64_t>(),
         .grad_scale = grad_scale,
         .filter_eps = filter_eps,
-        .M = M, .N = N
+        .M = M, .N = N,
+        .encode_centric = encode_centric
     };
     kittens::py::launch_kernel<C, G, nvfp4_cce_backward_v2::backward_kernel_v2<C>>(g);
+}
+
+template <typename C>
+static void launch_backward_v2_fp4_enc(
+    const at::Tensor &A, const at::Tensor &A_sc, const at::Tensor &A_sc_global,
+    const at::Tensor &B, const at::Tensor &B_sc, const at::Tensor &B_sc_global,
+    at::Tensor &G_fp4_row, at::Tensor &G_sc_row, at::Tensor &G_sg_row,
+    const at::Tensor &lse, const at::Tensor &targets,
+    float grad_scale, int M, int N, float filter_eps = 0.0f)
+{
+    launch_backward_v2_fp4<C>(
+        A, A_sc, A_sc_global,
+        B, B_sc, B_sc_global,
+        G_fp4_row, G_sc_row, G_sg_row,
+        lse, targets,
+        grad_scale, M, N, filter_eps, true);
+}
+
+template <typename C>
+static void launch_backward_v2_fp4_dec(
+    const at::Tensor &A, const at::Tensor &A_sc, const at::Tensor &A_sc_global,
+    const at::Tensor &B, const at::Tensor &B_sc, const at::Tensor &B_sc_global,
+    at::Tensor &G_fp4_row, at::Tensor &G_sc_row, at::Tensor &G_sg_row,
+    const at::Tensor &lse, const at::Tensor &targets,
+    float grad_scale, int M, int N, float filter_eps = 0.0f)
+{
+    launch_backward_v2_fp4<C>(
+        A, A_sc, A_sc_global,
+        B, B_sc, B_sc_global,
+        G_fp4_row, G_sc_row, G_sg_row,
+        lse, targets,
+        grad_scale, M, N, filter_eps, false);
 }
 
 // Config instantiations
@@ -108,6 +158,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           "NVFP4 CCE backward v2 (BF16 output) L4 SG8");
     m.def("backward_v2_fp4_L4_SG8", &launch_backward_v2_fp4<bwd_v2_fp4_L4_SG8>,
           "NVFP4 CCE backward v2 (FP4 output) L4 SG8");
+    m.def("backward_v2_fp4_enc_L4_SG8", &launch_backward_v2_fp4_enc<bwd_v2_fp4_L4_SG8>,
+          "NVFP4 CCE backward v2 (FP4 encode-centric output) L4 SG8");
+    m.def("backward_v2_fp4_dec_L4_SG8", &launch_backward_v2_fp4_dec<bwd_v2_fp4_L4_SG8>,
+          "NVFP4 CCE backward v2 (FP4 decode-centric output) L4 SG8");
     m.def("experimental_backward_v2_bf16_epipipe_L4_SG8", &launch_backward_v2_bf16<bwd_v2_bf16_epipipe_L4_SG8>,
           "NVFP4 CCE backward v2 experimental epipipe (BF16 output) L4 SG8");
     m.def("experimental_backward_v2_fp4_epipipe_L4_SG8", &launch_backward_v2_fp4<bwd_v2_fp4_epipipe_L4_SG8>,
