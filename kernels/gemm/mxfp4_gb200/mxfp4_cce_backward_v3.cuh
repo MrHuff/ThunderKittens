@@ -383,6 +383,7 @@ __device__ inline void backward_kernel_v3(const globals<C>& g) {
         using subtile_rt_bf = rt_bf<C::Mb / 8, SUBTILE_COLS>;
 
         const int lane_id = threadIdx.x % 32;
+        __shared__ float col_stage_smem[WARPGROUP_WARPS][32][33];
         int phase = 0;
 
         for (int block_idx = cluster_id; block_idx < num_blocks; block_idx += gridDim.x / C::CLUSTER_SIZE) {
@@ -569,100 +570,105 @@ __device__ inline void backward_kernel_v3(const globals<C>& g) {
                     // Step 4: Pack fp4x2 bytes, write to global
 
                     const int ntk = g.N / 128;  // number of col-tiles in K dimension
+                    const bool do_row = g.G_sc_row != nullptr;
+                    const bool do_col = g.G_fp4_col_ptr != nullptr && g.G_sc_col_ptr != nullptr;
+                    uint8_t* row_fp4_ptr = reinterpret_cast<uint8_t*>(g.G_fp4_row.raw_ptr);
+                    const int row_fp4_stride = g.G_fp4_row.cols();
+                    const int col_fp4_stride = g.A.rows() / 2;  // stride along padded M/2
 
-                    #pragma unroll
-                    for (int epi = 0; epi < C::EPI_PIPE_DEPTH; epi++) {
-                        subtile_rt& D_fl = D_regs_fl[epi];
-                        int col_start = col_block_idx * C::Nb + epi * SUBTILE_COLS;
-
+                    if (do_row) {
                         #pragma unroll
-                        for (int i = 0; i < subtile_rt::height; i++) {
-                            int global_row_x = warp_row_base + i * 16 + lane_id / 4;
-                            int global_row_y = warp_row_base + i * 16 + 8 + lane_id / 4;
+                        for (int epi = 0; epi < C::EPI_PIPE_DEPTH; epi++) {
+                            subtile_rt& D_fl = D_regs_fl[epi];
+                            int col_start = col_block_idx * C::Nb + epi * SUBTILE_COLS;
 
-                            // Collect all 8 values per row across j=0,1 (32 cols total)
-                            float vals_x[8], vals_y[8];
                             #pragma unroll
-                            for (int j = 0; j < subtile_rt::width; j++) {
-                                vals_x[j*4 + 0] = D_fl.tiles[i][j].data[0].x;
-                                vals_x[j*4 + 1] = D_fl.tiles[i][j].data[0].y;
-                                vals_x[j*4 + 2] = D_fl.tiles[i][j].data[2].x;
-                                vals_x[j*4 + 3] = D_fl.tiles[i][j].data[2].y;
-                                vals_y[j*4 + 0] = D_fl.tiles[i][j].data[1].x;
-                                vals_y[j*4 + 1] = D_fl.tiles[i][j].data[1].y;
-                                vals_y[j*4 + 2] = D_fl.tiles[i][j].data[3].x;
-                                vals_y[j*4 + 3] = D_fl.tiles[i][j].data[3].y;
-                            }
+                            for (int i = 0; i < subtile_rt::height; i++) {
+                                int global_row_x = warp_row_base + i * 16 + lane_id / 4;
+                                int global_row_y = warp_row_base + i * 16 + 8 + lane_id / 4;
 
-                            // Per-row, per-32-col-block amax
-                            // Each thread has 8 values, reduce across 4 lanes
-                            float amax_x = 0.0f, amax_y = 0.0f;
-                            #pragma unroll
-                            for (int v = 0; v < 8; v++) {
-                                amax_x = fmaxf(amax_x, fabsf(vals_x[v]));
-                                amax_y = fmaxf(amax_y, fabsf(vals_y[v]));
-                            }
-                            // Warp shuffle across 4 threads sharing a row
-                            #pragma unroll
-                            for (int offset = 1; offset < 4; offset <<= 1) {
-                                amax_x = fmaxf(amax_x, __shfl_xor_sync(0xFFFFFFFF, amax_x, offset));
-                                amax_y = fmaxf(amax_y, __shfl_xor_sync(0xFFFFFFFF, amax_y, offset));
-                            }
-
-                            // Convert amax to E8M0 scale (mode-dependent rounding)
-                            uint8_t e8m0_x = (amax_x <= 1e-9f) ? 0 : float_to_e8m0_dispatch<C::QUANT_MODE>(amax_x);
-                            uint8_t e8m0_y = (amax_y <= 1e-9f) ? 0 : float_to_e8m0_dispatch<C::QUANT_MODE>(amax_y);
-                            float rcp_x = exp2f_rcp_e8m0(e8m0_x);
-                            float rcp_y = exp2f_rcp_e8m0(e8m0_y);
-                            float coeff_x = 6.0f * rcp_x;
-                            float coeff_y = 6.0f * rcp_y;
-
-                            // Quantize and pack FP4 pairs
-                            #pragma unroll
-                            for (int j = 0; j < subtile_rt::width; j++) {
-                                // Low cols: data[0].x/y (cols base_col, base_col+1)
-                                uint8_t fp4_x_lo = quantize_fp4_pair(
-                                    D_fl.tiles[i][j].data[0].x, D_fl.tiles[i][j].data[0].y, coeff_x);
-                                uint8_t fp4_x_hi = quantize_fp4_pair(
-                                    D_fl.tiles[i][j].data[2].x, D_fl.tiles[i][j].data[2].y, coeff_x);
-                                uint8_t fp4_y_lo = quantize_fp4_pair(
-                                    D_fl.tiles[i][j].data[1].x, D_fl.tiles[i][j].data[1].y, coeff_y);
-                                uint8_t fp4_y_hi = quantize_fp4_pair(
-                                    D_fl.tiles[i][j].data[3].x, D_fl.tiles[i][j].data[3].y, coeff_y);
-
-                                // Write FP4 data to global
-                                uint8_t* row_fp4_ptr = reinterpret_cast<uint8_t*>(g.G_fp4_row.raw_ptr);
-                                int row_fp4_stride = g.G_fp4_row.cols();
-                                int global_byte_lo = col_start / 2 + (lane_id % 4) + j * 8;
-                                int global_byte_hi = global_byte_lo + 4;
-                                if (global_row_x < g.M) {
-                                    row_fp4_ptr[global_row_x * row_fp4_stride + global_byte_lo] = fp4_x_lo;
-                                    row_fp4_ptr[global_row_x * row_fp4_stride + global_byte_hi] = fp4_x_hi;
+                                // Collect all 8 values per row across j=0,1 (32 cols total)
+                                float vals_x[8], vals_y[8];
+                                #pragma unroll
+                                for (int j = 0; j < subtile_rt::width; j++) {
+                                    vals_x[j*4 + 0] = D_fl.tiles[i][j].data[0].x;
+                                    vals_x[j*4 + 1] = D_fl.tiles[i][j].data[0].y;
+                                    vals_x[j*4 + 2] = D_fl.tiles[i][j].data[2].x;
+                                    vals_x[j*4 + 3] = D_fl.tiles[i][j].data[2].y;
+                                    vals_y[j*4 + 0] = D_fl.tiles[i][j].data[1].x;
+                                    vals_y[j*4 + 1] = D_fl.tiles[i][j].data[1].y;
+                                    vals_y[j*4 + 2] = D_fl.tiles[i][j].data[3].x;
+                                    vals_y[j*4 + 3] = D_fl.tiles[i][j].data[3].y;
                                 }
-                                if (global_row_y < g.M) {
-                                    row_fp4_ptr[global_row_y * row_fp4_stride + global_byte_lo] = fp4_y_lo;
-                                    row_fp4_ptr[global_row_y * row_fp4_stride + global_byte_hi] = fp4_y_hi;
-                                }
-                            }
 
-                            // Write E8M0 scale (one per row per 32-col block)
-                            if ((lane_id % 4) == 0) {
-                                int sc_row_blk_x = global_row_x / 128;
-                                int sc_col_blk   = col_start / 128;
-                                int epi_block    = epi;
-
-                                if (global_row_x < g.M) {
-                                    int j_in_tile = global_row_x % 32;
-                                    int grp       = (global_row_x % 128) / 32;
-                                    int base = (sc_row_blk_x * ntk + sc_col_blk) * 512 + j_in_tile * 16 + grp * 4;
-                                    g.G_sc_row[base + epi_block] = e8m0_x;
+                                // Per-row, per-32-col-block amax
+                                // Each thread has 8 values, reduce across 4 lanes
+                                float amax_x = 0.0f, amax_y = 0.0f;
+                                #pragma unroll
+                                for (int v = 0; v < 8; v++) {
+                                    amax_x = fmaxf(amax_x, fabsf(vals_x[v]));
+                                    amax_y = fmaxf(amax_y, fabsf(vals_y[v]));
                                 }
-                                if (global_row_y < g.M) {
-                                    int sc_row_blk_y = global_row_y / 128;
-                                    int j_in_tile = global_row_y % 32;
-                                    int grp       = (global_row_y % 128) / 32;
-                                    int base = (sc_row_blk_y * ntk + sc_col_blk) * 512 + j_in_tile * 16 + grp * 4;
-                                    g.G_sc_row[base + epi_block] = e8m0_y;
+                                // Warp shuffle across 4 threads sharing a row
+                                #pragma unroll
+                                for (int offset = 1; offset < 4; offset <<= 1) {
+                                    amax_x = fmaxf(amax_x, __shfl_xor_sync(0xFFFFFFFF, amax_x, offset));
+                                    amax_y = fmaxf(amax_y, __shfl_xor_sync(0xFFFFFFFF, amax_y, offset));
+                                }
+
+                                // Convert amax to E8M0 scale (mode-dependent rounding)
+                                uint8_t e8m0_x = (amax_x <= 1e-9f) ? 0 : float_to_e8m0_dispatch<C::QUANT_MODE>(amax_x);
+                                uint8_t e8m0_y = (amax_y <= 1e-9f) ? 0 : float_to_e8m0_dispatch<C::QUANT_MODE>(amax_y);
+                                float rcp_x = exp2f_rcp_e8m0(e8m0_x);
+                                float rcp_y = exp2f_rcp_e8m0(e8m0_y);
+                                float coeff_x = 6.0f * rcp_x;
+                                float coeff_y = 6.0f * rcp_y;
+
+                                // Quantize and pack FP4 pairs
+                                #pragma unroll
+                                for (int j = 0; j < subtile_rt::width; j++) {
+                                    // Low cols: data[0].x/y (cols base_col, base_col+1)
+                                    uint8_t fp4_x_lo = quantize_fp4_pair(
+                                        D_fl.tiles[i][j].data[0].x, D_fl.tiles[i][j].data[0].y, coeff_x);
+                                    uint8_t fp4_x_hi = quantize_fp4_pair(
+                                        D_fl.tiles[i][j].data[2].x, D_fl.tiles[i][j].data[2].y, coeff_x);
+                                    uint8_t fp4_y_lo = quantize_fp4_pair(
+                                        D_fl.tiles[i][j].data[1].x, D_fl.tiles[i][j].data[1].y, coeff_y);
+                                    uint8_t fp4_y_hi = quantize_fp4_pair(
+                                        D_fl.tiles[i][j].data[3].x, D_fl.tiles[i][j].data[3].y, coeff_y);
+
+                                    // Write FP4 data to global
+                                    int global_byte_lo = col_start / 2 + (lane_id % 4) + j * 8;
+                                    int global_byte_hi = global_byte_lo + 4;
+                                    if (global_row_x < g.M) {
+                                        row_fp4_ptr[global_row_x * row_fp4_stride + global_byte_lo] = fp4_x_lo;
+                                        row_fp4_ptr[global_row_x * row_fp4_stride + global_byte_hi] = fp4_x_hi;
+                                    }
+                                    if (global_row_y < g.M) {
+                                        row_fp4_ptr[global_row_y * row_fp4_stride + global_byte_lo] = fp4_y_lo;
+                                        row_fp4_ptr[global_row_y * row_fp4_stride + global_byte_hi] = fp4_y_hi;
+                                    }
+                                }
+
+                                // Write E8M0 scale (one per row per 32-col block)
+                                if ((lane_id % 4) == 0) {
+                                    int sc_row_blk_x = global_row_x / 128;
+                                    int sc_col_blk   = col_start / 128;
+                                    int epi_block    = epi;
+
+                                    if (global_row_x < g.M) {
+                                        int j_in_tile = global_row_x % 32;
+                                        int grp       = (global_row_x % 128) / 32;
+                                        int base = (sc_row_blk_x * ntk + sc_col_blk) * 512 + j_in_tile * 16 + grp * 4;
+                                        g.G_sc_row[base + epi_block] = e8m0_x;
+                                    }
+                                    if (global_row_y < g.M) {
+                                        int sc_row_blk_y = global_row_y / 128;
+                                        int j_in_tile = global_row_y % 32;
+                                        int grp       = (global_row_y % 128) / 32;
+                                        int base = (sc_row_blk_y * ntk + sc_col_blk) * 512 + j_in_tile * 16 + grp * 4;
+                                        g.G_sc_row[base + epi_block] = e8m0_y;
+                                    }
                                 }
                             }
                         }
@@ -682,164 +688,72 @@ __device__ inline void backward_kernel_v3(const globals<C>& g) {
                     //     col8 = col0 + 8
                     //     col9 = col0 + 9
 
-                    #pragma unroll
-                    for (int epi = 0; epi < C::EPI_PIPE_DEPTH; epi++) {
-                        subtile_rt& D_fl = D_regs_fl[epi];
-                        int col_start = col_block_idx * C::Nb + epi * SUBTILE_COLS;
-
+                    if (do_col) {
+                        const int lane_col_pair = (lane_id % 4) * 2;
+                        const int row_pair_idx = lane_id / 4;
+                        const int m_kgroup = warp_row_base / 128;
+                        const int m_32_in_128 = (warp_row_base / 32) % 4;
+                        float (*col_tile)[33] = col_stage_smem[warpgroup::warpid()];
                         #pragma unroll
-                        for (int j = 0; j < subtile_rt::width; j++) {
-                            // Each thread has 4 columns: gc0, gc1, gc8, gc9
-                            int gc0 = col_start + j * 16 + (lane_id % 4) * 2;
-                            int gc1 = gc0 + 1;
-                            int gc8 = gc0 + 8;
-                            int gc9 = gc8 + 1;
-
-                            // Accumulate per-column amax across the 32 M-rows
-                            // (2 i-values × 16 rows per i = 32 rows)
-                            float col_amax[4] = {0.0f, 0.0f, 0.0f, 0.0f};
-
+                        for (int epi = 0; epi < C::EPI_PIPE_DEPTH; epi++) {
+                            subtile_rt& D_fl = D_regs_fl[epi];
+                            int col_start = col_block_idx * C::Nb + epi * SUBTILE_COLS;
                             #pragma unroll
                             for (int i = 0; i < subtile_rt::height; i++) {
-                                // x-rows: data[0].x, data[0].y (lo cols)
-                                //         data[2].x, data[2].y (hi cols +8)
-                                col_amax[0] = fmaxf(col_amax[0], fabsf(D_fl.tiles[i][j].data[0].x));
-                                col_amax[1] = fmaxf(col_amax[1], fabsf(D_fl.tiles[i][j].data[0].y));
-                                col_amax[2] = fmaxf(col_amax[2], fabsf(D_fl.tiles[i][j].data[2].x));
-                                col_amax[3] = fmaxf(col_amax[3], fabsf(D_fl.tiles[i][j].data[2].y));
-                                // y-rows: data[1].x, data[1].y (lo cols)
-                                //         data[3].x, data[3].y (hi cols +8)
-                                col_amax[0] = fmaxf(col_amax[0], fabsf(D_fl.tiles[i][j].data[1].x));
-                                col_amax[1] = fmaxf(col_amax[1], fabsf(D_fl.tiles[i][j].data[1].y));
-                                col_amax[2] = fmaxf(col_amax[2], fabsf(D_fl.tiles[i][j].data[3].x));
-                                col_amax[3] = fmaxf(col_amax[3], fabsf(D_fl.tiles[i][j].data[3].y));
-                            }
-
-                            // Cross-thread reduction: threads with different lane_id/4
-                            // share same columns but different rows. 8 threads per half
-                            // × 2 halves (x, y) × 2 i-values = 32 rows.
-                            // We already included x+y and both i values above.
-                            // Reduce across lane_id/4 (offsets 4, 8, 16):
-                            #pragma unroll
-                            for (int v = 0; v < 4; v++) {
-                                col_amax[v] = fmaxf(col_amax[v], __shfl_xor_sync(0xFFFFFFFF, col_amax[v], 4));
-                                col_amax[v] = fmaxf(col_amax[v], __shfl_xor_sync(0xFFFFFFFF, col_amax[v], 8));
-                                col_amax[v] = fmaxf(col_amax[v], __shfl_xor_sync(0xFFFFFFFF, col_amax[v], 16));
-                            }
-
-                            // Compute E8M0 scales and reciprocals
-                            uint8_t col_e8m0[4];
-                            float col_coeff[4];
-                            #pragma unroll
-                            for (int v = 0; v < 4; v++) {
-                                col_e8m0[v] = (col_amax[v] <= 1e-9f) ? 0 : float_to_e8m0_dispatch<C::QUANT_MODE>(col_amax[v]);
-                                col_coeff[v] = 6.0f * exp2f_rcp_e8m0(col_e8m0[v]);
-                            }
-
-                            // Quantize and write transposed FP4: G_col[col, row/2]
-                            int col_fp4_stride = g.A.rows() / 2;  // stride along padded M/2
-                            #pragma unroll
-                            for (int i = 0; i < subtile_rt::height; i++) {
-                                int row_pair_idx = lane_id / 4;
-                                int global_row_pair_lo = warp_row_base + i * 16 + row_pair_idx;
-                                int global_row_pair_hi = global_row_pair_lo + 8;
-
-                                float vals_x[4] = {
-                                    D_fl.tiles[i][j].data[0].x,
-                                    D_fl.tiles[i][j].data[0].y,
-                                    D_fl.tiles[i][j].data[2].x,
-                                    D_fl.tiles[i][j].data[2].y,
-                                };
-                                float vals_y[4] = {
-                                    D_fl.tiles[i][j].data[1].x,
-                                    D_fl.tiles[i][j].data[1].y,
-                                    D_fl.tiles[i][j].data[3].x,
-                                    D_fl.tiles[i][j].data[3].y,
-                                };
-
-                                float row_x_pair_hi[4];
-                                float row_y_pair_hi[4];
+                                const int row_base = i * 16 + row_pair_idx;
+                                const int row_base_hi = row_base + 8;
                                 #pragma unroll
-                                for (int v = 0; v < 4; v++) {
-                                    row_x_pair_hi[v] = __shfl_xor_sync(0xFFFFFFFF, vals_x[v], 4);
-                                    row_y_pair_hi[v] = __shfl_xor_sync(0xFFFFFFFF, vals_y[v], 4);
-                                }
-
-                                if ((row_pair_idx % 2) == 0) {
-                                    if (gc0 < g.N && global_row_pair_lo < g.M) {
-                                        float pair_hi = (global_row_pair_lo + 1 < g.M) ? row_x_pair_hi[0] : 0.0f;
-                                        g.G_fp4_col_ptr[gc0 * col_fp4_stride + global_row_pair_lo / 2] =
-                                            quantize_fp4_pair(vals_x[0], pair_hi, col_coeff[0]);
-                                    }
-                                    if (gc1 < g.N && global_row_pair_lo < g.M) {
-                                        float pair_hi = (global_row_pair_lo + 1 < g.M) ? row_x_pair_hi[1] : 0.0f;
-                                        g.G_fp4_col_ptr[gc1 * col_fp4_stride + global_row_pair_lo / 2] =
-                                            quantize_fp4_pair(vals_x[1], pair_hi, col_coeff[1]);
-                                    }
-                                    if (gc8 < g.N && global_row_pair_lo < g.M) {
-                                        float pair_hi = (global_row_pair_lo + 1 < g.M) ? row_x_pair_hi[2] : 0.0f;
-                                        g.G_fp4_col_ptr[gc8 * col_fp4_stride + global_row_pair_lo / 2] =
-                                            quantize_fp4_pair(vals_x[2], pair_hi, col_coeff[2]);
-                                    }
-                                    if (gc9 < g.N && global_row_pair_lo < g.M) {
-                                        float pair_hi = (global_row_pair_lo + 1 < g.M) ? row_x_pair_hi[3] : 0.0f;
-                                        g.G_fp4_col_ptr[gc9 * col_fp4_stride + global_row_pair_lo / 2] =
-                                            quantize_fp4_pair(vals_x[3], pair_hi, col_coeff[3]);
-                                    }
-
-                                    if (gc0 < g.N && global_row_pair_hi < g.M) {
-                                        float pair_hi = (global_row_pair_hi + 1 < g.M) ? row_y_pair_hi[0] : 0.0f;
-                                        g.G_fp4_col_ptr[gc0 * col_fp4_stride + global_row_pair_hi / 2] =
-                                            quantize_fp4_pair(vals_y[0], pair_hi, col_coeff[0]);
-                                    }
-                                    if (gc1 < g.N && global_row_pair_hi < g.M) {
-                                        float pair_hi = (global_row_pair_hi + 1 < g.M) ? row_y_pair_hi[1] : 0.0f;
-                                        g.G_fp4_col_ptr[gc1 * col_fp4_stride + global_row_pair_hi / 2] =
-                                            quantize_fp4_pair(vals_y[1], pair_hi, col_coeff[1]);
-                                    }
-                                    if (gc8 < g.N && global_row_pair_hi < g.M) {
-                                        float pair_hi = (global_row_pair_hi + 1 < g.M) ? row_y_pair_hi[2] : 0.0f;
-                                        g.G_fp4_col_ptr[gc8 * col_fp4_stride + global_row_pair_hi / 2] =
-                                            quantize_fp4_pair(vals_y[2], pair_hi, col_coeff[2]);
-                                    }
-                                    if (gc9 < g.N && global_row_pair_hi < g.M) {
-                                        float pair_hi = (global_row_pair_hi + 1 < g.M) ? row_y_pair_hi[3] : 0.0f;
-                                        g.G_fp4_col_ptr[gc9 * col_fp4_stride + global_row_pair_hi / 2] =
-                                            quantize_fp4_pair(vals_y[3], pair_hi, col_coeff[3]);
-                                    }
+                                for (int j = 0; j < subtile_rt::width; j++) {
+                                    const int col_base = j * 16 + lane_col_pair;
+                                    col_tile[row_base][col_base + 0] = D_fl.tiles[i][j].data[0].x;
+                                    col_tile[row_base][col_base + 1] = D_fl.tiles[i][j].data[0].y;
+                                    col_tile[row_base_hi][col_base + 0] = D_fl.tiles[i][j].data[1].x;
+                                    col_tile[row_base_hi][col_base + 1] = D_fl.tiles[i][j].data[1].y;
+                                    col_tile[row_base][col_base + 8] = D_fl.tiles[i][j].data[2].x;
+                                    col_tile[row_base][col_base + 9] = D_fl.tiles[i][j].data[2].y;
+                                    col_tile[row_base_hi][col_base + 8] = D_fl.tiles[i][j].data[3].x;
+                                    col_tile[row_base_hi][col_base + 9] = D_fl.tiles[i][j].data[3].y;
                                 }
                             }
+                            __syncwarp();
 
-                            // Write col-quantized E8M0 scale in TK 3D format
-                            // For G^T (V, M): [V/128, M/128, 512]
-                            // "row" = V-dim (gc), "col" = M-dim (warp_row_base)
-                            // Within 512-byte chunk: byte = (gc%32)*16 + (gc/32%4)*4 + m_32_in_128
-                            // m_32_in_128 = (warp_row_base / 32) % 4 → which 32-row MX block
-                            // But need to be careful: warp_row_base selects the 32-row block
-                            if ((lane_id / 4) == 0) {
-                                int global_row_m = warp_row_base;  // start of 32-row block
-                                int m_kgroup = global_row_m / 128;
-                                int m_32_in_128 = (global_row_m / 32) % 4;
+                            const int local_col = lane_id;
+                            const int global_col = col_start + local_col;
+                            float col_amax = 0.0f;
+                            #pragma unroll
+                            for (int row = 0; row < 32; row++) {
+                                col_amax = fmaxf(col_amax, fabsf(col_tile[row][local_col]));
+                            }
 
-                                int gc_vals[4] = {gc0, gc1, gc8, gc9};
+                            const uint8_t col_e8m0 =
+                                (col_amax <= 1e-9f) ? 0 : float_to_e8m0_dispatch<C::QUANT_MODE>(col_amax);
+                            const float col_coeff = 6.0f * exp2f_rcp_e8m0(col_e8m0);
+
+                            if (global_col < g.N) {
                                 #pragma unroll
-                                for (int v = 0; v < 4; v++) {
-                                    int gc = gc_vals[v];
-                                    if (gc < g.N) {
-                                        int depth = gc / 128;
-                                        int sr = gc % 32;
-                                        int rr = (gc / 32) % 4;
-                                        int chunk = depth * g.G_sc_col_kgroups + m_kgroup;
-                                        int byte_idx = sr * 16 + rr * 4 + m_32_in_128;
-                                        g.G_sc_col_ptr[chunk * 512 + byte_idx] = col_e8m0[v];
+                                for (int pair = 0; pair < 16; pair++) {
+                                    const int row = pair * 2;
+                                    const int global_row = warp_row_base + row;
+                                    if (global_row < g.M) {
+                                        const float v0 = col_tile[row + 0][local_col];
+                                        const float v1 = (global_row + 1 < g.M) ? col_tile[row + 1][local_col] : 0.0f;
+                                        g.G_fp4_col_ptr[global_col * col_fp4_stride + global_row / 2] =
+                                            quantize_fp4_pair(v0, v1, col_coeff);
                                     }
                                 }
+
+                                const int depth = global_col / 128;
+                                const int sr = global_col % 32;
+                                const int rr = (global_col / 32) % 4;
+                                const int chunk = depth * g.G_sc_col_kgroups + m_kgroup;
+                                const int byte_idx = sr * 16 + rr * 4 + m_32_in_128;
+                                g.G_sc_col_ptr[chunk * 512 + byte_idx] = col_e8m0;
                             }
+                            __syncwarp();
                         }
                     }
                 }
             }
-
             update_phasebit<0>(phasebits, 0);
             phase ^= 1;
         }
