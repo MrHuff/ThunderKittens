@@ -157,7 +157,6 @@ outer_scale_desc check_outer_scale_tiles(
     bool row_axis
 ) {
     TORCH_CHECK(t.is_cuda(), name, " must be CUDA");
-    TORCH_CHECK(t.is_contiguous(), name, " must be contiguous");
     TORCH_CHECK(t.scalar_type() == at::kFloat, name, " must be float32");
     if (t.dim() == 1) {
         TORCH_CHECK(t.size(0) == tiles, name, " length mismatch");
