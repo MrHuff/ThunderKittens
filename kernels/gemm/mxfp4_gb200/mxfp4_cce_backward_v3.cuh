@@ -216,7 +216,6 @@ __device__ __noinline__ void quantize_rows_from_stage_full(
     const int local_row = lane_id;
     const int global_row = warp_row_base + local_row;
     if (global_row >= g.M) return;
-    const bool full_row_tile = (warp_row_base + 31) < g.M;
 
     bf16_2 cached_pairs[16];
     float row_amax = 0.0f;
@@ -257,9 +256,9 @@ __device__ __noinline__ void quantize_rows_from_stage_full(
     *reinterpret_cast<uint64_t*>(&row_fp4_ptr[row_fp4_base + 0]) = packed_lo;
     *reinterpret_cast<uint64_t*>(&row_fp4_ptr[row_fp4_base + 8]) = packed_hi;
 
-    const int sc_row_blk = global_row / 128;
-    const int j_in_tile = global_row % 32;
-    const int grp = (global_row % 128) / 32;
+    const int sc_row_blk = warp_row_base / 128;
+    const int j_in_tile = local_row;
+    const int grp = (warp_row_base % 128) / 32;
     const int sc_col_blk = col_start / 128;
     const int base =
         (sc_row_blk * ntk + sc_col_blk) * 512 + j_in_tile * 16 + grp * 4;
@@ -278,6 +277,10 @@ __device__ __noinline__ void quantize_rows_from_stage_full_interior(
 {
     const int local_row = lane_id;
     const int global_row = warp_row_base + local_row;
+    const int sc_row_blk = warp_row_base / 128;
+    const int grp = (warp_row_base % 128) / 32;
+    const int sc_col_blk = col_start / 128;
+    const int sc_col_off = (col_start % 128) / (C::Nb / C::EPI_PIPE_DEPTH);
 
     float cached_x[16];
     float cached_y[16];
@@ -320,13 +323,10 @@ __device__ __noinline__ void quantize_rows_from_stage_full_interior(
     *reinterpret_cast<uint64_t*>(&row_fp4_ptr[row_fp4_base + 0]) = packed_lo;
     *reinterpret_cast<uint64_t*>(&row_fp4_ptr[row_fp4_base + 8]) = packed_hi;
 
-    const int sc_row_blk = global_row / 128;
-    const int j_in_tile = global_row % 32;
-    const int grp = (global_row % 128) / 32;
-    const int sc_col_blk = col_start / 128;
+    const int j_in_tile = local_row;
     const int base =
         (sc_row_blk * ntk + sc_col_blk) * 512 + j_in_tile * 16 + grp * 4;
-    g.G_sc_row[base + (col_start % 128) / (C::Nb / C::EPI_PIPE_DEPTH)] = row_e8m0;
+    g.G_sc_row[base + sc_col_off] = row_e8m0;
 }
 
 template <typename C, typename subtile_rt>
