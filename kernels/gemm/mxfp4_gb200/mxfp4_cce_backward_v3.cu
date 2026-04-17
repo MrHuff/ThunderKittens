@@ -77,7 +77,7 @@ static void launch_backward_v3_fp4(
         .filter_eps = filter_eps,
         .M = M, .N = N
     };
-    kittens::py::launch_kernel<C, G, mxfp4_cce_backward_v3::backward_kernel_v3_fp4_full<C>>(g);
+    kittens::py::launch_kernel<C, G, mxfp4_cce_backward_v3::backward_kernel_v3<C, true, true>>(g);
 }
 
 template <typename C>
@@ -108,7 +108,7 @@ static void launch_backward_v3_fp4_fullprobe(
         .filter_eps = filter_eps,
         .M = M, .N = N
     };
-    kittens::py::launch_kernel<C, G, mxfp4_cce_backward_v3::backward_kernel_v3_fp4_full<C>>(g);
+    kittens::py::launch_kernel<C, G, mxfp4_cce_backward_v3::backward_kernel_v3<C, true, true>>(g);
 }
 
 template <typename C>
@@ -139,7 +139,7 @@ static void launch_backward_v3_fp4_rowonly(
         .filter_eps = filter_eps,
         .M = M, .N = N
     };
-    kittens::py::launch_kernel<C, G, mxfp4_cce_backward_v3::backward_kernel_v3<C>>(g);
+    kittens::py::launch_kernel<C, G, mxfp4_cce_backward_v3::backward_kernel_v3<C, true, false>>(g);
 }
 
 template <typename C>
@@ -171,7 +171,7 @@ static void launch_backward_v3_fp4_colonly(
         .filter_eps = filter_eps,
         .M = M, .N = N
     };
-    kittens::py::launch_kernel<C, G, mxfp4_cce_backward_v3::backward_kernel_v3<C>>(g);
+    kittens::py::launch_kernel<C, G, mxfp4_cce_backward_v3::backward_kernel_v3<C, false, true>>(g);
 }
 
 template <typename C>
