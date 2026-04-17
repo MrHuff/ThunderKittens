@@ -11,6 +11,7 @@
 #include <cstdint>
 #include <cstring>
 #include <optional>
+#include <string>
 #include <tuple>
 #include <vector>
 
@@ -30,6 +31,7 @@ using localcta_regular_smalln_config = nvfp4_localcta_gemm::config<128, 5, 4, 12
 using localcta_regular_smallk_config = nvfp4_localcta_gemm::config<256, 5, 8, 4, 2, false, 256, true, 2, 128>;
 using localcta_regular_largek_config = nvfp4_localcta_gemm::config<256, 5, 8, 12, 2, false, 256, true, 2, 128>;
 using localcta_parity_config = nvfp4_localcta_gemm::config<256, 5, 8, 4, 2, false, 256, true, 2, 128>;
+using localcta_tilegrid256_config = nvfp4_localcta_gemm::config<256, 5, 8, 12, 2, false, 256, true, 2, 256>;
 using localcta_fast_smallk_config = nvfp4_gemm::config<256, 5, 8, 4, 2, false>;
 using localcta_fast_largek_config = nvfp4_gemm::config<256, 5, 8, 12, 2, false>;
 using localcta_fast_grouped_config = nvfp4_gemm::config<256, 5, 8, 4, 2, false>;
@@ -57,6 +59,23 @@ __global__ void sum_tensors_kernel(
     __nv_bfloat16* __restrict__ out,
     int64_t numel
 );
+
+enum class V3ContractMode {
+    OuterScale,
+    TileGrid256,
+};
+
+V3ContractMode get_v3_contract_mode() {
+    const char* value = std::getenv("USE_TK_LOCALCTA_V3_CONTRACT");
+    if (value == nullptr) {
+        return V3ContractMode::OuterScale;
+    }
+    const std::string mode(value);
+    if (mode == "tilegrid256" || mode == "tilegrid" || mode == "2d") {
+        return V3ContractMode::TileGrid256;
+    }
+    return V3ContractMode::OuterScale;
+}
 
 void check_fp4_matrix(const at::Tensor& t, const char* name) {
     TORCH_CHECK(t.is_cuda(), name, " must be CUDA");
@@ -225,6 +244,41 @@ void check_v3_fast_gemm_inputs(
     kittens::py::device_check(A, A_sc, A_sg_tiles, B, B_sc, B_sg_tiles);
 }
 
+void check_tilegrid256_sg(
+    const at::Tensor& t,
+    const char* name,
+    int64_t rows,
+    int64_t cols
+) {
+    TORCH_CHECK(t.is_cuda(), name, " must be CUDA");
+    TORCH_CHECK(t.is_contiguous(), name, " must be contiguous");
+    TORCH_CHECK(t.dim() == 2, name, " must be 2D");
+    TORCH_CHECK(t.scalar_type() == at::kFloat, name, " must be float32");
+    TORCH_CHECK(t.size(0) == rows, name, " first dim mismatch");
+    TORCH_CHECK(t.size(1) == cols, name, " second dim mismatch");
+}
+
+void check_v3_tilegrid256_gemm_inputs(
+    const at::Tensor& A,
+    const at::Tensor& A_sc,
+    const at::Tensor& A_sg_grid,
+    const at::Tensor& B,
+    const at::Tensor& B_sc,
+    const at::Tensor& B_sg_grid
+) {
+    check_fp4_matrix(A, "A");
+    check_fp4_matrix(B, "B");
+    TORCH_CHECK(A.size(0) % 256 == 0 && B.size(0) % 256 == 0,
+                "tilegrid256 GEMM requires M and N to be multiples of 256");
+    TORCH_CHECK(A.size(1) == B.size(1), "A and B must share packed K");
+    TORCH_CHECK((A.size(1) * 2) % 256 == 0, "tilegrid256 GEMM requires K to be a multiple of 256");
+    check_scale_tensor(A_sc, "A_sc", A.size(0), A.size(1) * 2);
+    check_scale_tensor(B_sc, "B_sc", B.size(0), B.size(1) * 2);
+    check_tilegrid256_sg(A_sg_grid, "A_sg_grid", A.size(0) / 256, (A.size(1) * 2) / 256);
+    check_tilegrid256_sg(B_sg_grid, "B_sg_grid", (B.size(1) * 2) / 256, B.size(0) / 256);
+    kittens::py::device_check(A, A_sc, A_sg_grid, B, B_sc, B_sg_grid);
+}
+
 at::Tensor get_unit_scale_tensor(const at::Tensor& ref) {
     static thread_local std::vector<at::Tensor> cache;
     const int device_index = ref.get_device();
@@ -373,6 +427,111 @@ void launch_grouped_gemm(
     launch_grouped_gemm_with_config<localcta_parity_config>(
         A, A_sc, A_sg_chunks, B, B_sc, B_sg_chunks,
         D, D_K_opt, D_V_opt, silu_dim);
+}
+
+template <typename C>
+void launch_tilegrid256_gemm_with_config(
+    const at::Tensor& A,
+    const at::Tensor& A_sc,
+    const at::Tensor& A_sg_grid,
+    const at::Tensor& B,
+    const at::Tensor& B_sc,
+    const at::Tensor& B_sg_grid,
+    at::Tensor& D
+) {
+    using G = nvfp4_localcta_gemm::globals<C>;
+    G g {
+        .A = kittens::py::tensor_to_gl<typename G::A_fp4x2_gl>(A),
+        .A_sc = kittens::py::tensor_to_gl<typename G::A_sc_gl, false>(
+            A_sc, 1, A_sc.size(0), A_sc.size(1), 256),
+        .A_sg_chunks = A_sg_grid.data_ptr<float>(),
+        .A_sg_stride = static_cast<int>(A_sg_grid.size(1)),
+        .B = kittens::py::tensor_to_gl<typename G::B_fp4x2_gl>(B),
+        .B_sc = kittens::py::tensor_to_gl<typename G::B_sc_gl, false>(
+            B_sc, 1, B_sc.size(0), B_sc.size(1), 256),
+        .B_sg_chunks = B_sg_grid.data_ptr<float>(),
+        .B_sg_stride = static_cast<int>(B_sg_grid.size(1)),
+        .D = kittens::py::tensor_to_gl<typename G::D_gl>(D),
+        .D_K = kittens::py::tensor_to_gl<typename G::D_gl>(D),
+        .D_V = kittens::py::tensor_to_gl<typename G::D_gl>(D),
+        .q_dim = 0,
+        .k_dim = 0,
+        .v_dim = 0,
+        .use_split_D = false,
+        .silu_dim = 0
+    };
+    kittens::py::launch_kernel<C, G, nvfp4_localcta_gemm::kernel_reduction_scaled<C>>(g);
+}
+
+template <typename C>
+void launch_tilegrid256_grouped_gemm_with_config(
+    const at::Tensor& A,
+    const at::Tensor& A_sc,
+    const at::Tensor& A_sg_grid,
+    const at::Tensor& B,
+    const at::Tensor& B_sc,
+    const at::Tensor& B_sg_grid,
+    at::Tensor& D,
+    std::optional<at::Tensor> D_K_opt,
+    std::optional<at::Tensor> D_V_opt,
+    int silu_dim
+) {
+    using G = nvfp4_localcta_gemm::globals<C>;
+    const bool use_split_D = D_K_opt.has_value();
+    const int v_dim = D_V_opt.has_value() ? static_cast<int>(D_V_opt.value().size(1)) : 0;
+    G g {
+        .A = kittens::py::tensor_to_gl<typename G::A_fp4x2_gl>(A),
+        .A_sc = kittens::py::tensor_to_gl<typename G::A_sc_gl, false>(
+            A_sc, 1, A_sc.size(0), A_sc.size(1), 256),
+        .A_sg_chunks = A_sg_grid.data_ptr<float>(),
+        .A_sg_stride = static_cast<int>(A_sg_grid.size(1)),
+        .B = kittens::py::tensor_to_gl<typename G::B_fp4x2_gl>(B),
+        .B_sc = kittens::py::tensor_to_gl<typename G::B_sc_gl, false>(
+            B_sc, 1, B_sc.size(0), B_sc.size(1), 256),
+        .B_sg_chunks = B_sg_grid.data_ptr<float>(),
+        .B_sg_stride = static_cast<int>(B_sg_grid.size(1)),
+        .D = kittens::py::tensor_to_gl<typename G::D_gl>(D),
+        .D_K = use_split_D ? kittens::py::tensor_to_gl<typename G::D_gl>(D_K_opt.value())
+                           : kittens::py::tensor_to_gl<typename G::D_gl>(D),
+        .D_V = D_V_opt.has_value() ? kittens::py::tensor_to_gl<typename G::D_gl>(D_V_opt.value())
+                                   : (use_split_D ? kittens::py::tensor_to_gl<typename G::D_gl>(D_K_opt.value())
+                                                  : kittens::py::tensor_to_gl<typename G::D_gl>(D)),
+        .q_dim = use_split_D ? static_cast<int>(D.size(1)) : 0,
+        .k_dim = use_split_D ? static_cast<int>(D_K_opt.value().size(1)) : 0,
+        .v_dim = use_split_D ? v_dim : 0,
+        .use_split_D = use_split_D,
+        .silu_dim = silu_dim
+    };
+    kittens::py::launch_kernel<C, G, nvfp4_localcta_gemm::kernel_reduction_scaled<C>>(g);
+}
+
+void launch_tilegrid256_regular_gemm(
+    const at::Tensor& A,
+    const at::Tensor& A_sc,
+    const at::Tensor& A_sg_grid,
+    const at::Tensor& B,
+    const at::Tensor& B_sc,
+    const at::Tensor& B_sg_grid,
+    at::Tensor& D
+) {
+    launch_tilegrid256_gemm_with_config<localcta_tilegrid256_config>(
+        A, A_sc, A_sg_grid, B, B_sc, B_sg_grid, D);
+}
+
+void launch_tilegrid256_grouped_gemm(
+    const at::Tensor& A,
+    const at::Tensor& A_sc,
+    const at::Tensor& A_sg_grid,
+    const at::Tensor& B,
+    const at::Tensor& B_sc,
+    const at::Tensor& B_sg_grid,
+    at::Tensor& D,
+    std::optional<at::Tensor> D_K_opt,
+    std::optional<at::Tensor> D_V_opt,
+    int silu_dim
+) {
+    launch_tilegrid256_grouped_gemm_with_config<localcta_tilegrid256_config>(
+        A, A_sc, A_sg_grid, B, B_sc, B_sg_grid, D, D_K_opt, D_V_opt, silu_dim);
 }
 
 template <typename C>
@@ -1713,6 +1872,12 @@ void nvfp4_localcta_gemm_entrypoint(
     const at::Tensor& B_sg_chunks,
     at::Tensor& D
 ) {
+    if (get_v3_contract_mode() == V3ContractMode::TileGrid256) {
+        check_v3_tilegrid256_gemm_inputs(A, A_sc, A_sg_chunks, B, B_sc, B_sg_chunks);
+        check_output_matrix(D, "D", A.size(0), B.size(0));
+        launch_fast_regular_gemm(A, A_sc, torch::Tensor(), B, B_sc, torch::Tensor(), D);
+        return;
+    }
     check_v3_fast_gemm_inputs(A, A_sc, A_sg_chunks, B, B_sc, B_sg_chunks);
     check_output_matrix(D, "D", A.size(0), B.size(0));
     launch_fast_regular_gemm(A, A_sc, A_sg_chunks, B, B_sc, B_sg_chunks, D);
@@ -1742,6 +1907,25 @@ void nvfp4_localcta_grouped_gemm_entrypoint(
     std::optional<at::Tensor> D_V_opt = std::nullopt,
     int silu_dim = 0
 ) {
+    if (get_v3_contract_mode() == V3ContractMode::TileGrid256) {
+        check_v3_tilegrid256_gemm_inputs(A, A_sc, A_sg_chunks, B, B_sc, B_sg_chunks);
+        TORCH_CHECK(D.is_cuda() && D.is_contiguous() && D.scalar_type() == at::kBFloat16,
+                    "D must be a contiguous CUDA bf16 tensor");
+        if (D_K_opt.has_value()) {
+            TORCH_CHECK(D_K_opt.value().is_cuda() && D_K_opt.value().is_contiguous() &&
+                        D_K_opt.value().scalar_type() == at::kBFloat16,
+                        "D_K must be a contiguous CUDA bf16 tensor");
+        }
+        if (D_V_opt.has_value()) {
+            TORCH_CHECK(D_V_opt.value().is_cuda() && D_V_opt.value().is_contiguous() &&
+                        D_V_opt.value().scalar_type() == at::kBFloat16,
+                        "D_V must be a contiguous CUDA bf16 tensor");
+        }
+        launch_fast_grouped_gemm(
+            A, A_sc, torch::Tensor(), B, B_sc, torch::Tensor(),
+            D, D_K_opt, D_V_opt, silu_dim);
+        return;
+    }
     check_v3_fast_gemm_inputs(A, A_sc, A_sg_chunks, B, B_sc, B_sg_chunks);
     TORCH_CHECK(D.is_cuda() && D.is_contiguous() && D.scalar_type() == at::kBFloat16,
                 "D must be a contiguous CUDA bf16 tensor");
@@ -1819,6 +2003,20 @@ void nvfp4_localcta_batched_gemm_entrypoint(
     TORCH_CHECK(n == static_cast<int>(D_list.size()),
                 "D_list length must match number of batches");
 
+    if (get_v3_contract_mode() == V3ContractMode::TileGrid256) {
+        for (int i = 0; i < n; ++i) {
+            check_v3_tilegrid256_gemm_inputs(
+                A_list[i], A_sc_list[i], A_sg_chunks_list[i],
+                B_list[i], B_sc_list[i], B_sg_chunks_list[i]);
+            check_output_matrix(D_list[i], "D_list[i]", A_list[i].size(0), B_list[i].size(0));
+        }
+        check_batched_shape_compatibility(A_list, B_list, D_list);
+        launch_fast_batched_gemm(
+            A_list, A_sc_list, std::vector<at::Tensor>(n, torch::Tensor()),
+            B_list, B_sc_list, std::vector<at::Tensor>(n, torch::Tensor()),
+            D_list);
+        return;
+    }
     for (int i = 0; i < n; ++i) {
         check_v3_fast_gemm_inputs(
             A_list[i], A_sc_list[i], A_sg_chunks_list[i],
@@ -1919,6 +2117,41 @@ void nvfp4_localcta_v3_batched_gemm_strided_entrypoint(
     const std::vector<at::Tensor>& B_sg_tiles_list,
     std::vector<at::Tensor>& D_list
 ) {
+    if (get_v3_contract_mode() == V3ContractMode::TileGrid256) {
+        const int n = static_cast<int>(A_sc_list.size());
+        TORCH_CHECK(n >= 1, "num_batches must be positive");
+        TORCH_CHECK(
+            n == static_cast<int>(A_sg_tiles_list.size()) &&
+            n == static_cast<int>(A_col_offsets.size()) &&
+            n == static_cast<int>(A_col_widths.size()) &&
+            n == static_cast<int>(B_list.size()) &&
+            n == static_cast<int>(B_sc_list.size()) &&
+            n == static_cast<int>(B_sg_tiles_list.size()) &&
+            n == static_cast<int>(D_list.size()),
+            "All batched strided v3 lists must have matching lengths");
+        check_fp4_matrix(A_full, "A_full");
+        TORCH_CHECK(A_full.size(0) % 256 == 0, "A_full rows must be multiple of 256");
+
+        for (int i = 0; i < n; ++i) {
+            TORCH_CHECK(A_col_offsets[i] >= 0, "A_col_offsets entries must be non-negative");
+            TORCH_CHECK(A_col_widths[i] > 0, "A_col_widths entries must be positive");
+            TORCH_CHECK(A_col_offsets[i] + A_col_widths[i] <= A_full.size(1),
+                        "A_full slice exceeds packed width");
+            TORCH_CHECK((2 * A_col_widths[i]) % 256 == 0,
+                        "Each tilegrid256 strided K width must be a multiple of 256");
+            check_v3_tilegrid256_gemm_inputs(
+                A_full.narrow(1, A_col_offsets[i], A_col_widths[i]).contiguous(),
+                A_sc_list[i], A_sg_tiles_list[i],
+                B_list[i], B_sc_list[i], B_sg_tiles_list[i]);
+            check_output_matrix(D_list[i], "D_list[i]", A_full.size(0), B_list[i].size(0));
+        }
+        launch_fast_batched_gemm_strided(
+            A_full, A_sc_list, std::vector<at::Tensor>(n, torch::Tensor()),
+            A_col_offsets, A_col_widths,
+            B_list, B_sc_list, std::vector<at::Tensor>(n, torch::Tensor()),
+            D_list);
+        return;
+    }
     const int n = static_cast<int>(A_sc_list.size());
     TORCH_CHECK(n >= 1, "num_batches must be positive");
     TORCH_CHECK(
@@ -1937,7 +2170,7 @@ void nvfp4_localcta_v3_batched_gemm_strided_entrypoint(
     for (int i = 0; i < n; ++i) {
         TORCH_CHECK(A_col_widths[i] > 0, "A_col_widths entries must be positive");
         TORCH_CHECK((2 * A_col_widths[i]) % 128 == 0, "Each strided K width must be a multiple of 128");
-        check_scale_tensor(A_sc_list[i], "A_sc_list[i]", A_full.size(0), 2 * A_col_widths[i]);
+        check_scale_tensor_tma_compatible(A_sc_list[i], "A_sc_list[i]", A_full.size(0), 2 * A_col_widths[i]);
         (void)check_outer_scale_tiles(A_sg_tiles_list[i], "A_sg_tiles_list[i]", A_full.size(0) / 256, true);
         check_fp4_matrix(B_list[i], "B_list[i]");
         TORCH_CHECK(B_list[i].size(1) == A_col_widths[i], "B_list[i] packed K must match A_col_widths[i]");
@@ -1966,6 +2199,25 @@ void nvfp4_localcta_batched_accum_gemm_entrypoint(
 ) {
     const int n = static_cast<int>(A_list.size());
     TORCH_CHECK(n <= 4, "num_batches must be 1..4");
+    if (get_v3_contract_mode() == V3ContractMode::TileGrid256) {
+        for (int i = 0; i < n; ++i) {
+            check_v3_tilegrid256_gemm_inputs(
+                A_list[i], A_sc_list[i], A_sg_chunks_list[i],
+                B_list[i], B_sc_list[i], B_sg_chunks_list[i]);
+        }
+        check_output_matrix(D_out, "D_out", A_list[0].size(0), B_list[0].size(0));
+        if (n == 1) {
+            launch_fast_regular_gemm(
+                A_list[0], A_sc_list[0], torch::Tensor(),
+                B_list[0], B_sc_list[0], torch::Tensor(), D_out);
+            return;
+        }
+        launch_fast_batched_accum_gemm(
+            A_list, A_sc_list, std::vector<at::Tensor>(n, torch::Tensor()),
+            B_list, B_sc_list, std::vector<at::Tensor>(n, torch::Tensor()),
+            D_out);
+        return;
+    }
     for (int i = 0; i < n; ++i) {
         check_v3_fast_gemm_inputs(
             A_list[i], A_sc_list[i], A_sg_chunks_list[i],
@@ -2068,7 +2320,38 @@ void nvfp4_localcta_v3_split3_dgrad_strided_gemm_entrypoint(
     const std::vector<at::Tensor>& B_sg_tiles_list,
     at::Tensor& D_out
 ) {
-    check_fast_batched_strided_inputs(
+    if (get_v3_contract_mode() == V3ContractMode::TileGrid256) {
+        TORCH_CHECK(A_sc_list.size() == 3, "split3 strided dgrad expects exactly 3 A batches");
+        TORCH_CHECK(B_list.size() == 3, "split3 strided dgrad expects exactly 3 B batches");
+        TORCH_CHECK(
+            A_sc_list.size() == A_sg_tiles_list.size() &&
+            A_sc_list.size() == A_col_offsets.size() &&
+            A_sc_list.size() == A_col_widths.size() &&
+            A_sc_list.size() == B_sc_list.size() &&
+            A_sc_list.size() == B_sg_tiles_list.size(),
+            "tilegrid256 split3 strided dgrad lists must have matching lengths");
+        check_fp4_matrix(A_full, "A_full");
+        TORCH_CHECK(A_full.size(0) % 256 == 0, "A_full rows must be multiple of 256");
+        check_output_matrix(D_out, "D_out", A_full.size(0), B_list[0].size(0));
+        for (int i = 0; i < 3; ++i) {
+            TORCH_CHECK(A_col_offsets[i] >= 0, "A_col_offsets entries must be non-negative");
+            TORCH_CHECK(A_col_widths[i] > 0, "A_col_widths entries must be positive");
+            TORCH_CHECK(A_col_offsets[i] + A_col_widths[i] <= A_full.size(1),
+                        "A_full slice exceeds packed width");
+            TORCH_CHECK((2 * A_col_widths[i]) % 256 == 0,
+                        "Each tilegrid256 strided K width must be a multiple of 256");
+            check_v3_tilegrid256_gemm_inputs(
+                A_full.narrow(1, A_col_offsets[i], A_col_widths[i]).contiguous(),
+                A_sc_list[i], A_sg_tiles_list[i],
+                B_list[i], B_sc_list[i], B_sg_tiles_list[i]);
+        }
+        launch_fast_split3_dgrad_gemm_strided(
+            A_full, A_sc_list, std::vector<at::Tensor>(3, torch::Tensor()),
+            A_col_offsets, A_col_widths,
+            B_list, B_sc_list, std::vector<at::Tensor>(3, torch::Tensor()), D_out);
+        return;
+    }
+    check_fast_batched_strided_inputs_allow_a_sc_views(
         A_full, A_sc_list,
         A_col_offsets, A_col_widths,
         B_list, B_sc_list);
@@ -2090,7 +2373,7 @@ void nvfp4_localcta_fast_split3_dgrad_strided_sum_gemm_entrypoint(
     const std::vector<at::Tensor>& B_sc_prepared_list,
     at::Tensor& D_out
 ) {
-    check_fast_batched_strided_inputs(
+    check_fast_batched_strided_inputs_allow_a_sc_views(
         A_full, A_sc_prepared_list,
         A_col_offsets, A_col_widths,
         B_list, B_sc_prepared_list);
@@ -2113,7 +2396,7 @@ void nvfp4_localcta_fast_split3_dgrad_strided_onepass_gemm_entrypoint(
     at::Tensor& D_out,
     int64_t config_idx
 ) {
-    check_fast_batched_strided_inputs(
+    check_fast_batched_strided_inputs_allow_a_sc_views(
         A_full, A_sc_prepared_list,
         A_col_offsets, A_col_widths,
         B_list, B_sc_prepared_list);

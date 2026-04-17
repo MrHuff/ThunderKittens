@@ -498,7 +498,8 @@ __device__ inline void kernel(const globals<C> &g) {
 template <typename C>
 __device__ inline void kernel_reduction_scaled(const globals<C> &g) {
     using G = globals<C>;
-    static_assert(C::Kb == 128, "reduction-scaled v3 kernel requires Kb=128");
+    static_assert(C::Kb == 128 || C::Kb == 256,
+                  "reduction-scaled v3 kernel requires Kb=128 or Kb=256");
 
     if (threadIdx.x == 0) {
         g.A.template prefetch_tma<typename G::A_fp4x2_tile>();
@@ -682,13 +683,11 @@ __device__ inline void kernel_reduction_scaled(const globals<C> &g) {
                 warpgroup::sync(1);
                 warpgroup::tma::cluster::arrive(outputs_finished, 0, 1);
 
-                const float a_sg = g.A_sg_chunks[(row_block_idx * 2 + cta_id) * g.A_sg_stride + i];
+                const float a_sg = g.A_sg_chunks[row_block_idx * g.A_sg_stride + i];
 
                 #pragma unroll
                 for (int epi = 0; epi < C::EPI_PIPE_DEPTH; ++epi) {
-                    const int epi_col_offset = epi * (C::Nb / C::EPI_PIPE_DEPTH);
-                    const int b_chunk_row = col_block_idx * C::B_SC_SIZE + (epi_col_offset / 128);
-                    const float b_sg = g.B_sg_chunks[b_chunk_row * g.B_sg_stride + i];
+                    const float b_sg = g.B_sg_chunks[i * g.B_sg_stride + col_block_idx];
                     const float gs = a_sg * b_sg;
                     warp::mul(D_reg_fl[epi], D_reg_fl[epi], gs);
                     if (i == 0) {
