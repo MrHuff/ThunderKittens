@@ -53,6 +53,10 @@ struct globals {
     CUtensorMap A_sc_tma[NUM_SPLITS];
     CUtensorMap B_tma[NUM_SPLITS];
     CUtensorMap B_sc_tma[NUM_SPLITS];
+    const float* A_sg[NUM_SPLITS];
+    const float* B_sg[NUM_SPLITS];
+    int A_sg_stride[NUM_SPLITS];
+    int B_sg_stride[NUM_SPLITS];
     CUtensorMap D_tma;
 
     int num_red_blocks[NUM_SPLITS];
@@ -207,12 +211,11 @@ __device__ inline void kernel(const globals<C> &g) {
             auto B_sc_tm = tm_allocator.template allocate<full_tt_fp8e4m3<32 * C::MMA_PER_TILE * C::LOAD_PIPE_DEPTH>>(256 + 4 * C::MMA_PER_TILE * C::LOAD_PIPE_DEPTH);
 
             for (int block_idx = cluster_id; block_idx < num_blocks; block_idx += gridDim.x / C::CLUSTER_SIZE) {
-                wait(outputs_finished, get_phasebit<1>(phasebits, 0));
-                tensor_after_thread_sync();
-                bool first_mma = true;
-
                 #pragma unroll
                 for (int batch = 0; batch < NUM_SPLITS; ++batch) {
+                    wait(outputs_finished, get_phasebit<1>(phasebits, 0));
+                    tensor_after_thread_sync();
+                    bool first_mma = true;
                     for (int i = 0; i < g.num_red_blocks[batch]; ++i) {
                         tma::expect_bytes(scales_arrived[stage], 2 * sizeof(typename G::input_scales_t));
                         wait(scales_arrived[stage], get_phasebit<0>(phasebits, stage));
@@ -247,10 +250,9 @@ __device__ inline void kernel(const globals<C> &g) {
                         update_phasebit<0>(phasebits, stage);
                         stage = (stage + 1) % C::LOAD_PIPE_DEPTH;
                     }
+                    tensor_commit<2>(outputs_arrived);
+                    update_phasebit<1>(phasebits, 0);
                 }
-
-                tensor_commit<2>(outputs_arrived);
-                update_phasebit<1>(phasebits, 0);
             }
         }
     } else if (warpgroup_id < C::CONSUMER_WARPGROUPS) {
@@ -271,19 +273,46 @@ __device__ inline void kernel(const globals<C> &g) {
             int row_block_idx = supergroup_idx * C::SUPERGROUP_SIZE + row_within_supergroup;
             int col_block_idx = idx_within_supergroup / rows_in_supergroup;
 
-            wait(outputs_arrived, get_phasebit<0>(phasebits, 0));
+            rt_fl<C::Mb / 8, C::Nb / C::EPI_PIPE_DEPTH> D_acc[C::EPI_PIPE_DEPTH];
+
+            #pragma unroll
+            for (int batch = 0; batch < NUM_SPLITS; ++batch) {
+                wait(outputs_arrived, get_phasebit<0>(phasebits, 0));
+
+                constexpr int ROW_SG_TILE = 256;
+                constexpr int COL_SG_TILE = 256;
+                const int row_sg_idx = row_block_idx / (ROW_SG_TILE / C::Mb);
+                const int col_sg_idx = col_block_idx / (COL_SG_TILE / C::Nb);
+                const float global_scale =
+                    g.A_sg[batch][row_sg_idx * g.A_sg_stride[batch]] *
+                    g.B_sg[batch][col_sg_idx * g.B_sg_stride[batch]];
+
+                #pragma unroll
+                for (int i = 0; i < C::EPI_PIPE_DEPTH; ++i) {
+                    rt_fl<C::Mb / 8, C::Nb / C::EPI_PIPE_DEPTH> D_reg_fl;
+                    warpgroup::load_async(
+                        D_reg_fl,
+                        out_tm.template subtile<full_tt_fl<C::Nb / C::EPI_PIPE_DEPTH>>(
+                            0, C::Nb / C::EPI_PIPE_DEPTH * i));
+                    tensor_load_wait();
+                    tensor_before_thread_sync();
+                    warpgroup::sync(1);
+                    warp::mul(D_reg_fl, D_reg_fl, global_scale);
+                    if (batch == 0) warp::copy(D_acc[i], D_reg_fl);
+                    else            warp::add(D_acc[i], D_acc[i], D_reg_fl);
+                    warpgroup::sync(1);
+                    tensor_after_thread_sync();
+                }
+
+                warpgroup::tma::cluster::arrive(outputs_finished, 0, 1);
+                update_phasebit<0>(phasebits, 0);
+            }
 
             rt_bf<C::Mb / 8, C::Nb / C::EPI_PIPE_DEPTH> D_reg[C::EPI_PIPE_DEPTH];
             #pragma unroll
             for (int i = 0; i < C::EPI_PIPE_DEPTH; ++i) {
-                rt_fl<C::Mb / 8, C::Nb / C::EPI_PIPE_DEPTH> D_reg_fl;
-                warpgroup::load_async(D_reg_fl, out_tm.template subtile<full_tt_fl<C::Nb / C::EPI_PIPE_DEPTH>>(0, C::Nb / C::EPI_PIPE_DEPTH * i));
-                warp::copy(D_reg[i], D_reg_fl);
+                warp::copy(D_reg[i], D_acc[i]);
             }
-            tensor_load_wait();
-            tensor_before_thread_sync();
-            warpgroup::sync(1);
-            warpgroup::tma::cluster::arrive(outputs_finished, 0, 1);
 
             #pragma unroll
             for (int i = 0; i < C::EPI_PIPE_DEPTH; ++i) {
@@ -293,7 +322,6 @@ __device__ inline void kernel(const globals<C> &g) {
                 warpgroup::sync(1);
                 warpgroup::tma::store_async<dim::ROW, C::D_CACHE_POLICY>(proxy_D, output_tiles.D[i % C::NUM_D_TILES], {row_block_idx * 2 + cta_id, C::EPI_PIPE_DEPTH * col_block_idx + i});
             }
-            update_phasebit<0>(phasebits, 0);
         }
         warpgroup::sync(1);
         warpgroup::tma::store_async_read_wait<0>();
