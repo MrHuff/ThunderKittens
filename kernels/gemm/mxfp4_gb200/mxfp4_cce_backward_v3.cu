@@ -77,38 +77,7 @@ static void launch_backward_v3_fp4(
         .filter_eps = filter_eps,
         .M = M, .N = N
     };
-    kittens::py::launch_kernel<C, G, mxfp4_cce_backward_v3::backward_kernel_v3<C, true, true>>(g);
-}
-
-template <typename C>
-static void launch_backward_v3_fp4_fullprobe(
-    const at::Tensor &A, const at::Tensor &A_sc,
-    const at::Tensor &B, const at::Tensor &B_sc,
-    at::Tensor &G_fp4_row, at::Tensor &G_sc_row,
-    at::Tensor &G_fp4_col, at::Tensor &G_sc_col,
-    const at::Tensor &lse, const at::Tensor &targets,
-    float grad_scale, int M, int N, float filter_eps = 0.0f)
-{
-    using G = mxfp4_cce_backward_v3::globals<C>;
-    G g {
-        .A = kittens::py::tensor_to_gl<typename G::A_fp4x2_gl>(A),
-        .A_sc = kittens::py::tensor_to_gl<typename G::A_sc_gl>(A_sc),
-        .B = kittens::py::tensor_to_gl<typename G::B_fp4x2_gl>(B),
-        .B_sc = kittens::py::tensor_to_gl<typename G::B_sc_gl>(B_sc),
-        .D_out = kittens::py::tensor_to_gl<typename G::D_gl>(
-            make_unused_bf16_placeholder(A)),
-        .G_fp4_row = kittens::py::tensor_to_gl<typename G::G_fp4x2_gl>(G_fp4_row),
-        .G_sc_row = G_sc_row.data_ptr<uint8_t>(),
-        .G_fp4_col_ptr = reinterpret_cast<uint8_t*>(G_fp4_col.data_ptr()),
-        .G_sc_col_ptr = reinterpret_cast<uint8_t*>(G_sc_col.data_ptr()),
-        .G_sc_col_kgroups = static_cast<int>(A.size(0) / 128),
-        .lse = lse.data_ptr<float>(),
-        .targets = targets.data_ptr<int64_t>(),
-        .grad_scale = grad_scale,
-        .filter_eps = filter_eps,
-        .M = M, .N = N
-    };
-    kittens::py::launch_kernel<C, G, mxfp4_cce_backward_v3::backward_kernel_v3<C, true, true>>(g);
+    kittens::py::launch_kernel<C, G, mxfp4_cce_backward_v3::backward_kernel_v3_fp4_full<C>>(g);
 }
 
 template <typename C>
@@ -174,69 +143,6 @@ static void launch_backward_v3_fp4_colonly(
     kittens::py::launch_kernel<C, G, mxfp4_cce_backward_v3::backward_kernel_v3<C, false, true>>(g);
 }
 
-template <typename C>
-static void launch_backward_v3_fp4_full_rowprobe(
-    const at::Tensor &A, const at::Tensor &A_sc,
-    const at::Tensor &B, const at::Tensor &B_sc,
-    at::Tensor &G_fp4_row, at::Tensor &G_sc_row,
-    at::Tensor &G_fp4_col, at::Tensor &G_sc_col,
-    const at::Tensor &lse, const at::Tensor &targets,
-    float grad_scale, int M, int N, float filter_eps = 0.0f)
-{
-    using G = mxfp4_cce_backward_v3::globals<C>;
-    G g {
-        .A = kittens::py::tensor_to_gl<typename G::A_fp4x2_gl>(A),
-        .A_sc = kittens::py::tensor_to_gl<typename G::A_sc_gl>(A_sc),
-        .B = kittens::py::tensor_to_gl<typename G::B_fp4x2_gl>(B),
-        .B_sc = kittens::py::tensor_to_gl<typename G::B_sc_gl>(B_sc),
-        .D_out = kittens::py::tensor_to_gl<typename G::D_gl>(
-            make_unused_bf16_placeholder(A)),
-        .G_fp4_row = kittens::py::tensor_to_gl<typename G::G_fp4x2_gl>(G_fp4_row),
-        .G_sc_row = G_sc_row.data_ptr<uint8_t>(),
-        .G_fp4_col_ptr = nullptr,
-        .G_sc_col_ptr = nullptr,
-        .G_sc_col_kgroups = static_cast<int>(A.size(0) / 128),
-        .lse = lse.data_ptr<float>(),
-        .targets = targets.data_ptr<int64_t>(),
-        .grad_scale = grad_scale,
-        .filter_eps = filter_eps,
-        .M = M, .N = N
-    };
-    kittens::py::launch_kernel<C, G, mxfp4_cce_backward_v3::backward_kernel_v3_fp4_full<C>>(g);
-}
-
-template <typename C>
-static void launch_backward_v3_fp4_full_colprobe(
-    const at::Tensor &A, const at::Tensor &A_sc,
-    const at::Tensor &B, const at::Tensor &B_sc,
-    at::Tensor &G_fp4_row, at::Tensor &G_sc_row,
-    at::Tensor &G_fp4_col, at::Tensor &G_sc_col,
-    const at::Tensor &lse, const at::Tensor &targets,
-    float grad_scale, int M, int N, float filter_eps = 0.0f)
-{
-    using G = mxfp4_cce_backward_v3::globals<C>;
-    G g {
-        .A = kittens::py::tensor_to_gl<typename G::A_fp4x2_gl>(A),
-        .A_sc = kittens::py::tensor_to_gl<typename G::A_sc_gl>(A_sc),
-        .B = kittens::py::tensor_to_gl<typename G::B_fp4x2_gl>(B),
-        .B_sc = kittens::py::tensor_to_gl<typename G::B_sc_gl>(B_sc),
-        .D_out = kittens::py::tensor_to_gl<typename G::D_gl>(
-            make_unused_bf16_placeholder(A)),
-        .G_fp4_row = kittens::py::tensor_to_gl<typename G::G_fp4x2_gl>(
-            make_unused_fp4_row_placeholder(A)),
-        .G_sc_row = nullptr,
-        .G_fp4_col_ptr = reinterpret_cast<uint8_t*>(G_fp4_col.data_ptr()),
-        .G_sc_col_ptr = reinterpret_cast<uint8_t*>(G_sc_col.data_ptr()),
-        .G_sc_col_kgroups = static_cast<int>(A.size(0) / 128),
-        .lse = lse.data_ptr<float>(),
-        .targets = targets.data_ptr<int64_t>(),
-        .grad_scale = grad_scale,
-        .filter_eps = filter_eps,
-        .M = M, .N = N
-    };
-    kittens::py::launch_kernel<C, G, mxfp4_cce_backward_v3::backward_kernel_v3_fp4_full<C>>(g);
-}
-
 // Config instantiations
 using bwd_v3_bf16_L5_SG8 = mxfp4_cce_backward_v3::config<5, 8, true, true>;
 using bwd_v3_bf16_L4_SG8 = mxfp4_cce_backward_v3::config<4, 8, true, true>;
@@ -272,12 +178,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           "MXFP4 CCE backward v3 (FP4 RTE col-only output) L4 SG8");
     m.def("backward_v3_fp4_enc_L4_SG8", &launch_backward_v3_fp4<bwd_v3_fp4_enc_L4_SG8>,
           "MXFP4 CCE backward v3 (FP4 encode-centric output) L4 SG8");
-    m.def("backward_v3_fp4_enc_fullprobe_L4_SG8", &launch_backward_v3_fp4_fullprobe<bwd_v3_fp4_enc_L4_SG8>,
-          "MXFP4 CCE backward v3 (FP4 encode-centric output, dedicated full-only probe) L4 SG8");
-    m.def("backward_v3_fp4_enc_full_rowprobe_L4_SG8", &launch_backward_v3_fp4_full_rowprobe<bwd_v3_fp4_enc_L4_SG8>,
-          "MXFP4 CCE backward v3 (FP4 encode-centric output, dedicated full-only row probe) L4 SG8");
-    m.def("backward_v3_fp4_enc_full_colprobe_L4_SG8", &launch_backward_v3_fp4_full_colprobe<bwd_v3_fp4_enc_L4_SG8>,
-          "MXFP4 CCE backward v3 (FP4 encode-centric output, dedicated full-only col probe) L4 SG8");
     m.def("backward_v3_fp4_enc_L4_SG4", &launch_backward_v3_fp4<bwd_v3_fp4_enc_L4_SG4>,
           "MXFP4 CCE backward v3 (FP4 encode-centric output) L4 SG4");
     m.def("backward_v3_fp4_enc_L5_SG8", &launch_backward_v3_fp4<bwd_v3_fp4_enc_L5_SG8>,

@@ -59,16 +59,15 @@ struct config {
 // =========================================================================
 __device__ __forceinline__ uint8_t float_to_fp4(float val) {
     float aval = fabsf(val);
-    uint8_t sign = (val < 0.0f) ? 0x8 : 0x0;
-    uint8_t enc;
-    if      (aval < 0.25f)  enc = 0;       // 0
-    else if (aval < 0.75f)  enc = 1;       // 0.5
-    else if (aval < 1.25f)  enc = 2;       // 1.0
-    else if (aval < 1.75f)  enc = 3;       // 1.5
-    else if (aval < 2.5f)   enc = 4;       // 2.0
-    else if (aval < 3.5f)   enc = 5;       // 3.0
-    else if (aval < 5.0f)   enc = 6;       // 4.0
-    else                    enc = 7;       // 6.0
+    uint8_t sign = ((__float_as_uint(val) >> 31) << 3);
+    uint8_t enc =
+        static_cast<uint8_t>(aval >= 0.25f) +
+        static_cast<uint8_t>(aval >= 0.75f) +
+        static_cast<uint8_t>(aval >= 1.25f) +
+        static_cast<uint8_t>(aval >= 1.75f) +
+        static_cast<uint8_t>(aval >= 2.5f) +
+        static_cast<uint8_t>(aval >= 3.5f) +
+        static_cast<uint8_t>(aval >= 5.0f);
     return sign | enc;
 }
 
