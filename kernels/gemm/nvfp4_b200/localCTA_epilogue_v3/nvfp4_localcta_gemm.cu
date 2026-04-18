@@ -19,6 +19,7 @@
 #include "nvfp4_localcta_kernel.cuh"
 #include "nvfp4_localcta_batched_kernel.cuh"
 #include "../nvfp4_accum_gemm.cuh"
+#include "../nvfp4_batched_accum_gemm.cuh"
 #include "../nvfp4_gemm.cuh"
 #include "../nvfp4_batched_gemm.cuh"
 #include "../nvfp4_split2_accum_gemm.cuh"
@@ -38,6 +39,7 @@ using localcta_fast_grouped_config = nvfp4_gemm::config<256, 5, 8, 4, 2, false>;
 using localcta_fast_batched_config = nvfp4_gemm::config<256, 5, 8, 4, 2, false>;
 using localcta_fast_split2_dgrad_config = nvfp4_gemm::config<256, 5, 8, 12, 2, false>;
 using localcta_fast_split3_dgrad_config = nvfp4_gemm::config<256, 5, 8, 12, 2, false>;
+using localcta_fast_split3_dgrad_sg_smalln_config = nvfp4_gemm::config<128, 5, 4, 12, 2, true>;
 using localcta_onepass_cfg0 = nvfp4_gemm::config<128, 5, 4, 12, 2, true, 256, false, 1>;
 using localcta_onepass_cfg1 = nvfp4_gemm::config<128, 5, 4, 12, 2, true, 256, false, 2>;
 using localcta_onepass_cfg2 = nvfp4_gemm::config<256, 5, 8, 4, 2, false, 256, false, 1>;
@@ -75,6 +77,22 @@ V3ContractMode get_v3_contract_mode() {
         return V3ContractMode::TileGrid256;
     }
     return V3ContractMode::OuterScale;
+}
+
+bool use_v3_split3_batched_accum() {
+    const char* value = std::getenv("USE_TK_LOCALCTA_V3_SPLIT3_BATCHED_ACCUM");
+    if (value == nullptr) {
+        return false;
+    }
+    return std::strcmp(value, "0") != 0;
+}
+
+bool use_v3_split3_batched_accum_smalln() {
+    const char* value = std::getenv("USE_TK_LOCALCTA_V3_SPLIT3_BATCHED_ACCUM_SMALLN");
+    if (value == nullptr) {
+        return false;
+    }
+    return std::strcmp(value, "0") != 0;
 }
 
 void check_fp4_matrix(const at::Tensor& t, const char* name) {
@@ -916,7 +934,7 @@ void launch_fast_batched_gemm_with_config(
             A_sg_tiles_list[i].defined() && A_sg_tiles_list[i].numel() > 0 &&
             !B_sg_tiles_list.empty() && i < static_cast<int>(B_sg_tiles_list.size()) &&
             B_sg_tiles_list[i].defined() && B_sg_tiles_list[i].numel() > 0) {
-            auto a_sg_desc = check_outer_scale_tiles(A_sg_tiles_list[i], "A_sg_tiles_list[i]", A_list[i].size(0) / C::Mb, true);
+            auto a_sg_desc = check_outer_scale_tiles(A_sg_tiles_list[i], "A_sg_tiles_list[i]", M / C::Mb, true);
             auto b_sg_desc = check_outer_scale_tiles(B_sg_tiles_list[i], "B_sg_tiles_list[i]", B_list[i].size(0) / C::Nb, false);
             g_host.A_sg[i] = a_sg_desc.ptr;
             g_host.B_sg[i] = b_sg_desc.ptr;
@@ -1021,7 +1039,7 @@ void launch_fast_batched_accum_gemm_with_config(
             A_sg_tiles_list[i].defined() && A_sg_tiles_list[i].numel() > 0 &&
             !B_sg_tiles_list.empty() && i < static_cast<int>(B_sg_tiles_list.size()) &&
             B_sg_tiles_list[i].defined() && B_sg_tiles_list[i].numel() > 0) {
-            auto a_sg_desc = check_outer_scale_tiles(A_sg_tiles_list[i], "A_sg_tiles_list[i]", A_list[i].size(0) / C::Mb, true);
+            auto a_sg_desc = check_outer_scale_tiles(A_sg_tiles_list[i], "A_sg_tiles_list[i]", M / C::Mb, true);
             auto b_sg_desc = check_outer_scale_tiles(B_sg_tiles_list[i], "B_sg_tiles_list[i]", B_list[i].size(0) / C::Nb, false);
             g_host.A_sg[i] = a_sg_desc.ptr;
             g_host.B_sg[i] = b_sg_desc.ptr;
@@ -1163,6 +1181,119 @@ void launch_fast_batched_accum_gemm_strided_with_config(
     memcpy(&g_host.D_tma, &d_gl.tma_descs.tma_desc, sizeof(CUtensorMap));
 
     kittens::py::launch_kernel<C, G, nvfp4_accum_gemm::kernel<C>>(g_host);
+}
+
+template <typename C>
+void launch_fast_batched_accum_gemm_strided_v3_with_config(
+    const at::Tensor& A_full,
+    const std::vector<at::Tensor>& A_sc_prepared_list,
+    const std::vector<at::Tensor>& A_sg_tiles_list,
+    const std::vector<at::Tensor>& B_list,
+    const std::vector<at::Tensor>& B_sc_prepared_list,
+    const std::vector<at::Tensor>& B_sg_tiles_list,
+    const std::vector<int64_t>& A_col_offsets,
+    const std::vector<int64_t>& A_col_widths,
+    at::Tensor& D_out
+) {
+    using G = nvfp4_batched_accum_gemm::globals<C>;
+    G g_host;
+    memset(&g_host, 0, sizeof(G));
+
+    const int n = static_cast<int>(A_sc_prepared_list.size());
+    const int64_t M = D_out.size(0);
+    const int64_t N_out = D_out.size(1);
+    const int64_t K_total_fp4 = A_full.size(1);
+    const int64_t max_fp4_cols =
+        *std::max_element(A_col_widths.begin(), A_col_widths.end());
+    auto one = get_unit_scale_tensor(A_full);
+    const float* one_ptr = one.data_ptr<float>();
+
+    g_host.num_batches = n;
+    g_host.num_row_blocks = static_cast<int>(M / C::Mb);
+    g_host.num_col_blocks = static_cast<int>(N_out / C::Nb);
+    g_host.num_red_blocks = static_cast<int>((2 * max_fp4_cols) / C::Kb);
+
+    const uint8_t* a_base = reinterpret_cast<const uint8_t*>(A_full.data_ptr());
+    const int64_t a_full_row_stride = K_total_fp4;
+
+    for (int i = 0; i < n; ++i) {
+        constexpr int64_t swizzle_elements = 128;
+        const int64_t fp4_cols = A_col_widths[i];
+        const int64_t fp4_offset = A_col_offsets[i];
+        const void* data_ptr = a_base + fp4_offset;
+
+        uint64_t gmem_shape[5] = {
+            static_cast<uint64_t>(swizzle_elements),
+            static_cast<uint64_t>(M),
+            static_cast<uint64_t>((fp4_cols + swizzle_elements - 1) / swizzle_elements),
+            1, 1
+        };
+        uint64_t gmem_stride[4] = {
+            static_cast<uint64_t>(a_full_row_stride),
+            128,
+            static_cast<uint64_t>(M * a_full_row_stride),
+            static_cast<uint64_t>(M * a_full_row_stride)
+        };
+        uint32_t smem_shape[5] = {
+            static_cast<uint32_t>(swizzle_elements),
+            static_cast<uint32_t>(C::Mb / 2),
+            1, 1, 1
+        };
+        uint32_t smem_stride[5] = {1, 1, 1, 1, 1};
+
+        CUresult result = cuTensorMapEncodeTiled(
+            &g_host.A_tma[i],
+            CU_TENSOR_MAP_DATA_TYPE_UINT8,
+            5,
+            const_cast<void*>(data_ptr),
+            gmem_shape,
+            gmem_stride,
+            smem_shape,
+            smem_stride,
+            CU_TENSOR_MAP_INTERLEAVE_NONE,
+            CU_TENSOR_MAP_SWIZZLE_128B,
+            CU_TENSOR_MAP_L2_PROMOTION_NONE,
+            CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE
+        );
+        TORCH_CHECK(result == CUDA_SUCCESS,
+                    "Strided localCTA A TMA creation failed for batch ", i);
+
+        auto b_gl = kittens::py::tensor_to_gl<typename G::B_fp4x2_gl>(B_list[i]);
+        auto b_sc_gl = kittens::py::tensor_to_gl<typename G::B_sc_gl, false>(
+            B_sc_prepared_list[i], 1,
+            B_sc_prepared_list[i].dim() == 2 ? B_sc_prepared_list[i].size(0) / 128 : B_sc_prepared_list[i].size(0),
+            B_sc_prepared_list[i].dim() == 2 ? B_sc_prepared_list[i].size(1) / 4 : B_sc_prepared_list[i].size(1),
+            256);
+
+        encode_prepared_scale_tensor_map<typename G::A_sc_tile>(
+            &g_host.A_sc_tma[i], A_sc_prepared_list[i], "A_sc_prepared_list[i]");
+        memcpy(&g_host.B_tma[i], &b_gl.tma_descs.tma_desc, sizeof(CUtensorMap));
+        memcpy(&g_host.B_sc_tma[i], &b_sc_gl.tma_descs.tma_desc, sizeof(CUtensorMap));
+
+        if (!A_sg_tiles_list.empty() && i < static_cast<int>(A_sg_tiles_list.size()) &&
+            A_sg_tiles_list[i].defined() && A_sg_tiles_list[i].numel() > 0 &&
+            !B_sg_tiles_list.empty() && i < static_cast<int>(B_sg_tiles_list.size()) &&
+            B_sg_tiles_list[i].defined() && B_sg_tiles_list[i].numel() > 0) {
+            // Exact v3 outerscale SG is always defined on 256x256 output tiles,
+            // regardless of the internal GEMM tile shape used by this kernel.
+            auto a_sg_desc = check_outer_scale_tiles(A_sg_tiles_list[i], "A_sg_tiles_list[i]", M / 256, true);
+            auto b_sg_desc = check_outer_scale_tiles(B_sg_tiles_list[i], "B_sg_tiles_list[i]", B_list[i].size(0) / 256, false);
+            g_host.A_sg[i] = a_sg_desc.ptr;
+            g_host.B_sg[i] = b_sg_desc.ptr;
+            g_host.A_sg_stride[i] = a_sg_desc.stride;
+            g_host.B_sg_stride[i] = b_sg_desc.stride;
+        } else {
+            g_host.A_sg[i] = one_ptr;
+            g_host.B_sg[i] = one_ptr;
+            g_host.A_sg_stride[i] = 0;
+            g_host.B_sg_stride[i] = 0;
+        }
+    }
+
+    auto d_gl = kittens::py::tensor_to_gl<typename G::D_gl>(D_out);
+    memcpy(&g_host.D_tma, &d_gl.tma_descs.tma_desc, sizeof(CUtensorMap));
+
+    kittens::py::launch_kernel<C, G, nvfp4_batched_accum_gemm::kernel<C>>(g_host);
 }
 
 template <typename C>
@@ -1698,6 +1829,28 @@ void launch_fast_split3_dgrad_gemm_strided(
     TORCH_CHECK(B_list.size() == 3, "split3 strided dgrad expects 3 B batches");
     const int64_t max_reduction_k =
         2 * (*std::max_element(A_col_widths.begin(), A_col_widths.end()));
+    if (use_v3_split3_batched_accum() &&
+        !A_sg_tiles_list.empty() &&
+        !B_sg_tiles_list.empty() &&
+        A_sg_tiles_list.size() == 3 &&
+        B_sg_tiles_list.size() == 3) {
+        if (use_v3_split3_batched_accum_smalln()) {
+            launch_fast_batched_accum_gemm_strided_v3_with_config<localcta_fast_split3_dgrad_sg_smalln_config>(
+                A_full, A_sc_prepared_list, A_sg_tiles_list, B_list, B_sc_prepared_list, B_sg_tiles_list,
+                A_col_offsets, A_col_widths, D_out);
+            return;
+        }
+        if (max_reduction_k >= 2048) {
+            launch_fast_batched_accum_gemm_strided_v3_with_config<localcta_fast_split3_dgrad_config>(
+                A_full, A_sc_prepared_list, A_sg_tiles_list, B_list, B_sc_prepared_list, B_sg_tiles_list,
+                A_col_offsets, A_col_widths, D_out);
+            return;
+        }
+        launch_fast_batched_accum_gemm_strided_v3_with_config<localcta_fast_batched_config>(
+            A_full, A_sc_prepared_list, A_sg_tiles_list, B_list, B_sc_prepared_list, B_sg_tiles_list,
+            A_col_offsets, A_col_widths, D_out);
+        return;
+    }
     if (max_reduction_k >= 2048) {
         launch_fast_batched_accum_gemm_strided_with_config<localcta_fast_split3_dgrad_config>(
             A_full, A_sc_prepared_list, A_sg_tiles_list, B_list, B_sc_prepared_list, B_sg_tiles_list,

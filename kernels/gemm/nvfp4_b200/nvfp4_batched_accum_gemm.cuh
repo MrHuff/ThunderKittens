@@ -36,6 +36,8 @@ struct globals {
 
     const float* A_sg[MAX_BATCHES];
     const float* B_sg[MAX_BATCHES];
+    int          A_sg_stride[MAX_BATCHES];
+    int          B_sg_stride[MAX_BATCHES];
 
     CUtensorMap D_tma;
 
@@ -258,27 +260,34 @@ __device__ inline void kernel(const globals<C> &g) {
             for (int batch = 0; batch < g.num_batches; ++batch) {
                 wait(outputs_arrived, get_phasebit<0>(phasebits, 0));
 
-                const float global_scale = *g.A_sg[batch] * *g.B_sg[batch];
+            constexpr int ROW_SG_TILE = 256;
+            constexpr int COL_SG_TILE = 256;
+            const int row_sg_idx = row_block_idx / (ROW_SG_TILE / C::Mb);
+            const int col_sg_idx = col_block_idx / (COL_SG_TILE / C::Nb);
+            const float global_scale =
+                    g.A_sg[batch][row_sg_idx * g.A_sg_stride[batch]] *
+                    g.B_sg[batch][col_sg_idx * g.B_sg_stride[batch]];
 
-                // Convert TMEM MMA result to fl registers and scale
-                rt_fl<C::Mb / 8, C::Nb/C::EPI_PIPE_DEPTH> D_reg_fl[C::EPI_PIPE_DEPTH];
+                // Stream one epilogue subtile at a time to keep register liveness down.
                 #pragma unroll
                 for (int i = 0; i < C::EPI_PIPE_DEPTH; i++) {
-                    warpgroup::load_async(D_reg_fl[i], out_tm.template subtile<full_tt_fl<C::Nb/C::EPI_PIPE_DEPTH>>(0, C::Nb/C::EPI_PIPE_DEPTH*i));
+                    rt_fl<C::Mb / 8, C::Nb/C::EPI_PIPE_DEPTH> D_reg_fl;
+                    warpgroup::load_async(
+                        D_reg_fl,
+                        out_tm.template subtile<full_tt_fl<C::Nb/C::EPI_PIPE_DEPTH>>(
+                            0, C::Nb/C::EPI_PIPE_DEPTH * i));
+                    tensor_load_wait();
+                    tensor_before_thread_sync();
+                    warpgroup::sync(1);
+                    warp::mul(D_reg_fl, D_reg_fl, global_scale);
+                    if (batch == 0) warp::copy(D_acc[i], D_reg_fl);
+                    else            warp::add(D_acc[i], D_acc[i], D_reg_fl);
+                    warpgroup::sync(1);
+                    tensor_after_thread_sync();
                 }
-                tensor_load_wait();
-                tensor_before_thread_sync();
 
-                warpgroup::sync(1);
                 warpgroup::tma::cluster::arrive(outputs_finished, 0, 1);
                 update_phasebit<0>(phasebits, 0);
-
-                #pragma unroll
-                for (int i = 0; i < C::EPI_PIPE_DEPTH; i++) {
-                    warp::mul(D_reg_fl[i], D_reg_fl[i], global_scale);
-                    if (batch == 0) warp::copy(D_acc[i], D_reg_fl[i]);
-                    else           warp::add(D_acc[i], D_acc[i], D_reg_fl[i]);
-                }
             }
 
             rt_bf<C::Mb / 8, C::Nb/C::EPI_PIPE_DEPTH> D_reg_bf[C::EPI_PIPE_DEPTH];
