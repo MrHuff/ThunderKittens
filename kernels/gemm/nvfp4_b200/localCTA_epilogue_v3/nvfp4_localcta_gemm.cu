@@ -95,6 +95,14 @@ bool use_v3_split3_batched_accum_smalln() {
     return std::strcmp(value, "0") != 0;
 }
 
+bool use_v3_split2_onepass() {
+    const char* value = std::getenv("USE_TK_LOCALCTA_V3_SPLIT2_ONEPASS");
+    if (value == nullptr) {
+        return false;
+    }
+    return std::strcmp(value, "0") != 0;
+}
+
 void check_fp4_matrix(const at::Tensor& t, const char* name) {
     TORCH_CHECK(t.is_cuda(), name, " must be CUDA");
     TORCH_CHECK(t.is_contiguous(), name, " must be contiguous");
@@ -1293,6 +1301,10 @@ void launch_fast_batched_accum_gemm_strided_v3_with_config(
     auto d_gl = kittens::py::tensor_to_gl<typename G::D_gl>(D_out);
     memcpy(&g_host.D_tma, &d_gl.tma_descs.tma_desc, sizeof(CUtensorMap));
 
+    if (n == 3) {
+        kittens::py::launch_kernel<C, G, nvfp4_batched_accum_gemm::kernel_fixed3<C>>(g_host);
+        return;
+    }
     kittens::py::launch_kernel<C, G, nvfp4_batched_accum_gemm::kernel<C>>(g_host);
 }
 
@@ -1811,6 +1823,122 @@ void launch_fast_split2_dgrad_gemm_onepass(
             break;
         default:
             TORCH_CHECK(false, "Unknown one-pass split2 config_idx=", resolved_idx);
+    }
+}
+
+template <typename C>
+void launch_v3_split2_dgrad_gemm_onepass_with_config(
+    const std::vector<at::Tensor>& A_list,
+    const std::vector<at::Tensor>& A_sc_list,
+    const std::vector<at::Tensor>& A_sg_tiles_list,
+    const std::vector<at::Tensor>& B_list,
+    const std::vector<at::Tensor>& B_sc_list,
+    const std::vector<at::Tensor>& B_sg_tiles_list,
+    at::Tensor& D_out
+) {
+    using G = nvfp4_split2_accum_gemm::globals<C>;
+    G g_host;
+    memset(&g_host, 0, sizeof(G));
+
+    TORCH_CHECK(get_v3_contract_mode() != V3ContractMode::TileGrid256,
+                "v3 split2 one-pass exact path only supports outerscale contract");
+    TORCH_CHECK(A_list.size() == 2, "v3 split2 one-pass dgrad expects 2 A batches");
+    TORCH_CHECK(A_sc_list.size() == 2, "v3 split2 one-pass dgrad expects 2 A scale batches");
+    TORCH_CHECK(A_sg_tiles_list.size() == 2, "v3 split2 one-pass dgrad expects 2 A SG batches");
+    TORCH_CHECK(B_list.size() == 2, "v3 split2 one-pass dgrad expects 2 B batches");
+    TORCH_CHECK(B_sc_list.size() == 2, "v3 split2 one-pass dgrad expects 2 B scale batches");
+    TORCH_CHECK(B_sg_tiles_list.size() == 2, "v3 split2 one-pass dgrad expects 2 B SG batches");
+
+    const int64_t M = D_out.size(0);
+    const int64_t N_out = D_out.size(1);
+    auto one = get_unit_scale_tensor(A_list[0]);
+    const float* one_ptr = one.data_ptr<float>();
+    g_host.num_row_blocks = static_cast<int>(M / C::Mb);
+    g_host.num_col_blocks = static_cast<int>(N_out / C::Nb);
+
+    for (int i = 0; i < 2; ++i) {
+        g_host.num_red_blocks[i] = static_cast<int>((2 * A_list[i].size(1)) / C::Kb);
+
+        auto a_gl = kittens::py::tensor_to_gl<typename G::A_fp4x2_gl>(A_list[i]);
+        auto a_sc_gl = kittens::py::tensor_to_gl<typename G::A_sc_gl, false>(
+            A_sc_list[i], 1,
+            A_sc_list[i].dim() == 2 ? A_sc_list[i].size(0) / 128 : A_sc_list[i].size(0),
+            A_sc_list[i].dim() == 2 ? A_sc_list[i].size(1) / 4 : A_sc_list[i].size(1),
+            256);
+        auto b_gl = kittens::py::tensor_to_gl<typename G::B_fp4x2_gl>(B_list[i]);
+        auto b_sc_gl = kittens::py::tensor_to_gl<typename G::B_sc_gl, false>(
+            B_sc_list[i], 1,
+            B_sc_list[i].dim() == 2 ? B_sc_list[i].size(0) / 128 : B_sc_list[i].size(0),
+            B_sc_list[i].dim() == 2 ? B_sc_list[i].size(1) / 4 : B_sc_list[i].size(1),
+            256);
+
+        memcpy(&g_host.A_tma[i], &a_gl.tma_descs.tma_desc, sizeof(CUtensorMap));
+        memcpy(&g_host.A_sc_tma[i], &a_sc_gl.tma_descs.tma_desc, sizeof(CUtensorMap));
+        memcpy(&g_host.B_tma[i], &b_gl.tma_descs.tma_desc, sizeof(CUtensorMap));
+        memcpy(&g_host.B_sc_tma[i], &b_sc_gl.tma_descs.tma_desc, sizeof(CUtensorMap));
+
+        if (A_sg_tiles_list[i].defined() && A_sg_tiles_list[i].numel() > 0 &&
+            B_sg_tiles_list[i].defined() && B_sg_tiles_list[i].numel() > 0) {
+            auto a_sg_desc = check_outer_scale_tiles(
+                A_sg_tiles_list[i], "A_sg_tiles_list[i]", M / C::Mb, true);
+            auto b_sg_desc = check_outer_scale_tiles(
+                B_sg_tiles_list[i], "B_sg_tiles_list[i]", B_list[i].size(0) / C::Nb, false);
+            g_host.A_sg[i] = a_sg_desc.ptr;
+            g_host.B_sg[i] = b_sg_desc.ptr;
+            g_host.A_sg_stride[i] = a_sg_desc.stride;
+            g_host.B_sg_stride[i] = b_sg_desc.stride;
+        } else {
+            g_host.A_sg[i] = one_ptr;
+            g_host.B_sg[i] = one_ptr;
+            g_host.A_sg_stride[i] = 0;
+            g_host.B_sg_stride[i] = 0;
+        }
+    }
+
+    auto d_gl = kittens::py::tensor_to_gl<typename G::D_gl>(D_out);
+    memcpy(&g_host.D_tma, &d_gl.tma_descs.tma_desc, sizeof(CUtensorMap));
+
+    kittens::py::launch_kernel<C, G, nvfp4_split2_accum_gemm::kernel<C>>(g_host);
+}
+
+void launch_v3_split2_dgrad_gemm_onepass(
+    const std::vector<at::Tensor>& A_list,
+    const std::vector<at::Tensor>& A_sc_list,
+    const std::vector<at::Tensor>& A_sg_tiles_list,
+    const std::vector<at::Tensor>& B_list,
+    const std::vector<at::Tensor>& B_sc_list,
+    const std::vector<at::Tensor>& B_sg_tiles_list,
+    at::Tensor& D_out,
+    int config_idx
+) {
+    int resolved_idx = config_idx;
+    if (resolved_idx < 0) {
+        resolved_idx = 5;
+    }
+    switch (resolved_idx) {
+        case 0:
+            TORCH_CHECK(false, "v3 one-pass split2 config_idx=0 is not legal with CLUSTER_SIZE=1 on this kernel");
+            break;
+        case 1:
+            launch_v3_split2_dgrad_gemm_onepass_with_config<localcta_onepass_cfg1>(
+                A_list, A_sc_list, A_sg_tiles_list, B_list, B_sc_list, B_sg_tiles_list, D_out);
+            break;
+        case 2:
+            TORCH_CHECK(false, "v3 one-pass split2 config_idx=2 is not legal with CLUSTER_SIZE=1 on this kernel");
+            break;
+        case 3:
+            launch_v3_split2_dgrad_gemm_onepass_with_config<localcta_onepass_cfg3>(
+                A_list, A_sc_list, A_sg_tiles_list, B_list, B_sc_list, B_sg_tiles_list, D_out);
+            break;
+        case 4:
+            TORCH_CHECK(false, "v3 one-pass split2 config_idx=4 is not legal with CLUSTER_SIZE=1 on this kernel");
+            break;
+        case 5:
+            launch_v3_split2_dgrad_gemm_onepass_with_config<localcta_onepass_cfg5>(
+                A_list, A_sc_list, A_sg_tiles_list, B_list, B_sc_list, B_sg_tiles_list, D_out);
+            break;
+        default:
+            TORCH_CHECK(false, "Unknown v3 one-pass split2 config_idx=", resolved_idx);
     }
 }
 
@@ -2440,6 +2568,30 @@ void nvfp4_localcta_fast_split2_dgrad_onepass_gemm_entrypoint(
         D_out, static_cast<int>(config_idx));
 }
 
+void nvfp4_localcta_v3_split2_dgrad_onepass_gemm_entrypoint(
+    const std::vector<at::Tensor>& A_list,
+    const std::vector<at::Tensor>& A_sc_list,
+    const std::vector<at::Tensor>& A_sg_tiles_list,
+    const std::vector<at::Tensor>& B_list,
+    const std::vector<at::Tensor>& B_sc_list,
+    const std::vector<at::Tensor>& B_sg_tiles_list,
+    at::Tensor& D_out,
+    int64_t config_idx
+) {
+    TORCH_CHECK(A_list.size() == 2, "v3 split2 one-pass dgrad expects exactly 2 A batches");
+    TORCH_CHECK(B_list.size() == 2, "v3 split2 one-pass dgrad expects exactly 2 B batches");
+    for (int i = 0; i < 2; ++i) {
+        check_v3_fast_gemm_inputs(
+            A_list[i], A_sc_list[i], A_sg_tiles_list[i],
+            B_list[i], B_sc_list[i], B_sg_tiles_list[i]);
+    }
+    check_output_matrix(D_out, "D_out", A_list[0].size(0), B_list[0].size(0));
+    launch_v3_split2_dgrad_gemm_onepass(
+        A_list, A_sc_list, A_sg_tiles_list,
+        B_list, B_sc_list, B_sg_tiles_list,
+        D_out, static_cast<int>(config_idx));
+}
+
 void nvfp4_localcta_fast_split3_dgrad_strided_gemm_entrypoint(
     const at::Tensor& A_full,
     const std::vector<at::Tensor>& A_sc_prepared_list,
@@ -2799,6 +2951,13 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           &nvfp4_localcta_fast_split2_dgrad_onepass_gemm_entrypoint,
           pybind11::arg("A_list"), pybind11::arg("A_sc_prepared_list"),
           pybind11::arg("B_list"), pybind11::arg("B_sc_prepared_list"),
+          pybind11::arg("D_out"), pybind11::arg("config_idx") = -1);
+    m.def("nvfp4_localcta_v3_split2_dgrad_onepass_gemm",
+          &nvfp4_localcta_v3_split2_dgrad_onepass_gemm_entrypoint,
+          pybind11::arg("A_list"), pybind11::arg("A_sc_list"),
+          pybind11::arg("A_sg_tiles_list"),
+          pybind11::arg("B_list"), pybind11::arg("B_sc_list"),
+          pybind11::arg("B_sg_tiles_list"),
           pybind11::arg("D_out"), pybind11::arg("config_idx") = -1);
     m.def("nvfp4_localcta_fast_split3_dgrad_strided_gemm",
           &nvfp4_localcta_fast_split3_dgrad_strided_gemm_entrypoint,

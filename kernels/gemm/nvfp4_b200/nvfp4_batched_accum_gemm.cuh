@@ -72,9 +72,10 @@ struct globals {
     }
 };
 
-template <typename C>
-__device__ inline void kernel(const globals<C> &g) {
+template <typename C, int FIXED_BATCHES = 0>
+__device__ inline void kernel_impl(const globals<C> &g) {
     using G = globals<C>;
+    constexpr bool kFixedBatches = FIXED_BATCHES > 0;
 
     const int num_blocks = g.num_row_blocks * g.num_col_blocks;
 
@@ -140,7 +141,14 @@ __device__ inline void kernel(const globals<C> &g) {
                 int row_block_idx = supergroup_idx * C::SUPERGROUP_SIZE + row_within_supergroup;
                 int col_block_idx = idx_within_supergroup / rows_in_supergroup;
 
-                for (int batch = 0; batch < g.num_batches; ++batch) {
+                const int num_batches = kFixedBatches ? FIXED_BATCHES : g.num_batches;
+                #pragma unroll
+                for (int batch = 0; batch < (kFixedBatches ? FIXED_BATCHES : MAX_BATCHES); ++batch) {
+                    if constexpr (!kFixedBatches) {
+                        if (batch >= num_batches) {
+                            break;
+                        }
+                    }
                     tma_dev_proxy<typename G::A_fp4x2_gl> proxy_A(&g.A_tma[batch]);
                     tma_dev_proxy<typename G::B_fp4x2_gl> proxy_B(&g.B_tma[batch]);
                     if (batch > 0 && threadIdx.x == 0) {
@@ -170,7 +178,14 @@ __device__ inline void kernel(const globals<C> &g) {
                 int row_block_idx = supergroup_idx * C::SUPERGROUP_SIZE + row_within_supergroup;
                 int col_block_idx = idx_within_supergroup / rows_in_supergroup;
 
-                for (int batch = 0; batch < g.num_batches; ++batch) {
+                const int num_batches = kFixedBatches ? FIXED_BATCHES : g.num_batches;
+                #pragma unroll
+                for (int batch = 0; batch < (kFixedBatches ? FIXED_BATCHES : MAX_BATCHES); ++batch) {
+                    if constexpr (!kFixedBatches) {
+                        if (batch >= num_batches) {
+                            break;
+                        }
+                    }
                     tma_dev_proxy<typename G::A_sc_gl>    proxy_A_sc(&g.A_sc_tma[batch]);
                     tma_dev_proxy<typename G::B_sc_gl>    proxy_B_sc(&g.B_sc_tma[batch]);
                     if (batch > 0 && threadIdx.x == 0) {
@@ -198,7 +213,14 @@ __device__ inline void kernel(const globals<C> &g) {
             auto B_sc_tm = tm_allocator.template allocate<full_tt_fp8e4m3<32*C::MMA_PER_TILE*C::LOAD_PIPE_DEPTH>>(256+4*C::MMA_PER_TILE*C::LOAD_PIPE_DEPTH);
 
             for (int block_idx = cluster_id; block_idx < num_blocks; block_idx += gridDim.x / C::CLUSTER_SIZE) {
-                for (int batch = 0; batch < g.num_batches; ++batch) {
+                const int num_batches = kFixedBatches ? FIXED_BATCHES : g.num_batches;
+                #pragma unroll
+                for (int batch = 0; batch < (kFixedBatches ? FIXED_BATCHES : MAX_BATCHES); ++batch) {
+                    if constexpr (!kFixedBatches) {
+                        if (batch >= num_batches) {
+                            break;
+                        }
+                    }
                     wait(outputs_finished, get_phasebit<1>(phasebits, 0));
                     tensor_after_thread_sync();
                     for (int i = 0; i < num_red_blocks; i++) {
@@ -257,7 +279,14 @@ __device__ inline void kernel(const globals<C> &g) {
 
             rt_fl<C::Mb / 8, C::Nb/C::EPI_PIPE_DEPTH> D_acc[C::EPI_PIPE_DEPTH];
 
-            for (int batch = 0; batch < g.num_batches; ++batch) {
+            const int num_batches = kFixedBatches ? FIXED_BATCHES : g.num_batches;
+            #pragma unroll
+            for (int batch = 0; batch < (kFixedBatches ? FIXED_BATCHES : MAX_BATCHES); ++batch) {
+                if constexpr (!kFixedBatches) {
+                    if (batch >= num_batches) {
+                        break;
+                    }
+                }
                 wait(outputs_arrived, get_phasebit<0>(phasebits, 0));
 
             constexpr int ROW_SG_TILE = 256;
@@ -311,6 +340,16 @@ __device__ inline void kernel(const globals<C> &g) {
         if constexpr (C::USE_PDL) warpgroup::pdl::arrive();
         if (warpgroup::warpid() == 0) tm_allocator.deprovision();
     }
+}
+
+template <typename C>
+__device__ inline void kernel(const globals<C> &g) {
+    kernel_impl<C, 0>(g);
+}
+
+template <typename C>
+__device__ inline void kernel_fixed3(const globals<C> &g) {
+    kernel_impl<C, 3>(g);
 }
 
 } // namespace nvfp4_batched_accum_gemm
