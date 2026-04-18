@@ -161,6 +161,8 @@ struct globals {
     uint8_t*   G_fp4_col_ptr;   // fp4x2 at [col, row/2], size (V, M/2)
     uint8_t*   G_sc_col_ptr;    // E8M0 scale in TK 3D format [V/128, M/128, 512]
     int        G_sc_col_kgroups; // = M/128
+    uint8_t*   G_tilemask;      // [M/128, N/128] tile activity mask
+    int        G_tilemask_cols; // = N/128
 
     const float* lse;
     const int64_t* targets;
@@ -1072,6 +1074,12 @@ __device__ inline void backward_kernel_v3(const globals<C>& g) {
                 for (int w = 0; w < WARPGROUP_WARPS; w++)
                     global_max = fmaxf(global_max, filter_max_smem[w]);
                 tile_is_filtered = (global_max < g.filter_eps);
+            }
+
+            if (g.G_tilemask != nullptr && threadIdx.x == 0) {
+                const int row_tile_idx = row_block_idx * 2 + cta_id;
+                g.G_tilemask[row_tile_idx * g.G_tilemask_cols + col_block_idx] =
+                    static_cast<uint8_t>(!tile_is_filtered);
             }
 
             // Store output
