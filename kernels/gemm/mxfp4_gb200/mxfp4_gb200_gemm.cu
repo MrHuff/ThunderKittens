@@ -433,18 +433,14 @@ void launch_mxfp4_split2_dgrad_gemm_strided_onepass(
 
 } // namespace
 
-void mxfp4_gemm_entrypoint(
+template <typename C>
+static void launch_mxfp4_gemm_dense(
     const at::Tensor &A,
     const at::Tensor &A_sc,
     const at::Tensor &B,
     const at::Tensor &B_sc,
     at::Tensor &D
 ) {
-    int K = A.size(1) * 2;
-    int N_out = D.size(1);
-    // Single config that works for all shapes with Kb=256.
-    // config<256,5,8,4,2,false> = Nb=256, LOAD_PIPE=5, EPI=8, SG=4, DT=2, no overlap
-    using C = mxfp4_gemm::config<256, 5, 8, 4, 2, false>;
     using G = mxfp4_gemm::globals<C>;
     G g {
         .A = kittens::py::tensor_to_gl<typename G::A_fp4x2_gl>(A),
@@ -460,7 +456,8 @@ void mxfp4_gemm_entrypoint(
     kittens::py::launch_kernel<C, G, mxfp4_gemm::kernel<C>>(g);
 }
 
-void mxfp4_gemm_masked_entrypoint(
+template <typename C>
+static void launch_mxfp4_gemm_masked(
     const at::Tensor &A,
     const at::Tensor &A_sc,
     const at::Tensor &B,
@@ -469,11 +466,6 @@ void mxfp4_gemm_masked_entrypoint(
     bool tilemask_transposed,
     at::Tensor &D
 ) {
-    int64_t mask_rows = tilemask_transposed ? A_sc.size(1) : A_sc.size(0);
-    int64_t mask_cols = tilemask_transposed ? A_sc.size(0) : A_sc.size(1);
-    check_tilemask(tilemask, "tilemask", mask_rows, mask_cols);
-
-    using C = mxfp4_gemm::config<256, 5, 8, 4, 2, false>;
     using G = mxfp4_gemm::globals<C>;
     G g {
         .A = kittens::py::tensor_to_gl<typename G::A_fp4x2_gl>(A),
@@ -489,6 +481,63 @@ void mxfp4_gemm_masked_entrypoint(
     kittens::py::launch_kernel<C, G, mxfp4_gemm::kernel<C>>(g);
 }
 
+void mxfp4_gemm_entrypoint(
+    const at::Tensor &A,
+    const at::Tensor &A_sc,
+    const at::Tensor &B,
+    const at::Tensor &B_sc,
+    at::Tensor &D
+) {
+    // Single config that works for all shapes with Kb=256.
+    // config<256,5,8,4,2,false> = Nb=256, LOAD_PIPE=5, EPI=8, SG=4, DT=2, no overlap
+    launch_mxfp4_gemm_dense<mxfp4_gemm::config<256, 5, 8, 4, 2, false, 256>>(A, A_sc, B, B_sc, D);
+}
+
+void mxfp4_gemm_k128_entrypoint(
+    const at::Tensor &A,
+    const at::Tensor &A_sc,
+    const at::Tensor &B,
+    const at::Tensor &B_sc,
+    at::Tensor &D
+) {
+    // Same launch shape as the default consumer, but with Kb=128 so the
+    // reduction granularity matches a single 128-column tile.
+    launch_mxfp4_gemm_dense<mxfp4_gemm::config<256, 5, 8, 4, 2, false, 128>>(A, A_sc, B, B_sc, D);
+}
+
+void mxfp4_gemm_masked_entrypoint(
+    const at::Tensor &A,
+    const at::Tensor &A_sc,
+    const at::Tensor &B,
+    const at::Tensor &B_sc,
+    const at::Tensor &tilemask,
+    bool tilemask_transposed,
+    at::Tensor &D
+) {
+    int64_t mask_rows = tilemask_transposed ? A_sc.size(1) : A_sc.size(0);
+    int64_t mask_cols = tilemask_transposed ? A_sc.size(0) : A_sc.size(1);
+    check_tilemask(tilemask, "tilemask", mask_rows, mask_cols);
+
+    launch_mxfp4_gemm_masked<mxfp4_gemm::config<256, 5, 8, 4, 2, false, 256>>(
+        A, A_sc, B, B_sc, tilemask, tilemask_transposed, D);
+}
+
+void mxfp4_gemm_masked_k128_entrypoint(
+    const at::Tensor &A,
+    const at::Tensor &A_sc,
+    const at::Tensor &B,
+    const at::Tensor &B_sc,
+    const at::Tensor &tilemask,
+    bool tilemask_transposed,
+    at::Tensor &D
+) {
+    int64_t mask_rows = tilemask_transposed ? A_sc.size(1) : A_sc.size(0);
+    int64_t mask_cols = tilemask_transposed ? A_sc.size(0) : A_sc.size(1);
+    check_tilemask(tilemask, "tilemask", mask_rows, mask_cols);
+
+    launch_mxfp4_gemm_masked<mxfp4_gemm::config<256, 5, 8, 4, 2, false, 128>>(
+        A, A_sc, B, B_sc, tilemask, tilemask_transposed, D);
+}
 
 
 // ================================================================
@@ -622,7 +671,13 @@ void mxfp4_split2_dgrad_strided_onepass_gemm_entrypoint(
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("mxfp4_gemm", &mxfp4_gemm_entrypoint);
+    m.def("mxfp4_gemm_k128", &mxfp4_gemm_k128_entrypoint);
     m.def("mxfp4_gemm_masked", &mxfp4_gemm_masked_entrypoint,
+          pybind11::arg("A"), pybind11::arg("A_sc"),
+          pybind11::arg("B"), pybind11::arg("B_sc"),
+          pybind11::arg("tilemask"), pybind11::arg("tilemask_transposed"),
+          pybind11::arg("D"));
+    m.def("mxfp4_gemm_masked_k128", &mxfp4_gemm_masked_k128_entrypoint,
           pybind11::arg("A"), pybind11::arg("A_sc"),
           pybind11::arg("B"), pybind11::arg("B_sc"),
           pybind11::arg("tilemask"), pybind11::arg("tilemask_transposed"),
