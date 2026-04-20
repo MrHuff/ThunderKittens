@@ -19,6 +19,9 @@ using namespace kittens;
 
 namespace mxfp4_cce_backward_v2 {
 
+template <typename C>
+struct globals;
+
 // =========================================================================
 // Config
 // =========================================================================
@@ -127,6 +130,295 @@ __device__ __forceinline__ float exp2f_rcp_e8m0(uint8_t e8m0) {
     return __uint_as_float(bits);
 }
 
+template <typename C>
+__device__ __noinline__ void quantize_rows_from_pair_stage_full(
+    const globals<C>& g,
+    bf16_2 (*row_pairs)[17],
+    int lane_id,
+    int warp_row_base,
+    int ntk,
+    int col_start,
+    int row_fp4_stride)
+{
+    const int lane_half = lane_id & 1;
+    const int row_in_half = lane_id >> 1;
+    uint8_t* row_fp4_ptr = reinterpret_cast<uint8_t*>(g.G_fp4_row.raw_ptr);
+    const int sc_col_blk = col_start / 128;
+
+    #pragma unroll
+    for (int row_block = 0; row_block < 2; row_block++) {
+        const int local_row = row_block * 16 + row_in_half;
+        const int global_row = warp_row_base + local_row;
+
+        bf16_2 cached_pairs[8];
+        float my_amax = 0.0f;
+        #pragma unroll
+        for (int p = 0; p < 8; p++) {
+            const bf16_2 v = row_pairs[local_row][lane_half * 8 + p];
+            cached_pairs[p] = v;
+            if (global_row < g.M) {
+                my_amax = fmaxf(my_amax, fabsf(__bfloat162float(v.x)));
+                my_amax = fmaxf(my_amax, fabsf(__bfloat162float(v.y)));
+            }
+        }
+        const float other_amax = __shfl_xor_sync(0xFFFFFFFF, my_amax, 1);
+        const float row_amax = fmaxf(my_amax, other_amax);
+        const uint8_t row_e8m0 =
+            (row_amax <= 1e-9f) ? 0 : float_to_e8m0_dispatch<C::QUANT_MODE>(row_amax);
+        const float row_coeff = 6.0f * exp2f_rcp_e8m0(row_e8m0);
+
+        uint64_t packed = 0;
+        #pragma unroll
+        for (int p = 0; p < 8; p++) {
+            packed |= static_cast<uint64_t>(
+                quantize_fp4_pair(
+                    __bfloat162float(cached_pairs[p].x),
+                    __bfloat162float(cached_pairs[p].y),
+                    row_coeff)) << (p * 8);
+        }
+
+        if (global_row < g.M) {
+            *reinterpret_cast<uint64_t*>(
+                &row_fp4_ptr[global_row * row_fp4_stride + col_start / 2 + lane_half * 8]) = packed;
+        }
+
+        if (lane_half == 0 && global_row < g.M) {
+            const int sc_row_blk = global_row / 128;
+            const int j_in_tile = global_row % 32;
+            const int grp = (global_row % 128) / 32;
+            const int base =
+                (sc_row_blk * ntk + sc_col_blk) * 512 + j_in_tile * 16 + grp * 4;
+            g.G_sc_row[base + (col_start % 128) / (C::Nb / C::EPI_PIPE_DEPTH)] = row_e8m0;
+        }
+    }
+}
+
+template <typename C>
+__device__ __noinline__ void write_zero_rows_from_pair_stage_full(
+    const globals<C>& g,
+    int lane_id,
+    int warp_row_base,
+    int ntk,
+    int col_start,
+    int row_fp4_stride)
+{
+    const int lane_half = lane_id & 1;
+    const int row_in_half = lane_id >> 1;
+    uint8_t* row_fp4_ptr = reinterpret_cast<uint8_t*>(g.G_fp4_row.raw_ptr);
+    const int sc_col_blk = col_start / 128;
+    constexpr uint64_t packed_zero = 0;
+
+    #pragma unroll
+    for (int row_block = 0; row_block < 2; row_block++) {
+        const int local_row = row_block * 16 + row_in_half;
+        const int global_row = warp_row_base + local_row;
+
+        if (global_row < g.M) {
+            *reinterpret_cast<uint64_t*>(
+                &row_fp4_ptr[global_row * row_fp4_stride + col_start / 2 + lane_half * 8]) = packed_zero;
+        }
+
+        if (lane_half == 0 && global_row < g.M) {
+            const int sc_row_blk = global_row / 128;
+            const int j_in_tile = global_row % 32;
+            const int grp = (global_row % 128) / 32;
+            const int base =
+                (sc_row_blk * ntk + sc_col_blk) * 512 + j_in_tile * 16 + grp * 4;
+            g.G_sc_row[base + (col_start % 128) / (C::Nb / C::EPI_PIPE_DEPTH)] = 0;
+        }
+    }
+}
+
+template <typename C>
+__device__ __noinline__ void quantize_cols_from_stage_full(
+    const globals<C>& g,
+    bf16_2 (*col_pairs)[33],
+    int lane_id,
+    int warp_row_base,
+    int col_start,
+    int col_fp4_stride)
+{
+    const int local_col = lane_id;
+    const int local_col_pair = local_col >> 1;
+    const bool use_y = (local_col & 1) != 0;
+    const int global_col = col_start + local_col;
+    if (global_col >= g.N) return;
+    const bool full_row_tile = (warp_row_base + 31) < g.M;
+
+    bf16_2 cached_pairs[16];
+    float col_amax = 0.0f;
+    if (full_row_tile) {
+        #pragma unroll
+        for (int pair = 0; pair < 16; pair++) {
+            const int row0 = pair * 2;
+            const bf16_2 v0 = col_pairs[local_col_pair][row0 + 0];
+            const bf16_2 v1 = col_pairs[local_col_pair][row0 + 1];
+            cached_pairs[pair] = use_y ? bf16_2{v0.y, v1.y} : bf16_2{v0.x, v1.x};
+            col_amax = fmaxf(col_amax, fabsf(__bfloat162float(cached_pairs[pair].x)));
+            col_amax = fmaxf(col_amax, fabsf(__bfloat162float(cached_pairs[pair].y)));
+        }
+    } else {
+        #pragma unroll
+        for (int pair = 0; pair < 16; pair++) {
+            const int row0 = pair * 2;
+            const bf16_2 v0 = col_pairs[local_col_pair][row0 + 0];
+            const bf16_2 v1 = col_pairs[local_col_pair][row0 + 1];
+            cached_pairs[pair] = use_y ? bf16_2{v0.y, v1.y} : bf16_2{v0.x, v1.x};
+            const int global_row0 = warp_row_base + row0;
+            if (global_row0 < g.M) {
+                col_amax = fmaxf(col_amax, fabsf(__bfloat162float(cached_pairs[pair].x)));
+            }
+            if (global_row0 + 1 < g.M) {
+                col_amax = fmaxf(col_amax, fabsf(__bfloat162float(cached_pairs[pair].y)));
+            }
+        }
+    }
+
+    const uint8_t col_e8m0 =
+        (col_amax <= 1e-9f) ? 0 : float_to_e8m0_dispatch<C::QUANT_MODE>(col_amax);
+    const float col_coeff = 6.0f * exp2f_rcp_e8m0(col_e8m0);
+
+    const int global_row_pair_base = warp_row_base / 2;
+    uint64_t packed_col_lo = 0;
+    uint64_t packed_col_hi = 0;
+    if (full_row_tile) {
+        #pragma unroll
+        for (int pair = 0; pair < 16; pair++) {
+            const uint64_t packed_pair = static_cast<uint64_t>(quantize_fp4_pair(
+                __bfloat162float(cached_pairs[pair].x),
+                __bfloat162float(cached_pairs[pair].y),
+                col_coeff));
+            if (pair < 8) packed_col_lo |= packed_pair << (pair * 8);
+            else          packed_col_hi |= packed_pair << ((pair - 8) * 8);
+        }
+        *reinterpret_cast<uint64_t*>(
+            &g.G_fp4_col_ptr[global_col * col_fp4_stride + global_row_pair_base + 0]) =
+            packed_col_lo;
+        *reinterpret_cast<uint64_t*>(
+            &g.G_fp4_col_ptr[global_col * col_fp4_stride + global_row_pair_base + 8]) =
+            packed_col_hi;
+    } else if (warp_row_base < g.M) {
+        #pragma unroll
+        for (int pair = 0; pair < 16; pair++) {
+            const int row0 = pair * 2;
+            const int global_row0 = warp_row_base + row0;
+            const float v0 = (global_row0 < g.M) ? __bfloat162float(cached_pairs[pair].x) : 0.0f;
+            const float v1 = (global_row0 + 1 < g.M) ? __bfloat162float(cached_pairs[pair].y) : 0.0f;
+            const uint64_t packed_pair = static_cast<uint64_t>(quantize_fp4_pair(v0, v1, col_coeff));
+            if (pair < 8) packed_col_lo |= packed_pair << (pair * 8);
+            else          packed_col_hi |= packed_pair << ((pair - 8) * 8);
+        }
+        *reinterpret_cast<uint64_t*>(
+            &g.G_fp4_col_ptr[global_col * col_fp4_stride + global_row_pair_base + 0]) =
+            packed_col_lo;
+        *reinterpret_cast<uint64_t*>(
+            &g.G_fp4_col_ptr[global_col * col_fp4_stride + global_row_pair_base + 8]) =
+            packed_col_hi;
+    }
+
+    const int m_kgroup = warp_row_base / 128;
+    const int m_32_in_128 = (warp_row_base / 32) % 4;
+    const int depth = global_col / 128;
+    const int sr = global_col % 32;
+    const int rr = (global_col / 32) % 4;
+    const int chunk = depth * g.G_sc_col_kgroups + m_kgroup;
+    const int byte_idx = sr * 16 + rr * 4 + m_32_in_128;
+    g.G_sc_col_ptr[chunk * 512 + byte_idx] = col_e8m0;
+}
+
+template <typename C>
+__device__ __noinline__ void write_zero_cols_from_stage_full(
+    const globals<C>& g,
+    int lane_id,
+    int warp_row_base,
+    int col_start,
+    int col_fp4_stride)
+{
+    const int global_col = col_start + lane_id;
+    if (global_col >= g.N) return;
+    const int global_row_pair_base = warp_row_base / 2;
+    constexpr uint64_t packed_zero = 0;
+
+    *reinterpret_cast<uint64_t*>(
+        &g.G_fp4_col_ptr[global_col * col_fp4_stride + global_row_pair_base + 0]) = packed_zero;
+    *reinterpret_cast<uint64_t*>(
+        &g.G_fp4_col_ptr[global_col * col_fp4_stride + global_row_pair_base + 8]) = packed_zero;
+
+    const int m_kgroup = warp_row_base / 128;
+    const int m_32_in_128 = (warp_row_base / 32) % 4;
+    const int depth = global_col / 128;
+    const int sr = global_col % 32;
+    const int rr = (global_col / 32) % 4;
+    const int chunk = depth * g.G_sc_col_kgroups + m_kgroup;
+    const int byte_idx = sr * 16 + rr * 4 + m_32_in_128;
+    g.G_sc_col_ptr[chunk * 512 + byte_idx] = 0;
+}
+
+template <typename C>
+__device__ __noinline__ void quantize_cols_from_stage_full_interior(
+    const globals<C>& g,
+    bf16_2 (*col_pairs)[33],
+    int lane_id,
+    int warp_row_base,
+    int col_start,
+    int col_fp4_stride)
+{
+    const int local_col = lane_id;
+    const int local_col_pair = local_col >> 1;
+    const bool use_y = (local_col & 1) != 0;
+    const int global_col = col_start + local_col;
+
+    float cached_x[16];
+    float cached_y[16];
+    float col_amax = 0.0f;
+    #pragma unroll
+    for (int pair = 0; pair < 16; pair++) {
+        const int row0 = pair * 2;
+        const bf16_2 v0 = col_pairs[local_col_pair][row0 + 0];
+        const bf16_2 v1 = col_pairs[local_col_pair][row0 + 1];
+        const bf16_2 packed = use_y ? bf16_2{v0.y, v1.y} : bf16_2{v0.x, v1.x};
+        const float x = __bfloat162float(packed.x);
+        const float y = __bfloat162float(packed.y);
+        cached_x[pair] = x;
+        cached_y[pair] = y;
+        col_amax = fmaxf(col_amax, fabsf(x));
+        col_amax = fmaxf(col_amax, fabsf(y));
+    }
+
+    const uint8_t col_e8m0 =
+        (col_amax <= 1e-9f) ? 0 : float_to_e8m0_dispatch<C::QUANT_MODE>(col_amax);
+    const float col_coeff = 6.0f * exp2f_rcp_e8m0(col_e8m0);
+
+    const int global_row_pair_base = warp_row_base / 2;
+    uint64_t packed_col_lo = 0;
+    uint64_t packed_col_hi = 0;
+    #pragma unroll
+    for (int pair = 0; pair < 16; pair++) {
+        const uint64_t packed_pair = static_cast<uint64_t>(quantize_fp4_pair(
+            cached_x[pair],
+            cached_y[pair],
+            col_coeff));
+        if (pair < 8) packed_col_lo |= packed_pair << (pair * 8);
+        else          packed_col_hi |= packed_pair << ((pair - 8) * 8);
+    }
+
+    *reinterpret_cast<uint64_t*>(
+        &g.G_fp4_col_ptr[global_col * col_fp4_stride + global_row_pair_base + 0]) =
+        packed_col_lo;
+    *reinterpret_cast<uint64_t*>(
+        &g.G_fp4_col_ptr[global_col * col_fp4_stride + global_row_pair_base + 8]) =
+        packed_col_hi;
+
+    const int m_kgroup = warp_row_base / 128;
+    const int m_32_in_128 = (warp_row_base / 32) % 4;
+    const int depth = global_col / 128;
+    const int sr = global_col % 32;
+    const int rr = (global_col / 32) % 4;
+    const int chunk = depth * g.G_sc_col_kgroups + m_kgroup;
+    const int byte_idx = sr * 16 + rr * 4 + m_32_in_128;
+    g.G_sc_col_ptr[chunk * 512 + byte_idx] = col_e8m0;
+}
+
 // =========================================================================
 // Globals
 // =========================================================================
@@ -160,6 +452,8 @@ struct globals {
     uint8_t*   G_fp4_col_ptr;   // fp4x2 at [col, row/2], size (V, M/2)
     uint8_t*   G_sc_col_ptr;    // E8M0 scales in TK 3D format [V/128, M/128, 512]
     int        G_sc_col_kgroups; // = M/128
+    uint8_t*   G_tilemask;      // [M/128, N/128] tile activity mask
+    int        G_tilemask_cols; // = N/128
 
     const float* lse;
     const int64_t* targets;
@@ -381,6 +675,10 @@ __device__ inline void backward_kernel_v2(const globals<C>& g) {
         using subtile_rt_bf = rt_bf<C::Mb / 8, SUBTILE_COLS>;
 
         const int lane_id = threadIdx.x % 32;
+        __shared__ bf16_2 row_stage_smem[WARPGROUP_WARPS][32][17];
+        __shared__ bf16_2 col_stage_smem[WARPGROUP_WARPS][16][33];
+        __shared__ unsigned int filter_max_bits[C::CONSUMER_WARPGROUPS];
+        __shared__ int filter_ready[C::CONSUMER_WARPGROUPS];
         int phase = 0;
 
         for (int block_idx = cluster_id; block_idx < num_blocks; block_idx += gridDim.x / C::CLUSTER_SIZE) {
@@ -523,18 +821,52 @@ __device__ inline void backward_kernel_v2(const globals<C>& g) {
                 #pragma unroll
                 for (int offset = 16; offset > 0; offset >>= 1)
                     local_max = fmaxf(local_max, __shfl_xor_sync(0xFFFFFFFF, local_max, offset));
-                __shared__ float filter_max_smem[WARPGROUP_WARPS];
-                if (lane_id == 0) filter_max_smem[warpgroup::warpid()] = local_max;
-                warpgroup::sync(1);
+                if (warpgroup::warpid() == 0 && lane_id == 0) {
+                    filter_max_bits[warpgroup_id] = 0;
+                    filter_ready[warpgroup_id] = 0;
+                }
+                warpgroup::sync(2);
                 float global_max = 0.0f;
-                for (int w = 0; w < WARPGROUP_WARPS; w++)
-                    global_max = fmaxf(global_max, filter_max_smem[w]);
-                tile_is_filtered = (global_max < g.filter_eps);
+                if (lane_id == 0) {
+                    atomicMax(&filter_max_bits[warpgroup_id], __float_as_uint(local_max));
+                    atomicAdd(&filter_ready[warpgroup_id], 1);
+                    while (atomicAdd(&filter_ready[warpgroup_id], 0) < WARPGROUP_WARPS) {
+                        __nanosleep(64);
+                    }
+                    global_max = __uint_as_float(filter_max_bits[warpgroup_id]);
+                }
+                global_max = __shfl_sync(0xFFFFFFFF, global_max, 0);
+                tile_is_filtered = (global_max < (g.filter_eps * fabsf(g.grad_scale)));
             }
 
-            // Store output
-            if (!tile_is_filtered) {
+            if (g.G_tilemask != nullptr && threadIdx.x == 0) {
+                const int row_tile_idx = row_block_idx * 2 + cta_id;
+                g.G_tilemask[row_tile_idx * g.G_tilemask_cols + col_block_idx] =
+                    static_cast<uint8_t>(!tile_is_filtered);
+            }
+            if (tile_is_filtered) {
+                #pragma unroll
+                for (int epi = 0; epi < C::EPI_PIPE_DEPTH; epi++) {
+                    #pragma unroll
+                    for (int i = 0; i < subtile_rt::height; i++) {
+                        #pragma unroll
+                        for (int j = 0; j < subtile_rt::width; j++) {
+                            #pragma unroll
+                            for (int k = 0; k < 4; k++) {
+                                D_regs_fl[epi].tiles[i][j].data[k].x = 0.0f;
+                                D_regs_fl[epi].tiles[i][j].data[k].y = 0.0f;
+                            }
+                        }
+                    }
+                    warp::copy(D_regs_bf[epi], D_regs_fl[epi]);
+                }
                 if constexpr (C::USE_BF16_ACCUM) {
+                    tile_is_filtered = false;
+                }
+            }
+            // Store output
+            if constexpr (C::USE_BF16_ACCUM) {
+                if (!tile_is_filtered) {
                     // BF16 path: TMA store G_bf16 (same as v1)
                     #pragma unroll
                     for (int epi = 0; epi < C::EPI_PIPE_DEPTH; epi++) {
@@ -546,284 +878,100 @@ __device__ inline void backward_kernel_v2(const globals<C>& g) {
                             g.D_out, output_tiles.D[epi % C::NUM_D_TILES],
                             {row_block_idx*2 + cta_id, C::EPI_PIPE_DEPTH*col_block_idx + epi});
                     }
-                } else {
-                    // ═══════ FP4 PATH: quantize G to MXFP4 on-the-fly ═══════
-                    // MXFP4: per-32-element blocks with E8M0 scales
-                    // Each subtile (epi) is 32 cols wide = exactly one MX scale block!
-                    //
-                    // Register layout per thread per (i,j) tile:
-                    //   data[0].x, data[0].y → row_x, col pair 0
-                    //   data[1].x, data[1].y → row_y, col pair 0
-                    //   data[2].x, data[2].y → row_x, col pair 1 (col+8)
-                    //   data[3].x, data[3].y → row_y, col pair 1 (col+8)
-                    //
-                    // subtile_rt::width = 2 (32 cols / 16 cols per j-tile)
-                    // So j=0 covers cols 0..15, j=1 covers cols 16..31
-                    // Combined j=0,1 → one 32-element MX block per row
-                    //
-                    // Step 1: Compute per-row, per-32-col-block amax
-                    // Step 2: Convert amax to E8M0 scale
-                    // Step 3: Quantize with coeff = 6.0 / scale
-                    // Step 4: Pack fp4x2 bytes, write to global
+                }
+            } else {
+                // ═══════ FP4 PATH: quantize G to MXFP4 on-the-fly ═══════
+                const int ntk = g.N / 128;
+                const bool do_row = g.G_sc_row != nullptr;
+                const bool do_col = g.G_fp4_col_ptr != nullptr && g.G_sc_col_ptr != nullptr;
+                uint8_t* row_fp4_ptr = reinterpret_cast<uint8_t*>(g.G_fp4_row.raw_ptr);
+                const int row_fp4_stride = g.G_fp4_row.cols();
+                const int col_fp4_stride = g.A.rows() / 2;
 
-                    const int ntk = g.N / 128;  // number of col-tiles in K dimension
-                    const bool do_col = g.G_fp4_col_ptr != nullptr && g.G_sc_col_ptr != nullptr;
-                    uint8_t* row_fp4_ptr = reinterpret_cast<uint8_t*>(g.G_fp4_row.raw_ptr);
-                    const int row_fp4_stride = g.G_fp4_row.cols();
-                    const int col_fp4_stride = g.A.rows() / 2;
-
+                auto stage_row_pairs = [&](subtile_rt &D_fl) {
+                    bf16_2 (*row_pairs)[17] = row_stage_smem[warpgroup::warpid()];
                     #pragma unroll
-                    for (int epi = 0; epi < C::EPI_PIPE_DEPTH; epi++) {
-                        subtile_rt& D_fl = D_regs_fl[epi];
-                        int col_start = col_block_idx * C::Nb + epi * SUBTILE_COLS;
-
+                    for (int i = 0; i < subtile_rt::height; i++) {
+                        const int row_x = i * 16 + lane_id / 4;
+                        const int row_y = row_x + 8;
                         #pragma unroll
-                        for (int i = 0; i < subtile_rt::height; i++) {
-                            int global_row_x = warp_row_base + i * 16 + lane_id / 4;
-                            int global_row_y = warp_row_base + i * 16 + 8 + lane_id / 4;
-
-                            // Collect all 8 values per row across j=0,1 (32 cols total)
-                            float vals_x[8], vals_y[8];
-                            #pragma unroll
-                            for (int j = 0; j < subtile_rt::width; j++) {
-                                vals_x[j*4 + 0] = D_fl.tiles[i][j].data[0].x;
-                                vals_x[j*4 + 1] = D_fl.tiles[i][j].data[0].y;
-                                vals_x[j*4 + 2] = D_fl.tiles[i][j].data[2].x;
-                                vals_x[j*4 + 3] = D_fl.tiles[i][j].data[2].y;
-                                vals_y[j*4 + 0] = D_fl.tiles[i][j].data[1].x;
-                                vals_y[j*4 + 1] = D_fl.tiles[i][j].data[1].y;
-                                vals_y[j*4 + 2] = D_fl.tiles[i][j].data[3].x;
-                                vals_y[j*4 + 3] = D_fl.tiles[i][j].data[3].y;
-                            }
-
-                            // Per-row, per-32-col-block amax
-                            // Each thread has 8 values, reduce across 4 lanes
-                            float amax_x = 0.0f, amax_y = 0.0f;
-                            #pragma unroll
-                            for (int v = 0; v < 8; v++) {
-                                amax_x = fmaxf(amax_x, fabsf(vals_x[v]));
-                                amax_y = fmaxf(amax_y, fabsf(vals_y[v]));
-                            }
-                            // Warp shuffle across 4 threads sharing a row
-                            #pragma unroll
-                            for (int offset = 1; offset < 4; offset <<= 1) {
-                                amax_x = fmaxf(amax_x, __shfl_xor_sync(0xFFFFFFFF, amax_x, offset));
-                                amax_y = fmaxf(amax_y, __shfl_xor_sync(0xFFFFFFFF, amax_y, offset));
-                            }
-
-                            // Convert amax to E8M0 scale (mode-dependent rounding)
-                            uint8_t e8m0_x = (amax_x <= 1e-9f) ? 0 : float_to_e8m0_dispatch<C::QUANT_MODE>(amax_x);
-                            uint8_t e8m0_y = (amax_y <= 1e-9f) ? 0 : float_to_e8m0_dispatch<C::QUANT_MODE>(amax_y);
-                            float rcp_x = exp2f_rcp_e8m0(e8m0_x);
-                            float rcp_y = exp2f_rcp_e8m0(e8m0_y);
-                            float coeff_x = 6.0f * rcp_x;
-                            float coeff_y = 6.0f * rcp_y;
-
-                            // Quantize and pack FP4 pairs
-                            #pragma unroll
-                            for (int j = 0; j < subtile_rt::width; j++) {
-                                // Low cols: data[0].x/y (cols base_col, base_col+1)
-                                uint8_t fp4_x_lo = quantize_fp4_pair(
-                                    D_fl.tiles[i][j].data[0].x, D_fl.tiles[i][j].data[0].y, coeff_x);
-                                uint8_t fp4_x_hi = quantize_fp4_pair(
-                                    D_fl.tiles[i][j].data[2].x, D_fl.tiles[i][j].data[2].y, coeff_x);
-                                uint8_t fp4_y_lo = quantize_fp4_pair(
-                                    D_fl.tiles[i][j].data[1].x, D_fl.tiles[i][j].data[1].y, coeff_y);
-                                uint8_t fp4_y_hi = quantize_fp4_pair(
-                                    D_fl.tiles[i][j].data[3].x, D_fl.tiles[i][j].data[3].y, coeff_y);
-
-                                // Write FP4 data to global
-                                int global_byte_lo = col_start / 2 + (lane_id % 4) + j * 8;
-                                int global_byte_hi = global_byte_lo + 4;
-                                if (global_row_x < g.M) {
-                                    row_fp4_ptr[global_row_x * row_fp4_stride + global_byte_lo] = fp4_x_lo;
-                                    row_fp4_ptr[global_row_x * row_fp4_stride + global_byte_hi] = fp4_x_hi;
-                                }
-                                if (global_row_y < g.M) {
-                                    row_fp4_ptr[global_row_y * row_fp4_stride + global_byte_lo] = fp4_y_lo;
-                                    row_fp4_ptr[global_row_y * row_fp4_stride + global_byte_hi] = fp4_y_hi;
-                                }
-                            }
-
-                            // Write E8M0 scale (one per row per 32-col block)
-                            // Scale layout: (row_blk * ntk + col_blk) * 512 + j_in_tile * 16 + grp * 4
-                            // For this tile: row_blk = global_row/128, col_blk = col_start/128
-                            // j_in_tile = row % 32, grp = (row % 128) / 32
-                            // Each MX block = 32 cols → one scale per epi subtile
-                            if ((lane_id % 4) == 0) {
-                                int sc_row_blk_x = global_row_x / 128;
-                                int sc_col_blk   = col_start / 128;
-                                int epi_block    = epi;  // which 32-col block within the 128-col tile
-
-                                if (global_row_x < g.M) {
-                                    int j_in_tile = global_row_x % 32;
-                                    int grp       = (global_row_x % 128) / 32;
-                                    int base = (sc_row_blk_x * ntk + sc_col_blk) * 512 + j_in_tile * 16 + grp * 4;
-                                    g.G_sc_row[base + epi_block] = e8m0_x;
-                                }
-                                if (global_row_y < g.M) {
-                                    int sc_row_blk_y = global_row_y / 128;
-                                    int j_in_tile = global_row_y % 32;
-                                    int grp       = (global_row_y % 128) / 32;
-                                    int base = (sc_row_blk_y * ntk + sc_col_blk) * 512 + j_in_tile * 16 + grp * 4;
-                                    g.G_sc_row[base + epi_block] = e8m0_y;
-                                }
-                            }
+                        for (int j = 0; j < subtile_rt::width; j++) {
+                            const int pair_base = j * 8 + (lane_id % 4);
+                            row_pairs[row_x][pair_base + 0] = bf16_2{
+                                __float2bfloat16_rn(D_fl.tiles[i][j].data[0].x),
+                                __float2bfloat16_rn(D_fl.tiles[i][j].data[0].y)};
+                            row_pairs[row_x][pair_base + 4] = bf16_2{
+                                __float2bfloat16_rn(D_fl.tiles[i][j].data[2].x),
+                                __float2bfloat16_rn(D_fl.tiles[i][j].data[2].y)};
+                            row_pairs[row_y][pair_base + 0] = bf16_2{
+                                __float2bfloat16_rn(D_fl.tiles[i][j].data[1].x),
+                                __float2bfloat16_rn(D_fl.tiles[i][j].data[1].y)};
+                            row_pairs[row_y][pair_base + 4] = bf16_2{
+                                __float2bfloat16_rn(D_fl.tiles[i][j].data[3].x),
+                                __float2bfloat16_rn(D_fl.tiles[i][j].data[3].y)};
                         }
                     }
+                };
 
-                    if (do_col) {
-                        const int lane_col_pair = (lane_id % 4) * 2;
-                        const int row_pair_idx = lane_id / 4;
-                        const bool is_scale_lane = row_pair_idx == 0;
-                        const int m_kgroup = warp_row_base / 128;
-                        const int m_32_in_128 = (warp_row_base / 32) % 4;
+                if (do_row) {
+                    #pragma unroll
+                    for (int epi = 0; epi < C::EPI_PIPE_DEPTH; epi++) {
+                        const int col_start = col_block_idx * C::Nb + epi * SUBTILE_COLS;
+                        if (tile_is_filtered) {
+                            write_zero_rows_from_pair_stage_full<C>(
+                                g,
+                                lane_id,
+                                warp_row_base,
+                                ntk,
+                                col_start,
+                                row_fp4_stride);
+                            __syncwarp();
+                        } else {
+                            stage_row_pairs(D_regs_fl[epi]);
+                            __syncwarp();
+                            quantize_rows_from_pair_stage_full<C>(
+                                g,
+                                row_stage_smem[warpgroup::warpid()],
+                                lane_id,
+                                warp_row_base,
+                                ntk,
+                                col_start,
+                                row_fp4_stride);
+                        }
+                    }
+                }
+
+                if (do_col) {
+                    bf16_2 (*col_pairs)[33] = col_stage_smem[warpgroup::warpid()];
+                    const int lane_col_pair = (lane_id % 4) * 2;
+                    const int row_pair_idx = lane_id / 4;
+                    auto stage_col_pairs = [&](subtile_rt_bf &D_bf) {
                         #pragma unroll
-                        for (int epi = 0; epi < C::EPI_PIPE_DEPTH; epi++) {
-                            subtile_rt& D_fl = D_regs_fl[epi];
-                            int col_start = col_block_idx * C::Nb + epi * SUBTILE_COLS;
-
+                        for (int i = 0; i < subtile_rt::height; i++) {
+                            const int row_base = i * 16 + row_pair_idx;
+                            const int row_base_hi = row_base + 8;
                             #pragma unroll
                             for (int j = 0; j < subtile_rt::width; j++) {
-                                int gc0 = col_start + j * 16 + lane_col_pair;
-                                int gc1 = gc0 + 1;
-                                int gc8 = gc0 + 8;
-                                int gc9 = gc8 + 1;
-
-                                float col_amax[4] = {0.0f, 0.0f, 0.0f, 0.0f};
-                                #pragma unroll
-                                for (int i = 0; i < subtile_rt::height; i++) {
-                                    col_amax[0] = fmaxf(col_amax[0], fabsf(D_fl.tiles[i][j].data[0].x));
-                                    col_amax[1] = fmaxf(col_amax[1], fabsf(D_fl.tiles[i][j].data[0].y));
-                                    col_amax[2] = fmaxf(col_amax[2], fabsf(D_fl.tiles[i][j].data[2].x));
-                                    col_amax[3] = fmaxf(col_amax[3], fabsf(D_fl.tiles[i][j].data[2].y));
-                                    col_amax[0] = fmaxf(col_amax[0], fabsf(D_fl.tiles[i][j].data[1].x));
-                                    col_amax[1] = fmaxf(col_amax[1], fabsf(D_fl.tiles[i][j].data[1].y));
-                                    col_amax[2] = fmaxf(col_amax[2], fabsf(D_fl.tiles[i][j].data[3].x));
-                                    col_amax[3] = fmaxf(col_amax[3], fabsf(D_fl.tiles[i][j].data[3].y));
-                                }
-                                #pragma unroll
-                                for (int v = 0; v < 4; v++) {
-                                    col_amax[v] = fmaxf(col_amax[v], __shfl_xor_sync(0xFFFFFFFF, col_amax[v], 4));
-                                    col_amax[v] = fmaxf(col_amax[v], __shfl_xor_sync(0xFFFFFFFF, col_amax[v], 8));
-                                    col_amax[v] = fmaxf(col_amax[v], __shfl_xor_sync(0xFFFFFFFF, col_amax[v], 16));
-                                }
-
-                                uint8_t col_e8m0[4];
-                                float col_coeff[4];
-                                #pragma unroll
-                                for (int v = 0; v < 4; v++) {
-                                    col_e8m0[v] = (col_amax[v] <= 1e-9f) ? 0 : float_to_e8m0_dispatch<C::QUANT_MODE>(col_amax[v]);
-                                    col_coeff[v] = 6.0f * exp2f_rcp_e8m0(col_e8m0[v]);
-                                }
-
-                                #pragma unroll
-                                for (int i = 0; i < subtile_rt::height; i++) {
-                                    int global_row_pair_lo = warp_row_base + i * 16 + row_pair_idx;
-                                    int global_row_pair_hi = global_row_pair_lo + 8;
-
-                                    float vals_x[4] = {
-                                        D_fl.tiles[i][j].data[0].x,
-                                        D_fl.tiles[i][j].data[0].y,
-                                        D_fl.tiles[i][j].data[2].x,
-                                        D_fl.tiles[i][j].data[2].y,
-                                    };
-                                    float vals_y[4] = {
-                                        D_fl.tiles[i][j].data[1].x,
-                                        D_fl.tiles[i][j].data[1].y,
-                                        D_fl.tiles[i][j].data[3].x,
-                                        D_fl.tiles[i][j].data[3].y,
-                                    };
-
-                                    float row_x_pair_hi[4];
-                                    float row_y_pair_hi[4];
-                                    #pragma unroll
-                                    for (int v = 0; v < 4; v++) {
-                                        row_x_pair_hi[v] = __shfl_xor_sync(0xFFFFFFFF, vals_x[v], 4);
-                                        row_y_pair_hi[v] = __shfl_xor_sync(0xFFFFFFFF, vals_y[v], 4);
-                                    }
-
-                                    if ((row_pair_idx % 2) == 0) {
-                                        if (gc0 < g.N && global_row_pair_lo < g.M) {
-                                            float pair_hi = (global_row_pair_lo + 1 < g.M) ? row_x_pair_hi[0] : 0.0f;
-                                            g.G_fp4_col_ptr[gc0 * col_fp4_stride + global_row_pair_lo / 2] =
-                                                quantize_fp4_pair(vals_x[0], pair_hi, col_coeff[0]);
-                                        }
-                                        if (gc1 < g.N && global_row_pair_lo < g.M) {
-                                            float pair_hi = (global_row_pair_lo + 1 < g.M) ? row_x_pair_hi[1] : 0.0f;
-                                            g.G_fp4_col_ptr[gc1 * col_fp4_stride + global_row_pair_lo / 2] =
-                                                quantize_fp4_pair(vals_x[1], pair_hi, col_coeff[1]);
-                                        }
-                                        if (gc8 < g.N && global_row_pair_lo < g.M) {
-                                            float pair_hi = (global_row_pair_lo + 1 < g.M) ? row_x_pair_hi[2] : 0.0f;
-                                            g.G_fp4_col_ptr[gc8 * col_fp4_stride + global_row_pair_lo / 2] =
-                                                quantize_fp4_pair(vals_x[2], pair_hi, col_coeff[2]);
-                                        }
-                                        if (gc9 < g.N && global_row_pair_lo < g.M) {
-                                            float pair_hi = (global_row_pair_lo + 1 < g.M) ? row_x_pair_hi[3] : 0.0f;
-                                            g.G_fp4_col_ptr[gc9 * col_fp4_stride + global_row_pair_lo / 2] =
-                                                quantize_fp4_pair(vals_x[3], pair_hi, col_coeff[3]);
-                                        }
-
-                                        if (gc0 < g.N && global_row_pair_hi < g.M) {
-                                            float pair_hi = (global_row_pair_hi + 1 < g.M) ? row_y_pair_hi[0] : 0.0f;
-                                            g.G_fp4_col_ptr[gc0 * col_fp4_stride + global_row_pair_hi / 2] =
-                                                quantize_fp4_pair(vals_y[0], pair_hi, col_coeff[0]);
-                                        }
-                                        if (gc1 < g.N && global_row_pair_hi < g.M) {
-                                            float pair_hi = (global_row_pair_hi + 1 < g.M) ? row_y_pair_hi[1] : 0.0f;
-                                            g.G_fp4_col_ptr[gc1 * col_fp4_stride + global_row_pair_hi / 2] =
-                                                quantize_fp4_pair(vals_y[1], pair_hi, col_coeff[1]);
-                                        }
-                                        if (gc8 < g.N && global_row_pair_hi < g.M) {
-                                            float pair_hi = (global_row_pair_hi + 1 < g.M) ? row_y_pair_hi[2] : 0.0f;
-                                            g.G_fp4_col_ptr[gc8 * col_fp4_stride + global_row_pair_hi / 2] =
-                                                quantize_fp4_pair(vals_y[2], pair_hi, col_coeff[2]);
-                                        }
-                                        if (gc9 < g.N && global_row_pair_hi < g.M) {
-                                            float pair_hi = (global_row_pair_hi + 1 < g.M) ? row_y_pair_hi[3] : 0.0f;
-                                            g.G_fp4_col_ptr[gc9 * col_fp4_stride + global_row_pair_hi / 2] =
-                                                quantize_fp4_pair(vals_y[3], pair_hi, col_coeff[3]);
-                                        }
-                                    }
-                                }
-
-                                if (is_scale_lane) {
-                                    if (gc0 < g.N) {
-                                        int depth = gc0 / 128;
-                                        int sr = gc0 % 32;
-                                        int rr = (gc0 / 32) % 4;
-                                        int chunk = depth * g.G_sc_col_kgroups + m_kgroup;
-                                        int byte_idx = sr * 16 + rr * 4 + m_32_in_128;
-                                        g.G_sc_col_ptr[chunk * 512 + byte_idx] = col_e8m0[0];
-                                    }
-                                    if (gc1 < g.N) {
-                                        int depth = gc1 / 128;
-                                        int sr = gc1 % 32;
-                                        int rr = (gc1 / 32) % 4;
-                                        int chunk = depth * g.G_sc_col_kgroups + m_kgroup;
-                                        int byte_idx = sr * 16 + rr * 4 + m_32_in_128;
-                                        g.G_sc_col_ptr[chunk * 512 + byte_idx] = col_e8m0[1];
-                                    }
-                                    if (gc8 < g.N) {
-                                        int depth = gc8 / 128;
-                                        int sr = gc8 % 32;
-                                        int rr = (gc8 / 32) % 4;
-                                        int chunk = depth * g.G_sc_col_kgroups + m_kgroup;
-                                        int byte_idx = sr * 16 + rr * 4 + m_32_in_128;
-                                        g.G_sc_col_ptr[chunk * 512 + byte_idx] = col_e8m0[2];
-                                    }
-                                    if (gc9 < g.N) {
-                                        int depth = gc9 / 128;
-                                        int sr = gc9 % 32;
-                                        int rr = (gc9 / 32) % 4;
-                                        int chunk = depth * g.G_sc_col_kgroups + m_kgroup;
-                                        int byte_idx = sr * 16 + rr * 4 + m_32_in_128;
-                                        g.G_sc_col_ptr[chunk * 512 + byte_idx] = col_e8m0[3];
-                                    }
-                                }
+                                const int col_pair_base = j * 8 + lane_col_pair / 2;
+                                col_pairs[col_pair_base + 0][row_base] = D_bf.tiles[i][j].data[0];
+                                col_pairs[col_pair_base + 0][row_base_hi] = D_bf.tiles[i][j].data[1];
+                                col_pairs[col_pair_base + 4][row_base] = D_bf.tiles[i][j].data[2];
+                                col_pairs[col_pair_base + 4][row_base_hi] = D_bf.tiles[i][j].data[3];
                             }
                         }
+                    };
+                    #pragma unroll
+                    for (int epi = 0; epi < C::EPI_PIPE_DEPTH; epi++) {
+                        const int col_start = col_block_idx * C::Nb + epi * SUBTILE_COLS;
+                        stage_col_pairs(D_regs_bf[epi]);
+                        __syncwarp();
+                        quantize_cols_from_stage_full<C>(
+                            g,
+                            col_pairs,
+                            lane_id,
+                            warp_row_base,
+                            col_start,
+                            col_fp4_stride);
                     }
                 }
             }
