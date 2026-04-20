@@ -419,7 +419,6 @@ __device__ __noinline__ void quantize_rows_from_regs_full(
     }
 }
 
-
 template <typename C>
 __device__ __noinline__ void quantize_rows_from_pair_stage_full(
     const globals<C>& g,
@@ -925,6 +924,8 @@ __device__ inline void backward_kernel_v3(const globals<C>& g) {
 
         const int lane_id = threadIdx.x % 32;
         __shared__ bf16_2 col_stage_smem[WARPGROUP_WARPS][16][33];
+        __shared__ unsigned int filter_max_bits[C::CONSUMER_WARPGROUPS];
+        __shared__ int filter_ready[C::CONSUMER_WARPGROUPS];
         int phase = 0;
 
         for (int block_idx = cluster_id; block_idx < num_blocks; block_idx += gridDim.x / C::CLUSTER_SIZE) {
@@ -1067,19 +1068,46 @@ __device__ inline void backward_kernel_v3(const globals<C>& g) {
                 #pragma unroll
                 for (int offset = 16; offset > 0; offset >>= 1)
                     local_max = fmaxf(local_max, __shfl_xor_sync(0xFFFFFFFF, local_max, offset));
-                __shared__ float filter_max_smem[WARPGROUP_WARPS];
-                if (lane_id == 0) filter_max_smem[warpgroup::warpid()] = local_max;
-                warpgroup::sync(1);
-                float global_max = 0.0f;
-                for (int w = 0; w < WARPGROUP_WARPS; w++)
-                    global_max = fmaxf(global_max, filter_max_smem[w]);
-                tile_is_filtered = (global_max < g.filter_eps);
+                if (warpgroup::warpid() == 0 && lane_id == 0) {
+                    filter_max_bits[warpgroup_id] = 0;
+                    filter_ready[warpgroup_id] = 0;
+                }
+                warpgroup::sync(2);
+                float global_max = local_max;
+                if (lane_id == 0) {
+                    atomicMax(&filter_max_bits[warpgroup_id], __float_as_uint(local_max));
+                    atomicAdd(&filter_ready[warpgroup_id], 1);
+                    while (atomicAdd(&filter_ready[warpgroup_id], 0) < WARPGROUP_WARPS) {
+                        __nanosleep(64);
+                    }
+                    global_max = __uint_as_float(filter_max_bits[warpgroup_id]);
+                }
+                global_max = __shfl_sync(0xFFFFFFFF, global_max, 0);
+                tile_is_filtered = (global_max < (g.filter_eps * fabsf(g.grad_scale)));
             }
 
             if (g.G_tilemask != nullptr && threadIdx.x == 0) {
                 const int row_tile_idx = row_block_idx * 2 + cta_id;
                 g.G_tilemask[row_tile_idx * g.G_tilemask_cols + col_block_idx] =
                     static_cast<uint8_t>(!tile_is_filtered);
+            }
+            if (tile_is_filtered) {
+                #pragma unroll
+                for (int epi = 0; epi < C::EPI_PIPE_DEPTH; epi++) {
+                    #pragma unroll
+                    for (int i = 0; i < subtile_rt::height; i++) {
+                        #pragma unroll
+                        for (int j = 0; j < subtile_rt::width; j++) {
+                            #pragma unroll
+                            for (int k = 0; k < 4; k++) {
+                                D_regs_fl[epi].tiles[i][j].data[k].x = 0.0f;
+                                D_regs_fl[epi].tiles[i][j].data[k].y = 0.0f;
+                            }
+                        }
+                    }
+                    warp::copy(D_regs_bf[epi], D_regs_fl[epi]);
+                }
+                tile_is_filtered = false;
             }
 
             // Store output

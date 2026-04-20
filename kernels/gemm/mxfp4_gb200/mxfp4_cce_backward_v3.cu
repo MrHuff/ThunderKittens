@@ -81,7 +81,7 @@ static void launch_backward_v3_fp4(
         .filter_eps = filter_eps,
         .M = M, .N = N
     };
-    kittens::py::launch_kernel<C, G, mxfp4_cce_backward_v3::backward_kernel_v3_fp4_full<C>>(g);
+    kittens::py::launch_kernel<C, G, mxfp4_cce_backward_v3::backward_kernel_v3<C, true, true>>(g);
 }
 
 template <typename C>
@@ -182,7 +182,42 @@ static void launch_backward_v3_fp4_masked(
         .filter_eps = filter_eps,
         .M = M, .N = N
     };
-    kittens::py::launch_kernel<C, G, mxfp4_cce_backward_v3::backward_kernel_v3_fp4_full<C>>(g);
+    kittens::py::launch_kernel<C, G, mxfp4_cce_backward_v3::backward_kernel_v3<C, true, true>>(g);
+}
+
+template <typename C>
+static void launch_backward_v3_fp4_colonly_masked(
+    const at::Tensor &A, const at::Tensor &A_sc,
+    const at::Tensor &B, const at::Tensor &B_sc,
+    at::Tensor &G_fp4_row, at::Tensor &G_sc_row,
+    at::Tensor &G_fp4_col, at::Tensor &G_sc_col,
+    at::Tensor &G_tilemask,
+    const at::Tensor &lse, const at::Tensor &targets,
+    float grad_scale, int M, int N, float filter_eps = 0.0f)
+{
+    using G = mxfp4_cce_backward_v3::globals<C>;
+    G g {
+        .A = kittens::py::tensor_to_gl<typename G::A_fp4x2_gl>(A),
+        .A_sc = kittens::py::tensor_to_gl<typename G::A_sc_gl>(A_sc),
+        .B = kittens::py::tensor_to_gl<typename G::B_fp4x2_gl>(B),
+        .B_sc = kittens::py::tensor_to_gl<typename G::B_sc_gl>(B_sc),
+        .D_out = kittens::py::tensor_to_gl<typename G::D_gl>(
+            make_unused_bf16_placeholder(A)),
+        .G_fp4_row = kittens::py::tensor_to_gl<typename G::G_fp4x2_gl>(
+            make_unused_fp4_row_placeholder(A)),
+        .G_sc_row = nullptr,
+        .G_fp4_col_ptr = reinterpret_cast<uint8_t*>(G_fp4_col.data_ptr()),
+        .G_sc_col_ptr = reinterpret_cast<uint8_t*>(G_sc_col.data_ptr()),
+        .G_sc_col_kgroups = static_cast<int>(A.size(0) / 128),
+        .G_tilemask = G_tilemask.data_ptr<uint8_t>(),
+        .G_tilemask_cols = static_cast<int>(G_tilemask.size(1)),
+        .lse = lse.data_ptr<float>(),
+        .targets = targets.data_ptr<int64_t>(),
+        .grad_scale = grad_scale,
+        .filter_eps = filter_eps,
+        .M = M, .N = N
+    };
+    kittens::py::launch_kernel<C, G, mxfp4_cce_backward_v3::backward_kernel_v3<C, false, true>>(g);
 }
 
 // Config instantiations
@@ -226,6 +261,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           "MXFP4 CCE backward v3 (FP4 encode-centric output) L5 SG8");
     m.def("backward_v3_fp4_enc_masked_L4_SG8", &launch_backward_v3_fp4_masked<bwd_v3_fp4_enc_L4_SG8>,
           "MXFP4 CCE backward v3 (FP4 encode-centric output + tile mask) L4 SG8");
+    m.def("backward_v3_fp4_enc_colonly_masked_L4_SG8", &launch_backward_v3_fp4_colonly_masked<bwd_v3_fp4_enc_colonly_L4_SG8>,
+          "MXFP4 CCE backward v3 (FP4 encode-centric col-only output + tile mask) L4 SG8");
     m.def("backward_v3_fp4_enc_rowonly_L4_SG8", &launch_backward_v3_fp4_rowonly<bwd_v3_fp4_enc_rowonly_L4_SG8>,
           "MXFP4 CCE backward v3 (FP4 encode-centric row-only output) L4 SG8");
     m.def("backward_v3_fp4_enc_colonly_L4_SG8", &launch_backward_v3_fp4_colonly<bwd_v3_fp4_enc_colonly_L4_SG8>,
