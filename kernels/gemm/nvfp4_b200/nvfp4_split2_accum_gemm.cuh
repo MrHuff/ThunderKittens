@@ -96,6 +96,10 @@ __device__ inline void kernel(const globals<C> &g) {
     using G = globals<C>;
 
     const int num_blocks = g.num_row_blocks * g.num_col_blocks;
+    const bool bypass_outer_scale =
+        g.A_sg_stride[0] == 0 && g.B_sg_stride[0] == 0 &&
+        g.A_sg_stride[1] == 0 && g.B_sg_stride[1] == 0 &&
+        g.A_sg[0] == g.B_sg[0] && g.A_sg[1] == g.B_sg[1];
 
     if (threadIdx.x == 0) {
         #pragma unroll
@@ -211,47 +215,92 @@ __device__ inline void kernel(const globals<C> &g) {
             auto B_sc_tm = tm_allocator.template allocate<full_tt_fp8e4m3<32 * C::MMA_PER_TILE * C::LOAD_PIPE_DEPTH>>(256 + 4 * C::MMA_PER_TILE * C::LOAD_PIPE_DEPTH);
 
             for (int block_idx = cluster_id; block_idx < num_blocks; block_idx += gridDim.x / C::CLUSTER_SIZE) {
-                #pragma unroll
-                for (int batch = 0; batch < NUM_SPLITS; ++batch) {
+                if (bypass_outer_scale) {
                     wait(outputs_finished, get_phasebit<1>(phasebits, 0));
                     tensor_after_thread_sync();
                     bool first_mma = true;
-                    for (int i = 0; i < g.num_red_blocks[batch]; ++i) {
-                        tma::expect_bytes(scales_arrived[stage], 2 * sizeof(typename G::input_scales_t));
-                        wait(scales_arrived[stage], get_phasebit<0>(phasebits, stage));
-                        #pragma unroll
-                        for (int ii = 0; ii < C::MMA_PER_TILE; ++ii) {
-                            auto A_sc_tm_subtile = A_sc_tm.template subtile<full_tt_fp8e4m3<16>>(stage * C::MMA_PER_TILE * 16 + ii * 16);
-                            auto &A_sc_sm_subtile = *reinterpret_cast<st_fp8e4m3<32, 16, false> *>(reinterpret_cast<uint64_t>(&input_scales[stage].A.data[0]) + 16 * 32 * ii);
-                            load_mxnv_scale_async2(A_sc_tm_subtile, A_sc_sm_subtile);
-                            auto B_sc_tm_subtile_0 = B_sc_tm.template subtile<full_tt_fp8e4m3<16>>(stage * C::MMA_PER_TILE * 32 + ii * C::B_SC_SIZE * 16);
-                            auto &B_sc_sm_subtile_0 = *reinterpret_cast<st_fp8e4m3<32, 16, false> *>(reinterpret_cast<uint64_t>(&input_scales[stage].B[0].data[0]) + 16 * 32 * ii);
-                            load_mxnv_scale_async2(B_sc_tm_subtile_0, B_sc_sm_subtile_0);
-                            if constexpr (C::B_SC_SIZE == 2) {
-                                auto B_sc_tm_subtile_1 = B_sc_tm.template subtile<full_tt_fp8e4m3<16>>(stage * C::MMA_PER_TILE * 32 + ii * C::B_SC_SIZE * 16 + 16);
-                                auto &B_sc_sm_subtile_1 = *reinterpret_cast<st_fp8e4m3<32, 16, false> *>(reinterpret_cast<uint64_t>(&input_scales[stage].B[1].data[0]) + 16 * 32 * ii);
-                                load_mxnv_scale_async2(B_sc_tm_subtile_1, B_sc_sm_subtile_1);
+                    #pragma unroll
+                    for (int batch = 0; batch < NUM_SPLITS; ++batch) {
+                        for (int i = 0; i < g.num_red_blocks[batch]; ++i) {
+                            tma::expect_bytes(scales_arrived[stage], 2 * sizeof(typename G::input_scales_t));
+                            wait(scales_arrived[stage], get_phasebit<0>(phasebits, stage));
+                            #pragma unroll
+                            for (int ii = 0; ii < C::MMA_PER_TILE; ++ii) {
+                                auto A_sc_tm_subtile = A_sc_tm.template subtile<full_tt_fp8e4m3<16>>(stage * C::MMA_PER_TILE * 16 + ii * 16);
+                                auto &A_sc_sm_subtile = *reinterpret_cast<st_fp8e4m3<32, 16, false> *>(reinterpret_cast<uint64_t>(&input_scales[stage].A.data[0]) + 16 * 32 * ii);
+                                load_mxnv_scale_async2(A_sc_tm_subtile, A_sc_sm_subtile);
+                                auto B_sc_tm_subtile_0 = B_sc_tm.template subtile<full_tt_fp8e4m3<16>>(stage * C::MMA_PER_TILE * 32 + ii * C::B_SC_SIZE * 16);
+                                auto &B_sc_sm_subtile_0 = *reinterpret_cast<st_fp8e4m3<32, 16, false> *>(reinterpret_cast<uint64_t>(&input_scales[stage].B[0].data[0]) + 16 * 32 * ii);
+                                load_mxnv_scale_async2(B_sc_tm_subtile_0, B_sc_sm_subtile_0);
+                                if constexpr (C::B_SC_SIZE == 2) {
+                                    auto B_sc_tm_subtile_1 = B_sc_tm.template subtile<full_tt_fp8e4m3<16>>(stage * C::MMA_PER_TILE * 32 + ii * C::B_SC_SIZE * 16 + 16);
+                                    auto &B_sc_sm_subtile_1 = *reinterpret_cast<st_fp8e4m3<32, 16, false> *>(reinterpret_cast<uint64_t>(&input_scales[stage].B[1].data[0]) + 16 * 32 * ii);
+                                    load_mxnv_scale_async2(B_sc_tm_subtile_1, B_sc_sm_subtile_1);
+                                }
                             }
+                            tma::expect_bytes(tiles_arrived[stage], 2 * sizeof(typename G::input_tiles_t));
+                            wait(tiles_arrived[stage], get_phasebit<0>(phasebits, stage));
+                            if (first_mma) {
+                                mm2_ABt(out_tm, input_tiles[stage].A, input_tiles[stage].B,
+                                        A_sc_tm.template subtile<full_tt_fp8e4m3<C::MMA_PER_TILE * 16>>(stage * C::MMA_PER_TILE * 16),
+                                        B_sc_tm.template subtile<full_tt_fp8e4m3<C::MMA_PER_TILE * 32>>(stage * C::MMA_PER_TILE * 32),
+                                        inputs_finished[stage]);
+                                first_mma = false;
+                            } else {
+                                mma2_ABt(out_tm, input_tiles[stage].A, input_tiles[stage].B,
+                                         A_sc_tm.template subtile<full_tt_fp8e4m3<C::MMA_PER_TILE * 16>>(stage * C::MMA_PER_TILE * 16),
+                                         B_sc_tm.template subtile<full_tt_fp8e4m3<C::MMA_PER_TILE * 32>>(stage * C::MMA_PER_TILE * 32),
+                                         inputs_finished[stage]);
+                            }
+                            update_phasebit<0>(phasebits, stage);
+                            stage = (stage + 1) % C::LOAD_PIPE_DEPTH;
                         }
-                        tma::expect_bytes(tiles_arrived[stage], 2 * sizeof(typename G::input_tiles_t));
-                        wait(tiles_arrived[stage], get_phasebit<0>(phasebits, stage));
-                        if (first_mma) {
-                            mm2_ABt(out_tm, input_tiles[stage].A, input_tiles[stage].B,
-                                    A_sc_tm.template subtile<full_tt_fp8e4m3<C::MMA_PER_TILE * 16>>(stage * C::MMA_PER_TILE * 16),
-                                    B_sc_tm.template subtile<full_tt_fp8e4m3<C::MMA_PER_TILE * 32>>(stage * C::MMA_PER_TILE * 32),
-                                    inputs_finished[stage]);
-                            first_mma = false;
-                        } else {
-                            mma2_ABt(out_tm, input_tiles[stage].A, input_tiles[stage].B,
-                                     A_sc_tm.template subtile<full_tt_fp8e4m3<C::MMA_PER_TILE * 16>>(stage * C::MMA_PER_TILE * 16),
-                                     B_sc_tm.template subtile<full_tt_fp8e4m3<C::MMA_PER_TILE * 32>>(stage * C::MMA_PER_TILE * 32),
-                                     inputs_finished[stage]);
-                        }
-                        update_phasebit<0>(phasebits, stage);
-                        stage = (stage + 1) % C::LOAD_PIPE_DEPTH;
                     }
                     tensor_commit<2>(outputs_arrived);
                     update_phasebit<1>(phasebits, 0);
+                } else {
+                    #pragma unroll
+                    for (int batch = 0; batch < NUM_SPLITS; ++batch) {
+                        wait(outputs_finished, get_phasebit<1>(phasebits, 0));
+                        tensor_after_thread_sync();
+                        bool first_mma = true;
+                        for (int i = 0; i < g.num_red_blocks[batch]; ++i) {
+                            tma::expect_bytes(scales_arrived[stage], 2 * sizeof(typename G::input_scales_t));
+                            wait(scales_arrived[stage], get_phasebit<0>(phasebits, stage));
+                            #pragma unroll
+                            for (int ii = 0; ii < C::MMA_PER_TILE; ++ii) {
+                                auto A_sc_tm_subtile = A_sc_tm.template subtile<full_tt_fp8e4m3<16>>(stage * C::MMA_PER_TILE * 16 + ii * 16);
+                                auto &A_sc_sm_subtile = *reinterpret_cast<st_fp8e4m3<32, 16, false> *>(reinterpret_cast<uint64_t>(&input_scales[stage].A.data[0]) + 16 * 32 * ii);
+                                load_mxnv_scale_async2(A_sc_tm_subtile, A_sc_sm_subtile);
+                                auto B_sc_tm_subtile_0 = B_sc_tm.template subtile<full_tt_fp8e4m3<16>>(stage * C::MMA_PER_TILE * 32 + ii * C::B_SC_SIZE * 16);
+                                auto &B_sc_sm_subtile_0 = *reinterpret_cast<st_fp8e4m3<32, 16, false> *>(reinterpret_cast<uint64_t>(&input_scales[stage].B[0].data[0]) + 16 * 32 * ii);
+                                load_mxnv_scale_async2(B_sc_tm_subtile_0, B_sc_sm_subtile_0);
+                                if constexpr (C::B_SC_SIZE == 2) {
+                                    auto B_sc_tm_subtile_1 = B_sc_tm.template subtile<full_tt_fp8e4m3<16>>(stage * C::MMA_PER_TILE * 32 + ii * C::B_SC_SIZE * 16 + 16);
+                                    auto &B_sc_sm_subtile_1 = *reinterpret_cast<st_fp8e4m3<32, 16, false> *>(reinterpret_cast<uint64_t>(&input_scales[stage].B[1].data[0]) + 16 * 32 * ii);
+                                    load_mxnv_scale_async2(B_sc_tm_subtile_1, B_sc_sm_subtile_1);
+                                }
+                            }
+                            tma::expect_bytes(tiles_arrived[stage], 2 * sizeof(typename G::input_tiles_t));
+                            wait(tiles_arrived[stage], get_phasebit<0>(phasebits, stage));
+                            if (first_mma) {
+                                mm2_ABt(out_tm, input_tiles[stage].A, input_tiles[stage].B,
+                                        A_sc_tm.template subtile<full_tt_fp8e4m3<C::MMA_PER_TILE * 16>>(stage * C::MMA_PER_TILE * 16),
+                                        B_sc_tm.template subtile<full_tt_fp8e4m3<C::MMA_PER_TILE * 32>>(stage * C::MMA_PER_TILE * 32),
+                                        inputs_finished[stage]);
+                                first_mma = false;
+                            } else {
+                                mma2_ABt(out_tm, input_tiles[stage].A, input_tiles[stage].B,
+                                         A_sc_tm.template subtile<full_tt_fp8e4m3<C::MMA_PER_TILE * 16>>(stage * C::MMA_PER_TILE * 16),
+                                         B_sc_tm.template subtile<full_tt_fp8e4m3<C::MMA_PER_TILE * 32>>(stage * C::MMA_PER_TILE * 32),
+                                         inputs_finished[stage]);
+                            }
+                            update_phasebit<0>(phasebits, stage);
+                            stage = (stage + 1) % C::LOAD_PIPE_DEPTH;
+                        }
+                        tensor_commit<2>(outputs_arrived);
+                        update_phasebit<1>(phasebits, 0);
+                    }
                 }
             }
         }
@@ -273,54 +322,73 @@ __device__ inline void kernel(const globals<C> &g) {
             int row_block_idx = supergroup_idx * C::SUPERGROUP_SIZE + row_within_supergroup;
             int col_block_idx = idx_within_supergroup / rows_in_supergroup;
 
-            rt_fl<C::Mb / 8, C::Nb / C::EPI_PIPE_DEPTH> D_acc[C::EPI_PIPE_DEPTH];
-
-            #pragma unroll
-            for (int batch = 0; batch < NUM_SPLITS; ++batch) {
+            if (bypass_outer_scale) {
                 wait(outputs_arrived, get_phasebit<0>(phasebits, 0));
-
-                constexpr int ROW_SG_TILE = 256;
-                constexpr int COL_SG_TILE = 256;
-                const int row_sg_idx = row_block_idx / (ROW_SG_TILE / C::Mb);
-                const int col_sg_idx = col_block_idx / (COL_SG_TILE / C::Nb);
-                const float global_scale =
-                    g.A_sg[batch][row_sg_idx * g.A_sg_stride[batch]] *
-                    g.B_sg[batch][col_sg_idx * g.B_sg_stride[batch]];
-
+                rt_bf<C::Mb / 8, C::Nb / C::EPI_PIPE_DEPTH> D_reg[C::EPI_PIPE_DEPTH];
                 #pragma unroll
                 for (int i = 0; i < C::EPI_PIPE_DEPTH; ++i) {
                     rt_fl<C::Mb / 8, C::Nb / C::EPI_PIPE_DEPTH> D_reg_fl;
-                    warpgroup::load_async(
-                        D_reg_fl,
-                        out_tm.template subtile<full_tt_fl<C::Nb / C::EPI_PIPE_DEPTH>>(
-                            0, C::Nb / C::EPI_PIPE_DEPTH * i));
+                    warpgroup::load_async(D_reg_fl, out_tm.template subtile<full_tt_fl<C::Nb / C::EPI_PIPE_DEPTH>>(0, C::Nb / C::EPI_PIPE_DEPTH * i));
                     tensor_load_wait();
                     tensor_before_thread_sync();
                     warpgroup::sync(1);
-                    warp::mul(D_reg_fl, D_reg_fl, global_scale);
-                    if (batch == 0) warp::copy(D_acc[i], D_reg_fl);
-                    else            warp::add(D_acc[i], D_acc[i], D_reg_fl);
-                    warpgroup::sync(1);
-                    tensor_after_thread_sync();
+                    warp::copy(D_reg[i], D_reg_fl);
                 }
-
+                warpgroup::sync(1);
                 warpgroup::tma::cluster::arrive(outputs_finished, 0, 1);
+                #pragma unroll
+                for (int i = 0; i < C::EPI_PIPE_DEPTH; ++i) {
+                    warpgroup::tma::store_async_read_wait<C::NUM_D_TILES - 1>();
+                    warpgroup::sync(1);
+                    warpgroup::store(output_tiles.D[i % C::NUM_D_TILES], D_reg[i]);
+                    warpgroup::sync(1);
+                    warpgroup::tma::store_async<dim::ROW, C::D_CACHE_POLICY>(proxy_D, output_tiles.D[i % C::NUM_D_TILES], {row_block_idx * 2 + cta_id, C::EPI_PIPE_DEPTH * col_block_idx + i});
+                }
                 update_phasebit<0>(phasebits, 0);
-            }
-
-            rt_bf<C::Mb / 8, C::Nb / C::EPI_PIPE_DEPTH> D_reg[C::EPI_PIPE_DEPTH];
-            #pragma unroll
-            for (int i = 0; i < C::EPI_PIPE_DEPTH; ++i) {
-                warp::copy(D_reg[i], D_acc[i]);
-            }
-
-            #pragma unroll
-            for (int i = 0; i < C::EPI_PIPE_DEPTH; ++i) {
-                warpgroup::tma::store_async_read_wait<C::NUM_D_TILES - 1>();
-                warpgroup::sync(1);
-                warpgroup::store(output_tiles.D[i % C::NUM_D_TILES], D_reg[i]);
-                warpgroup::sync(1);
-                warpgroup::tma::store_async<dim::ROW, C::D_CACHE_POLICY>(proxy_D, output_tiles.D[i % C::NUM_D_TILES], {row_block_idx * 2 + cta_id, C::EPI_PIPE_DEPTH * col_block_idx + i});
+            } else {
+                rt_fl<C::Mb / 8, C::Nb / C::EPI_PIPE_DEPTH> D_acc[C::EPI_PIPE_DEPTH];
+                #pragma unroll
+                for (int batch = 0; batch < NUM_SPLITS; ++batch) {
+                    wait(outputs_arrived, get_phasebit<0>(phasebits, 0));
+                    constexpr int ROW_SG_TILE = 256;
+                    constexpr int COL_SG_TILE = 256;
+                    const int row_sg_idx = row_block_idx / (ROW_SG_TILE / C::Mb);
+                    const int col_sg_idx = col_block_idx / (COL_SG_TILE / C::Nb);
+                    const float global_scale =
+                        g.A_sg[batch][row_sg_idx * g.A_sg_stride[batch]] *
+                        g.B_sg[batch][col_sg_idx * g.B_sg_stride[batch]];
+                    #pragma unroll
+                    for (int i = 0; i < C::EPI_PIPE_DEPTH; ++i) {
+                        rt_fl<C::Mb / 8, C::Nb / C::EPI_PIPE_DEPTH> D_reg_fl;
+                        warpgroup::load_async(
+                            D_reg_fl,
+                            out_tm.template subtile<full_tt_fl<C::Nb / C::EPI_PIPE_DEPTH>>(
+                                0, C::Nb / C::EPI_PIPE_DEPTH * i));
+                        tensor_load_wait();
+                        tensor_before_thread_sync();
+                        warpgroup::sync(1);
+                        warp::mul(D_reg_fl, D_reg_fl, global_scale);
+                        if (batch == 0) warp::copy(D_acc[i], D_reg_fl);
+                        else            warp::add(D_acc[i], D_acc[i], D_reg_fl);
+                        warpgroup::sync(1);
+                        tensor_after_thread_sync();
+                    }
+                    warpgroup::tma::cluster::arrive(outputs_finished, 0, 1);
+                    update_phasebit<0>(phasebits, 0);
+                }
+                rt_bf<C::Mb / 8, C::Nb / C::EPI_PIPE_DEPTH> D_reg[C::EPI_PIPE_DEPTH];
+                #pragma unroll
+                for (int i = 0; i < C::EPI_PIPE_DEPTH; ++i) {
+                    warp::copy(D_reg[i], D_acc[i]);
+                }
+                #pragma unroll
+                for (int i = 0; i < C::EPI_PIPE_DEPTH; ++i) {
+                    warpgroup::tma::store_async_read_wait<C::NUM_D_TILES - 1>();
+                    warpgroup::sync(1);
+                    warpgroup::store(output_tiles.D[i % C::NUM_D_TILES], D_reg[i]);
+                    warpgroup::sync(1);
+                    warpgroup::tma::store_async<dim::ROW, C::D_CACHE_POLICY>(proxy_D, output_tiles.D[i % C::NUM_D_TILES], {row_block_idx * 2 + cta_id, C::EPI_PIPE_DEPTH * col_block_idx + i});
+                }
             }
         }
         warpgroup::sync(1);

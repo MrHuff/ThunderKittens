@@ -1542,6 +1542,8 @@ void launch_fast_split2_dgrad_gemm_strided_onepass_with_config(
     const int64_t K_total_fp4 = A_full.size(1);
     const uint8_t* a_base = reinterpret_cast<const uint8_t*>(A_full.data_ptr());
     const int64_t a_full_row_stride = K_total_fp4;
+    auto one = get_unit_scale_tensor(A_full);
+    const float* one_ptr = one.data_ptr<float>();
 
     g_host.num_row_blocks = static_cast<int>(M / C::Mb);
     g_host.num_col_blocks = static_cast<int>(N_out / C::Nb);
@@ -1604,6 +1606,10 @@ void launch_fast_split2_dgrad_gemm_strided_onepass_with_config(
             &g_host.A_sc_tma[i], A_sc_prepared_list[i], "A_sc_prepared_list[i]");
         memcpy(&g_host.B_tma[i], &b_gl.tma_descs.tma_desc, sizeof(CUtensorMap));
         memcpy(&g_host.B_sc_tma[i], &b_sc_gl.tma_descs.tma_desc, sizeof(CUtensorMap));
+        g_host.A_sg[i] = one_ptr;
+        g_host.B_sg[i] = one_ptr;
+        g_host.A_sg_stride[i] = 0;
+        g_host.B_sg_stride[i] = 0;
     }
 
     auto d_gl = kittens::py::tensor_to_gl<typename G::D_gl>(D_out);
@@ -1760,6 +1766,8 @@ void launch_fast_split2_dgrad_gemm_onepass_with_config(
 
     const int64_t M = D_out.size(0);
     const int64_t N_out = D_out.size(1);
+    auto one = get_unit_scale_tensor(D_out);
+    const float* one_ptr = one.data_ptr<float>();
     g_host.num_row_blocks = static_cast<int>(M / C::Mb);
     g_host.num_col_blocks = static_cast<int>(N_out / C::Nb);
 
@@ -1779,6 +1787,10 @@ void launch_fast_split2_dgrad_gemm_onepass_with_config(
         memcpy(&g_host.A_sc_tma[i], &a_sc_gl.tma_descs.tma_desc, sizeof(CUtensorMap));
         memcpy(&g_host.B_tma[i], &b_gl.tma_descs.tma_desc, sizeof(CUtensorMap));
         memcpy(&g_host.B_sc_tma[i], &b_sc_gl.tma_descs.tma_desc, sizeof(CUtensorMap));
+        g_host.A_sg[i] = one_ptr;
+        g_host.B_sg[i] = one_ptr;
+        g_host.A_sg_stride[i] = 0;
+        g_host.B_sg_stride[i] = 0;
     }
 
     auto d_gl = kittens::py::tensor_to_gl<typename G::D_gl>(D_out);
