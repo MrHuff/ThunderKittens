@@ -6,6 +6,7 @@
 // ================================================================
 
 #include "kittens.cuh"
+#include "mxfp4_rope_epilogue.cuh"
 
 using namespace kittens;
 
@@ -65,6 +66,8 @@ struct globals {
     B_fp4x2_gl B;       // N x (K/2)
     B_sc_gl    B_sc;    // (N/128) x (K/128) x 32 x 16
     D_gl       D;       // M x N
+    mxfp4_rope_epilogue::rope_desc rope;
+    mxfp4_rope_epilogue::rope_live64_desc rope_live64;
 
     struct input_tiles_t {
         A_fp4x2_tile A;
@@ -295,6 +298,21 @@ __device__ inline void kernel(const globals<C> &g) {
                         warpgroup::tma::cluster::arrive(outputs_finished, 0, 1);
                     }
                     warp::mul(D_reg_fl, D_reg_fl, MXFP4_ALPHA);
+                    if (g.rope_live64.enabled()) {
+                        mxfp4_rope_epilogue::apply_inplace_live64(
+                            D_reg_fl,
+                            g.rope_live64,
+                            (row_block_idx * 2 + cta_id) * (C::Mb / 2),
+                            (col_block_idx * C::EPI_PIPE_DEPTH + i) * (C::Nb / C::EPI_PIPE_DEPTH)
+                        );
+                    } else {
+                        mxfp4_rope_epilogue::apply_inplace(
+                            D_reg_fl,
+                            g.rope,
+                            (row_block_idx * 2 + cta_id) * (C::Mb / 2),
+                            (col_block_idx * C::EPI_PIPE_DEPTH + i) * (C::Nb / C::EPI_PIPE_DEPTH)
+                        );
+                    }
                     rt_bf<C::Mb / 8, C::Nb / C::EPI_PIPE_DEPTH> D_reg;
                     warp::copy(D_reg, D_reg_fl);
                     warpgroup::tma::store_async_read_wait<C::NUM_D_TILES-1>();
@@ -310,6 +328,21 @@ __device__ inline void kernel(const globals<C> &g) {
                     rt_fl<C::Mb / 8, C::Nb / C::EPI_PIPE_DEPTH> D_reg_fl;
                     warpgroup::load_async(D_reg_fl, out_tm.template subtile<full_tt_fl<C::Nb / C::EPI_PIPE_DEPTH>>(0, C::Nb / C::EPI_PIPE_DEPTH * i));
                     warp::mul(D_reg_fl, D_reg_fl, MXFP4_ALPHA);
+                    if (g.rope_live64.enabled()) {
+                        mxfp4_rope_epilogue::apply_inplace_live64(
+                            D_reg_fl,
+                            g.rope_live64,
+                            (row_block_idx * 2 + cta_id) * (C::Mb / 2),
+                            (col_block_idx * C::EPI_PIPE_DEPTH + i) * (C::Nb / C::EPI_PIPE_DEPTH)
+                        );
+                    } else {
+                        mxfp4_rope_epilogue::apply_inplace(
+                            D_reg_fl,
+                            g.rope,
+                            (row_block_idx * 2 + cta_id) * (C::Mb / 2),
+                            (col_block_idx * C::EPI_PIPE_DEPTH + i) * (C::Nb / C::EPI_PIPE_DEPTH)
+                        );
+                    }
                     warp::copy(D_reg[i], D_reg_fl);
                 }
                 tensor_load_wait();
