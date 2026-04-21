@@ -62,6 +62,8 @@ struct globals {
     CUtensorMap B_tma[MAX_BATCHES];
     CUtensorMap B_sc_tma[MAX_BATCHES];
     CUtensorMap D_tma[MAX_BATCHES];
+    mxfp4_rope_epilogue::rope_desc rope[MAX_BATCHES];
+    mxfp4_rope_epilogue::rope_live64_desc rope_live64[MAX_BATCHES];
 
     int       num_red_blocks;
     int       num_batches;
@@ -304,6 +306,24 @@ __device__ inline void kernel(const globals<C> &g) {
             tensor_before_thread_sync();
             warpgroup::sync(1);
             warpgroup::tma::cluster::arrive(outputs_finished, 0, 1);
+            #pragma unroll
+            for (int i = 0; i < C::EPI_PIPE_DEPTH; i++) {
+                if (g.rope_live64[batch].enabled()) {
+                    mxfp4_rope_epilogue::apply_inplace_live64(
+                        D_reg[i],
+                        g.rope_live64[batch],
+                        (row_block_idx * 2 + cta_id) * (C::Mb / 2),
+                        (col_block_idx * C::EPI_PIPE_DEPTH + i) * (C::Nb / C::EPI_PIPE_DEPTH)
+                    );
+                } else {
+                    mxfp4_rope_epilogue::apply_inplace(
+                        D_reg[i],
+                        g.rope[batch],
+                        (row_block_idx * 2 + cta_id) * (C::Mb / 2),
+                        (col_block_idx * C::EPI_PIPE_DEPTH + i) * (C::Nb / C::EPI_PIPE_DEPTH)
+                    );
+                }
+            }
             #pragma unroll
             for (int i = 0; i < C::EPI_PIPE_DEPTH; i++) {
                 warpgroup::tma::store_async_read_wait<C::NUM_D_TILES-1>();

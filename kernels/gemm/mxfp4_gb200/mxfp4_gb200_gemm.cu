@@ -6,6 +6,7 @@
 // mxfp4_quantize.cuh removed — use standalone mxfp4_v2 quantizer
 #include "mxfp4_batched_gemm.cuh"
 #include "mxfp4_split2_accum_gemm.cuh"
+#include "mxfp4_split3_accum_gemm.cuh"
 #include <cstdint>
 #include <cstring>
 #include <optional>
@@ -166,6 +167,9 @@ namespace {
 using mxfp4_onepass_cfg1 = mxfp4_split2_accum_gemm::config<128, 5, 4, 12, 2, true, 2, false>;
 using mxfp4_onepass_cfg3 = mxfp4_split2_accum_gemm::config<256, 5, 8, 4, 2, false, 2, false>;
 using mxfp4_onepass_cfg5 = mxfp4_split2_accum_gemm::config<256, 5, 8, 12, 2, false, 2, false>;
+using mxfp4_split3_onepass_cfg1 = mxfp4_split3_accum_gemm::config<128, 5, 4, 12, 2, true, 2, false>;
+using mxfp4_split3_onepass_cfg3 = mxfp4_split3_accum_gemm::config<256, 5, 8, 4, 2, false, 2, false>;
+using mxfp4_split3_onepass_cfg5 = mxfp4_split3_accum_gemm::config<256, 5, 8, 12, 2, false, 2, false>;
 
 void check_fp4_matrix(const at::Tensor& t, const char* name) {
     TORCH_CHECK(t.is_cuda(), name, " must be CUDA");
@@ -180,6 +184,76 @@ void check_output_matrix(const at::Tensor& t, const char* name, int64_t rows, in
     TORCH_CHECK(t.dim() == 2, name, " must be 2D");
     TORCH_CHECK(t.scalar_type() == at::kBFloat16, name, " must be bf16");
     TORCH_CHECK(t.size(0) == rows && t.size(1) == cols, name, " shape mismatch");
+}
+
+bool rope_tensor_disabled(const at::Tensor& t) {
+    return t.numel() == 0;
+}
+
+bool is_power_of_two(int64_t value) {
+    return value > 0 && (value & (value - 1)) == 0;
+}
+
+void check_rope_tensor(
+    const at::Tensor& t,
+    const char* name,
+    int64_t seq_len,
+    int64_t rotary_dim
+) {
+    TORCH_CHECK(t.is_cuda(), name, " must be CUDA");
+    TORCH_CHECK(t.is_contiguous(), name, " must be contiguous");
+    TORCH_CHECK(t.dim() == 2, name, " must be 2D");
+    TORCH_CHECK(t.scalar_type() == at::kFloat, name, " must be float32");
+    TORCH_CHECK(t.size(0) == seq_len, name, " seq_len mismatch");
+    TORCH_CHECK(t.size(1) == rotary_dim / 2, name, " rotary_dim/2 mismatch");
+}
+
+void check_rope_epilogue_args(
+    const at::Tensor& D,
+    const at::Tensor& rope_cos,
+    const at::Tensor& rope_sin,
+    int64_t rope_seq_len,
+    int64_t rope_head_dim,
+    int64_t rope_rotary_dim
+) {
+    TORCH_CHECK(rope_seq_len > 0, "rope_seq_len must be positive");
+    TORCH_CHECK(rope_head_dim > 0, "rope_head_dim must be positive");
+    TORCH_CHECK(rope_rotary_dim > 0, "rope_rotary_dim must be positive");
+    TORCH_CHECK((rope_head_dim % 2) == 0, "rope_head_dim must be even");
+    TORCH_CHECK((rope_rotary_dim % 2) == 0, "rope_rotary_dim must be even");
+    TORCH_CHECK(rope_rotary_dim <= rope_head_dim, "rope_rotary_dim must be <= rope_head_dim");
+    TORCH_CHECK(D.size(0) % rope_seq_len == 0, "output rows must be divisible by rope_seq_len");
+    TORCH_CHECK(D.size(1) % rope_head_dim == 0, "output cols must be divisible by rope_head_dim");
+    check_rope_tensor(rope_cos, "rope_cos", rope_seq_len, rope_rotary_dim);
+    check_rope_tensor(rope_sin, "rope_sin", rope_seq_len, rope_rotary_dim);
+    kittens::py::device_check(D, rope_cos, rope_sin);
+}
+
+void check_rope_live64_tensor(
+    const at::Tensor& t,
+    const char* name,
+    int64_t seq_len
+) {
+    TORCH_CHECK(t.is_cuda(), name, " must be CUDA");
+    TORCH_CHECK(t.is_contiguous(), name, " must be contiguous");
+    TORCH_CHECK(t.dim() == 3, name, " must be 3D");
+    TORCH_CHECK(t.scalar_type() == at::kFloat, name, " must be float32");
+    TORCH_CHECK(t.size(0) == seq_len, name, " seq_len mismatch");
+    TORCH_CHECK(t.size(1) == 32, name, " second dim must equal 32");
+    TORCH_CHECK(t.size(2) == 2, name, " third dim must equal 2");
+}
+
+void check_rope_live64_args(
+    const at::Tensor& D,
+    const at::Tensor& rope_cs,
+    int64_t rope_seq_len
+) {
+    TORCH_CHECK(rope_seq_len > 0, "rope_seq_len must be positive");
+    TORCH_CHECK(is_power_of_two(rope_seq_len), "rope_seq_len must be a power of two");
+    TORCH_CHECK(D.size(0) % rope_seq_len == 0, "output rows must be divisible by rope_seq_len");
+    TORCH_CHECK(D.size(1) % 64 == 0, "output cols must be divisible by 64");
+    check_rope_live64_tensor(rope_cs, "rope_cs", rope_seq_len);
+    kittens::py::device_check(D, rope_cs);
 }
 
 void check_mxfp4_scale_tensor(
@@ -297,6 +371,46 @@ void check_mxfp4_split2_dgrad_inputs(
     }
 }
 
+void check_mxfp4_split3_dgrad_inputs(
+    const at::Tensor& A_full,
+    const std::vector<at::Tensor>& A_sc_list,
+    const std::vector<int64_t>& A_col_offsets,
+    const std::vector<int64_t>& A_col_widths,
+    const std::vector<at::Tensor>& B_list,
+    const std::vector<at::Tensor>& B_sc_list
+) {
+    check_fp4_matrix(A_full, "A_full");
+    TORCH_CHECK(A_full.size(0) % 128 == 0, "A_full M must be a multiple of 128");
+    TORCH_CHECK((A_full.size(1) * 2) % 128 == 0, "A_full K must be a multiple of 128");
+
+    const int n = static_cast<int>(A_sc_list.size());
+    TORCH_CHECK(n == 3, "split3 one-pass dgrad expects exactly 3 A scale tensors");
+    TORCH_CHECK(
+        n == static_cast<int>(A_col_offsets.size()) &&
+        n == static_cast<int>(A_col_widths.size()) &&
+        n == static_cast<int>(B_list.size()) &&
+        n == static_cast<int>(B_sc_list.size()),
+        "all split3 one-pass inputs must have length 3"
+    );
+
+    for (int i = 0; i < n; ++i) {
+        TORCH_CHECK(A_col_offsets[i] >= 0, "A_col_offsets must be non-negative");
+        TORCH_CHECK(A_col_widths[i] > 0, "A_col_widths must be positive");
+        TORCH_CHECK(
+            A_col_offsets[i] + A_col_widths[i] <= A_full.size(1),
+            "A_full slice exceeds packed width"
+        );
+        TORCH_CHECK((A_col_widths[i] * 2) % 128 == 0, "split widths must be multiples of 128");
+        check_mxfp4_scale_tensor(A_sc_list[i], "A_sc_list[i]", A_full.size(0), A_col_widths[i] * 2, true);
+        check_fp4_matrix(B_list[i], "B_list[i]");
+        TORCH_CHECK(B_list[i].size(1) == A_col_widths[i], "B_list packed K must match A_col_widths");
+        TORCH_CHECK(B_list[i].size(0) % 128 == 0, "B_list rows must be multiples of 128");
+        check_mxfp4_scale_tensor(B_sc_list[i], "B_sc_list[i]", B_list[i].size(0), B_list[i].size(1) * 2, false);
+        kittens::py::device_check(A_full, A_sc_list[i], B_list[i], B_sc_list[i]);
+    }
+}
+
+
 template <typename C>
 void launch_mxfp4_split2_dgrad_gemm_strided_onepass_with_config(
     const at::Tensor& A_full,
@@ -385,6 +499,95 @@ void launch_mxfp4_split2_dgrad_gemm_strided_onepass_with_config(
     kittens::py::launch_kernel<C, G, mxfp4_split2_accum_gemm::kernel<C>>(g_host);
 }
 
+template <typename C>
+void launch_mxfp4_split3_dgrad_gemm_strided_onepass_with_config(
+    const at::Tensor& A_full,
+    const std::vector<at::Tensor>& A_sc_list,
+    const std::vector<int64_t>& A_col_offsets,
+    const std::vector<int64_t>& A_col_widths,
+    const std::vector<at::Tensor>& B_list,
+    const std::vector<at::Tensor>& B_sc_list,
+    at::Tensor& D_out
+) {
+    using G = mxfp4_split3_accum_gemm::globals<C>;
+    G g_host;
+    memset(&g_host, 0, sizeof(G));
+
+    const int64_t M = D_out.size(0);
+    const int64_t N_out = D_out.size(1);
+    const int64_t K_total_fp4 = A_full.size(1);
+    const uint8_t* a_base = reinterpret_cast<const uint8_t*>(A_full.data_ptr());
+    const int64_t a_full_row_stride = K_total_fp4;
+
+    g_host.num_row_blocks = static_cast<int>(M / C::Mb);
+    g_host.num_col_blocks = static_cast<int>(N_out / C::Nb);
+
+    for (int i = 0; i < 3; ++i) {
+        constexpr int64_t swizzle_elements = 128;
+        const int64_t fp4_cols = A_col_widths[i];
+        const int64_t fp4_offset = A_col_offsets[i];
+        const void* data_ptr = a_base + fp4_offset;
+
+        TORCH_CHECK(fp4_cols > 0, "A_col_widths must be positive");
+        TORCH_CHECK((2 * fp4_cols) % C::Kb == 0,
+                    "one-pass split3 dgrad expects reduction widths aligned to Kb=", C::Kb);
+        g_host.num_red_blocks[i] = static_cast<int>((2 * fp4_cols) / C::Kb);
+
+        uint64_t gmem_shape[5] = {
+            static_cast<uint64_t>(swizzle_elements),
+            static_cast<uint64_t>(M),
+            static_cast<uint64_t>((fp4_cols + swizzle_elements - 1) / swizzle_elements),
+            1, 1
+        };
+        uint64_t gmem_stride[4] = {
+            static_cast<uint64_t>(a_full_row_stride),
+            128,
+            static_cast<uint64_t>(M * a_full_row_stride),
+            static_cast<uint64_t>(M * a_full_row_stride)
+        };
+        uint32_t smem_shape[5] = {
+            static_cast<uint32_t>(swizzle_elements),
+            static_cast<uint32_t>(C::Mb / 2),
+            1, 1, 1
+        };
+        uint32_t smem_stride[5] = {1, 1, 1, 1, 1};
+
+        CUresult result = cuTensorMapEncodeTiled(
+            &g_host.A_tma[i],
+            CU_TENSOR_MAP_DATA_TYPE_UINT8,
+            5,
+            const_cast<void*>(data_ptr),
+            gmem_shape,
+            gmem_stride,
+            smem_shape,
+            smem_stride,
+            CU_TENSOR_MAP_INTERLEAVE_NONE,
+            CU_TENSOR_MAP_SWIZZLE_128B,
+            CU_TENSOR_MAP_L2_PROMOTION_NONE,
+            CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE
+        );
+        TORCH_CHECK(result == CUDA_SUCCESS, "One-pass split3 MXFP4 A TMA creation failed for batch ", i);
+
+        if (A_sc_list[i].is_contiguous()) {
+            auto a_sc_gl = kittens::py::tensor_to_gl<typename G::A_sc_gl>(A_sc_list[i]);
+            memcpy(&g_host.A_sc_tma[i], &a_sc_gl.tma_descs.tma_desc, sizeof(CUtensorMap));
+        } else {
+            encode_mxfp4_scale_tensor_map<typename G::A_sc_tile>(&g_host.A_sc_tma[i], A_sc_list[i], "A_sc_list[i]");
+        }
+
+        auto b_gl = kittens::py::tensor_to_gl<typename G::B_fp4x2_gl>(B_list[i]);
+        auto b_sc_gl = kittens::py::tensor_to_gl<typename G::B_sc_gl>(B_sc_list[i]);
+        memcpy(&g_host.B_tma[i], &b_gl.tma_descs.tma_desc, sizeof(CUtensorMap));
+        memcpy(&g_host.B_sc_tma[i], &b_sc_gl.tma_descs.tma_desc, sizeof(CUtensorMap));
+    }
+
+    auto d_gl = kittens::py::tensor_to_gl<typename G::D_gl>(D_out);
+    memcpy(&g_host.D_tma, &d_gl.tma_descs.tma_desc, sizeof(CUtensorMap));
+
+    kittens::py::launch_kernel<C, G, mxfp4_split3_accum_gemm::kernel<C>>(g_host);
+}
+
+
 void launch_mxfp4_split2_dgrad_gemm_strided_onepass(
     const at::Tensor& A_full,
     const std::vector<at::Tensor>& A_sc_list,
@@ -416,6 +619,39 @@ void launch_mxfp4_split2_dgrad_gemm_strided_onepass(
             TORCH_CHECK(false, "Unknown MXFP4 split2 one-pass config_idx=", resolved_idx);
     }
 }
+
+void launch_mxfp4_split3_dgrad_gemm_strided_onepass(
+    const at::Tensor& A_full,
+    const std::vector<at::Tensor>& A_sc_list,
+    const std::vector<int64_t>& A_col_offsets,
+    const std::vector<int64_t>& A_col_widths,
+    const std::vector<at::Tensor>& B_list,
+    const std::vector<at::Tensor>& B_sc_list,
+    at::Tensor& D_out,
+    int config_idx
+) {
+    int resolved_idx = config_idx;
+    if (resolved_idx < 0) {
+        resolved_idx = 5;
+    }
+    switch (resolved_idx) {
+        case 1:
+            launch_mxfp4_split3_dgrad_gemm_strided_onepass_with_config<mxfp4_split3_onepass_cfg1>(
+                A_full, A_sc_list, A_col_offsets, A_col_widths, B_list, B_sc_list, D_out);
+            break;
+        case 3:
+            launch_mxfp4_split3_dgrad_gemm_strided_onepass_with_config<mxfp4_split3_onepass_cfg3>(
+                A_full, A_sc_list, A_col_offsets, A_col_widths, B_list, B_sc_list, D_out);
+            break;
+        case 5:
+            launch_mxfp4_split3_dgrad_gemm_strided_onepass_with_config<mxfp4_split3_onepass_cfg5>(
+                A_full, A_sc_list, A_col_offsets, A_col_widths, B_list, B_sc_list, D_out);
+            break;
+        default:
+            TORCH_CHECK(false, "Unknown MXFP4 split3 one-pass config_idx=", resolved_idx);
+    }
+}
+
 
 } // namespace
 
@@ -464,6 +700,59 @@ static void run_gemm_with_config(
     kittens::py::launch_kernel<C, G, mxfp4_gemm::kernel<C>>(g);
 }
 
+template <typename C>
+static void run_gemm_with_config_rope(
+    const at::Tensor &A, const at::Tensor &A_sc,
+    const at::Tensor &B, const at::Tensor &B_sc,
+    at::Tensor &D,
+    const at::Tensor &rope_cos,
+    const at::Tensor &rope_sin,
+    int64_t rope_seq_len,
+    int64_t rope_head_dim,
+    int64_t rope_rotary_dim
+) {
+    using G = mxfp4_gemm::globals<C>;
+    G g {
+        .A = kittens::py::tensor_to_gl<typename G::A_fp4x2_gl>(A),
+        .A_sc = kittens::py::tensor_to_gl<typename G::A_sc_gl>(A_sc),
+        .B = kittens::py::tensor_to_gl<typename G::B_fp4x2_gl>(B),
+        .B_sc = kittens::py::tensor_to_gl<typename G::B_sc_gl>(B_sc),
+        .D = kittens::py::tensor_to_gl<typename G::D_gl>(D),
+        .rope = {
+            .cos = rope_cos.data_ptr<float>(),
+            .sin = rope_sin.data_ptr<float>(),
+            .seq_len = static_cast<int>(rope_seq_len),
+            .head_dim = static_cast<int>(rope_head_dim),
+            .rotary_dim = static_cast<int>(rope_rotary_dim),
+        },
+    };
+    kittens::py::launch_kernel<C, G, mxfp4_gemm::kernel<C>>(g);
+}
+
+template <typename C>
+static void run_gemm_with_config_rope_live64(
+    const at::Tensor &A, const at::Tensor &A_sc,
+    const at::Tensor &B, const at::Tensor &B_sc,
+    at::Tensor &D,
+    const at::Tensor &rope_cs,
+    int64_t rope_seq_len
+) {
+    using G = mxfp4_gemm::globals<C>;
+    G g {
+        .A = kittens::py::tensor_to_gl<typename G::A_fp4x2_gl>(A),
+        .A_sc = kittens::py::tensor_to_gl<typename G::A_sc_gl>(A_sc),
+        .B = kittens::py::tensor_to_gl<typename G::B_fp4x2_gl>(B),
+        .B_sc = kittens::py::tensor_to_gl<typename G::B_sc_gl>(B_sc),
+        .D = kittens::py::tensor_to_gl<typename G::D_gl>(D),
+        .rope_live64 = {
+            .cs = reinterpret_cast<const float2*>(rope_cs.data_ptr<float>()),
+            .seq_len = static_cast<int>(rope_seq_len),
+            .seq_mask = static_cast<int>(rope_seq_len - 1),
+        },
+    };
+    kittens::py::launch_kernel<C, G, mxfp4_gemm::kernel<C>>(g);
+}
+
 void mxfp4_gemm_config_entrypoint(
     const at::Tensor &A, const at::Tensor &A_sc,
     const at::Tensor &B, const at::Tensor &B_sc,
@@ -486,6 +775,84 @@ void mxfp4_gemm_config_entrypoint(
     case 8:  run_gemm_with_config<mxfp4_gemm::config<256, 4, 16, 12, 2, false>>(A, A_sc, B, B_sc, D); break;
     case 9:  run_gemm_with_config<mxfp4_gemm::config<256, 5,  8,  4, 2, true >>(A, A_sc, B, B_sc, D); break;
 
+    default: TORCH_CHECK(false, "Invalid config_id: ", config_id, " (valid: 0-9)");
+    }
+}
+
+void mxfp4_gemm_rope_live64_entrypoint(
+    const at::Tensor &A, const at::Tensor &A_sc,
+    const at::Tensor &B, const at::Tensor &B_sc,
+    at::Tensor &D,
+    const at::Tensor &rope_cs,
+    int64_t rope_seq_len
+) {
+    check_rope_live64_args(D, rope_cs, rope_seq_len);
+    run_gemm_with_config_rope_live64<mxfp4_gemm::config<256, 5, 8, 4, 2, false>>(
+        A, A_sc, B, B_sc, D, rope_cs, rope_seq_len);
+}
+
+void mxfp4_gemm_rope_live64_config_entrypoint(
+    const at::Tensor &A, const at::Tensor &A_sc,
+    const at::Tensor &B, const at::Tensor &B_sc,
+    at::Tensor &D,
+    const at::Tensor &rope_cs,
+    int64_t rope_seq_len,
+    int config_id
+) {
+    check_rope_live64_args(D, rope_cs, rope_seq_len);
+    switch (config_id) {
+    case 0:  run_gemm_with_config_rope_live64<mxfp4_gemm::config<256, 5,  8,  4, 2, false>>(A, A_sc, B, B_sc, D, rope_cs, rope_seq_len); break;
+    case 1:  run_gemm_with_config_rope_live64<mxfp4_gemm::config<256, 4, 16,  4, 2, false>>(A, A_sc, B, B_sc, D, rope_cs, rope_seq_len); break;
+    case 2:  run_gemm_with_config_rope_live64<mxfp4_gemm::config<256, 5,  8,  8, 2, true >>(A, A_sc, B, B_sc, D, rope_cs, rope_seq_len); break;
+    case 3:  run_gemm_with_config_rope_live64<mxfp4_gemm::config<256, 5,  8, 12, 4, true >>(A, A_sc, B, B_sc, D, rope_cs, rope_seq_len); break;
+    case 4:  run_gemm_with_config_rope_live64<mxfp4_gemm::config<256, 5,  8, 12, 2, false>>(A, A_sc, B, B_sc, D, rope_cs, rope_seq_len); break;
+    case 5:  run_gemm_with_config_rope_live64<mxfp4_gemm::config<256, 5, 16,  4, 2, true >>(A, A_sc, B, B_sc, D, rope_cs, rope_seq_len); break;
+    case 6:  run_gemm_with_config_rope_live64<mxfp4_gemm::config<256, 4,  8, 12, 2, false>>(A, A_sc, B, B_sc, D, rope_cs, rope_seq_len); break;
+    case 7:  run_gemm_with_config_rope_live64<mxfp4_gemm::config<256, 5,  8,  4, 4, false>>(A, A_sc, B, B_sc, D, rope_cs, rope_seq_len); break;
+    case 8:  run_gemm_with_config_rope_live64<mxfp4_gemm::config<256, 4, 16, 12, 2, false>>(A, A_sc, B, B_sc, D, rope_cs, rope_seq_len); break;
+    case 9:  run_gemm_with_config_rope_live64<mxfp4_gemm::config<256, 5,  8,  4, 2, true >>(A, A_sc, B, B_sc, D, rope_cs, rope_seq_len); break;
+    default: TORCH_CHECK(false, "Invalid config_id: ", config_id, " (valid: 0-9)");
+    }
+}
+
+void mxfp4_gemm_rope_entrypoint(
+    const at::Tensor &A, const at::Tensor &A_sc,
+    const at::Tensor &B, const at::Tensor &B_sc,
+    at::Tensor &D,
+    const at::Tensor &rope_cos,
+    const at::Tensor &rope_sin,
+    int64_t rope_seq_len,
+    int64_t rope_head_dim,
+    int64_t rope_rotary_dim
+) {
+    check_rope_epilogue_args(D, rope_cos, rope_sin, rope_seq_len, rope_head_dim, rope_rotary_dim);
+    run_gemm_with_config_rope<mxfp4_gemm::config<256, 5, 8, 4, 2, false>>(
+        A, A_sc, B, B_sc, D, rope_cos, rope_sin, rope_seq_len, rope_head_dim, rope_rotary_dim);
+}
+
+void mxfp4_gemm_rope_config_entrypoint(
+    const at::Tensor &A, const at::Tensor &A_sc,
+    const at::Tensor &B, const at::Tensor &B_sc,
+    at::Tensor &D,
+    const at::Tensor &rope_cos,
+    const at::Tensor &rope_sin,
+    int64_t rope_seq_len,
+    int64_t rope_head_dim,
+    int64_t rope_rotary_dim,
+    int config_id
+) {
+    check_rope_epilogue_args(D, rope_cos, rope_sin, rope_seq_len, rope_head_dim, rope_rotary_dim);
+    switch (config_id) {
+    case 0:  run_gemm_with_config_rope<mxfp4_gemm::config<256, 5,  8,  4, 2, false>>(A, A_sc, B, B_sc, D, rope_cos, rope_sin, rope_seq_len, rope_head_dim, rope_rotary_dim); break;
+    case 1:  run_gemm_with_config_rope<mxfp4_gemm::config<256, 4, 16,  4, 2, false>>(A, A_sc, B, B_sc, D, rope_cos, rope_sin, rope_seq_len, rope_head_dim, rope_rotary_dim); break;
+    case 2:  run_gemm_with_config_rope<mxfp4_gemm::config<256, 5,  8,  8, 2, true >>(A, A_sc, B, B_sc, D, rope_cos, rope_sin, rope_seq_len, rope_head_dim, rope_rotary_dim); break;
+    case 3:  run_gemm_with_config_rope<mxfp4_gemm::config<256, 5,  8, 12, 4, true >>(A, A_sc, B, B_sc, D, rope_cos, rope_sin, rope_seq_len, rope_head_dim, rope_rotary_dim); break;
+    case 4:  run_gemm_with_config_rope<mxfp4_gemm::config<256, 5,  8, 12, 2, false>>(A, A_sc, B, B_sc, D, rope_cos, rope_sin, rope_seq_len, rope_head_dim, rope_rotary_dim); break;
+    case 5:  run_gemm_with_config_rope<mxfp4_gemm::config<256, 5, 16,  4, 2, true >>(A, A_sc, B, B_sc, D, rope_cos, rope_sin, rope_seq_len, rope_head_dim, rope_rotary_dim); break;
+    case 6:  run_gemm_with_config_rope<mxfp4_gemm::config<256, 4,  8, 12, 2, false>>(A, A_sc, B, B_sc, D, rope_cos, rope_sin, rope_seq_len, rope_head_dim, rope_rotary_dim); break;
+    case 7:  run_gemm_with_config_rope<mxfp4_gemm::config<256, 5,  8,  4, 4, false>>(A, A_sc, B, B_sc, D, rope_cos, rope_sin, rope_seq_len, rope_head_dim, rope_rotary_dim); break;
+    case 8:  run_gemm_with_config_rope<mxfp4_gemm::config<256, 4, 16, 12, 2, false>>(A, A_sc, B, B_sc, D, rope_cos, rope_sin, rope_seq_len, rope_head_dim, rope_rotary_dim); break;
+    case 9:  run_gemm_with_config_rope<mxfp4_gemm::config<256, 5,  8,  4, 2, true >>(A, A_sc, B, B_sc, D, rope_cos, rope_sin, rope_seq_len, rope_head_dim, rope_rotary_dim); break;
     default: TORCH_CHECK(false, "Invalid config_id: ", config_id, " (valid: 0-9)");
     }
 }
@@ -544,6 +911,140 @@ void mxfp4_batched_gemm_entrypoint(
     }
 }
 
+void mxfp4_batched_gemm_rope_entrypoint(
+    const std::vector<at::Tensor> &A_list,
+    const std::vector<at::Tensor> &A_sc_list,
+    const std::vector<at::Tensor> &B_list,
+    const std::vector<at::Tensor> &B_sc_list,
+    std::vector<at::Tensor> &D_out_list,
+    const std::vector<at::Tensor> &rope_cos_list,
+    const std::vector<at::Tensor> &rope_sin_list,
+    const std::vector<int64_t> &rope_seq_len_list,
+    const std::vector<int64_t> &rope_head_dim_list,
+    const std::vector<int64_t> &rope_rotary_dim_list
+) {
+    const int n = (int)A_list.size();
+    TORCH_CHECK(n > 0 && n <= mxfp4_batched_gemm::MAX_BATCHES,
+                "num_batches must be 1..", mxfp4_batched_gemm::MAX_BATCHES);
+    TORCH_CHECK(n == (int)A_sc_list.size());
+    TORCH_CHECK(n == (int)B_list.size());
+    TORCH_CHECK(n == (int)B_sc_list.size());
+    TORCH_CHECK(n == (int)D_out_list.size());
+    TORCH_CHECK(n == (int)rope_cos_list.size());
+    TORCH_CHECK(n == (int)rope_sin_list.size());
+    TORCH_CHECK(n == (int)rope_seq_len_list.size());
+    TORCH_CHECK(n == (int)rope_head_dim_list.size());
+    TORCH_CHECK(n == (int)rope_rotary_dim_list.size());
+
+    const int64_t M = D_out_list[0].size(0);
+    const int64_t N_out = D_out_list[0].size(1);
+
+    auto build_and_launch = [&]<typename C>() {
+        using G = mxfp4_batched_gemm::globals<C>;
+        G g_host {};
+        g_host.num_batches = n;
+        g_host.num_row_blocks = (int)(M / C::Mb);
+        g_host.num_col_blocks = (int)(N_out / C::Nb);
+        g_host.num_red_blocks = (int)(2 * A_list[0].size(1) / C::Kb);
+
+        for (int i = 0; i < n; ++i) {
+            auto a_gl = kittens::py::tensor_to_gl<typename G::A_fp4x2_gl>(A_list[i]);
+            auto a_sc_gl = kittens::py::tensor_to_gl<typename G::A_sc_gl>(A_sc_list[i]);
+            auto b_gl = kittens::py::tensor_to_gl<typename G::B_fp4x2_gl>(B_list[i]);
+            auto b_sc_gl = kittens::py::tensor_to_gl<typename G::B_sc_gl>(B_sc_list[i]);
+            memcpy(&g_host.A_tma[i], &a_gl.tma_descs.tma_desc, sizeof(CUtensorMap));
+            memcpy(&g_host.A_sc_tma[i], &a_sc_gl.tma_descs.tma_desc, sizeof(CUtensorMap));
+            memcpy(&g_host.B_tma[i], &b_gl.tma_descs.tma_desc, sizeof(CUtensorMap));
+            memcpy(&g_host.B_sc_tma[i], &b_sc_gl.tma_descs.tma_desc, sizeof(CUtensorMap));
+
+            auto d_gl = kittens::py::tensor_to_gl<typename G::D_gl>(D_out_list[i]);
+            memcpy(&g_host.D_tma[i], &d_gl.tma_descs.tma_desc, sizeof(CUtensorMap));
+
+            if (!rope_tensor_disabled(rope_cos_list[i]) && !rope_tensor_disabled(rope_sin_list[i])) {
+                check_rope_epilogue_args(
+                    D_out_list[i],
+                    rope_cos_list[i],
+                    rope_sin_list[i],
+                    rope_seq_len_list[i],
+                    rope_head_dim_list[i],
+                    rope_rotary_dim_list[i]);
+                g_host.rope[i].cos = rope_cos_list[i].data_ptr<float>();
+                g_host.rope[i].sin = rope_sin_list[i].data_ptr<float>();
+                g_host.rope[i].seq_len = static_cast<int>(rope_seq_len_list[i]);
+                g_host.rope[i].head_dim = static_cast<int>(rope_head_dim_list[i]);
+                g_host.rope[i].rotary_dim = static_cast<int>(rope_rotary_dim_list[i]);
+            }
+        }
+        kittens::py::launch_kernel<C, G, mxfp4_batched_gemm::kernel<C>>(g_host);
+    };
+
+    if (N_out <= 4096) {
+        build_and_launch.template operator()<mxfp4_gemm::config<256, 5, 8, 4, 2, false>>();
+    } else {
+        build_and_launch.template operator()<mxfp4_gemm::config<256, 4, 16, 4, 2, false>>();
+    }
+}
+
+void mxfp4_batched_gemm_rope_live64_entrypoint(
+    const std::vector<at::Tensor> &A_list,
+    const std::vector<at::Tensor> &A_sc_list,
+    const std::vector<at::Tensor> &B_list,
+    const std::vector<at::Tensor> &B_sc_list,
+    std::vector<at::Tensor> &D_out_list,
+    const std::vector<at::Tensor> &rope_cs_list,
+    const std::vector<int64_t> &rope_seq_len_list
+) {
+    const int n = (int)A_list.size();
+    TORCH_CHECK(n > 0 && n <= mxfp4_batched_gemm::MAX_BATCHES,
+                "num_batches must be 1..", mxfp4_batched_gemm::MAX_BATCHES);
+    TORCH_CHECK(n == (int)A_sc_list.size());
+    TORCH_CHECK(n == (int)B_list.size());
+    TORCH_CHECK(n == (int)B_sc_list.size());
+    TORCH_CHECK(n == (int)D_out_list.size());
+    TORCH_CHECK(n == (int)rope_cs_list.size());
+    TORCH_CHECK(n == (int)rope_seq_len_list.size());
+
+    const int64_t M = D_out_list[0].size(0);
+    const int64_t N_out = D_out_list[0].size(1);
+
+    auto build_and_launch = [&]<typename C>() {
+        using G = mxfp4_batched_gemm::globals<C>;
+        G g_host {};
+        g_host.num_batches = n;
+        g_host.num_row_blocks = (int)(M / C::Mb);
+        g_host.num_col_blocks = (int)(N_out / C::Nb);
+        g_host.num_red_blocks = (int)(2 * A_list[0].size(1) / C::Kb);
+
+        for (int i = 0; i < n; ++i) {
+            auto a_gl = kittens::py::tensor_to_gl<typename G::A_fp4x2_gl>(A_list[i]);
+            auto a_sc_gl = kittens::py::tensor_to_gl<typename G::A_sc_gl>(A_sc_list[i]);
+            auto b_gl = kittens::py::tensor_to_gl<typename G::B_fp4x2_gl>(B_list[i]);
+            auto b_sc_gl = kittens::py::tensor_to_gl<typename G::B_sc_gl>(B_sc_list[i]);
+            memcpy(&g_host.A_tma[i], &a_gl.tma_descs.tma_desc, sizeof(CUtensorMap));
+            memcpy(&g_host.A_sc_tma[i], &a_sc_gl.tma_descs.tma_desc, sizeof(CUtensorMap));
+            memcpy(&g_host.B_tma[i], &b_gl.tma_descs.tma_desc, sizeof(CUtensorMap));
+            memcpy(&g_host.B_sc_tma[i], &b_sc_gl.tma_descs.tma_desc, sizeof(CUtensorMap));
+
+            auto d_gl = kittens::py::tensor_to_gl<typename G::D_gl>(D_out_list[i]);
+            memcpy(&g_host.D_tma[i], &d_gl.tma_descs.tma_desc, sizeof(CUtensorMap));
+
+            if (!rope_tensor_disabled(rope_cs_list[i])) {
+                check_rope_live64_args(D_out_list[i], rope_cs_list[i], rope_seq_len_list[i]);
+                g_host.rope_live64[i].cs = reinterpret_cast<const float2*>(rope_cs_list[i].data_ptr<float>());
+                g_host.rope_live64[i].seq_len = static_cast<int>(rope_seq_len_list[i]);
+                g_host.rope_live64[i].seq_mask = static_cast<int>(rope_seq_len_list[i] - 1);
+            }
+        }
+        kittens::py::launch_kernel<C, G, mxfp4_batched_gemm::kernel<C>>(g_host);
+    };
+
+    if (N_out <= 4096) {
+        build_and_launch.template operator()<mxfp4_gemm::config<256, 5, 8, 4, 2, false>>();
+    } else {
+        build_and_launch.template operator()<mxfp4_gemm::config<256, 4, 16, 4, 2, false>>();
+    }
+}
+
 void mxfp4_split2_dgrad_strided_onepass_gemm_entrypoint(
     const at::Tensor& A_full,
     const std::vector<at::Tensor>& A_sc_list,
@@ -569,6 +1070,32 @@ void mxfp4_split2_dgrad_strided_onepass_gemm_entrypoint(
         static_cast<int>(config_idx));
 }
 
+void mxfp4_split3_dgrad_strided_onepass_gemm_entrypoint(
+    const at::Tensor& A_full,
+    const std::vector<at::Tensor>& A_sc_list,
+    const std::vector<int64_t>& A_col_offsets,
+    const std::vector<int64_t>& A_col_widths,
+    const std::vector<at::Tensor>& B_list,
+    const std::vector<at::Tensor>& B_sc_list,
+    at::Tensor& D_out,
+    int64_t config_idx
+) {
+    check_mxfp4_split3_dgrad_inputs(
+        A_full, A_sc_list, A_col_offsets, A_col_widths, B_list, B_sc_list);
+    TORCH_CHECK(B_list.size() == 3, "split3 one-pass dgrad expects exactly 3 B tensors");
+    check_output_matrix(D_out, "D_out", A_full.size(0), B_list[0].size(0));
+    launch_mxfp4_split3_dgrad_gemm_strided_onepass(
+        A_full,
+        A_sc_list,
+        A_col_offsets,
+        A_col_widths,
+        B_list,
+        B_sc_list,
+        D_out,
+        static_cast<int>(config_idx));
+}
+
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("mxfp4_gemm", &mxfp4_gemm_entrypoint);
     m.def("mxfp4_gemm_config", &mxfp4_gemm_config_entrypoint,
@@ -576,15 +1103,76 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           pybind11::arg("A"), pybind11::arg("A_sc"),
           pybind11::arg("B"), pybind11::arg("B_sc"),
           pybind11::arg("D"), pybind11::arg("config_id"));
+    m.def("mxfp4_gemm_rope", &mxfp4_gemm_rope_entrypoint,
+          "GEMM with a RoPE epilogue",
+          pybind11::arg("A"), pybind11::arg("A_sc"),
+          pybind11::arg("B"), pybind11::arg("B_sc"),
+          pybind11::arg("D"),
+          pybind11::arg("rope_cos"), pybind11::arg("rope_sin"),
+          pybind11::arg("rope_seq_len"),
+          pybind11::arg("rope_head_dim"),
+          pybind11::arg("rope_rotary_dim"));
+    m.def("mxfp4_gemm_rope_live64", &mxfp4_gemm_rope_live64_entrypoint,
+          "GEMM with an exact-shape live64 RoPE epilogue",
+          pybind11::arg("A"), pybind11::arg("A_sc"),
+          pybind11::arg("B"), pybind11::arg("B_sc"),
+          pybind11::arg("D"),
+          pybind11::arg("rope_cs"),
+          pybind11::arg("rope_seq_len"));
+    m.def("mxfp4_gemm_rope_live64_config", &mxfp4_gemm_rope_live64_config_entrypoint,
+          "GEMM with selectable tile config and an exact-shape live64 RoPE epilogue",
+          pybind11::arg("A"), pybind11::arg("A_sc"),
+          pybind11::arg("B"), pybind11::arg("B_sc"),
+          pybind11::arg("D"),
+          pybind11::arg("rope_cs"),
+          pybind11::arg("rope_seq_len"),
+          pybind11::arg("config_id"));
+    m.def("mxfp4_gemm_rope_config", &mxfp4_gemm_rope_config_entrypoint,
+          "GEMM with selectable tile config and a RoPE epilogue",
+          pybind11::arg("A"), pybind11::arg("A_sc"),
+          pybind11::arg("B"), pybind11::arg("B_sc"),
+          pybind11::arg("D"),
+          pybind11::arg("rope_cos"), pybind11::arg("rope_sin"),
+          pybind11::arg("rope_seq_len"),
+          pybind11::arg("rope_head_dim"),
+          pybind11::arg("rope_rotary_dim"),
+          pybind11::arg("config_id"));
 
     m.def("mxfp4_batched_gemm", &mxfp4_batched_gemm_entrypoint,
           "True Batched GEMM: D_i = A_i × B_i^T, independently per batch",
           pybind11::arg("A_list"), pybind11::arg("A_sc_list"),
           pybind11::arg("B_list"), pybind11::arg("B_sc_list"),
           pybind11::arg("D_out_list"));
+    m.def("mxfp4_batched_gemm_rope", &mxfp4_batched_gemm_rope_entrypoint,
+          "True Batched GEMM with an optional per-batch RoPE epilogue",
+          pybind11::arg("A_list"), pybind11::arg("A_sc_list"),
+          pybind11::arg("B_list"), pybind11::arg("B_sc_list"),
+          pybind11::arg("D_out_list"),
+          pybind11::arg("rope_cos_list"), pybind11::arg("rope_sin_list"),
+          pybind11::arg("rope_seq_len_list"),
+          pybind11::arg("rope_head_dim_list"),
+          pybind11::arg("rope_rotary_dim_list"));
+    m.def("mxfp4_batched_gemm_rope_live64", &mxfp4_batched_gemm_rope_live64_entrypoint,
+          "True Batched GEMM with an exact-shape live64 per-batch RoPE epilogue",
+          pybind11::arg("A_list"), pybind11::arg("A_sc_list"),
+          pybind11::arg("B_list"), pybind11::arg("B_sc_list"),
+          pybind11::arg("D_out_list"),
+          pybind11::arg("rope_cs_list"),
+          pybind11::arg("rope_seq_len_list"));
     m.def("mxfp4_split2_dgrad_strided_onepass_gemm",
           &mxfp4_split2_dgrad_strided_onepass_gemm_entrypoint,
           "MXFP4 split2 one-pass dgrad GEMM with strided row slices",
+          pybind11::arg("A_full"),
+          pybind11::arg("A_sc_list"),
+          pybind11::arg("A_col_offsets"),
+          pybind11::arg("A_col_widths"),
+          pybind11::arg("B_list"),
+          pybind11::arg("B_sc_list"),
+          pybind11::arg("D_out"),
+          pybind11::arg("config_idx") = -1);
+    m.def("mxfp4_split3_dgrad_strided_onepass_gemm",
+          &mxfp4_split3_dgrad_strided_onepass_gemm_entrypoint,
+          "MXFP4 split3 one-pass dgrad GEMM with strided row slices",
           pybind11::arg("A_full"),
           pybind11::arg("A_sc_list"),
           pybind11::arg("A_col_offsets"),
