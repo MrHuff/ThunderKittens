@@ -12,9 +12,10 @@ using namespace kittens;
 
 namespace mxfp4_gemm {
 
-template <int _Nb, int _LOAD_PIPE_DEPTH, int _EPI_PIPE_DEPTH, int _SUPERGROUP_SIZE, int _NUM_D_TILES, bool _OVERLAP_EPI>
+template <int _Nb, int _LOAD_PIPE_DEPTH, int _EPI_PIPE_DEPTH, int _SUPERGROUP_SIZE, int _NUM_D_TILES, bool _OVERLAP_EPI, int _Kb = 256>
 struct config {
     static_assert(_Nb == 128 || _Nb == 256, "Nb must be 128 or 256");
+    static_assert(_Kb == 128 || _Kb == 256, "Kb must be 128 or 256");
     static_assert(_LOAD_PIPE_DEPTH > 0 && _LOAD_PIPE_DEPTH <= 5, "LOAD_PIPE_DEPTH must be greater than 0 and at most 5");
     static_assert(_EPI_PIPE_DEPTH > 0, "EPI_PIPE_DEPTH must be greater than 0");
     static_assert(_SUPERGROUP_SIZE > 0, "SUPERGROUP_SIZE must be greater than 0");
@@ -37,9 +38,9 @@ struct config {
     static constexpr int SUPERGROUP_SIZE = _SUPERGROUP_SIZE;
     static constexpr int Mb = 256;
     static constexpr int Nb = _Nb;
-    static constexpr int Kb = 256;  // Doubled from 128 to match NVFP4 architecture
+    static constexpr int Kb = _Kb;
     static constexpr int B_SC_SIZE = Nb/128;
-    static constexpr int MMA_PER_TILE = Kb/128;  // 2: number of 128-wide sub-MMAs per Kb tile
+    static constexpr int MMA_PER_TILE = Kb/128;
 
     static constexpr int NUM_D_TILES = _NUM_D_TILES;
 };
@@ -68,6 +69,10 @@ struct globals {
     D_gl       D;       // M x N
     mxfp4_rope_epilogue::rope_desc rope;
     mxfp4_rope_epilogue::rope_live64_desc rope_live64;
+    const uint8_t* tilemask_ptr;   // optional [mask_rows, mask_cols] activity mask
+    int            tilemask_rows;
+    int            tilemask_cols;
+    bool           tilemask_transposed;
 
     struct input_tiles_t {
         A_fp4x2_tile A;
@@ -95,6 +100,40 @@ struct globals {
         return _dynamic_shared_memory;
     }
 };
+
+template <typename C>
+__device__ inline bool reduction_iter_active(
+    const globals<C> &g,
+    int row_tile_128,
+    int red_iter
+) {
+    if (g.tilemask_ptr == nullptr) {
+        return true;
+    }
+
+    constexpr int RED_TILES_PER_ITER = C::Kb / 128;
+    const int red_tile_base = red_iter * RED_TILES_PER_ITER;
+
+    auto tile_active = [&](int red_tile_128) {
+        if (g.tilemask_transposed) {
+            if (red_tile_128 >= g.tilemask_rows || row_tile_128 >= g.tilemask_cols) {
+                return false;
+            }
+            return g.tilemask_ptr[red_tile_128 * g.tilemask_cols + row_tile_128] != 0;
+        }
+        if (row_tile_128 >= g.tilemask_rows || red_tile_128 >= g.tilemask_cols) {
+            return false;
+        }
+        return g.tilemask_ptr[row_tile_128 * g.tilemask_cols + red_tile_128] != 0;
+    };
+
+    bool active = false;
+    #pragma unroll
+    for (int red_tile_offset = 0; red_tile_offset < RED_TILES_PER_ITER; ++red_tile_offset) {
+        active = active || tile_active(red_tile_base + red_tile_offset);
+    }
+    return active;
+}
 
 template <typename C>
 __device__ inline void kernel(const globals<C> &g) {
@@ -165,8 +204,13 @@ __device__ inline void kernel(const globals<C> &g) {
                 int row_within_supergroup = idx_within_supergroup % rows_in_supergroup;
                 int row_block_idx = supergroup_idx * C::SUPERGROUP_SIZE + row_within_supergroup;
                 int col_block_idx = idx_within_supergroup / rows_in_supergroup;
-
+                const int row_tile_128_0 = row_block_idx * 2 + 0;
+                const int row_tile_128_1 = row_block_idx * 2 + 1;
                 for (int i = 0; i < num_iters_per_block; ++i) {
+                    const bool block_iter_active =
+                        reduction_iter_active(g, row_tile_128_0, i) ||
+                        reduction_iter_active(g, row_tile_128_1, i);
+                    if (!block_iter_active) continue;
                     wait(inputs_finished[stage], get_phasebit<1>(phasebits, stage));
                     tma::cluster::load_async(input_tiles[stage].A, g.A, {row_block_idx*2 + cta_id, i}, tiles_arrived[stage], (uint16_t)(1<<cta_id), 0);
                     tma::cluster::load_async(input_tiles[stage].B, g.B, {col_block_idx*2 + cta_id, i}, tiles_arrived[stage], (uint16_t)(1<<cta_id), 0);
@@ -186,8 +230,14 @@ __device__ inline void kernel(const globals<C> &g) {
                 int row_within_supergroup = idx_within_supergroup % rows_in_supergroup;
                 int row_block_idx = supergroup_idx * C::SUPERGROUP_SIZE + row_within_supergroup;
                 int col_block_idx = idx_within_supergroup / rows_in_supergroup;
+                const int row_tile_128_0 = row_block_idx * 2 + 0;
+                const int row_tile_128_1 = row_block_idx * 2 + 1;
 
                 for (int i = 0; i < num_iters_per_block; ++i) {
+                    const bool block_iter_active =
+                        reduction_iter_active(g, row_tile_128_0, i) ||
+                        reduction_iter_active(g, row_tile_128_1, i);
+                    if (!block_iter_active) continue;
                     wait(inputs_finished[stage], get_phasebit<1>(phasebits, stage));
                     // Load MMA_PER_TILE A scale tiles (each covers 128 K elements)
                     #pragma unroll
@@ -228,9 +278,22 @@ __device__ inline void kernel(const globals<C> &g) {
             auto A_sc_tm = tm_allocator.template allocate<full_tt_fp8e8m0<16*C::MMA_PER_TILE*C::LOAD_PIPE_DEPTH>>(256);
             auto B_sc_tm = tm_allocator.template allocate<full_tt_fp8e8m0<32*C::MMA_PER_TILE*C::LOAD_PIPE_DEPTH>>(256+4*C::MMA_PER_TILE*C::LOAD_PIPE_DEPTH);
             for (int block_idx = cluster_id; block_idx < num_blocks; block_idx += gridDim.x / C::CLUSTER_SIZE) {
+                int supergroup_idx = block_idx / num_blocks_per_supergroup;
+                int idx_within_supergroup = block_idx % num_blocks_per_supergroup;
+                int rows_in_supergroup = min(C::SUPERGROUP_SIZE, num_row_blocks - supergroup_idx * C::SUPERGROUP_SIZE);
+                int row_within_supergroup = idx_within_supergroup % rows_in_supergroup;
+                int row_block_idx = supergroup_idx * C::SUPERGROUP_SIZE + row_within_supergroup;
+                const int row_tile_128 = row_block_idx * 2 + cta_id;
+                const int row_tile_128_0 = row_block_idx * 2 + 0;
+                const int row_tile_128_1 = row_block_idx * 2 + 1;
                 wait(outputs_finished, get_phasebit<1>(phasebits, 0));
                 tensor_after_thread_sync();
+                bool issued_mma = false;
                 for (int i = 0; i < num_iters_per_block; i++) {
+                    const bool block_iter_active =
+                        reduction_iter_active(g, row_tile_128_0, i) ||
+                        reduction_iter_active(g, row_tile_128_1, i);
+                    if (!block_iter_active) continue;
                     tma::expect_bytes(scales_arrived[stage], 2*sizeof(G::input_scales_t));
                     wait(scales_arrived[stage], get_phasebit<0>(phasebits, stage));
                     // Load MMA_PER_TILE scale subtiles into tensor memory
@@ -247,14 +310,18 @@ __device__ inline void kernel(const globals<C> &g) {
                     }
                     tma::expect_bytes(tiles_arrived[stage], 2*sizeof(G::input_tiles_t));
                     wait(tiles_arrived[stage], get_phasebit<0>(phasebits, stage));
-                    if (i == 0) mm2_ABt(out_tm, input_tiles[stage].A, input_tiles[stage].B,
-                                        A_sc_tm.template subtile<full_tt_fp8e8m0<C::MMA_PER_TILE*16>>(stage * C::MMA_PER_TILE * 16),
-                                        B_sc_tm.template subtile<full_tt_fp8e8m0<C::MMA_PER_TILE*32>>(stage * C::MMA_PER_TILE * 32),
-                                        inputs_finished[stage]);
-                    else       mma2_ABt(out_tm, input_tiles[stage].A, input_tiles[stage].B,
-                                        A_sc_tm.template subtile<full_tt_fp8e8m0<C::MMA_PER_TILE*16>>(stage * C::MMA_PER_TILE * 16),
-                                        B_sc_tm.template subtile<full_tt_fp8e8m0<C::MMA_PER_TILE*32>>(stage * C::MMA_PER_TILE * 32),
-                                        inputs_finished[stage]);
+                    if (!issued_mma) {
+                        mm2_ABt(out_tm, input_tiles[stage].A, input_tiles[stage].B,
+                                            A_sc_tm.template subtile<full_tt_fp8e8m0<C::MMA_PER_TILE*16>>(stage * C::MMA_PER_TILE * 16),
+                                            B_sc_tm.template subtile<full_tt_fp8e8m0<C::MMA_PER_TILE*32>>(stage * C::MMA_PER_TILE * 32),
+                                            inputs_finished[stage]);
+                        issued_mma = true;
+                    } else {
+                        mma2_ABt(out_tm, input_tiles[stage].A, input_tiles[stage].B,
+                                            A_sc_tm.template subtile<full_tt_fp8e8m0<C::MMA_PER_TILE*16>>(stage * C::MMA_PER_TILE * 16),
+                                            B_sc_tm.template subtile<full_tt_fp8e8m0<C::MMA_PER_TILE*32>>(stage * C::MMA_PER_TILE * 32),
+                                            inputs_finished[stage]);
+                    }
                     update_phasebit<0>(phasebits, stage);
                     stage = (stage + 1) % C::LOAD_PIPE_DEPTH;
                 }
@@ -279,6 +346,12 @@ __device__ inline void kernel(const globals<C> &g) {
             int row_within_supergroup = idx_within_supergroup % rows_in_supergroup;
             int row_block_idx = supergroup_idx * C::SUPERGROUP_SIZE + row_within_supergroup;
             int col_block_idx = idx_within_supergroup / rows_in_supergroup;
+            const int row_tile_128 = row_block_idx * 2 + cta_id;
+            bool block_has_active = false;
+            #pragma unroll
+            for (int i = 0; i < num_iters_per_block; ++i) {
+                block_has_active = block_has_active || reduction_iter_active(g, row_tile_128, i);
+            }
 
             // Wait for the last matmul to complete
             wait(outputs_arrived, get_phasebit<0>(phasebits, 0));
@@ -286,7 +359,35 @@ __device__ inline void kernel(const globals<C> &g) {
             // Load the output from tensor memory into registers and store to HBM
             // Apply MXFP4 alpha scaling (1/36) in-register before store.
             constexpr float MXFP4_ALPHA = 1.0f / 36.0f;
-            if constexpr (C::OVERLAP_EPI) {
+            if (!block_has_active) {
+                if constexpr (C::OVERLAP_EPI) {
+                    #pragma unroll
+                    for (int i = 0; i < C::EPI_PIPE_DEPTH; i++) {
+                        rt_bf<C::Mb / 8, C::Nb / C::EPI_PIPE_DEPTH> D_reg {};
+                        if (i == C::EPI_PIPE_DEPTH - 1) {
+                            warpgroup::sync(1);
+                            warpgroup::tma::cluster::arrive(outputs_finished, 0, 1);
+                        }
+                        warpgroup::tma::store_async_read_wait<C::NUM_D_TILES-1>();
+                        warpgroup::sync(1);
+                        warpgroup::store(output_tiles.D[i%C::NUM_D_TILES], D_reg);
+                        warpgroup::sync(1);
+                        warpgroup::tma::store_async<dim::ROW, cache_policy::EVICT_FIRST>(g.D, output_tiles.D[i%C::NUM_D_TILES], {row_block_idx * 2 + cta_id, col_block_idx * C::EPI_PIPE_DEPTH + i});
+                    }
+                } else {
+                    rt_bf<C::Mb / 8, C::Nb / C::EPI_PIPE_DEPTH> D_reg[C::EPI_PIPE_DEPTH] {};
+                    warpgroup::sync(1);
+                    warpgroup::tma::cluster::arrive(outputs_finished, 0, 1);
+                    #pragma unroll
+                    for (int i = 0; i < C::EPI_PIPE_DEPTH; i++) {
+                        warpgroup::tma::store_async_read_wait<C::NUM_D_TILES-1>();
+                        warpgroup::sync(1);
+                        warpgroup::store(output_tiles.D[i%C::NUM_D_TILES], D_reg[i]);
+                        warpgroup::sync(1);
+                        warpgroup::tma::store_async<dim::ROW, cache_policy::EVICT_FIRST>(g.D, output_tiles.D[i%C::NUM_D_TILES], {row_block_idx * 2 + cta_id, col_block_idx * C::EPI_PIPE_DEPTH + i});
+                    }
+                }
+            } else if constexpr (C::OVERLAP_EPI) {
                 #pragma unroll
                 for (int i = 0; i < C::EPI_PIPE_DEPTH; i++) {
                     rt_fl<C::Mb / 8, C::Nb / C::EPI_PIPE_DEPTH> D_reg_fl;
