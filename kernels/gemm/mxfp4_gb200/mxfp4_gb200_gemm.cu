@@ -186,7 +186,6 @@ void check_output_matrix(const at::Tensor& t, const char* name, int64_t rows, in
     TORCH_CHECK(t.size(0) == rows && t.size(1) == cols, name, " shape mismatch");
 }
 
-<<<<<<< HEAD
 void check_tilemask(
     const at::Tensor& t,
     const char* name,
