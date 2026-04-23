@@ -1011,6 +1011,64 @@ void mxfp4_batched_gemm_entrypoint(
     }
 }
 
+void mxfp4_batched_gemm_config_entrypoint(
+    const std::vector<at::Tensor> &A_list,
+    const std::vector<at::Tensor> &A_sc_list,
+    const std::vector<at::Tensor> &B_list,
+    const std::vector<at::Tensor> &B_sc_list,
+    std::vector<at::Tensor> &D_out_list,
+    int config_id
+) {
+    const int n = (int)A_list.size();
+    TORCH_CHECK(n > 0 && n <= mxfp4_batched_gemm::MAX_BATCHES,
+                "num_batches must be 1..", mxfp4_batched_gemm::MAX_BATCHES);
+    TORCH_CHECK(n == (int)A_sc_list.size());
+    TORCH_CHECK(n == (int)B_list.size());
+    TORCH_CHECK(n == (int)B_sc_list.size());
+    TORCH_CHECK(n == (int)D_out_list.size());
+
+    const int64_t M = D_out_list[0].size(0);
+    const int64_t N_out = D_out_list[0].size(1);
+
+    auto build_and_launch = [&]<typename C>() {
+        using G = mxfp4_batched_gemm::globals<C>;
+        G g_host {};
+        g_host.num_batches = n;
+        g_host.num_row_blocks = (int)(M / C::Mb);
+        g_host.num_col_blocks = (int)(N_out / C::Nb);
+        g_host.num_red_blocks = (int)(2 * A_list[0].size(1) / C::Kb);
+
+        for (int i = 0; i < n; ++i) {
+            auto a_gl = kittens::py::tensor_to_gl<typename G::A_fp4x2_gl>(A_list[i]);
+            auto a_sc_gl = kittens::py::tensor_to_gl<typename G::A_sc_gl>(A_sc_list[i]);
+            auto b_gl = kittens::py::tensor_to_gl<typename G::B_fp4x2_gl>(B_list[i]);
+            auto b_sc_gl = kittens::py::tensor_to_gl<typename G::B_sc_gl>(B_sc_list[i]);
+            memcpy(&g_host.A_tma[i], &a_gl.tma_descs.tma_desc, sizeof(CUtensorMap));
+            memcpy(&g_host.A_sc_tma[i], &a_sc_gl.tma_descs.tma_desc, sizeof(CUtensorMap));
+            memcpy(&g_host.B_tma[i], &b_gl.tma_descs.tma_desc, sizeof(CUtensorMap));
+            memcpy(&g_host.B_sc_tma[i], &b_sc_gl.tma_descs.tma_desc, sizeof(CUtensorMap));
+
+            auto d_gl = kittens::py::tensor_to_gl<typename G::D_gl>(D_out_list[i]);
+            memcpy(&g_host.D_tma[i], &d_gl.tma_descs.tma_desc, sizeof(CUtensorMap));
+        }
+        kittens::py::launch_kernel<C, G, mxfp4_batched_gemm::kernel<C>>(g_host);
+    };
+
+    switch (config_id) {
+    case 0:  build_and_launch.template operator()<mxfp4_gemm::config<256, 5,  8,  4, 2, false>>(); break;
+    case 1:  build_and_launch.template operator()<mxfp4_gemm::config<256, 4, 16,  4, 2, false>>(); break;
+    case 2:  build_and_launch.template operator()<mxfp4_gemm::config<256, 5,  8,  8, 2, true >>(); break;
+    case 3:  build_and_launch.template operator()<mxfp4_gemm::config<256, 5,  8, 12, 4, true >>(); break;
+    case 4:  build_and_launch.template operator()<mxfp4_gemm::config<256, 5,  8, 12, 2, false>>(); break;
+    case 5:  build_and_launch.template operator()<mxfp4_gemm::config<256, 5, 16,  4, 2, true >>(); break;
+    case 6:  build_and_launch.template operator()<mxfp4_gemm::config<256, 4,  8, 12, 2, false>>(); break;
+    case 7:  build_and_launch.template operator()<mxfp4_gemm::config<256, 5,  8,  4, 4, false>>(); break;
+    case 8:  build_and_launch.template operator()<mxfp4_gemm::config<256, 4, 16, 12, 2, false>>(); break;
+    case 9:  build_and_launch.template operator()<mxfp4_gemm::config<256, 5,  8,  4, 2, true >>(); break;
+    default: TORCH_CHECK(false, "Invalid config_id: ", config_id, " (valid: 0-9)");
+    }
+}
+
 void mxfp4_batched_gemm_rope_entrypoint(
     const std::vector<at::Tensor> &A_list,
     const std::vector<at::Tensor> &A_sc_list,
@@ -1145,6 +1203,75 @@ void mxfp4_batched_gemm_rope_live64_entrypoint(
     }
 }
 
+void mxfp4_batched_gemm_rope_live64_config_entrypoint(
+    const std::vector<at::Tensor> &A_list,
+    const std::vector<at::Tensor> &A_sc_list,
+    const std::vector<at::Tensor> &B_list,
+    const std::vector<at::Tensor> &B_sc_list,
+    std::vector<at::Tensor> &D_out_list,
+    const std::vector<at::Tensor> &rope_cs_list,
+    const std::vector<int64_t> &rope_seq_len_list,
+    int config_id
+) {
+    const int n = (int)A_list.size();
+    TORCH_CHECK(n > 0 && n <= mxfp4_batched_gemm::MAX_BATCHES,
+                "num_batches must be 1..", mxfp4_batched_gemm::MAX_BATCHES);
+    TORCH_CHECK(n == (int)A_sc_list.size());
+    TORCH_CHECK(n == (int)B_list.size());
+    TORCH_CHECK(n == (int)B_sc_list.size());
+    TORCH_CHECK(n == (int)D_out_list.size());
+    TORCH_CHECK(n == (int)rope_cs_list.size());
+    TORCH_CHECK(n == (int)rope_seq_len_list.size());
+
+    const int64_t M = D_out_list[0].size(0);
+    const int64_t N_out = D_out_list[0].size(1);
+
+    auto build_and_launch = [&]<typename C>() {
+        using G = mxfp4_batched_gemm::globals<C>;
+        G g_host {};
+        g_host.num_batches = n;
+        g_host.num_row_blocks = (int)(M / C::Mb);
+        g_host.num_col_blocks = (int)(N_out / C::Nb);
+        g_host.num_red_blocks = (int)(2 * A_list[0].size(1) / C::Kb);
+
+        for (int i = 0; i < n; ++i) {
+            auto a_gl = kittens::py::tensor_to_gl<typename G::A_fp4x2_gl>(A_list[i]);
+            auto a_sc_gl = kittens::py::tensor_to_gl<typename G::A_sc_gl>(A_sc_list[i]);
+            auto b_gl = kittens::py::tensor_to_gl<typename G::B_fp4x2_gl>(B_list[i]);
+            auto b_sc_gl = kittens::py::tensor_to_gl<typename G::B_sc_gl>(B_sc_list[i]);
+            memcpy(&g_host.A_tma[i], &a_gl.tma_descs.tma_desc, sizeof(CUtensorMap));
+            memcpy(&g_host.A_sc_tma[i], &a_sc_gl.tma_descs.tma_desc, sizeof(CUtensorMap));
+            memcpy(&g_host.B_tma[i], &b_gl.tma_descs.tma_desc, sizeof(CUtensorMap));
+            memcpy(&g_host.B_sc_tma[i], &b_sc_gl.tma_descs.tma_desc, sizeof(CUtensorMap));
+
+            auto d_gl = kittens::py::tensor_to_gl<typename G::D_gl>(D_out_list[i]);
+            memcpy(&g_host.D_tma[i], &d_gl.tma_descs.tma_desc, sizeof(CUtensorMap));
+
+            if (!rope_tensor_disabled(rope_cs_list[i])) {
+                check_rope_live64_args(D_out_list[i], rope_cs_list[i], rope_seq_len_list[i]);
+                g_host.rope_live64[i].cs = reinterpret_cast<const float2*>(rope_cs_list[i].data_ptr<float>());
+                g_host.rope_live64[i].seq_len = static_cast<int>(rope_seq_len_list[i]);
+                g_host.rope_live64[i].seq_mask = static_cast<int>(rope_seq_len_list[i] - 1);
+            }
+        }
+        kittens::py::launch_kernel<C, G, mxfp4_batched_gemm::kernel<C>>(g_host);
+    };
+
+    switch (config_id) {
+    case 0:  build_and_launch.template operator()<mxfp4_gemm::config<256, 5,  8,  4, 2, false>>(); break;
+    case 1:  build_and_launch.template operator()<mxfp4_gemm::config<256, 4, 16,  4, 2, false>>(); break;
+    case 2:  build_and_launch.template operator()<mxfp4_gemm::config<256, 5,  8,  8, 2, true >>(); break;
+    case 3:  build_and_launch.template operator()<mxfp4_gemm::config<256, 5,  8, 12, 4, true >>(); break;
+    case 4:  build_and_launch.template operator()<mxfp4_gemm::config<256, 5,  8, 12, 2, false>>(); break;
+    case 5:  build_and_launch.template operator()<mxfp4_gemm::config<256, 5, 16,  4, 2, true >>(); break;
+    case 6:  build_and_launch.template operator()<mxfp4_gemm::config<256, 4,  8, 12, 2, false>>(); break;
+    case 7:  build_and_launch.template operator()<mxfp4_gemm::config<256, 5,  8,  4, 4, false>>(); break;
+    case 8:  build_and_launch.template operator()<mxfp4_gemm::config<256, 4, 16, 12, 2, false>>(); break;
+    case 9:  build_and_launch.template operator()<mxfp4_gemm::config<256, 5,  8,  4, 2, true >>(); break;
+    default: TORCH_CHECK(false, "Invalid config_id: ", config_id, " (valid: 0-9)");
+    }
+}
+
 void mxfp4_split2_dgrad_strided_onepass_gemm_entrypoint(
     const at::Tensor& A_full,
     const std::vector<at::Tensor>& A_sc_list,
@@ -1254,6 +1381,11 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           pybind11::arg("A_list"), pybind11::arg("A_sc_list"),
           pybind11::arg("B_list"), pybind11::arg("B_sc_list"),
           pybind11::arg("D_out_list"));
+    m.def("mxfp4_batched_gemm_config", &mxfp4_batched_gemm_config_entrypoint,
+          "True Batched GEMM with selectable tile config",
+          pybind11::arg("A_list"), pybind11::arg("A_sc_list"),
+          pybind11::arg("B_list"), pybind11::arg("B_sc_list"),
+          pybind11::arg("D_out_list"), pybind11::arg("config_id"));
     m.def("mxfp4_batched_gemm_rope", &mxfp4_batched_gemm_rope_entrypoint,
           "True Batched GEMM with an optional per-batch RoPE epilogue",
           pybind11::arg("A_list"), pybind11::arg("A_sc_list"),
@@ -1270,6 +1402,14 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           pybind11::arg("D_out_list"),
           pybind11::arg("rope_cs_list"),
           pybind11::arg("rope_seq_len_list"));
+    m.def("mxfp4_batched_gemm_rope_live64_config", &mxfp4_batched_gemm_rope_live64_config_entrypoint,
+          "True Batched GEMM with selectable tile config and an exact-shape live64 per-batch RoPE epilogue",
+          pybind11::arg("A_list"), pybind11::arg("A_sc_list"),
+          pybind11::arg("B_list"), pybind11::arg("B_sc_list"),
+          pybind11::arg("D_out_list"),
+          pybind11::arg("rope_cs_list"),
+          pybind11::arg("rope_seq_len_list"),
+          pybind11::arg("config_id"));
     m.def("mxfp4_split2_dgrad_strided_onepass_gemm",
           &mxfp4_split2_dgrad_strided_onepass_gemm_entrypoint,
           "MXFP4 split2 one-pass dgrad GEMM with strided row slices",
