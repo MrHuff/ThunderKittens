@@ -62,6 +62,48 @@ __global__ void sum_tensors_kernel(
     int64_t numel
 );
 
+__global__ void sum4_tensors_kernel(
+    const __nv_bfloat16* __restrict__ A,
+    const __nv_bfloat16* __restrict__ B,
+    const __nv_bfloat16* __restrict__ C,
+    const __nv_bfloat16* __restrict__ D,
+    __nv_bfloat16* __restrict__ out,
+    int64_t numel
+);
+
+enum class OuterScaleReduceKind : int {
+    FillScalar = 0,
+    Pair1D = 1,
+    ReduceRows = 2,
+    PairReduceRows = 3,
+    ReduceCols = 4,
+    PairReduceCols = 5,
+    PairMeanRows = 6,
+    GlobalMeanFill = 7,
+};
+
+__global__ void reduce_outer_scale_tiles_kernel(
+    const float* __restrict__ in,
+    float* __restrict__ out,
+    int64_t tiles,
+    int64_t dim0,
+    int64_t dim1,
+    int64_t stride0,
+    int64_t stride1,
+    int kind,
+    float scale
+);
+
+void launch_batched_gemm(
+    const std::vector<at::Tensor>& A_list,
+    const std::vector<at::Tensor>& A_sc_list,
+    const std::vector<at::Tensor>& A_sg_chunks_list,
+    const std::vector<at::Tensor>& B_list,
+    const std::vector<at::Tensor>& B_sc_list,
+    const std::vector<at::Tensor>& B_sg_chunks_list,
+    std::vector<at::Tensor>& D_list
+);
+
 enum class V3ContractMode {
     OuterScale,
     TileGrid256,
@@ -194,6 +236,309 @@ struct outer_scale_desc {
     const float* ptr;
     int stride;
 };
+
+enum class SGContractMode {
+    ChunkGrid128,
+    OuterScale,
+    TileGrid256,
+};
+
+bool is_chunk_grid_tensor_shape(
+    const at::Tensor& t,
+    int64_t rows,
+    int64_t cols
+) {
+    return t.defined() &&
+           t.is_cuda() &&
+           t.is_contiguous() &&
+           t.dim() == 2 &&
+           t.scalar_type() == at::kFloat &&
+           t.size(0) == rows / 128 &&
+           t.size(1) == cols / 128;
+}
+
+bool is_flat_chunk_grid_tensor_shape(
+    const at::Tensor& t,
+    int64_t rows,
+    int64_t cols
+) {
+    return t.defined() &&
+           t.is_cuda() &&
+           t.is_contiguous() &&
+           t.dim() == 1 &&
+           t.scalar_type() == at::kFloat &&
+           t.numel() == (rows / 128) * (cols / 128);
+}
+
+at::Tensor as_chunk_grid_tensor(
+    const at::Tensor& t,
+    int64_t rows,
+    int64_t cols
+) {
+    if (is_chunk_grid_tensor_shape(t, rows, cols)) {
+        return t;
+    }
+    if (is_flat_chunk_grid_tensor_shape(t, rows, cols)) {
+        return t.view({rows / 128, cols / 128});
+    }
+    return t;
+}
+
+at::Tensor normalize_outer_scale_tiles_tensor(
+    const at::Tensor& t,
+    int64_t tiles,
+    bool row_axis
+) {
+    TORCH_CHECK(t.defined(), "SG tensor must be defined");
+    TORCH_CHECK(t.is_cuda(), "SG tensor must be CUDA");
+    auto x = t.scalar_type() == at::kFloat ? t : t.to(torch::kFloat32);
+
+    if (x.dim() == 0) {
+        auto out = at::empty({tiles, 1}, x.options());
+        const int threads = 256;
+        const int blocks = static_cast<int>((tiles + threads - 1) / threads);
+            auto stream = at::cuda::getCurrentCUDAStream();
+            reduce_outer_scale_tiles_kernel<<<blocks, threads, 0, stream>>>(
+                x.data_ptr<float>(), out.data_ptr<float>(), tiles, 1, 1, 1, 1,
+                static_cast<int>(OuterScaleReduceKind::FillScalar), 1.0f);
+            CUDACHECK(cudaGetLastError());
+        return out;
+    }
+    if (x.dim() == 1) {
+        const int64_t stride0 = x.stride(0);
+        if (x.numel() == tiles) {
+            return x.view({tiles, 1});
+        }
+        if (x.numel() == tiles * 2) {
+            auto out = at::empty({tiles, 1}, x.options());
+            const int threads = 256;
+            const int blocks = static_cast<int>((tiles + threads - 1) / threads);
+            auto stream = at::cuda::getCurrentCUDAStream();
+            reduce_outer_scale_tiles_kernel<<<blocks, threads, 0, stream>>>(
+                x.data_ptr<float>(), out.data_ptr<float>(), tiles, 1, 2, stride0, 1,
+                static_cast<int>(OuterScaleReduceKind::Pair1D), 1.0f);
+            CUDACHECK(cudaGetLastError());
+            return out;
+        }
+        if (x.numel() == 1) {
+            auto out = at::empty({tiles, 1}, x.options());
+            const int threads = 256;
+            const int blocks = static_cast<int>((tiles + threads - 1) / threads);
+            auto stream = at::cuda::getCurrentCUDAStream();
+            reduce_outer_scale_tiles_kernel<<<blocks, threads, 0, stream>>>(
+                x.data_ptr<float>(), out.data_ptr<float>(), tiles, 1, 1, stride0, 1,
+                static_cast<int>(OuterScaleReduceKind::FillScalar), 1.0f);
+            CUDACHECK(cudaGetLastError());
+            return out;
+        }
+        TORCH_CHECK(false, "Unsupported 1D SG tensor length for outer-scale normalization");
+    }
+
+    TORCH_CHECK(x.dim() == 2, "SG tensor must be 0D, 1D, or 2D");
+    if (row_axis) {
+        if ((x.size(0) == tiles && x.size(1) == 1) ||
+            (x.size(0) == 1 && x.size(1) == tiles)) {
+            return x;
+        }
+    } else {
+        if ((x.size(0) == 1 && x.size(1) == tiles) ||
+            (x.size(0) == tiles && x.size(1) == 1)) {
+            return x;
+        }
+    }
+    auto out = at::empty({tiles, 1}, x.options());
+    const int threads = 256;
+    const int blocks = static_cast<int>((tiles + threads - 1) / threads);
+    auto stream = at::cuda::getCurrentCUDAStream();
+    const int64_t stride0 = x.stride(0);
+    const int64_t stride1 = x.stride(1);
+    if (x.size(0) == tiles || x.size(0) == tiles * 2) {
+        const auto kind = x.size(0) == tiles * 2
+            ? OuterScaleReduceKind::PairReduceRows
+            : OuterScaleReduceKind::ReduceRows;
+        reduce_outer_scale_tiles_kernel<<<blocks, threads, 0, stream>>>(
+            x.data_ptr<float>(), out.data_ptr<float>(), tiles, x.size(0), x.size(1), stride0, stride1,
+            static_cast<int>(kind), 1.0f);
+        CUDACHECK(cudaGetLastError());
+        return out;
+    }
+    if (x.size(1) == tiles || x.size(1) == tiles * 2) {
+        const auto kind = x.size(1) == tiles * 2
+            ? OuterScaleReduceKind::PairReduceCols
+            : OuterScaleReduceKind::ReduceCols;
+        reduce_outer_scale_tiles_kernel<<<blocks, threads, 0, stream>>>(
+            x.data_ptr<float>(), out.data_ptr<float>(), tiles, x.size(0), x.size(1), stride0, stride1,
+            static_cast<int>(kind), 1.0f);
+        CUDACHECK(cudaGetLastError());
+        return out;
+    }
+    TORCH_CHECK(false, "Unsupported 2D SG tensor shape for outer-scale normalization");
+}
+
+at::Tensor prepare_split_wgrad_a_sg_tensor(
+    const at::Tensor& t,
+    int64_t tiles,
+    float scale
+) {
+    TORCH_CHECK(t.defined(), "SG tensor must be defined");
+    TORCH_CHECK(t.is_cuda(), "SG tensor must be CUDA");
+    auto x = t.scalar_type() == at::kFloat ? t : t.to(torch::kFloat32);
+    if (x.dim() == 2 && x.size(0) == tiles * 2) {
+        auto out = at::empty({tiles, 1}, x.options());
+        const int threads = 256;
+        const int blocks = static_cast<int>((tiles + threads - 1) / threads);
+        auto stream = at::cuda::getCurrentCUDAStream();
+        reduce_outer_scale_tiles_kernel<<<blocks, threads, 0, stream>>>(
+            x.data_ptr<float>(), out.data_ptr<float>(), tiles, x.size(0), x.size(1), x.stride(0), x.stride(1),
+            static_cast<int>(OuterScaleReduceKind::GlobalMeanFill), scale);
+        CUDACHECK(cudaGetLastError());
+        return out;
+    }
+    return normalize_outer_scale_tiles_tensor(x, tiles, true);
+}
+
+at::Tensor prepare_split2_b_sg_tensor(
+    const at::Tensor& t,
+    int64_t tiles,
+    float scale
+) {
+    TORCH_CHECK(t.defined(), "SG tensor must be defined");
+    TORCH_CHECK(t.is_cuda(), "SG tensor must be CUDA");
+    auto x = t.scalar_type() == at::kFloat ? t : t.to(torch::kFloat32);
+    if (x.dim() == 2 && x.size(0) == tiles * 2) {
+        auto out = at::empty({tiles, 1}, x.options());
+        const int threads = 256;
+        const int blocks = static_cast<int>((tiles + threads - 1) / threads);
+        auto stream = at::cuda::getCurrentCUDAStream();
+        reduce_outer_scale_tiles_kernel<<<blocks, threads, 0, stream>>>(
+            x.data_ptr<float>(), out.data_ptr<float>(), tiles, x.size(0), x.size(1), x.stride(0), x.stride(1),
+            static_cast<int>(OuterScaleReduceKind::PairMeanRows), scale);
+        CUDACHECK(cudaGetLastError());
+        return out;
+    }
+    return normalize_outer_scale_tiles_tensor(x, tiles, true);
+}
+
+at::Tensor prepare_w2_dgrad_b_sg_tensor(
+    const at::Tensor& t,
+    int64_t tiles,
+    float scale
+) {
+    TORCH_CHECK(t.defined(), "SG tensor must be defined");
+    TORCH_CHECK(t.is_cuda(), "SG tensor must be CUDA");
+    auto x = t.scalar_type() == at::kFloat ? t : t.to(torch::kFloat32);
+    if (x.dim() == 2) {
+        auto out = at::empty({tiles, 1}, x.options());
+        const int threads = 256;
+        const int blocks = static_cast<int>((tiles + threads - 1) / threads);
+        auto stream = at::cuda::getCurrentCUDAStream();
+        reduce_outer_scale_tiles_kernel<<<blocks, threads, 0, stream>>>(
+            x.data_ptr<float>(), out.data_ptr<float>(), tiles, x.size(0), x.size(1), x.stride(0), x.stride(1),
+            static_cast<int>(OuterScaleReduceKind::GlobalMeanFill), scale);
+        CUDACHECK(cudaGetLastError());
+        return out;
+    }
+    return normalize_outer_scale_tiles_tensor(x, tiles, true);
+}
+
+at::Tensor fold_sg_into_prepared_sc_tensor(
+    const at::Tensor& sc_raw,
+    const at::Tensor& sg,
+    int64_t rows,
+    int64_t cols
+) {
+    TORCH_CHECK(sc_raw.defined(), "sc_raw must be defined");
+    TORCH_CHECK(sc_raw.is_cuda(), "sc_raw must be CUDA");
+    TORCH_CHECK(sc_raw.is_contiguous(), "sc_raw must be contiguous");
+    TORCH_CHECK(sc_raw.scalar_type() == at::kFloat8_e4m3fn,
+                "sc_raw must be fp8 e4m3fn prepared scales");
+    TORCH_CHECK(sc_raw.dim() == 3, "sc_raw must be rank-3 prepared scales");
+    TORCH_CHECK(sg.defined(), "SG tensor must be defined");
+    TORCH_CHECK(sg.is_cuda(), "SG tensor must be CUDA");
+
+    const int64_t row_tiles = rows / 128;
+    const int64_t col_tiles = cols / 128;
+    TORCH_CHECK(row_tiles > 0 && col_tiles > 0, "rows/cols must be multiples of 128");
+
+    auto x = sg.scalar_type() == at::kFloat ? sg : sg.to(torch::kFloat32);
+    if (!x.is_contiguous()) {
+        x = x.contiguous();
+    }
+
+    at::Tensor sg_grid;
+    if (x.dim() == 0) {
+        sg_grid = x.view({1, 1}).expand({row_tiles, col_tiles});
+    } else if (x.dim() == 1) {
+        if (x.numel() == row_tiles) {
+            sg_grid = x.view({row_tiles, 1}).expand({row_tiles, col_tiles});
+        } else if (x.numel() == col_tiles) {
+            sg_grid = x.view({1, col_tiles}).expand({row_tiles, col_tiles});
+        } else if (x.numel() == 1) {
+            sg_grid = x.view({1, 1}).expand({row_tiles, col_tiles});
+        } else {
+            TORCH_CHECK(false, "Unsupported 1D SG tensor length for prepared-scale folding");
+        }
+    } else if (x.dim() == 2) {
+        if (x.size(0) == row_tiles && x.size(1) == col_tiles) {
+            sg_grid = x;
+        } else if (x.size(0) == row_tiles && x.size(1) == 1) {
+            sg_grid = x.expand({row_tiles, col_tiles});
+        } else if (x.size(0) == 1 && x.size(1) == col_tiles) {
+            sg_grid = x.expand({row_tiles, col_tiles});
+        } else if (x.size(0) == 1 && x.size(1) == 1) {
+            sg_grid = x.expand({row_tiles, col_tiles});
+        } else {
+            TORCH_CHECK(false, "Unsupported 2D SG tensor shape for prepared-scale folding");
+        }
+    } else {
+        TORCH_CHECK(false, "SG tensor must be 0D, 1D, or 2D for prepared-scale folding");
+    }
+
+    auto sg_prepared = at::repeat_interleave(sg_grid, 2, 1).unsqueeze(-1);
+    return (sc_raw.to(torch::kFloat32) * sg_prepared).contiguous().to(torch::kFloat8_e4m3fn);
+}
+
+bool is_tilegrid256_tensor_shape(
+    const at::Tensor& t,
+    int64_t rows,
+    int64_t cols
+) {
+    return t.defined() &&
+           t.is_cuda() &&
+           t.is_contiguous() &&
+           t.dim() == 2 &&
+           t.scalar_type() == at::kFloat &&
+           t.size(0) == rows / 256 &&
+           t.size(1) == cols / 256;
+}
+
+SGContractMode infer_regular_sg_contract(
+    const at::Tensor& A,
+    const at::Tensor& A_sg,
+    const at::Tensor& B,
+    const at::Tensor& B_sg
+) {
+    const int64_t K = A.size(1) * 2;
+    const bool a_chunk =
+        is_chunk_grid_tensor_shape(A_sg, A.size(0), K) ||
+        is_flat_chunk_grid_tensor_shape(A_sg, A.size(0), K);
+    const bool b_chunk =
+        is_chunk_grid_tensor_shape(B_sg, B.size(0), K) ||
+        is_flat_chunk_grid_tensor_shape(B_sg, B.size(0), K);
+    if (a_chunk && b_chunk) {
+        return SGContractMode::ChunkGrid128;
+    }
+
+    if (get_v3_contract_mode() == V3ContractMode::TileGrid256) {
+        const bool a_tilegrid = is_tilegrid256_tensor_shape(A_sg, A.size(0), K);
+        const bool b_tilegrid = is_tilegrid256_tensor_shape(B_sg, B.size(0), K);
+        if (a_tilegrid && b_tilegrid) {
+            return SGContractMode::TileGrid256;
+        }
+    }
+
+    return SGContractMode::OuterScale;
+}
 
 outer_scale_desc check_outer_scale_tiles(
     const at::Tensor& t,
@@ -453,6 +798,64 @@ void launch_grouped_gemm(
     launch_grouped_gemm_with_config<localcta_parity_config>(
         A, A_sc, A_sg_chunks, B, B_sc, B_sg_chunks,
         D, D_K_opt, D_V_opt, silu_dim);
+}
+
+void launch_chunkgrid_batched_accum_gemm(
+    const std::vector<at::Tensor>& A_list,
+    const std::vector<at::Tensor>& A_sc_list,
+    const std::vector<at::Tensor>& A_sg_chunks_list,
+    const std::vector<at::Tensor>& B_list,
+    const std::vector<at::Tensor>& B_sc_list,
+    const std::vector<at::Tensor>& B_sg_chunks_list,
+    at::Tensor& D_out
+) {
+    const int n = static_cast<int>(A_list.size());
+    TORCH_CHECK(n >= 1 && n <= 4, "chunk-grid accum supports 1..4 batches");
+    if (n == 1) {
+        launch_regular_gemm(
+            A_list[0], A_sc_list[0], A_sg_chunks_list[0],
+            B_list[0], B_sc_list[0], B_sg_chunks_list[0],
+            D_out);
+        return;
+    }
+
+    std::vector<at::Tensor> D_list;
+    D_list.reserve(n);
+    for (int i = 0; i < n; ++i) {
+        D_list.push_back(at::empty_like(D_out));
+    }
+    launch_batched_gemm(
+        A_list, A_sc_list, A_sg_chunks_list,
+        B_list, B_sc_list, B_sg_chunks_list,
+        D_list);
+
+    const int64_t numel = D_out.numel();
+    const int threads = 256;
+    const int blocks = static_cast<int>((numel + threads - 1) / threads);
+    auto stream = at::cuda::getCurrentCUDAStream();
+    if (n == 2) {
+        sum_tensors_kernel<<<blocks, threads, 0, stream>>>(
+            reinterpret_cast<const __nv_bfloat16*>(D_list[0].data_ptr()),
+            reinterpret_cast<const __nv_bfloat16*>(D_list[1].data_ptr()),
+            reinterpret_cast<__nv_bfloat16*>(D_out.data_ptr()),
+            numel);
+    } else if (n == 3) {
+        sum3_tensors_kernel<<<blocks, threads, 0, stream>>>(
+            reinterpret_cast<const __nv_bfloat16*>(D_list[0].data_ptr()),
+            reinterpret_cast<const __nv_bfloat16*>(D_list[1].data_ptr()),
+            reinterpret_cast<const __nv_bfloat16*>(D_list[2].data_ptr()),
+            reinterpret_cast<__nv_bfloat16*>(D_out.data_ptr()),
+            numel);
+    } else {
+        sum4_tensors_kernel<<<blocks, threads, 0, stream>>>(
+            reinterpret_cast<const __nv_bfloat16*>(D_list[0].data_ptr()),
+            reinterpret_cast<const __nv_bfloat16*>(D_list[1].data_ptr()),
+            reinterpret_cast<const __nv_bfloat16*>(D_list[2].data_ptr()),
+            reinterpret_cast<const __nv_bfloat16*>(D_list[3].data_ptr()),
+            reinterpret_cast<__nv_bfloat16*>(D_out.data_ptr()),
+            numel);
+    }
+    CUDACHECK(cudaGetLastError());
 }
 
 template <typename C>
@@ -1799,6 +2202,62 @@ void launch_fast_split2_dgrad_gemm_onepass_with_config(
     kittens::py::launch_kernel<C, G, nvfp4_split2_accum_gemm::kernel<C>>(g_host);
 }
 
+template <typename C>
+void launch_fast_split2_dgrad_gemm_onepass_sg_with_config(
+    const std::vector<at::Tensor>& A_list,
+    const std::vector<at::Tensor>& A_sc_prepared_list,
+    const std::vector<at::Tensor>& A_sg_tiles_list,
+    const std::vector<at::Tensor>& B_list,
+    const std::vector<at::Tensor>& B_sc_prepared_list,
+    const std::vector<at::Tensor>& B_sg_tiles_list,
+    at::Tensor& D_out
+) {
+    using G = nvfp4_split2_accum_gemm::globals<C>;
+    G g_host;
+    memset(&g_host, 0, sizeof(G));
+
+    TORCH_CHECK(A_list.size() == 2, "one-pass split2 dgrad expects 2 A batches");
+    TORCH_CHECK(A_sc_prepared_list.size() == 2, "one-pass split2 dgrad expects 2 A scale batches");
+    TORCH_CHECK(A_sg_tiles_list.size() == 2, "one-pass split2 dgrad expects 2 A SG batches");
+    TORCH_CHECK(B_list.size() == 2, "one-pass split2 dgrad expects 2 B batches");
+    TORCH_CHECK(B_sc_prepared_list.size() == 2, "one-pass split2 dgrad expects 2 B scale batches");
+    TORCH_CHECK(B_sg_tiles_list.size() == 2, "one-pass split2 dgrad expects 2 B SG batches");
+
+    const int64_t M = D_out.size(0);
+    const int64_t N_out = D_out.size(1);
+    g_host.num_row_blocks = static_cast<int>(M / C::Mb);
+    g_host.num_col_blocks = static_cast<int>(N_out / C::Nb);
+
+    for (int i = 0; i < 2; ++i) {
+        g_host.num_red_blocks[i] = static_cast<int>((2 * A_list[i].size(1)) / C::Kb);
+
+        auto a_gl = kittens::py::tensor_to_gl<typename G::A_fp4x2_gl>(A_list[i]);
+        auto a_sc_gl = kittens::py::tensor_to_gl<typename G::A_sc_gl, false>(
+            A_sc_prepared_list[i], 1,
+            A_sc_prepared_list[i].size(0), A_sc_prepared_list[i].size(1), 256);
+        auto b_gl = kittens::py::tensor_to_gl<typename G::B_fp4x2_gl>(B_list[i]);
+        auto b_sc_gl = kittens::py::tensor_to_gl<typename G::B_sc_gl, false>(
+            B_sc_prepared_list[i], 1,
+            B_sc_prepared_list[i].size(0), B_sc_prepared_list[i].size(1), 256);
+        auto a_sg_desc = check_outer_scale_tiles(A_sg_tiles_list[i], "A_sg_tiles_list[i]", A_list[i].size(0) / 256, true);
+        auto b_sg_desc = check_outer_scale_tiles(B_sg_tiles_list[i], "B_sg_tiles_list[i]", B_list[i].size(0) / 256, false);
+
+        memcpy(&g_host.A_tma[i], &a_gl.tma_descs.tma_desc, sizeof(CUtensorMap));
+        memcpy(&g_host.A_sc_tma[i], &a_sc_gl.tma_descs.tma_desc, sizeof(CUtensorMap));
+        memcpy(&g_host.B_tma[i], &b_gl.tma_descs.tma_desc, sizeof(CUtensorMap));
+        memcpy(&g_host.B_sc_tma[i], &b_sc_gl.tma_descs.tma_desc, sizeof(CUtensorMap));
+        g_host.A_sg[i] = a_sg_desc.ptr;
+        g_host.B_sg[i] = b_sg_desc.ptr;
+        g_host.A_sg_stride[i] = a_sg_desc.stride;
+        g_host.B_sg_stride[i] = b_sg_desc.stride;
+    }
+
+    auto d_gl = kittens::py::tensor_to_gl<typename G::D_gl>(D_out);
+    memcpy(&g_host.D_tma, &d_gl.tma_descs.tma_desc, sizeof(CUtensorMap));
+
+    kittens::py::launch_kernel<C, G, nvfp4_split2_accum_gemm::kernel<C>>(g_host);
+}
+
 void launch_fast_split2_dgrad_gemm_onepass(
     const std::vector<at::Tensor>& A_list,
     const std::vector<at::Tensor>& A_sc_prepared_list,
@@ -1832,6 +2291,47 @@ void launch_fast_split2_dgrad_gemm_onepass(
         case 5:
             launch_fast_split2_dgrad_gemm_onepass_with_config<localcta_onepass_cfg5>(
                 A_list, A_sc_prepared_list, B_list, B_sc_prepared_list, D_out);
+            break;
+        default:
+            TORCH_CHECK(false, "Unknown one-pass split2 config_idx=", resolved_idx);
+    }
+}
+
+void launch_fast_split2_dgrad_gemm_onepass_sg(
+    const std::vector<at::Tensor>& A_list,
+    const std::vector<at::Tensor>& A_sc_prepared_list,
+    const std::vector<at::Tensor>& A_sg_tiles_list,
+    const std::vector<at::Tensor>& B_list,
+    const std::vector<at::Tensor>& B_sc_prepared_list,
+    const std::vector<at::Tensor>& B_sg_tiles_list,
+    at::Tensor& D_out,
+    int config_idx
+) {
+    int resolved_idx = config_idx;
+    if (resolved_idx < 0) {
+        resolved_idx = 5;
+    }
+    switch (resolved_idx) {
+        case 0:
+            TORCH_CHECK(false, "one-pass split2 config_idx=0 is not legal with CLUSTER_SIZE=1 on this kernel");
+            break;
+        case 1:
+            launch_fast_split2_dgrad_gemm_onepass_sg_with_config<localcta_onepass_cfg1>(
+                A_list, A_sc_prepared_list, A_sg_tiles_list, B_list, B_sc_prepared_list, B_sg_tiles_list, D_out);
+            break;
+        case 2:
+            TORCH_CHECK(false, "one-pass split2 config_idx=2 is not legal with CLUSTER_SIZE=1 on this kernel");
+            break;
+        case 3:
+            launch_fast_split2_dgrad_gemm_onepass_sg_with_config<localcta_onepass_cfg3>(
+                A_list, A_sc_prepared_list, A_sg_tiles_list, B_list, B_sc_prepared_list, B_sg_tiles_list, D_out);
+            break;
+        case 4:
+            TORCH_CHECK(false, "one-pass split2 config_idx=4 is not legal with CLUSTER_SIZE=1 on this kernel");
+            break;
+        case 5:
+            launch_fast_split2_dgrad_gemm_onepass_sg_with_config<localcta_onepass_cfg5>(
+                A_list, A_sc_prepared_list, A_sg_tiles_list, B_list, B_sc_prepared_list, B_sg_tiles_list, D_out);
             break;
         default:
             TORCH_CHECK(false, "Unknown one-pass split2 config_idx=", resolved_idx);
@@ -2115,6 +2615,83 @@ void launch_fast_batched_gemm_strided(
         A_col_offsets, A_col_widths, D_list);
 }
 
+__global__ void reduce_outer_scale_tiles_kernel(
+    const float* __restrict__ in,
+    float* __restrict__ out,
+    int64_t tiles,
+    int64_t dim0,
+    int64_t dim1,
+    int64_t stride0,
+    int64_t stride1,
+    int kind,
+    float scale
+) {
+    const int64_t tile_idx = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (tile_idx >= tiles) {
+        return;
+    }
+
+    float acc = 0.0f;
+    switch (static_cast<OuterScaleReduceKind>(kind)) {
+        case OuterScaleReduceKind::FillScalar:
+            acc = in[0];
+            break;
+        case OuterScaleReduceKind::Pair1D:
+            acc = fmaxf(in[(2 * tile_idx) * stride0], in[(2 * tile_idx + 1) * stride0]);
+            break;
+        case OuterScaleReduceKind::ReduceRows:
+            acc = in[tile_idx * stride0];
+            for (int64_t j = 1; j < dim1; ++j) {
+                acc = fmaxf(acc, in[tile_idx * stride0 + j * stride1]);
+            }
+            break;
+        case OuterScaleReduceKind::PairReduceRows:
+            acc = fmaxf(in[(2 * tile_idx) * stride0], in[(2 * tile_idx + 1) * stride0]);
+            for (int64_t j = 1; j < dim1; ++j) {
+                const float v0 = in[(2 * tile_idx) * stride0 + j * stride1];
+                const float v1 = in[(2 * tile_idx + 1) * stride0 + j * stride1];
+                acc = fmaxf(acc, fmaxf(v0, v1));
+            }
+            break;
+        case OuterScaleReduceKind::ReduceCols:
+            acc = in[tile_idx * stride1];
+            for (int64_t i = 1; i < dim0; ++i) {
+                acc = fmaxf(acc, in[i * stride0 + tile_idx * stride1]);
+            }
+            break;
+        case OuterScaleReduceKind::PairReduceCols:
+            acc = fmaxf(in[(2 * tile_idx) * stride1], in[(2 * tile_idx + 1) * stride1]);
+            for (int64_t i = 1; i < dim0; ++i) {
+                const int64_t base = i * stride0 + (2 * tile_idx) * stride1;
+                acc = fmaxf(acc, fmaxf(in[base], in[base + stride1]));
+            }
+            break;
+        case OuterScaleReduceKind::PairMeanRows: {
+            float sum = 0.0f;
+            const int64_t row0 = 2 * tile_idx;
+            const int64_t row1 = row0 + 1;
+            for (int64_t j = 0; j < dim1; ++j) {
+                sum += in[row0 * stride0 + j * stride1] + in[row1 * stride0 + j * stride1];
+            }
+            acc = (sum / static_cast<float>(2 * dim1)) * scale;
+            out[tile_idx] = acc;
+            return;
+        }
+        case OuterScaleReduceKind::GlobalMeanFill: {
+            float sum = 0.0f;
+            for (int64_t i = 0; i < dim0; ++i) {
+                for (int64_t j = 0; j < dim1; ++j) {
+                    sum += in[i * stride0 + j * stride1];
+                }
+            }
+            acc = (sum / static_cast<float>(dim0 * dim1)) * scale;
+            out[tile_idx] = acc;
+            return;
+        }
+    }
+    out[tile_idx] = acc;
+}
+
 __global__ void sum_tensors_kernel(
     const __nv_bfloat16* __restrict__ A,
     const __nv_bfloat16* __restrict__ B,
@@ -2165,15 +2742,26 @@ void nvfp4_localcta_gemm_entrypoint(
     const at::Tensor& B_sg_chunks,
     at::Tensor& D
 ) {
-    if (get_v3_contract_mode() == V3ContractMode::TileGrid256) {
+    const auto sg_contract = infer_regular_sg_contract(A, A_sg_chunks, B, B_sg_chunks);
+    if (sg_contract == SGContractMode::ChunkGrid128) {
+        auto A_sg_chunkgrid = as_chunk_grid_tensor(A_sg_chunks, A.size(0), A.size(1) * 2);
+        auto B_sg_chunkgrid = as_chunk_grid_tensor(B_sg_chunks, B.size(0), B.size(1) * 2);
+        check_gemm_inputs(A, A_sc, A_sg_chunkgrid, B, B_sc, B_sg_chunkgrid);
+        check_output_matrix(D, "D", A.size(0), B.size(0));
+        launch_regular_gemm(A, A_sc, A_sg_chunkgrid, B, B_sc, B_sg_chunkgrid, D);
+        return;
+    }
+    if (sg_contract == SGContractMode::TileGrid256) {
         check_v3_tilegrid256_gemm_inputs(A, A_sc, A_sg_chunks, B, B_sc, B_sg_chunks);
         check_output_matrix(D, "D", A.size(0), B.size(0));
         launch_fast_regular_gemm(A, A_sc, torch::Tensor(), B, B_sc, torch::Tensor(), D);
         return;
     }
-    check_v3_fast_gemm_inputs(A, A_sc, A_sg_chunks, B, B_sc, B_sg_chunks);
+    auto A_sg_outer = normalize_outer_scale_tiles_tensor(A_sg_chunks, A.size(0) / 256, true);
+    auto B_sg_outer = normalize_outer_scale_tiles_tensor(B_sg_chunks, B.size(0) / 256, false);
+    check_v3_fast_gemm_inputs(A, A_sc, A_sg_outer, B, B_sc, B_sg_outer);
     check_output_matrix(D, "D", A.size(0), B.size(0));
-    launch_fast_regular_gemm(A, A_sc, A_sg_chunks, B, B_sc, B_sg_chunks, D);
+    launch_fast_regular_gemm(A, A_sc, A_sg_outer, B, B_sc, B_sg_outer, D);
 }
 
 void nvfp4_localcta_fast_gemm_entrypoint(
@@ -2188,6 +2776,22 @@ void nvfp4_localcta_fast_gemm_entrypoint(
     launch_fast_regular_gemm(A, A_sc_prepared, torch::Tensor(), B, B_sc_prepared, torch::Tensor(), D);
 }
 
+void nvfp4_localcta_fast_gemm_sg_entrypoint(
+    const at::Tensor& A,
+    const at::Tensor& A_sc_prepared,
+    const at::Tensor& A_sg_chunks,
+    const at::Tensor& B,
+    const at::Tensor& B_sc_prepared,
+    const at::Tensor& B_sg_chunks,
+    at::Tensor& D
+) {
+    auto A_sg_outer = normalize_outer_scale_tiles_tensor(A_sg_chunks, A.size(0) / 256, true);
+    auto B_sg_outer = normalize_outer_scale_tiles_tensor(B_sg_chunks, B.size(0) / 256, false);
+    check_v3_fast_gemm_inputs(A, A_sc_prepared, A_sg_outer, B, B_sc_prepared, B_sg_outer);
+    check_output_matrix(D, "D", A.size(0), B.size(0));
+    launch_fast_regular_gemm(A, A_sc_prepared, A_sg_outer, B, B_sc_prepared, B_sg_outer, D);
+}
+
 void nvfp4_localcta_grouped_gemm_entrypoint(
     const at::Tensor& A,
     const at::Tensor& A_sc,
@@ -2200,7 +2804,29 @@ void nvfp4_localcta_grouped_gemm_entrypoint(
     std::optional<at::Tensor> D_V_opt = std::nullopt,
     int silu_dim = 0
 ) {
-    if (get_v3_contract_mode() == V3ContractMode::TileGrid256) {
+    const auto sg_contract = infer_regular_sg_contract(A, A_sg_chunks, B, B_sg_chunks);
+    if (sg_contract == SGContractMode::ChunkGrid128) {
+        auto A_sg_chunkgrid = as_chunk_grid_tensor(A_sg_chunks, A.size(0), A.size(1) * 2);
+        auto B_sg_chunkgrid = as_chunk_grid_tensor(B_sg_chunks, B.size(0), B.size(1) * 2);
+        check_gemm_inputs(A, A_sc, A_sg_chunkgrid, B, B_sc, B_sg_chunkgrid);
+        TORCH_CHECK(D.is_cuda() && D.is_contiguous() && D.scalar_type() == at::kBFloat16,
+                    "D must be a contiguous CUDA bf16 tensor");
+        if (D_K_opt.has_value()) {
+            TORCH_CHECK(D_K_opt.value().is_cuda() && D_K_opt.value().is_contiguous() &&
+                        D_K_opt.value().scalar_type() == at::kBFloat16,
+                        "D_K must be a contiguous CUDA bf16 tensor");
+        }
+        if (D_V_opt.has_value()) {
+            TORCH_CHECK(D_V_opt.value().is_cuda() && D_V_opt.value().is_contiguous() &&
+                        D_V_opt.value().scalar_type() == at::kBFloat16,
+                        "D_V must be a contiguous CUDA bf16 tensor");
+        }
+        launch_grouped_gemm(
+            A, A_sc, A_sg_chunkgrid, B, B_sc, B_sg_chunkgrid,
+            D, D_K_opt, D_V_opt, silu_dim);
+        return;
+    }
+    if (sg_contract == SGContractMode::TileGrid256) {
         check_v3_tilegrid256_gemm_inputs(A, A_sc, A_sg_chunks, B, B_sc, B_sg_chunks);
         TORCH_CHECK(D.is_cuda() && D.is_contiguous() && D.scalar_type() == at::kBFloat16,
                     "D must be a contiguous CUDA bf16 tensor");
@@ -2219,7 +2845,9 @@ void nvfp4_localcta_grouped_gemm_entrypoint(
             D, D_K_opt, D_V_opt, silu_dim);
         return;
     }
-    check_v3_fast_gemm_inputs(A, A_sc, A_sg_chunks, B, B_sc, B_sg_chunks);
+    auto A_sg_outer = normalize_outer_scale_tiles_tensor(A_sg_chunks, A.size(0) / 256, true);
+    auto B_sg_outer = normalize_outer_scale_tiles_tensor(B_sg_chunks, B.size(0) / 256, false);
+    check_v3_fast_gemm_inputs(A, A_sc, A_sg_outer, B, B_sc, B_sg_outer);
     TORCH_CHECK(D.is_cuda() && D.is_contiguous() && D.scalar_type() == at::kBFloat16,
                 "D must be a contiguous CUDA bf16 tensor");
     if (D_K_opt.has_value()) {
@@ -2233,7 +2861,7 @@ void nvfp4_localcta_grouped_gemm_entrypoint(
                     "D_V must be a contiguous CUDA bf16 tensor");
     }
     launch_fast_grouped_gemm(
-        A, A_sc, A_sg_chunks, B, B_sc, B_sg_chunks,
+        A, A_sc, A_sg_outer, B, B_sc, B_sg_outer,
         D, D_K_opt, D_V_opt, silu_dim);
 }
 
@@ -2281,6 +2909,37 @@ void nvfp4_localcta_fast_grouped_gemm_entrypoint(
         A, A_sc_prepared, torch::Tensor(), B, B_sc_prepared, torch::Tensor(), D, D_K_opt, D_V_opt, silu_dim);
 }
 
+void nvfp4_localcta_fast_grouped_gemm_sg_entrypoint(
+    const at::Tensor& A,
+    const at::Tensor& A_sc_prepared,
+    const at::Tensor& A_sg_chunks,
+    const at::Tensor& B,
+    const at::Tensor& B_sc_prepared,
+    const at::Tensor& B_sg_chunks,
+    at::Tensor& D,
+    std::optional<at::Tensor> D_K_opt = std::nullopt,
+    std::optional<at::Tensor> D_V_opt = std::nullopt,
+    int silu_dim = 0
+) {
+    auto A_sg_outer = normalize_outer_scale_tiles_tensor(A_sg_chunks, A.size(0) / 256, true);
+    auto B_sg_outer = normalize_outer_scale_tiles_tensor(B_sg_chunks, B.size(0) / 256, false);
+    check_v3_fast_gemm_inputs(A, A_sc_prepared, A_sg_outer, B, B_sc_prepared, B_sg_outer);
+    TORCH_CHECK(D.is_cuda() && D.is_contiguous() && D.scalar_type() == at::kBFloat16,
+                "D must be a contiguous CUDA bf16 tensor");
+    if (D_K_opt.has_value()) {
+        TORCH_CHECK(D_K_opt.value().is_cuda() && D_K_opt.value().is_contiguous() &&
+                    D_K_opt.value().scalar_type() == at::kBFloat16,
+                    "D_K must be a contiguous CUDA bf16 tensor");
+    }
+    if (D_V_opt.has_value()) {
+        TORCH_CHECK(D_V_opt.value().is_cuda() && D_V_opt.value().is_contiguous() &&
+                    D_V_opt.value().scalar_type() == at::kBFloat16,
+                    "D_V must be a contiguous CUDA bf16 tensor");
+    }
+    launch_fast_grouped_gemm(
+        A, A_sc_prepared, A_sg_outer, B, B_sc_prepared, B_sg_outer, D, D_K_opt, D_V_opt, silu_dim);
+}
+
 void nvfp4_localcta_batched_gemm_entrypoint(
     const std::vector<at::Tensor>& A_list,
     const std::vector<at::Tensor>& A_sc_list,
@@ -2296,6 +2955,33 @@ void nvfp4_localcta_batched_gemm_entrypoint(
     TORCH_CHECK(n == static_cast<int>(D_list.size()),
                 "D_list length must match number of batches");
 
+    const bool use_chunkgrid =
+        n > 0 && infer_regular_sg_contract(A_list[0], A_sg_chunks_list[0], B_list[0], B_sg_chunks_list[0]) == SGContractMode::ChunkGrid128;
+    if (use_chunkgrid) {
+        std::vector<at::Tensor> A_sg_chunkgrid_list;
+        std::vector<at::Tensor> B_sg_chunkgrid_list;
+        A_sg_chunkgrid_list.reserve(n);
+        B_sg_chunkgrid_list.reserve(n);
+        for (int i = 0; i < n; ++i) {
+            A_sg_chunkgrid_list.push_back(
+                as_chunk_grid_tensor(A_sg_chunks_list[i], A_list[i].size(0), A_list[i].size(1) * 2));
+            B_sg_chunkgrid_list.push_back(
+                as_chunk_grid_tensor(B_sg_chunks_list[i], B_list[i].size(0), B_list[i].size(1) * 2));
+        }
+        check_batched_inputs(
+            A_list, A_sc_list, A_sg_chunkgrid_list,
+            B_list, B_sc_list, B_sg_chunkgrid_list);
+        for (int i = 0; i < n; ++i) {
+            check_output_matrix(D_list[i], "D_list[i]", A_list[i].size(0), B_list[i].size(0));
+        }
+        check_batched_shape_compatibility(A_list, B_list, D_list);
+        launch_batched_gemm(
+            A_list, A_sc_list, A_sg_chunkgrid_list,
+            B_list, B_sc_list, B_sg_chunkgrid_list,
+            D_list);
+        return;
+    }
+
     if (get_v3_contract_mode() == V3ContractMode::TileGrid256) {
         for (int i = 0; i < n; ++i) {
             check_v3_tilegrid256_gemm_inputs(
@@ -2310,17 +2996,25 @@ void nvfp4_localcta_batched_gemm_entrypoint(
             D_list);
         return;
     }
+    std::vector<at::Tensor> A_sg_outer_list;
+    std::vector<at::Tensor> B_sg_outer_list;
+    A_sg_outer_list.reserve(n);
+    B_sg_outer_list.reserve(n);
     for (int i = 0; i < n; ++i) {
+        A_sg_outer_list.push_back(
+            normalize_outer_scale_tiles_tensor(A_sg_chunks_list[i], A_list[i].size(0) / 256, true));
+        B_sg_outer_list.push_back(
+            normalize_outer_scale_tiles_tensor(B_sg_chunks_list[i], B_list[i].size(0) / 256, false));
         check_v3_fast_gemm_inputs(
-            A_list[i], A_sc_list[i], A_sg_chunks_list[i],
-            B_list[i], B_sc_list[i], B_sg_chunks_list[i]);
+            A_list[i], A_sc_list[i], A_sg_outer_list[i],
+            B_list[i], B_sc_list[i], B_sg_outer_list[i]);
         check_output_matrix(D_list[i], "D_list[i]", A_list[i].size(0), B_list[i].size(0));
     }
     check_batched_shape_compatibility(A_list, B_list, D_list);
 
     launch_fast_batched_gemm(
-        A_list, A_sc_list, A_sg_chunks_list,
-        B_list, B_sc_list, B_sg_chunks_list,
+        A_list, A_sc_list, A_sg_outer_list,
+        B_list, B_sc_list, B_sg_outer_list,
         D_list);
 }
 
@@ -2363,7 +3057,7 @@ void nvfp4_localcta_fast_batched_gemm_strided_entrypoint(
 ) {
     (void)A_sg_chunks_list;
     (void)B_sg_chunks_list;
-    check_fast_batched_strided_inputs(
+    check_fast_batched_strided_inputs_allow_a_sc_views(
         A_full, A_sc_prepared_list,
         A_col_offsets, A_col_widths,
         B_list, B_sc_prepared_list);
@@ -2492,6 +3186,29 @@ void nvfp4_localcta_batched_accum_gemm_entrypoint(
 ) {
     const int n = static_cast<int>(A_list.size());
     TORCH_CHECK(n <= 4, "num_batches must be 1..4");
+    const bool use_chunkgrid =
+        n > 0 && infer_regular_sg_contract(A_list[0], A_sg_chunks_list[0], B_list[0], B_sg_chunks_list[0]) == SGContractMode::ChunkGrid128;
+    if (use_chunkgrid) {
+        std::vector<at::Tensor> A_sg_chunkgrid_list;
+        std::vector<at::Tensor> B_sg_chunkgrid_list;
+        A_sg_chunkgrid_list.reserve(n);
+        B_sg_chunkgrid_list.reserve(n);
+        for (int i = 0; i < n; ++i) {
+            A_sg_chunkgrid_list.push_back(
+                as_chunk_grid_tensor(A_sg_chunks_list[i], A_list[i].size(0), A_list[i].size(1) * 2));
+            B_sg_chunkgrid_list.push_back(
+                as_chunk_grid_tensor(B_sg_chunks_list[i], B_list[i].size(0), B_list[i].size(1) * 2));
+        }
+        check_batched_inputs(
+            A_list, A_sc_list, A_sg_chunkgrid_list,
+            B_list, B_sc_list, B_sg_chunkgrid_list);
+        check_output_matrix(D_out, "D_out", A_list[0].size(0), B_list[0].size(0));
+        launch_chunkgrid_batched_accum_gemm(
+            A_list, A_sc_list, A_sg_chunkgrid_list,
+            B_list, B_sc_list, B_sg_chunkgrid_list,
+            D_out);
+        return;
+    }
     if (get_v3_contract_mode() == V3ContractMode::TileGrid256) {
         for (int i = 0; i < n; ++i) {
             check_v3_tilegrid256_gemm_inputs(
@@ -2511,22 +3228,30 @@ void nvfp4_localcta_batched_accum_gemm_entrypoint(
             D_out);
         return;
     }
+    std::vector<at::Tensor> A_sg_outer_list;
+    std::vector<at::Tensor> B_sg_outer_list;
+    A_sg_outer_list.reserve(n);
+    B_sg_outer_list.reserve(n);
     for (int i = 0; i < n; ++i) {
+        A_sg_outer_list.push_back(
+            normalize_outer_scale_tiles_tensor(A_sg_chunks_list[i], A_list[i].size(0) / 256, true));
+        B_sg_outer_list.push_back(
+            normalize_outer_scale_tiles_tensor(B_sg_chunks_list[i], B_list[i].size(0) / 256, false));
         check_v3_fast_gemm_inputs(
-            A_list[i], A_sc_list[i], A_sg_chunks_list[i],
-            B_list[i], B_sc_list[i], B_sg_chunks_list[i]);
+            A_list[i], A_sc_list[i], A_sg_outer_list[i],
+            B_list[i], B_sc_list[i], B_sg_outer_list[i]);
     }
     check_output_matrix(D_out, "D_out", A_list[0].size(0), B_list[0].size(0));
 
     if (n == 1) {
         launch_fast_regular_gemm(
-            A_list[0], A_sc_list[0], A_sg_chunks_list[0],
-            B_list[0], B_sc_list[0], B_sg_chunks_list[0], D_out);
+            A_list[0], A_sc_list[0], A_sg_outer_list[0],
+            B_list[0], B_sc_list[0], B_sg_outer_list[0], D_out);
         return;
     }
     launch_fast_batched_accum_gemm(
-        A_list, A_sc_list, A_sg_chunks_list,
-        B_list, B_sc_list, B_sg_chunks_list,
+        A_list, A_sc_list, A_sg_outer_list,
+        B_list, B_sc_list, B_sg_outer_list,
         D_out);
 }
 
@@ -2580,6 +3305,38 @@ void nvfp4_localcta_fast_split2_dgrad_onepass_gemm_entrypoint(
         D_out, static_cast<int>(config_idx));
 }
 
+void nvfp4_localcta_fast_split2_dgrad_onepass_gemm_sg_entrypoint(
+    const std::vector<at::Tensor>& A_list,
+    const std::vector<at::Tensor>& A_sc_prepared_list,
+    const std::vector<at::Tensor>& A_sg_chunks_list,
+    const std::vector<at::Tensor>& B_list,
+    const std::vector<at::Tensor>& B_sc_prepared_list,
+    const std::vector<at::Tensor>& B_sg_chunks_list,
+    at::Tensor& D_out,
+    int64_t config_idx
+) {
+    check_fast_batched_inputs(A_list, A_sc_prepared_list, B_list, B_sc_prepared_list);
+    TORCH_CHECK(A_list.size() == 2, "split2 one-pass dgrad expects exactly 2 A batches");
+    TORCH_CHECK(B_list.size() == 2, "split2 one-pass dgrad expects exactly 2 B batches");
+    TORCH_CHECK(A_sg_chunks_list.size() == 2, "split2 one-pass dgrad expects exactly 2 A SG batches");
+    TORCH_CHECK(B_sg_chunks_list.size() == 2, "split2 one-pass dgrad expects exactly 2 B SG batches");
+    std::vector<at::Tensor> A_sg_tiles_list;
+    std::vector<at::Tensor> B_sg_tiles_list;
+    A_sg_tiles_list.reserve(2);
+    B_sg_tiles_list.reserve(2);
+    for (int i = 0; i < 2; ++i) {
+        A_sg_tiles_list.push_back(
+            normalize_outer_scale_tiles_tensor(A_sg_chunks_list[i], A_list[i].size(0) / 256, true));
+        B_sg_tiles_list.push_back(
+            normalize_outer_scale_tiles_tensor(B_sg_chunks_list[i], B_list[i].size(0) / 256, false));
+    }
+    check_output_matrix(D_out, "D_out", A_list[0].size(0), B_list[0].size(0));
+    launch_fast_split2_dgrad_gemm_onepass_sg(
+        A_list, A_sc_prepared_list, A_sg_tiles_list,
+        B_list, B_sc_prepared_list, B_sg_tiles_list,
+        D_out, static_cast<int>(config_idx));
+}
+
 void nvfp4_localcta_v3_split2_dgrad_onepass_gemm_entrypoint(
     const std::vector<at::Tensor>& A_list,
     const std::vector<at::Tensor>& A_sc_list,
@@ -2613,7 +3370,7 @@ void nvfp4_localcta_fast_split3_dgrad_strided_gemm_entrypoint(
     const std::vector<at::Tensor>& B_sc_prepared_list,
     at::Tensor& D_out
 ) {
-    check_fast_batched_strided_inputs(
+    check_fast_batched_strided_inputs_allow_a_sc_views(
         A_full, A_sc_prepared_list,
         A_col_offsets, A_col_widths,
         B_list, B_sc_prepared_list);
@@ -2624,6 +3381,42 @@ void nvfp4_localcta_fast_split3_dgrad_strided_gemm_entrypoint(
         A_full, A_sc_prepared_list, std::vector<at::Tensor>(),
         A_col_offsets, A_col_widths,
         B_list, B_sc_prepared_list, std::vector<at::Tensor>(), D_out);
+}
+
+void nvfp4_localcta_fast_split3_dgrad_strided_gemm_sg_entrypoint(
+    const at::Tensor& A_full,
+    const std::vector<at::Tensor>& A_sc_prepared_list,
+    const std::vector<at::Tensor>& A_sg_chunks_list,
+    const std::vector<int64_t>& A_col_offsets,
+    const std::vector<int64_t>& A_col_widths,
+    const std::vector<at::Tensor>& B_list,
+    const std::vector<at::Tensor>& B_sc_prepared_list,
+    const std::vector<at::Tensor>& B_sg_chunks_list,
+    at::Tensor& D_out
+) {
+    check_fast_batched_strided_inputs_allow_a_sc_views(
+        A_full, A_sc_prepared_list,
+        A_col_offsets, A_col_widths,
+        B_list, B_sc_prepared_list);
+    TORCH_CHECK(A_sc_prepared_list.size() == 3, "split3 strided dgrad expects exactly 3 A batches");
+    TORCH_CHECK(B_list.size() == 3, "split3 strided dgrad expects exactly 3 B batches");
+    TORCH_CHECK(A_sg_chunks_list.size() == 3, "split3 strided dgrad expects exactly 3 A SG batches");
+    TORCH_CHECK(B_sg_chunks_list.size() == 3, "split3 strided dgrad expects exactly 3 B SG batches");
+    std::vector<at::Tensor> A_sg_tiles_list;
+    std::vector<at::Tensor> B_sg_tiles_list;
+    A_sg_tiles_list.reserve(3);
+    B_sg_tiles_list.reserve(3);
+    for (int i = 0; i < 3; ++i) {
+        A_sg_tiles_list.push_back(
+            normalize_outer_scale_tiles_tensor(A_sg_chunks_list[i], A_full.size(0) / 256, true));
+        B_sg_tiles_list.push_back(
+            normalize_outer_scale_tiles_tensor(B_sg_chunks_list[i], B_list[i].size(0) / 256, false));
+    }
+    check_output_matrix(D_out, "D_out", A_full.size(0), B_list[0].size(0));
+    launch_fast_split3_dgrad_gemm_strided(
+        A_full, A_sc_prepared_list, A_sg_tiles_list,
+        A_col_offsets, A_col_widths,
+        B_list, B_sc_prepared_list, B_sg_tiles_list, D_out);
 }
 
 void nvfp4_localcta_v3_split3_dgrad_strided_gemm_entrypoint(
@@ -2893,6 +3686,47 @@ void sum3_bf16_entrypoint(
     CUDACHECK(cudaGetLastError());
 }
 
+at::Tensor nvfp4_localcta_prepare_outer_sg_entrypoint(
+    const at::Tensor& sg,
+    int64_t tiles,
+    bool row_axis = true
+) {
+    return normalize_outer_scale_tiles_tensor(sg, tiles, row_axis);
+}
+
+at::Tensor nvfp4_localcta_prepare_split_wgrad_a_sg_entrypoint(
+    const at::Tensor& sg,
+    int64_t tiles,
+    float scale
+) {
+    return prepare_split_wgrad_a_sg_tensor(sg, tiles, scale);
+}
+
+at::Tensor nvfp4_localcta_prepare_split2_b_sg_entrypoint(
+    const at::Tensor& sg,
+    int64_t tiles,
+    float scale
+) {
+    return prepare_split2_b_sg_tensor(sg, tiles, scale);
+}
+
+at::Tensor nvfp4_localcta_prepare_w2_dgrad_b_sg_entrypoint(
+    const at::Tensor& sg,
+    int64_t tiles,
+    float scale
+) {
+    return prepare_w2_dgrad_b_sg_tensor(sg, tiles, scale);
+}
+
+at::Tensor nvfp4_localcta_fold_sg_into_prepared_sc_entrypoint(
+    const at::Tensor& sc_raw,
+    const at::Tensor& sg,
+    int64_t rows,
+    int64_t cols
+) {
+    return fold_sg_into_prepared_sc_tensor(sc_raw, sg, rows, cols);
+}
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("nvfp4_localcta_gemm", &nvfp4_localcta_gemm_entrypoint,
           pybind11::arg("A"), pybind11::arg("A_sc"), pybind11::arg("A_sg_chunks"),
@@ -2901,6 +3735,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("nvfp4_localcta_fast_gemm", &nvfp4_localcta_fast_gemm_entrypoint,
           pybind11::arg("A"), pybind11::arg("A_sc_prepared"),
           pybind11::arg("B"), pybind11::arg("B_sc_prepared"),
+          pybind11::arg("D"));
+    m.def("nvfp4_localcta_fast_gemm_sg", &nvfp4_localcta_fast_gemm_sg_entrypoint,
+          pybind11::arg("A"), pybind11::arg("A_sc_prepared"), pybind11::arg("A_sg_chunks"),
+          pybind11::arg("B"), pybind11::arg("B_sc_prepared"), pybind11::arg("B_sg_chunks"),
           pybind11::arg("D"));
     m.def("nvfp4_localcta_grouped_gemm", &nvfp4_localcta_grouped_gemm_entrypoint,
           pybind11::arg("A"), pybind11::arg("A_sc"), pybind11::arg("A_sg_chunks"),
@@ -2914,6 +3752,11 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("nvfp4_localcta_fast_grouped_gemm", &nvfp4_localcta_fast_grouped_gemm_entrypoint,
           pybind11::arg("A"), pybind11::arg("A_sc_prepared"),
           pybind11::arg("B"), pybind11::arg("B_sc_prepared"),
+          pybind11::arg("D"), pybind11::arg("D_K") = std::nullopt,
+          pybind11::arg("D_V") = std::nullopt, pybind11::arg("silu_dim") = 0);
+    m.def("nvfp4_localcta_fast_grouped_gemm_sg", &nvfp4_localcta_fast_grouped_gemm_sg_entrypoint,
+          pybind11::arg("A"), pybind11::arg("A_sc_prepared"), pybind11::arg("A_sg_chunks"),
+          pybind11::arg("B"), pybind11::arg("B_sc_prepared"), pybind11::arg("B_sg_chunks"),
           pybind11::arg("D"), pybind11::arg("D_K") = std::nullopt,
           pybind11::arg("D_V") = std::nullopt, pybind11::arg("silu_dim") = 0);
     m.def("nvfp4_localcta_batched_gemm", &nvfp4_localcta_batched_gemm_entrypoint,
@@ -2964,6 +3807,12 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           pybind11::arg("A_list"), pybind11::arg("A_sc_prepared_list"),
           pybind11::arg("B_list"), pybind11::arg("B_sc_prepared_list"),
           pybind11::arg("D_out"), pybind11::arg("config_idx") = -1);
+    m.def("nvfp4_localcta_fast_split2_dgrad_onepass_gemm_sg",
+          &nvfp4_localcta_fast_split2_dgrad_onepass_gemm_sg_entrypoint,
+          pybind11::arg("A_list"), pybind11::arg("A_sc_prepared_list"),
+          pybind11::arg("A_sg_chunks_list"), pybind11::arg("B_list"),
+          pybind11::arg("B_sc_prepared_list"), pybind11::arg("B_sg_chunks_list"),
+          pybind11::arg("D_out"), pybind11::arg("config_idx") = -1);
     m.def("nvfp4_localcta_v3_split2_dgrad_onepass_gemm",
           &nvfp4_localcta_v3_split2_dgrad_onepass_gemm_entrypoint,
           pybind11::arg("A_list"), pybind11::arg("A_sc_list"),
@@ -2977,6 +3826,13 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           pybind11::arg("A_col_offsets"), pybind11::arg("A_col_widths"),
           pybind11::arg("B_list"),
           pybind11::arg("B_sc_prepared_list"), pybind11::arg("D_out"));
+    m.def("nvfp4_localcta_fast_split3_dgrad_strided_gemm_sg",
+          &nvfp4_localcta_fast_split3_dgrad_strided_gemm_sg_entrypoint,
+          pybind11::arg("A_full"), pybind11::arg("A_sc_prepared_list"),
+          pybind11::arg("A_sg_chunks_list"), pybind11::arg("A_col_offsets"),
+          pybind11::arg("A_col_widths"), pybind11::arg("B_list"),
+          pybind11::arg("B_sc_prepared_list"), pybind11::arg("B_sg_chunks_list"),
+          pybind11::arg("D_out"));
     m.def("nvfp4_localcta_v3_split3_dgrad_strided_gemm",
           &nvfp4_localcta_v3_split3_dgrad_strided_gemm_entrypoint,
           pybind11::arg("A_full"), pybind11::arg("A_sc_list"),
@@ -3022,4 +3878,14 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("sum3_bf16", &sum3_bf16_entrypoint,
           pybind11::arg("A"), pybind11::arg("B"), pybind11::arg("C"),
           pybind11::arg("D_out"));
+    m.def("nvfp4_localcta_prepare_outer_sg", &nvfp4_localcta_prepare_outer_sg_entrypoint,
+          pybind11::arg("sg"), pybind11::arg("tiles"), pybind11::arg("row_axis") = true);
+    m.def("nvfp4_localcta_prepare_split_wgrad_a_sg", &nvfp4_localcta_prepare_split_wgrad_a_sg_entrypoint,
+          pybind11::arg("sg"), pybind11::arg("tiles"), pybind11::arg("scale"));
+    m.def("nvfp4_localcta_prepare_split2_b_sg", &nvfp4_localcta_prepare_split2_b_sg_entrypoint,
+          pybind11::arg("sg"), pybind11::arg("tiles"), pybind11::arg("scale"));
+    m.def("nvfp4_localcta_prepare_w2_dgrad_b_sg", &nvfp4_localcta_prepare_w2_dgrad_b_sg_entrypoint,
+          pybind11::arg("sg"), pybind11::arg("tiles"), pybind11::arg("scale"));
+    m.def("nvfp4_localcta_fold_sg_into_prepared_sc", &nvfp4_localcta_fold_sg_into_prepared_sc_entrypoint,
+          pybind11::arg("sc_raw"), pybind11::arg("sg"), pybind11::arg("rows"), pybind11::arg("cols"));
 }
