@@ -252,6 +252,8 @@ __global__ void kernel(const __grid_constant__ globals<C> g) {
     }
 }
 
+#ifndef TORCH_COMPILE
+
 template <typename C>
 __host__ double run_benchmark(size_t M, size_t N, size_t K, bool ncu = false) {
     std::cout << "--------------------  M=" << M << " N=" << N << " K=" << K << "  --------------------\n";
@@ -379,3 +381,62 @@ __host__ int main() {
 
     return 0;
 }
+
+#else
+
+#include "pyutils/torchutils.cuh"
+#include "ATen/Functions.h"
+
+template <typename C>
+void launch_bf16_gemm(const at::Tensor &A, const at::Tensor &B, at::Tensor &D) {
+    using G = globals<C>;
+
+    G g {
+        .a = kittens::py::tensor_to_gl<typename G::a_gl>(A),
+        .b = kittens::py::tensor_to_gl<typename G::b_gl>(B),
+        .d = kittens::py::tensor_to_gl<typename G::d_gl>(D),
+    };
+
+    CUDACHECK(cudaFuncSetAttribute(
+        kernel<C>, cudaFuncAttributeMaxDynamicSharedMemorySize, g.dynamic_shared_memory()));
+
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    LaunchConfig<true, true> launch_config(
+        g.grid(), g.block(), g.dynamic_shared_memory(), stream, C::CLUSTER_SIZE);
+    CUDACHECK(cudaLaunchKernelEx(launch_config, kernel<C>, g));
+}
+
+void bf16_gemm_out_entrypoint(
+    const at::Tensor &A,
+    const at::Tensor &B,
+    at::Tensor &D
+) {
+    TORCH_CHECK(A.dim() == 2, "A must be rank-2");
+    TORCH_CHECK(B.dim() == 2, "B must be rank-2");
+    TORCH_CHECK(D.dim() == 2, "D must be rank-2");
+    TORCH_CHECK(A.size(1) == B.size(1), "A and B must have the same K dimension");
+    TORCH_CHECK(D.size(0) == A.size(0), "D rows must match A rows");
+    TORCH_CHECK(D.size(1) == B.size(0), "D cols must match B rows");
+    TORCH_CHECK(A.size(0) % 512 == 0, "A rows must be a multiple of 512 for this B200 config");
+    TORCH_CHECK(B.size(0) % 256 == 0, "B rows/output columns must be a multiple of 256");
+    TORCH_CHECK(A.size(1) % 64 == 0, "K must be a multiple of 64");
+    kittens::py::device_check(A, B, D);
+
+    using C = config<256, 256, 64, 4, false, 4, 8>;
+    launch_bf16_gemm<C>(A, B, D);
+}
+
+at::Tensor bf16_gemm_entrypoint(const at::Tensor &A, const at::Tensor &B) {
+    TORCH_CHECK(A.dim() == 2, "A must be rank-2");
+    TORCH_CHECK(B.dim() == 2, "B must be rank-2");
+    auto D = at::empty({A.size(0), B.size(0)}, A.options());
+    bf16_gemm_out_entrypoint(A, B, D);
+    return D;
+}
+
+PYBIND11_MODULE(_C, m) {
+    m.def("bf16_gemm", &bf16_gemm_entrypoint, "TK BF16 GEMM: D = A @ B.T");
+    m.def("bf16_gemm_out", &bf16_gemm_out_entrypoint, "TK BF16 GEMM out: D = A @ B.T");
+}
+
+#endif
