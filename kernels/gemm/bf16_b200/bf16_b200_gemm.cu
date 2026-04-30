@@ -46,6 +46,7 @@ struct globals {
     a_gl a;
     b_gl b;
     d_gl d;
+    float alpha = 1.0f;
 
     __host__ __inline__ dim3 grid() { return dim3(d.rows()/(C::NUM_CONSUMERS*C::Mb/2) * d.cols()/C::Nb); }
     __host__ __inline__ dim3 block() { return dim3(C::NUM_THREADS); }
@@ -224,7 +225,7 @@ __global__ void kernel(const __grid_constant__ globals<C> g) {
                     warpgroup::tma::store_async<dim::ROW, cache_policy::EVICT_FIRST>(g.d, d_smem[warpgroup::groupid()][i%C::NUM_D_TILES], {(2*tile_coord.x+cta_rank)*C::NUM_CONSUMERS+warpgroup::groupid(), C::EPI_PIPE_DEPTH*tile_coord.y+i});
                 }
             } else {
-                rt_bf<C::Mb/8, C::Nb/C::EPI_PIPE_DEPTH> d_reg[C::EPI_PIPE_DEPTH];
+                rt_fl<C::Mb/8, C::Nb/C::EPI_PIPE_DEPTH> d_reg[C::EPI_PIPE_DEPTH];
                 #pragma unroll
                 for(int i = 0; i < C::EPI_PIPE_DEPTH; i++)
                     warpgroup::load_async(d_reg[i], d_tt[task_iter%C::MMA_PIPE_DEPTH].template subtile<tt<float, C::Mb/2, C::Nb/C::EPI_PIPE_DEPTH>>(0, C::Nb/C::EPI_PIPE_DEPTH*i));
@@ -236,6 +237,7 @@ __global__ void kernel(const __grid_constant__ globals<C> g) {
                 for(int i = 0; i < C::EPI_PIPE_DEPTH; i++) {
                     warpgroup::tma::store_async_read_wait<C::NUM_D_TILES-1>();
                     warpgroup::sync(warpgroup::groupid()+1);
+                    d_reg[i] *= g.alpha;
                     warpgroup::store(d_smem[warpgroup::groupid()][i%C::NUM_D_TILES], d_reg[i]);
                     warpgroup::sync(warpgroup::groupid()+1);
                     warpgroup::tma::store_async<dim::ROW, cache_policy::EVICT_FIRST>(g.d, d_smem[warpgroup::groupid()][i%C::NUM_D_TILES], {(2*tile_coord.x+cta_rank)*C::NUM_CONSUMERS+warpgroup::groupid(), C::EPI_PIPE_DEPTH*tile_coord.y+i});
@@ -388,13 +390,14 @@ __host__ int main() {
 #include "ATen/Functions.h"
 
 template <typename C>
-void launch_bf16_gemm(const at::Tensor &A, const at::Tensor &B, at::Tensor &D) {
+void launch_bf16_gemm(const at::Tensor &A, const at::Tensor &B, at::Tensor &D, float alpha) {
     using G = globals<C>;
 
     G g {
         .a = kittens::py::tensor_to_gl<typename G::a_gl>(A),
         .b = kittens::py::tensor_to_gl<typename G::b_gl>(B),
         .d = kittens::py::tensor_to_gl<typename G::d_gl>(D),
+        .alpha = alpha,
     };
 
     CUDACHECK(cudaFuncSetAttribute(
@@ -409,7 +412,8 @@ void launch_bf16_gemm(const at::Tensor &A, const at::Tensor &B, at::Tensor &D) {
 void bf16_gemm_out_entrypoint(
     const at::Tensor &A,
     const at::Tensor &B,
-    at::Tensor &D
+    at::Tensor &D,
+    float alpha = 1.0f
 ) {
     TORCH_CHECK(A.dim() == 2, "A must be rank-2");
     TORCH_CHECK(B.dim() == 2, "B must be rank-2");
@@ -423,20 +427,33 @@ void bf16_gemm_out_entrypoint(
     kittens::py::device_check(A, B, D);
 
     using C = config<256, 256, 64, 4, false, 4, 8>;
-    launch_bf16_gemm<C>(A, B, D);
+    launch_bf16_gemm<C>(A, B, D, alpha);
 }
 
-at::Tensor bf16_gemm_entrypoint(const at::Tensor &A, const at::Tensor &B) {
+at::Tensor bf16_gemm_entrypoint(const at::Tensor &A, const at::Tensor &B, float alpha = 1.0f) {
     TORCH_CHECK(A.dim() == 2, "A must be rank-2");
     TORCH_CHECK(B.dim() == 2, "B must be rank-2");
     auto D = at::empty({A.size(0), B.size(0)}, A.options());
-    bf16_gemm_out_entrypoint(A, B, D);
+    bf16_gemm_out_entrypoint(A, B, D, alpha);
     return D;
 }
 
 PYBIND11_MODULE(_C, m) {
-    m.def("bf16_gemm", &bf16_gemm_entrypoint, "TK BF16 GEMM: D = A @ B.T");
-    m.def("bf16_gemm_out", &bf16_gemm_out_entrypoint, "TK BF16 GEMM out: D = A @ B.T");
+    m.def(
+        "bf16_gemm",
+        &bf16_gemm_entrypoint,
+        "TK BF16 GEMM: D = alpha * (A @ B.T)",
+        pybind11::arg("A"),
+        pybind11::arg("B"),
+        pybind11::arg("alpha") = 1.0f);
+    m.def(
+        "bf16_gemm_out",
+        &bf16_gemm_out_entrypoint,
+        "TK BF16 GEMM out: D = alpha * (A @ B.T)",
+        pybind11::arg("A"),
+        pybind11::arg("B"),
+        pybind11::arg("D"),
+        pybind11::arg("alpha") = 1.0f);
 }
 
 #endif

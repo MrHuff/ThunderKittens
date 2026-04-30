@@ -38,6 +38,17 @@ def main() -> None:
     if not torch.equal(out, out2):
         raise AssertionError("bf16_gemm and bf16_gemm_out produced different outputs")
 
+    alpha = 3.94728715e-7
+    out_scaled = bf16_gemm(a, b, alpha)
+    ref_scaled = (torch.mm(a.float(), b.t().float()) * alpha).to(torch.bfloat16)
+    scaled_stats = _diff_stats(out_scaled, ref_scaled)
+    print(
+        "TK scaled BF16 vs fp32-mm scaled: "
+        f"max={scaled_stats['max']:.8f} "
+        f"mean={scaled_stats['mean']:.8f} "
+        f"nonzero={int(scaled_stats['nonzero'])}"
+    )
+
     warmup = 5
     iters = 20
     for _ in range(warmup):
