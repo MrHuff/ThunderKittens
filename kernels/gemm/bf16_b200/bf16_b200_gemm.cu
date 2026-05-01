@@ -3,7 +3,15 @@
 
 using namespace kittens;
 
-template <int _Mb, int _Nb, int _Kb, int _SUPERGROUP_SIZE, bool _OVERLAP_MMA_EPI, int _LOAD_PIPE_DEPTH, int _EPI_PIPE_DEPTH>
+template <
+    int _Mb,
+    int _Nb,
+    int _Kb,
+    int _SUPERGROUP_SIZE,
+    bool _OVERLAP_MMA_EPI,
+    int _LOAD_PIPE_DEPTH,
+    int _EPI_PIPE_DEPTH,
+    bool _REVERSE_K = false>
 struct config {
     static_assert(_Mb == 256, "Mb must be 256");
     static_assert(_Nb >= 16 && _Nb <= 256 && _Nb % 16 == 0, "Nb must be 16, 32, ..., 256");
@@ -22,6 +30,7 @@ struct config {
     static constexpr int LOAD_PIPE_DEPTH = _LOAD_PIPE_DEPTH;
     static constexpr int MMA_PIPE_DEPTH = OVERLAP_MMA_EPI ? 2 : 1;
     static constexpr int EPI_PIPE_DEPTH = _EPI_PIPE_DEPTH;
+    static constexpr bool REVERSE_K = _REVERSE_K;
     static constexpr int CLC_PIPE_DEPTH = 1;
 
     static constexpr int CLUSTER_SIZE = 2;
@@ -47,6 +56,7 @@ struct globals {
     b_gl b;
     d_gl d;
     float alpha = 1.0f;
+    const float *alpha_ptr = nullptr;
 
     __host__ __inline__ dim3 grid() { return dim3(d.rows()/(C::NUM_CONSUMERS*C::Mb/2) * d.cols()/C::Nb); }
     __host__ __inline__ dim3 block() { return dim3(C::NUM_THREADS); }
@@ -125,11 +135,18 @@ __global__ void kernel(const __grid_constant__ globals<C> g) {
             everyone::tma::cluster::wait();
             for (int task_iter = 0; true; task_iter++) {
                 for (int idx = 0; idx < iters_per_task; idx++) {
+                    const int k_idx = C::REVERSE_K ? iters_per_task - 1 - idx : idx;
                     wait(inputs_finished[input_ring], get_phasebit<1>(bitfield, input_ring));
                     #pragma unroll
-                    for (int i = 0; i < C::NUM_CONSUMERS; i++)
-                        tma::cluster::load_async(a_smem[input_ring][i], g.a, {(tile_coord.x*2+cta_rank)*C::NUM_CONSUMERS+i, idx}, inputs_arrived[input_ring], (uint16_t)(1<<cta_rank), 0);
-                    tma::cluster::load_async(b_smem[input_ring], g.b, {tile_coord.y*2+cta_rank, idx}, inputs_arrived[input_ring], (uint16_t)(1<<cta_rank), 0);
+                    for (int i = 0; i < C::NUM_CONSUMERS; i++) {
+                        tma::cluster::load_async(
+                            a_smem[input_ring][i], g.a,
+                            {(tile_coord.x*2+cta_rank)*C::NUM_CONSUMERS+i, k_idx},
+                            inputs_arrived[input_ring], (uint16_t)(1<<cta_rank), 0);
+                    }
+                    tma::cluster::load_async(
+                        b_smem[input_ring], g.b, {tile_coord.y*2+cta_rank, k_idx},
+                        inputs_arrived[input_ring], (uint16_t)(1<<cta_rank), 0);
                     update_phasebit<1>(bitfield, input_ring);
                     input_ring=ring_advance<C::LOAD_PIPE_DEPTH>(input_ring);
                 }
@@ -233,11 +250,12 @@ __global__ void kernel(const __grid_constant__ globals<C> g) {
                 warpgroup::sync(warpgroup::groupid()+1);
                 if (!schedule.success) warpgroup::pdl::arrive();
                 warpgroup::tma::cluster::arrive(outputs_finished[task_iter%C::MMA_PIPE_DEPTH], 0);
+                const float alpha = g.alpha_ptr == nullptr ? g.alpha : *g.alpha_ptr;
                 #pragma unroll
                 for(int i = 0; i < C::EPI_PIPE_DEPTH; i++) {
                     warpgroup::tma::store_async_read_wait<C::NUM_D_TILES-1>();
                     warpgroup::sync(warpgroup::groupid()+1);
-                    d_reg[i] *= g.alpha;
+                    d_reg[i] *= alpha;
                     warpgroup::store(d_smem[warpgroup::groupid()][i%C::NUM_D_TILES], d_reg[i]);
                     warpgroup::sync(warpgroup::groupid()+1);
                     warpgroup::tma::store_async<dim::ROW, cache_policy::EVICT_FIRST>(g.d, d_smem[warpgroup::groupid()][i%C::NUM_D_TILES], {(2*tile_coord.x+cta_rank)*C::NUM_CONSUMERS+warpgroup::groupid(), C::EPI_PIPE_DEPTH*tile_coord.y+i});
@@ -388,9 +406,16 @@ __host__ int main() {
 
 #include "pyutils/torchutils.cuh"
 #include "ATen/Functions.h"
+#include <cublasLt.h>
 
 template <typename C>
-void launch_bf16_gemm(const at::Tensor &A, const at::Tensor &B, at::Tensor &D, float alpha) {
+void launch_bf16_gemm(
+    const at::Tensor &A,
+    const at::Tensor &B,
+    at::Tensor &D,
+    float alpha,
+    const float *alpha_ptr = nullptr
+) {
     using G = globals<C>;
 
     G g {
@@ -398,6 +423,7 @@ void launch_bf16_gemm(const at::Tensor &A, const at::Tensor &B, at::Tensor &D, f
         .b = kittens::py::tensor_to_gl<typename G::b_gl>(B),
         .d = kittens::py::tensor_to_gl<typename G::d_gl>(D),
         .alpha = alpha,
+        .alpha_ptr = alpha_ptr,
     };
 
     CUDACHECK(cudaFuncSetAttribute(
@@ -409,11 +435,11 @@ void launch_bf16_gemm(const at::Tensor &A, const at::Tensor &B, at::Tensor &D, f
     CUDACHECK(cudaLaunchKernelEx(launch_config, kernel<C>, g));
 }
 
-void bf16_gemm_out_entrypoint(
+void check_bf16_gemm_inputs(
     const at::Tensor &A,
     const at::Tensor &B,
-    at::Tensor &D,
-    float alpha = 1.0f
+    const at::Tensor &D,
+    int kb = 64
 ) {
     TORCH_CHECK(A.dim() == 2, "A must be rank-2");
     TORCH_CHECK(B.dim() == 2, "B must be rank-2");
@@ -423,11 +449,110 @@ void bf16_gemm_out_entrypoint(
     TORCH_CHECK(D.size(1) == B.size(0), "D cols must match B rows");
     TORCH_CHECK(A.size(0) % 512 == 0, "A rows must be a multiple of 512 for this B200 config");
     TORCH_CHECK(B.size(0) % 256 == 0, "B rows/output columns must be a multiple of 256");
-    TORCH_CHECK(A.size(1) % 64 == 0, "K must be a multiple of 64");
+    TORCH_CHECK(A.size(1) % kb == 0, "K must be a multiple of the selected K tile size");
     kittens::py::device_check(A, B, D);
+}
+
+void check_alpha_tensor(const at::Tensor &alpha) {
+    TORCH_CHECK(alpha.dim() == 0 || alpha.numel() == 1, "alpha tensor must be scalar-like");
+    TORCH_CHECK(alpha.scalar_type() == at::ScalarType::Float, "alpha tensor must be float32");
+    TORCH_CHECK(alpha.is_cuda(), "alpha tensor must be CUDA");
+}
+
+#define CHECK_CUBLASLT(call)                                                   \
+    do {                                                                       \
+        cublasStatus_t status = (call);                                        \
+        TORCH_CHECK(status == CUBLAS_STATUS_SUCCESS, "cuBLASLt error: ", status); \
+    } while (0)
+
+void bf16_gemm_out_entrypoint(
+    const at::Tensor &A,
+    const at::Tensor &B,
+    at::Tensor &D,
+    float alpha = 1.0f
+) {
+    check_bf16_gemm_inputs(A, B, D, 64);
 
     using C = config<256, 256, 64, 4, false, 4, 8>;
     launch_bf16_gemm<C>(A, B, D, alpha);
+}
+
+void bf16_gemm_out_alpha_entrypoint(
+    const at::Tensor &A,
+    const at::Tensor &B,
+    at::Tensor &D,
+    const at::Tensor &alpha
+) {
+    check_bf16_gemm_inputs(A, B, D, 64);
+    check_alpha_tensor(alpha);
+
+    using C = config<256, 256, 64, 4, false, 4, 8>;
+    launch_bf16_gemm<C>(A, B, D, 1.0f, alpha.data_ptr<float>());
+}
+
+void bf16_gemm_out_alpha_k16_entrypoint(
+    const at::Tensor &A,
+    const at::Tensor &B,
+    at::Tensor &D,
+    const at::Tensor &alpha
+) {
+    check_bf16_gemm_inputs(A, B, D, 16);
+    check_alpha_tensor(alpha);
+
+    using C = config<256, 256, 16, 4, false, 4, 8>;
+    launch_bf16_gemm<C>(A, B, D, 1.0f, alpha.data_ptr<float>());
+}
+
+void bf16_gemm_out_alpha_k32_entrypoint(
+    const at::Tensor &A,
+    const at::Tensor &B,
+    at::Tensor &D,
+    const at::Tensor &alpha
+) {
+    check_bf16_gemm_inputs(A, B, D, 32);
+    check_alpha_tensor(alpha);
+
+    using C = config<256, 256, 32, 4, false, 4, 8>;
+    launch_bf16_gemm<C>(A, B, D, 1.0f, alpha.data_ptr<float>());
+}
+
+void bf16_gemm_out_alpha_k128_entrypoint(
+    const at::Tensor &A,
+    const at::Tensor &B,
+    at::Tensor &D,
+    const at::Tensor &alpha
+) {
+    check_bf16_gemm_inputs(A, B, D, 128);
+    check_alpha_tensor(alpha);
+
+    using C = config<256, 256, 128, 4, false, 1, 8>;
+    launch_bf16_gemm<C>(A, B, D, 1.0f, alpha.data_ptr<float>());
+}
+
+void bf16_gemm_out_alpha_reverse_entrypoint(
+    const at::Tensor &A,
+    const at::Tensor &B,
+    at::Tensor &D,
+    const at::Tensor &alpha
+) {
+    check_bf16_gemm_inputs(A, B, D, 64);
+    check_alpha_tensor(alpha);
+
+    using C = config<256, 256, 64, 4, false, 4, 8, true>;
+    launch_bf16_gemm<C>(A, B, D, 1.0f, alpha.data_ptr<float>());
+}
+
+void bf16_gemm_out_alpha_reverse_k16_entrypoint(
+    const at::Tensor &A,
+    const at::Tensor &B,
+    at::Tensor &D,
+    const at::Tensor &alpha
+) {
+    check_bf16_gemm_inputs(A, B, D, 16);
+    check_alpha_tensor(alpha);
+
+    using C = config<256, 256, 16, 4, false, 4, 8, true>;
+    launch_bf16_gemm<C>(A, B, D, 1.0f, alpha.data_ptr<float>());
 }
 
 at::Tensor bf16_gemm_entrypoint(const at::Tensor &A, const at::Tensor &B, float alpha = 1.0f) {
@@ -435,6 +560,144 @@ at::Tensor bf16_gemm_entrypoint(const at::Tensor &A, const at::Tensor &B, float 
     TORCH_CHECK(B.dim() == 2, "B must be rank-2");
     auto D = at::empty({A.size(0), B.size(0)}, A.options());
     bf16_gemm_out_entrypoint(A, B, D, alpha);
+    return D;
+}
+
+at::Tensor bf16_gemm_alpha_entrypoint(const at::Tensor &A, const at::Tensor &B, const at::Tensor &alpha) {
+    TORCH_CHECK(A.dim() == 2, "A must be rank-2");
+    TORCH_CHECK(B.dim() == 2, "B must be rank-2");
+    auto D = at::empty({A.size(0), B.size(0)}, A.options());
+    bf16_gemm_out_alpha_entrypoint(A, B, D, alpha);
+    return D;
+}
+
+at::Tensor bf16_gemm_alpha_k16_entrypoint(const at::Tensor &A, const at::Tensor &B, const at::Tensor &alpha) {
+    TORCH_CHECK(A.dim() == 2, "A must be rank-2");
+    TORCH_CHECK(B.dim() == 2, "B must be rank-2");
+    auto D = at::empty({A.size(0), B.size(0)}, A.options());
+    bf16_gemm_out_alpha_k16_entrypoint(A, B, D, alpha);
+    return D;
+}
+
+at::Tensor bf16_gemm_alpha_k32_entrypoint(const at::Tensor &A, const at::Tensor &B, const at::Tensor &alpha) {
+    TORCH_CHECK(A.dim() == 2, "A must be rank-2");
+    TORCH_CHECK(B.dim() == 2, "B must be rank-2");
+    auto D = at::empty({A.size(0), B.size(0)}, A.options());
+    bf16_gemm_out_alpha_k32_entrypoint(A, B, D, alpha);
+    return D;
+}
+
+at::Tensor bf16_gemm_alpha_k128_entrypoint(const at::Tensor &A, const at::Tensor &B, const at::Tensor &alpha) {
+    TORCH_CHECK(A.dim() == 2, "A must be rank-2");
+    TORCH_CHECK(B.dim() == 2, "B must be rank-2");
+    auto D = at::empty({A.size(0), B.size(0)}, A.options());
+    bf16_gemm_out_alpha_k128_entrypoint(A, B, D, alpha);
+    return D;
+}
+
+at::Tensor bf16_gemm_alpha_cublaslt_entrypoint(
+    const at::Tensor &A,
+    const at::Tensor &B,
+    const at::Tensor &alpha
+) {
+    TORCH_CHECK(A.dim() == 2, "A must be rank-2");
+    TORCH_CHECK(B.dim() == 2, "B must be rank-2");
+    auto D = at::empty({A.size(0), B.size(0)}, A.options());
+    check_bf16_gemm_inputs(A, B, D, 64);
+    check_alpha_tensor(alpha);
+
+    const int64_t M = A.size(0);
+    const int64_t N = B.size(0);
+    const int64_t K = A.size(1);
+    const float alpha_host = alpha.item<float>();
+    const float beta_host = 0.0f;
+
+    cublasLtHandle_t handle = nullptr;
+    cublasLtMatmulDesc_t matmul_desc = nullptr;
+    cublasLtMatrixLayout_t layout_a = nullptr;
+    cublasLtMatrixLayout_t layout_b = nullptr;
+    cublasLtMatrixLayout_t layout_d = nullptr;
+    cublasLtMatmulPreference_t preference = nullptr;
+    void *workspace = nullptr;
+    size_t workspace_size = 32 * 1024 * 1024;
+
+    CHECK_CUBLASLT(cublasLtCreate(&handle));
+    CHECK_CUBLASLT(cublasLtMatmulDescCreate(&matmul_desc, CUBLAS_COMPUTE_32F, CUDA_R_32F));
+    cublasOperation_t trans_a = CUBLAS_OP_T;
+    cublasOperation_t trans_b = CUBLAS_OP_N;
+    CHECK_CUBLASLT(cublasLtMatmulDescSetAttribute(
+        matmul_desc, CUBLASLT_MATMUL_DESC_TRANSA, &trans_a, sizeof(trans_a)));
+    CHECK_CUBLASLT(cublasLtMatmulDescSetAttribute(
+        matmul_desc, CUBLASLT_MATMUL_DESC_TRANSB, &trans_b, sizeof(trans_b)));
+
+    CHECK_CUBLASLT(cublasLtMatrixLayoutCreate(&layout_a, CUDA_R_16BF, K, N, K));
+    CHECK_CUBLASLT(cublasLtMatrixLayoutCreate(&layout_b, CUDA_R_16BF, K, M, K));
+    CHECK_CUBLASLT(cublasLtMatrixLayoutCreate(&layout_d, CUDA_R_16BF, N, M, N));
+    CHECK_CUBLASLT(cublasLtMatmulPreferenceCreate(&preference));
+    CHECK_CUBLASLT(cublasLtMatmulPreferenceSetAttribute(
+        preference,
+        CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES,
+        &workspace_size,
+        sizeof(workspace_size)));
+    CUDACHECK(cudaMalloc(&workspace, workspace_size));
+
+    cublasLtMatmulHeuristicResult_t heuristic;
+    int returned_results = 0;
+    CHECK_CUBLASLT(cublasLtMatmulAlgoGetHeuristic(
+        handle,
+        matmul_desc,
+        layout_a,
+        layout_b,
+        layout_d,
+        layout_d,
+        preference,
+        1,
+        &heuristic,
+        &returned_results));
+    TORCH_CHECK(returned_results > 0, "cuBLASLt found no BF16 GEMM algorithm");
+
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    CHECK_CUBLASLT(cublasLtMatmul(
+        handle,
+        matmul_desc,
+        &alpha_host,
+        B.data_ptr(),
+        layout_a,
+        A.data_ptr(),
+        layout_b,
+        &beta_host,
+        D.data_ptr(),
+        layout_d,
+        D.data_ptr(),
+        layout_d,
+        &heuristic.algo,
+        workspace,
+        workspace_size,
+        stream));
+
+    CUDACHECK(cudaFree(workspace));
+    CHECK_CUBLASLT(cublasLtMatmulPreferenceDestroy(preference));
+    CHECK_CUBLASLT(cublasLtMatrixLayoutDestroy(layout_a));
+    CHECK_CUBLASLT(cublasLtMatrixLayoutDestroy(layout_b));
+    CHECK_CUBLASLT(cublasLtMatrixLayoutDestroy(layout_d));
+    CHECK_CUBLASLT(cublasLtMatmulDescDestroy(matmul_desc));
+    CHECK_CUBLASLT(cublasLtDestroy(handle));
+    return D;
+}
+
+at::Tensor bf16_gemm_alpha_reverse_entrypoint(const at::Tensor &A, const at::Tensor &B, const at::Tensor &alpha) {
+    TORCH_CHECK(A.dim() == 2, "A must be rank-2");
+    TORCH_CHECK(B.dim() == 2, "B must be rank-2");
+    auto D = at::empty({A.size(0), B.size(0)}, A.options());
+    bf16_gemm_out_alpha_reverse_entrypoint(A, B, D, alpha);
+    return D;
+}
+
+at::Tensor bf16_gemm_alpha_reverse_k16_entrypoint(const at::Tensor &A, const at::Tensor &B, const at::Tensor &alpha) {
+    TORCH_CHECK(A.dim() == 2, "A must be rank-2");
+    TORCH_CHECK(B.dim() == 2, "B must be rank-2");
+    auto D = at::empty({A.size(0), B.size(0)}, A.options());
+    bf16_gemm_out_alpha_reverse_k16_entrypoint(A, B, D, alpha);
     return D;
 }
 
@@ -454,6 +717,103 @@ PYBIND11_MODULE(_C, m) {
         pybind11::arg("B"),
         pybind11::arg("D"),
         pybind11::arg("alpha") = 1.0f);
+    m.def(
+        "bf16_gemm_alpha",
+        &bf16_gemm_alpha_entrypoint,
+        "TK BF16 GEMM with device alpha: D = alpha * (A @ B.T)",
+        pybind11::arg("A"),
+        pybind11::arg("B"),
+        pybind11::arg("alpha"));
+    m.def(
+        "bf16_gemm_out_alpha",
+        &bf16_gemm_out_alpha_entrypoint,
+        "TK BF16 GEMM out with device alpha: D = alpha * (A @ B.T)",
+        pybind11::arg("A"),
+        pybind11::arg("B"),
+        pybind11::arg("D"),
+        pybind11::arg("alpha"));
+    m.def(
+        "bf16_gemm_alpha_k16",
+        &bf16_gemm_alpha_k16_entrypoint,
+        "TK BF16 GEMM with device alpha and Kb16 accumulation: D = alpha * (A @ B.T)",
+        pybind11::arg("A"),
+        pybind11::arg("B"),
+        pybind11::arg("alpha"));
+    m.def(
+        "bf16_gemm_out_alpha_k16",
+        &bf16_gemm_out_alpha_k16_entrypoint,
+        "TK BF16 GEMM out with device alpha and Kb16 accumulation: D = alpha * (A @ B.T)",
+        pybind11::arg("A"),
+        pybind11::arg("B"),
+        pybind11::arg("D"),
+        pybind11::arg("alpha"));
+    m.def(
+        "bf16_gemm_alpha_k32",
+        &bf16_gemm_alpha_k32_entrypoint,
+        "TK BF16 GEMM with device alpha and Kb32 accumulation: D = alpha * (A @ B.T)",
+        pybind11::arg("A"),
+        pybind11::arg("B"),
+        pybind11::arg("alpha"));
+    m.def(
+        "bf16_gemm_out_alpha_k32",
+        &bf16_gemm_out_alpha_k32_entrypoint,
+        "TK BF16 GEMM out with device alpha and Kb32 accumulation: D = alpha * (A @ B.T)",
+        pybind11::arg("A"),
+        pybind11::arg("B"),
+        pybind11::arg("D"),
+        pybind11::arg("alpha"));
+    m.def(
+        "bf16_gemm_alpha_k128",
+        &bf16_gemm_alpha_k128_entrypoint,
+        "TK BF16 GEMM with device alpha and Kb128 accumulation: D = alpha * (A @ B.T)",
+        pybind11::arg("A"),
+        pybind11::arg("B"),
+        pybind11::arg("alpha"));
+    m.def(
+        "bf16_gemm_out_alpha_k128",
+        &bf16_gemm_out_alpha_k128_entrypoint,
+        "TK BF16 GEMM out with device alpha and Kb128 accumulation: D = alpha * (A @ B.T)",
+        pybind11::arg("A"),
+        pybind11::arg("B"),
+        pybind11::arg("D"),
+        pybind11::arg("alpha"));
+    m.def(
+        "bf16_gemm_alpha_cublaslt",
+        &bf16_gemm_alpha_cublaslt_entrypoint,
+        "cuBLASLt BF16 GEMM with device alpha: D = alpha * (A @ B.T)",
+        pybind11::arg("A"),
+        pybind11::arg("B"),
+        pybind11::arg("alpha"));
+    m.def(
+        "bf16_gemm_alpha_reverse",
+        &bf16_gemm_alpha_reverse_entrypoint,
+        "TK BF16 GEMM with device alpha and reverse-K accumulation: D = alpha * (A @ B.T)",
+        pybind11::arg("A"),
+        pybind11::arg("B"),
+        pybind11::arg("alpha"));
+    m.def(
+        "bf16_gemm_out_alpha_reverse",
+        &bf16_gemm_out_alpha_reverse_entrypoint,
+        "TK BF16 GEMM out with device alpha and reverse-K accumulation: D = alpha * (A @ B.T)",
+        pybind11::arg("A"),
+        pybind11::arg("B"),
+        pybind11::arg("D"),
+        pybind11::arg("alpha"));
+    m.def(
+        "bf16_gemm_alpha_reverse_k16",
+        &bf16_gemm_alpha_reverse_k16_entrypoint,
+        "TK BF16 GEMM with device alpha and reverse-Kb16 accumulation: D = alpha * (A @ B.T)",
+        pybind11::arg("A"),
+        pybind11::arg("B"),
+        pybind11::arg("alpha"));
+    m.def(
+        "bf16_gemm_out_alpha_reverse_k16",
+        &bf16_gemm_out_alpha_reverse_k16_entrypoint,
+        "TK BF16 GEMM out with device alpha and reverse-Kb16 accumulation: D = alpha * (A @ B.T)",
+        pybind11::arg("A"),
+        pybind11::arg("B"),
+        pybind11::arg("D"),
+        pybind11::arg("alpha"));
 }
 
 #endif

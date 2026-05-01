@@ -6,6 +6,7 @@ CONFIG := standalone
 
 ifeq ($(CONFIG),pytorch)
 NVCCFLAGS += -DTORCH_COMPILE
+NVCCFLAGS += -lcublasLt -lcublas
 endif
 
 # PyTorch extension smoke:
