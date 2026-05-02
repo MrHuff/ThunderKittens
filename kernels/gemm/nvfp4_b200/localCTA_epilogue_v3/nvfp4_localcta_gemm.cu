@@ -36,6 +36,12 @@ using localcta_tilegrid256_config = nvfp4_localcta_gemm::config<256, 5, 8, 12, 2
 using localcta_fast_smallk_config = nvfp4_gemm::config<256, 5, 8, 4, 2, false>;
 using localcta_fast_largek_config = nvfp4_gemm::config<256, 5, 8, 12, 2, false>;
 using localcta_fast_grouped_config = nvfp4_gemm::config<256, 5, 8, 4, 2, false>;
+using localcta_fast_chunkgrid_smallk_config = nvfp4_gemm::config<256, 5, 8, 4, 2, false, 256, true, 2, 128>;
+using localcta_fast_chunkgrid_largek_config = nvfp4_gemm::config<256, 5, 8, 12, 2, false, 256, true, 2, 128>;
+using localcta_fast_chunkgrid_grouped_config = nvfp4_gemm::config<256, 5, 8, 4, 2, false, 256, true, 2, 128>;
+using localcta_fast_chunkgrid_smalln_config = nvfp4_gemm::config<128, 5, 4, 12, 2, true, 256, true, 2, 128>;
+using localcta_fast_chunkgrid_smalln_epi2_config = nvfp4_gemm::config<128, 5, 2, 12, 2, true, 256, true, 2, 128>;
+using localcta_fast_chunkgrid_smalln_epi1_config = nvfp4_gemm::config<128, 5, 1, 12, 2, true, 256, true, 2, 128>;
 using localcta_fast_batched_config = nvfp4_gemm::config<256, 5, 8, 4, 2, false>;
 using localcta_fast_split2_dgrad_config = nvfp4_gemm::config<256, 5, 8, 12, 2, false>;
 using localcta_fast_split3_dgrad_config = nvfp4_gemm::config<256, 5, 8, 12, 2, false>;
@@ -46,6 +52,11 @@ using localcta_onepass_cfg2 = nvfp4_gemm::config<256, 5, 8, 4, 2, false, 256, fa
 using localcta_onepass_cfg3 = nvfp4_gemm::config<256, 5, 8, 4, 2, false, 256, false, 2>;
 using localcta_onepass_cfg4 = nvfp4_gemm::config<256, 5, 8, 12, 2, false, 256, false, 1>;
 using localcta_onepass_cfg5 = nvfp4_gemm::config<256, 5, 8, 12, 2, false, 256, false, 2>;
+using localcta_onepass_sg_cfg1 = nvfp4_gemm::config<128, 5, 4, 12, 2, true, 256, false, 2, 128>;
+using localcta_onepass_sg_cfg3 = nvfp4_gemm::config<256, 5, 8, 4, 2, false, 256, false, 2, 128>;
+using localcta_onepass_sg_cfg5 = nvfp4_gemm::config<256, 5, 8, 12, 2, false, 256, false, 2, 128>;
+using localcta_onepass_sg_cfg6 = nvfp4_gemm::config<128, 5, 2, 12, 2, true, 256, false, 2, 128>;
+using localcta_onepass_sg_cfg7 = nvfp4_gemm::config<128, 5, 1, 12, 2, true, 256, false, 2, 128>;
 
 __global__ void sum3_tensors_kernel(
     const __nv_bfloat16* __restrict__ A,
@@ -143,6 +154,18 @@ bool use_v3_split2_onepass() {
         return false;
     }
     return std::strcmp(value, "0") != 0;
+}
+
+int get_chunkgrid_gemm_config_idx() {
+    const char* value = std::getenv("USE_TK_LOCALCTA_V4_CHUNKGRID_GEMM_CONFIG");
+    if (value == nullptr) {
+        return 7;
+    }
+    try {
+        return std::stoi(std::string(value));
+    } catch (...) {
+        return 7;
+    }
 }
 
 void check_fp4_matrix(const at::Tensor& t, const char* name) {
@@ -713,7 +736,7 @@ void launch_gemm_with_config(
         .use_split_D = false,
         .silu_dim = 0
     };
-    kittens::py::launch_kernel<C, G, nvfp4_localcta_gemm::kernel<C>>(g);
+    kittens::py::launch_kernel<C, G, nvfp4_localcta_gemm::kernel_reduction_scaled<C>>(g);
 }
 
 template <typename C>
@@ -756,7 +779,7 @@ void launch_grouped_gemm_with_config(
         .use_split_D = use_split_D,
         .silu_dim = silu_dim
     };
-    kittens::py::launch_kernel<C, G, nvfp4_localcta_gemm::kernel<C>>(g);
+    kittens::py::launch_kernel<C, G, nvfp4_localcta_gemm::kernel_reduction_scaled<C>>(g);
 }
 
 void launch_regular_gemm(
@@ -818,16 +841,17 @@ void launch_chunkgrid_batched_accum_gemm(
             D_out);
         return;
     }
-
     std::vector<at::Tensor> D_list;
     D_list.reserve(n);
     for (int i = 0; i < n; ++i) {
         D_list.push_back(at::empty_like(D_out));
     }
-    launch_batched_gemm(
-        A_list, A_sc_list, A_sg_chunks_list,
-        B_list, B_sc_list, B_sg_chunks_list,
-        D_list);
+    for (int i = 0; i < n; ++i) {
+        launch_regular_gemm(
+            A_list[i], A_sc_list[i], A_sg_chunks_list[i],
+            B_list[i], B_sc_list[i], B_sg_chunks_list[i],
+            D_list[i]);
+    }
 
     const int64_t numel = D_out.numel();
     const int threads = 256;
@@ -1100,6 +1124,143 @@ void launch_fast_grouped_gemm(
     }
     launch_fast_grouped_gemm_with_config<localcta_fast_grouped_config>(
         A, A_sc_prepared, A_sg_tiles, B, B_sc_prepared, B_sg_tiles, D, D_K_opt, D_V_opt, silu_dim);
+}
+
+template <typename C>
+void launch_fast_gemm_chunkgrid_sg_with_config(
+    const at::Tensor& A,
+    const at::Tensor& A_sc,
+    const at::Tensor& A_sg_chunks,
+    const at::Tensor& B,
+    const at::Tensor& B_sc,
+    const at::Tensor& B_sg_chunks,
+    at::Tensor& D
+) {
+    using G = nvfp4_gemm::globals<C>;
+    auto one = get_unit_scale_tensor(A);
+    G g {
+        .A = kittens::py::tensor_to_gl<typename G::A_fp4x2_gl>(A),
+        .A_sc = kittens::py::tensor_to_gl<typename G::A_sc_gl, false>(
+            A_sc, 1, A_sc.size(0), A_sc.size(1), 256),
+        .A_sc_global = kittens::py::tensor_to_gl<typename G::A_sc_global_gl>(one),
+        .B = kittens::py::tensor_to_gl<typename G::B_fp4x2_gl>(B),
+        .B_sc = kittens::py::tensor_to_gl<typename G::B_sc_gl, false>(
+            B_sc, 1, B_sc.size(0), B_sc.size(1), 256),
+        .B_sc_global = kittens::py::tensor_to_gl<typename G::B_sc_global_gl>(one),
+        .D = kittens::py::tensor_to_gl<typename G::D_gl>(D),
+        .D_K = kittens::py::tensor_to_gl<typename G::D_gl>(D),
+        .D_V = kittens::py::tensor_to_gl<typename G::D_gl>(D),
+        .q_dim = 0,
+        .k_dim = 0,
+        .v_dim = 0,
+        .use_split_D = false,
+        .a_sg_per_tile = A_sg_chunks.data_ptr<float>(),
+        .a_sg_stride = static_cast<int>(A_sg_chunks.size(1)),
+        .b_sg_per_tile = B_sg_chunks.data_ptr<float>(),
+        .b_sg_stride = static_cast<int>(B_sg_chunks.size(1)),
+        .silu_dim = 0
+    };
+    kittens::py::launch_kernel<C, G, nvfp4_gemm::kernel_chunk_grid<C>>(g);
+}
+
+template <typename C>
+void launch_fast_grouped_gemm_chunkgrid_sg_with_config(
+    const at::Tensor& A,
+    const at::Tensor& A_sc,
+    const at::Tensor& A_sg_chunks,
+    const at::Tensor& B,
+    const at::Tensor& B_sc,
+    const at::Tensor& B_sg_chunks,
+    at::Tensor& D,
+    std::optional<at::Tensor> D_K_opt,
+    std::optional<at::Tensor> D_V_opt,
+    int silu_dim
+) {
+    using G = nvfp4_gemm::globals<C>;
+    const bool use_split_D = D_K_opt.has_value();
+    const int v_dim = D_V_opt.has_value() ? static_cast<int>(D_V_opt.value().size(1)) : 0;
+    auto one = get_unit_scale_tensor(A);
+    G g {
+        .A = kittens::py::tensor_to_gl<typename G::A_fp4x2_gl>(A),
+        .A_sc = kittens::py::tensor_to_gl<typename G::A_sc_gl, false>(
+            A_sc, 1, A_sc.size(0), A_sc.size(1), 256),
+        .A_sc_global = kittens::py::tensor_to_gl<typename G::A_sc_global_gl>(one),
+        .B = kittens::py::tensor_to_gl<typename G::B_fp4x2_gl>(B),
+        .B_sc = kittens::py::tensor_to_gl<typename G::B_sc_gl, false>(
+            B_sc, 1, B_sc.size(0), B_sc.size(1), 256),
+        .B_sc_global = kittens::py::tensor_to_gl<typename G::B_sc_global_gl>(one),
+        .D = kittens::py::tensor_to_gl<typename G::D_gl>(D),
+        .D_K = use_split_D ? kittens::py::tensor_to_gl<typename G::D_gl>(D_K_opt.value())
+                           : kittens::py::tensor_to_gl<typename G::D_gl>(D),
+        .D_V = D_V_opt.has_value() ? kittens::py::tensor_to_gl<typename G::D_gl>(D_V_opt.value())
+                                   : (use_split_D ? kittens::py::tensor_to_gl<typename G::D_gl>(D_K_opt.value())
+                                                  : kittens::py::tensor_to_gl<typename G::D_gl>(D)),
+        .q_dim = use_split_D ? static_cast<int>(D.size(1)) : 0,
+        .k_dim = use_split_D ? static_cast<int>(D_K_opt.value().size(1)) : 0,
+        .v_dim = use_split_D ? v_dim : 0,
+        .use_split_D = use_split_D,
+        .a_sg_per_tile = A_sg_chunks.data_ptr<float>(),
+        .a_sg_stride = static_cast<int>(A_sg_chunks.size(1)),
+        .b_sg_per_tile = B_sg_chunks.data_ptr<float>(),
+        .b_sg_stride = static_cast<int>(B_sg_chunks.size(1)),
+        .silu_dim = silu_dim
+    };
+    kittens::py::launch_kernel<C, G, nvfp4_gemm::kernel_chunk_grid<C>>(g);
+}
+
+void launch_fast_regular_gemm_chunkgrid_sg(
+    const at::Tensor& A,
+    const at::Tensor& A_sc,
+    const at::Tensor& A_sg_chunks,
+    const at::Tensor& B,
+    const at::Tensor& B_sc,
+    const at::Tensor& B_sg_chunks,
+    at::Tensor& D
+) {
+    switch (get_chunkgrid_gemm_config_idx()) {
+        case 6:
+            launch_fast_gemm_chunkgrid_sg_with_config<localcta_fast_chunkgrid_smalln_epi2_config>(
+                A, A_sc, A_sg_chunks, B, B_sc, B_sg_chunks, D);
+            break;
+        case 7:
+            launch_fast_gemm_chunkgrid_sg_with_config<localcta_fast_chunkgrid_smalln_epi1_config>(
+                A, A_sc, A_sg_chunks, B, B_sc, B_sg_chunks, D);
+            break;
+        case 1:
+        default:
+            launch_fast_gemm_chunkgrid_sg_with_config<localcta_fast_chunkgrid_smalln_config>(
+                A, A_sc, A_sg_chunks, B, B_sc, B_sg_chunks, D);
+            break;
+    }
+}
+
+void launch_fast_grouped_gemm_chunkgrid_sg(
+    const at::Tensor& A,
+    const at::Tensor& A_sc,
+    const at::Tensor& A_sg_chunks,
+    const at::Tensor& B,
+    const at::Tensor& B_sc,
+    const at::Tensor& B_sg_chunks,
+    at::Tensor& D,
+    std::optional<at::Tensor> D_K_opt,
+    std::optional<at::Tensor> D_V_opt,
+    int silu_dim
+) {
+    switch (get_chunkgrid_gemm_config_idx()) {
+        case 6:
+            launch_fast_grouped_gemm_chunkgrid_sg_with_config<localcta_fast_chunkgrid_smalln_epi2_config>(
+                A, A_sc, A_sg_chunks, B, B_sc, B_sg_chunks, D, D_K_opt, D_V_opt, silu_dim);
+            break;
+        case 7:
+            launch_fast_grouped_gemm_chunkgrid_sg_with_config<localcta_fast_chunkgrid_smalln_epi1_config>(
+                A, A_sc, A_sg_chunks, B, B_sc, B_sg_chunks, D, D_K_opt, D_V_opt, silu_dim);
+            break;
+        case 1:
+        default:
+            launch_fast_grouped_gemm_chunkgrid_sg_with_config<localcta_fast_chunkgrid_smalln_config>(
+                A, A_sc, A_sg_chunks, B, B_sc, B_sg_chunks, D, D_K_opt, D_V_opt, silu_dim);
+            break;
+    }
 }
 
 void check_batched_inputs(
@@ -2239,23 +2400,23 @@ void launch_fast_split2_dgrad_gemm_onepass_sg_with_config(
         auto b_sc_gl = kittens::py::tensor_to_gl<typename G::B_sc_gl, false>(
             B_sc_prepared_list[i], 1,
             B_sc_prepared_list[i].size(0), B_sc_prepared_list[i].size(1), 256);
-        auto a_sg_desc = check_outer_scale_tiles(A_sg_tiles_list[i], "A_sg_tiles_list[i]", A_list[i].size(0) / 256, true);
-        auto b_sg_desc = check_outer_scale_tiles(B_sg_tiles_list[i], "B_sg_tiles_list[i]", B_list[i].size(0) / 256, false);
+        check_chunk_grid(A_sg_tiles_list[i], "A_sg_tiles_list[i]", A_list[i].size(0), A_list[i].size(1) * 2);
+        check_chunk_grid(B_sg_tiles_list[i], "B_sg_tiles_list[i]", B_list[i].size(0), B_list[i].size(1) * 2);
 
         memcpy(&g_host.A_tma[i], &a_gl.tma_descs.tma_desc, sizeof(CUtensorMap));
         memcpy(&g_host.A_sc_tma[i], &a_sc_gl.tma_descs.tma_desc, sizeof(CUtensorMap));
         memcpy(&g_host.B_tma[i], &b_gl.tma_descs.tma_desc, sizeof(CUtensorMap));
         memcpy(&g_host.B_sc_tma[i], &b_sc_gl.tma_descs.tma_desc, sizeof(CUtensorMap));
-        g_host.A_sg[i] = a_sg_desc.ptr;
-        g_host.B_sg[i] = b_sg_desc.ptr;
-        g_host.A_sg_stride[i] = a_sg_desc.stride;
-        g_host.B_sg_stride[i] = b_sg_desc.stride;
+        g_host.A_sg[i] = A_sg_tiles_list[i].data_ptr<float>();
+        g_host.B_sg[i] = B_sg_tiles_list[i].data_ptr<float>();
+        g_host.A_sg_stride[i] = static_cast<int>(A_sg_tiles_list[i].size(1));
+        g_host.B_sg_stride[i] = static_cast<int>(B_sg_tiles_list[i].size(1));
     }
 
     auto d_gl = kittens::py::tensor_to_gl<typename G::D_gl>(D_out);
     memcpy(&g_host.D_tma, &d_gl.tma_descs.tma_desc, sizeof(CUtensorMap));
 
-    kittens::py::launch_kernel<C, G, nvfp4_split2_accum_gemm::kernel<C>>(g_host);
+    kittens::py::launch_kernel<C, G, nvfp4_split2_accum_gemm::kernel_chunk_grid<C>>(g_host);
 }
 
 void launch_fast_split2_dgrad_gemm_onepass(
@@ -2316,21 +2477,29 @@ void launch_fast_split2_dgrad_gemm_onepass_sg(
             TORCH_CHECK(false, "one-pass split2 config_idx=0 is not legal with CLUSTER_SIZE=1 on this kernel");
             break;
         case 1:
-            launch_fast_split2_dgrad_gemm_onepass_sg_with_config<localcta_onepass_cfg1>(
+            launch_fast_split2_dgrad_gemm_onepass_sg_with_config<localcta_onepass_sg_cfg1>(
                 A_list, A_sc_prepared_list, A_sg_tiles_list, B_list, B_sc_prepared_list, B_sg_tiles_list, D_out);
             break;
         case 2:
             TORCH_CHECK(false, "one-pass split2 config_idx=2 is not legal with CLUSTER_SIZE=1 on this kernel");
             break;
         case 3:
-            launch_fast_split2_dgrad_gemm_onepass_sg_with_config<localcta_onepass_cfg3>(
+            launch_fast_split2_dgrad_gemm_onepass_sg_with_config<localcta_onepass_sg_cfg3>(
                 A_list, A_sc_prepared_list, A_sg_tiles_list, B_list, B_sc_prepared_list, B_sg_tiles_list, D_out);
             break;
         case 4:
             TORCH_CHECK(false, "one-pass split2 config_idx=4 is not legal with CLUSTER_SIZE=1 on this kernel");
             break;
         case 5:
-            launch_fast_split2_dgrad_gemm_onepass_sg_with_config<localcta_onepass_cfg5>(
+            launch_fast_split2_dgrad_gemm_onepass_sg_with_config<localcta_onepass_sg_cfg5>(
+                A_list, A_sc_prepared_list, A_sg_tiles_list, B_list, B_sc_prepared_list, B_sg_tiles_list, D_out);
+            break;
+        case 6:
+            launch_fast_split2_dgrad_gemm_onepass_sg_with_config<localcta_onepass_sg_cfg6>(
+                A_list, A_sc_prepared_list, A_sg_tiles_list, B_list, B_sc_prepared_list, B_sg_tiles_list, D_out);
+            break;
+        case 7:
+            launch_fast_split2_dgrad_gemm_onepass_sg_with_config<localcta_onepass_sg_cfg7>(
                 A_list, A_sc_prepared_list, A_sg_tiles_list, B_list, B_sc_prepared_list, B_sg_tiles_list, D_out);
             break;
         default:
@@ -2778,18 +2947,18 @@ void nvfp4_localcta_fast_gemm_entrypoint(
 
 void nvfp4_localcta_fast_gemm_sg_entrypoint(
     const at::Tensor& A,
-    const at::Tensor& A_sc_prepared,
+    const at::Tensor& A_sc,
     const at::Tensor& A_sg_chunks,
     const at::Tensor& B,
-    const at::Tensor& B_sc_prepared,
+    const at::Tensor& B_sc,
     const at::Tensor& B_sg_chunks,
     at::Tensor& D
 ) {
-    auto A_sg_outer = normalize_outer_scale_tiles_tensor(A_sg_chunks, A.size(0) / 256, true);
-    auto B_sg_outer = normalize_outer_scale_tiles_tensor(B_sg_chunks, B.size(0) / 256, false);
-    check_v3_fast_gemm_inputs(A, A_sc_prepared, A_sg_outer, B, B_sc_prepared, B_sg_outer);
+    auto A_sg_chunkgrid = as_chunk_grid_tensor(A_sg_chunks, A.size(0), A.size(1) * 2);
+    auto B_sg_chunkgrid = as_chunk_grid_tensor(B_sg_chunks, B.size(0), B.size(1) * 2);
+    check_gemm_inputs(A, A_sc, A_sg_chunkgrid, B, B_sc, B_sg_chunkgrid);
     check_output_matrix(D, "D", A.size(0), B.size(0));
-    launch_fast_regular_gemm(A, A_sc_prepared, A_sg_outer, B, B_sc_prepared, B_sg_outer, D);
+    launch_fast_regular_gemm_chunkgrid_sg(A, A_sc, A_sg_chunkgrid, B, B_sc, B_sg_chunkgrid, D);
 }
 
 void nvfp4_localcta_grouped_gemm_entrypoint(
@@ -2911,19 +3080,19 @@ void nvfp4_localcta_fast_grouped_gemm_entrypoint(
 
 void nvfp4_localcta_fast_grouped_gemm_sg_entrypoint(
     const at::Tensor& A,
-    const at::Tensor& A_sc_prepared,
+    const at::Tensor& A_sc,
     const at::Tensor& A_sg_chunks,
     const at::Tensor& B,
-    const at::Tensor& B_sc_prepared,
+    const at::Tensor& B_sc,
     const at::Tensor& B_sg_chunks,
     at::Tensor& D,
     std::optional<at::Tensor> D_K_opt = std::nullopt,
     std::optional<at::Tensor> D_V_opt = std::nullopt,
     int silu_dim = 0
 ) {
-    auto A_sg_outer = normalize_outer_scale_tiles_tensor(A_sg_chunks, A.size(0) / 256, true);
-    auto B_sg_outer = normalize_outer_scale_tiles_tensor(B_sg_chunks, B.size(0) / 256, false);
-    check_v3_fast_gemm_inputs(A, A_sc_prepared, A_sg_outer, B, B_sc_prepared, B_sg_outer);
+    auto A_sg_chunkgrid = as_chunk_grid_tensor(A_sg_chunks, A.size(0), A.size(1) * 2);
+    auto B_sg_chunkgrid = as_chunk_grid_tensor(B_sg_chunks, B.size(0), B.size(1) * 2);
+    check_gemm_inputs(A, A_sc, A_sg_chunkgrid, B, B_sc, B_sg_chunkgrid);
     TORCH_CHECK(D.is_cuda() && D.is_contiguous() && D.scalar_type() == at::kBFloat16,
                 "D must be a contiguous CUDA bf16 tensor");
     if (D_K_opt.has_value()) {
@@ -2936,8 +3105,8 @@ void nvfp4_localcta_fast_grouped_gemm_sg_entrypoint(
                     D_V_opt.value().scalar_type() == at::kBFloat16,
                     "D_V must be a contiguous CUDA bf16 tensor");
     }
-    launch_fast_grouped_gemm(
-        A, A_sc_prepared, A_sg_outer, B, B_sc_prepared, B_sg_outer, D, D_K_opt, D_V_opt, silu_dim);
+    launch_fast_grouped_gemm_chunkgrid_sg(
+        A, A_sc, A_sg_chunkgrid, B, B_sc, B_sg_chunkgrid, D, D_K_opt, D_V_opt, silu_dim);
 }
 
 void nvfp4_localcta_batched_gemm_entrypoint(
@@ -2975,10 +3144,12 @@ void nvfp4_localcta_batched_gemm_entrypoint(
             check_output_matrix(D_list[i], "D_list[i]", A_list[i].size(0), B_list[i].size(0));
         }
         check_batched_shape_compatibility(A_list, B_list, D_list);
-        launch_batched_gemm(
-            A_list, A_sc_list, A_sg_chunkgrid_list,
-            B_list, B_sc_list, B_sg_chunkgrid_list,
-            D_list);
+        for (int i = 0; i < n; ++i) {
+            launch_regular_gemm(
+                A_list[i], A_sc_list[i], A_sg_chunkgrid_list[i],
+                B_list[i], B_sc_list[i], B_sg_chunkgrid_list[i],
+                D_list[i]);
+        }
         return;
     }
 
@@ -3326,9 +3497,9 @@ void nvfp4_localcta_fast_split2_dgrad_onepass_gemm_sg_entrypoint(
     B_sg_tiles_list.reserve(2);
     for (int i = 0; i < 2; ++i) {
         A_sg_tiles_list.push_back(
-            normalize_outer_scale_tiles_tensor(A_sg_chunks_list[i], A_list[i].size(0) / 256, true));
+            as_chunk_grid_tensor(A_sg_chunks_list[i], A_list[i].size(0), A_list[i].size(1) * 2));
         B_sg_tiles_list.push_back(
-            normalize_outer_scale_tiles_tensor(B_sg_chunks_list[i], B_list[i].size(0) / 256, false));
+            as_chunk_grid_tensor(B_sg_chunks_list[i], B_list[i].size(0), B_list[i].size(1) * 2));
     }
     check_output_matrix(D_out, "D_out", A_list[0].size(0), B_list[0].size(0));
     launch_fast_split2_dgrad_gemm_onepass_sg(

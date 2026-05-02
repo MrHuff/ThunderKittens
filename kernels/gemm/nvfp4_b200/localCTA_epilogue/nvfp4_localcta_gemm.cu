@@ -33,6 +33,9 @@ using localcta_parity_config = nvfp4_localcta_gemm::config<256, 5, 8, 4, 2, fals
 using localcta_fast_smallk_config = nvfp4_gemm::config<256, 5, 8, 4, 2, false>;
 using localcta_fast_largek_config = nvfp4_gemm::config<256, 5, 8, 12, 2, false>;
 using localcta_fast_grouped_config = nvfp4_gemm::config<256, 5, 8, 4, 2, false>;
+using localcta_fast_chunkgrid_smallk_config = nvfp4_gemm::config<256, 5, 8, 4, 2, false, 256, true, 2, 128>;
+using localcta_fast_chunkgrid_largek_config = nvfp4_gemm::config<256, 5, 8, 12, 2, false, 256, true, 2, 128>;
+using localcta_fast_chunkgrid_grouped_config = nvfp4_gemm::config<256, 5, 8, 4, 2, false, 256, true, 2, 128>;
 using localcta_fast_batched_config = nvfp4_gemm::config<256, 5, 8, 4, 2, false>;
 using localcta_fast_split2_dgrad_config = nvfp4_gemm::config<256, 5, 8, 12, 2, false>;
 using localcta_fast_split3_dgrad_config = nvfp4_gemm::config<256, 5, 8, 12, 2, false>;
@@ -42,6 +45,9 @@ using localcta_onepass_cfg2 = nvfp4_gemm::config<256, 5, 8, 4, 2, false, 256, fa
 using localcta_onepass_cfg3 = nvfp4_gemm::config<256, 5, 8, 4, 2, false, 256, false, 2>;
 using localcta_onepass_cfg4 = nvfp4_gemm::config<256, 5, 8, 12, 2, false, 256, false, 1>;
 using localcta_onepass_cfg5 = nvfp4_gemm::config<256, 5, 8, 12, 2, false, 256, false, 2>;
+using localcta_onepass_sg_cfg1 = nvfp4_gemm::config<128, 5, 4, 12, 2, true, 256, false, 2, 128>;
+using localcta_onepass_sg_cfg3 = nvfp4_gemm::config<256, 5, 8, 4, 2, false, 256, false, 2, 128>;
+using localcta_onepass_sg_cfg5 = nvfp4_gemm::config<256, 5, 8, 12, 2, false, 256, false, 2, 128>;
 
 __global__ void sum3_tensors_kernel(
     const __nv_bfloat16* __restrict__ A,
@@ -167,6 +173,47 @@ void check_fast_gemm_inputs(
     check_scale_tensor(A_sc_prepared, "A_sc_prepared", A.size(0), A.size(1) * 2);
     check_scale_tensor(B_sc_prepared, "B_sc_prepared", B.size(0), B.size(1) * 2);
     kittens::py::device_check(A, A_sc_prepared, B, B_sc_prepared);
+}
+
+void check_outer_sg_tensor(const at::Tensor& sg, const char* name, int64_t tiles) {
+    TORCH_CHECK(sg.defined() && sg.is_cuda() && sg.scalar_type() == at::kFloat,
+                name, " must be a CUDA float32 tensor");
+    TORCH_CHECK(sg.dim() == 1 || sg.dim() == 2,
+                name, " must be rank-1 or rank-2 outer SG");
+    if (sg.dim() == 1) {
+        TORCH_CHECK(sg.size(0) == tiles, name, " shape mismatch");
+        return;
+    }
+    TORCH_CHECK((sg.size(0) == tiles && sg.size(1) == 1) ||
+                (sg.size(0) == 1 && sg.size(1) == tiles),
+                name, " must have shape [tiles], [tiles, 1], or [1, tiles]");
+}
+
+int outer_sg_stride(const at::Tensor& sg, int64_t tiles) {
+    if (sg.dim() == 1) {
+        TORCH_CHECK(sg.stride(0) == 1, "outer SG vector must be contiguous");
+        return 1;
+    }
+    if (sg.size(0) == tiles) {
+        return static_cast<int>(sg.stride(0));
+    }
+    return static_cast<int>(sg.stride(1));
+}
+
+void check_fast_gemm_outer_sg_inputs(
+    const at::Tensor& A,
+    const at::Tensor& A_sc,
+    const at::Tensor& A_sg,
+    const at::Tensor& B,
+    const at::Tensor& B_sc,
+    const at::Tensor& B_sg
+) {
+    check_fast_gemm_inputs(A, A_sc, B, B_sc);
+    TORCH_CHECK(A.size(0) % 256 == 0 && B.size(0) % 256 == 0,
+                "outer SG fast GEMM requires M and N multiples of 256");
+    check_outer_sg_tensor(A_sg, "A_sg", A.size(0) / 256);
+    check_outer_sg_tensor(B_sg, "B_sg", B.size(0) / 256);
+    kittens::py::device_check(A, A_sc, A_sg, B, B_sc, B_sg);
 }
 
 at::Tensor get_unit_scale_tensor(const at::Tensor& ref) {
@@ -345,7 +392,10 @@ void launch_fast_gemm_with_config(
         .k_dim = 0,
         .v_dim = 0,
         .use_split_D = false,
+        .a_sg_per_tile = nullptr,
+        .a_sg_stride = 0,
         .b_sg_per_tile = nullptr,
+        .b_sg_stride = 0,
         .silu_dim = 0
     };
     kittens::py::launch_kernel<C, G, nvfp4_gemm::kernel<C>>(g);
@@ -386,10 +436,179 @@ void launch_fast_grouped_gemm_with_config(
         .k_dim = use_split_D ? static_cast<int>(D_K_opt.value().size(1)) : 0,
         .v_dim = use_split_D ? v_dim : 0,
         .use_split_D = use_split_D,
+        .a_sg_per_tile = nullptr,
+        .a_sg_stride = 0,
         .b_sg_per_tile = nullptr,
+        .b_sg_stride = 0,
         .silu_dim = silu_dim
     };
     kittens::py::launch_kernel<C, G, nvfp4_gemm::kernel<C>>(g);
+}
+
+template <typename C>
+void launch_fast_gemm_outer_sg_with_config(
+    const at::Tensor& A,
+    const at::Tensor& A_sc,
+    const at::Tensor& A_sg,
+    const at::Tensor& B,
+    const at::Tensor& B_sc,
+    const at::Tensor& B_sg,
+    at::Tensor& D
+) {
+    using G = nvfp4_gemm::globals<C>;
+    auto one = get_unit_scale_tensor(A);
+    G g {
+        .A = kittens::py::tensor_to_gl<typename G::A_fp4x2_gl>(A),
+        .A_sc = kittens::py::tensor_to_gl<typename G::A_sc_gl, false>(
+            A_sc, 1, A_sc.size(0), A_sc.size(1), 256),
+        .A_sc_global = kittens::py::tensor_to_gl<typename G::A_sc_global_gl>(one),
+        .B = kittens::py::tensor_to_gl<typename G::B_fp4x2_gl>(B),
+        .B_sc = kittens::py::tensor_to_gl<typename G::B_sc_gl, false>(
+            B_sc, 1, B_sc.size(0), B_sc.size(1), 256),
+        .B_sc_global = kittens::py::tensor_to_gl<typename G::B_sc_global_gl>(one),
+        .D = kittens::py::tensor_to_gl<typename G::D_gl>(D),
+        .D_K = kittens::py::tensor_to_gl<typename G::D_gl>(D),
+        .D_V = kittens::py::tensor_to_gl<typename G::D_gl>(D),
+        .q_dim = 0,
+        .k_dim = 0,
+        .v_dim = 0,
+        .use_split_D = false,
+        .a_sg_per_tile = A_sg.data_ptr<float>(),
+        .a_sg_stride = outer_sg_stride(A_sg, A.size(0) / 256),
+        .b_sg_per_tile = B_sg.data_ptr<float>(),
+        .b_sg_stride = outer_sg_stride(B_sg, B.size(0) / 256),
+        .silu_dim = 0
+    };
+    kittens::py::launch_kernel<C, G, nvfp4_gemm::kernel<C>>(g);
+}
+
+template <typename C>
+void launch_fast_grouped_gemm_outer_sg_with_config(
+    const at::Tensor& A,
+    const at::Tensor& A_sc,
+    const at::Tensor& A_sg,
+    const at::Tensor& B,
+    const at::Tensor& B_sc,
+    const at::Tensor& B_sg,
+    at::Tensor& D,
+    std::optional<at::Tensor> D_K_opt,
+    std::optional<at::Tensor> D_V_opt,
+    int silu_dim
+) {
+    using G = nvfp4_gemm::globals<C>;
+    const bool use_split_D = D_K_opt.has_value();
+    const int v_dim = D_V_opt.has_value() ? static_cast<int>(D_V_opt.value().size(1)) : 0;
+    auto one = get_unit_scale_tensor(A);
+
+    G g {
+        .A = kittens::py::tensor_to_gl<typename G::A_fp4x2_gl>(A),
+        .A_sc = kittens::py::tensor_to_gl<typename G::A_sc_gl, false>(
+            A_sc, 1, A_sc.size(0), A_sc.size(1), 256),
+        .A_sc_global = kittens::py::tensor_to_gl<typename G::A_sc_global_gl>(one),
+        .B = kittens::py::tensor_to_gl<typename G::B_fp4x2_gl>(B),
+        .B_sc = kittens::py::tensor_to_gl<typename G::B_sc_gl, false>(
+            B_sc, 1, B_sc.size(0), B_sc.size(1), 256),
+        .B_sc_global = kittens::py::tensor_to_gl<typename G::B_sc_global_gl>(one),
+        .D = kittens::py::tensor_to_gl<typename G::D_gl>(D),
+        .D_K = use_split_D ? kittens::py::tensor_to_gl<typename G::D_gl>(D_K_opt.value())
+                           : kittens::py::tensor_to_gl<typename G::D_gl>(D),
+        .D_V = D_V_opt.has_value() ? kittens::py::tensor_to_gl<typename G::D_gl>(D_V_opt.value())
+                                   : (use_split_D ? kittens::py::tensor_to_gl<typename G::D_gl>(D_K_opt.value())
+                                                  : kittens::py::tensor_to_gl<typename G::D_gl>(D)),
+        .q_dim = use_split_D ? static_cast<int>(D.size(1)) : 0,
+        .k_dim = use_split_D ? static_cast<int>(D_K_opt.value().size(1)) : 0,
+        .v_dim = use_split_D ? v_dim : 0,
+        .use_split_D = use_split_D,
+        .a_sg_per_tile = A_sg.data_ptr<float>(),
+        .a_sg_stride = outer_sg_stride(A_sg, A.size(0) / 256),
+        .b_sg_per_tile = B_sg.data_ptr<float>(),
+        .b_sg_stride = outer_sg_stride(B_sg, B.size(0) / 256),
+        .silu_dim = silu_dim
+    };
+    kittens::py::launch_kernel<C, G, nvfp4_gemm::kernel<C>>(g);
+}
+
+template <typename C>
+void launch_fast_gemm_sg_with_config(
+    const at::Tensor& A,
+    const at::Tensor& A_sc,
+    const at::Tensor& A_sg_chunks,
+    const at::Tensor& B,
+    const at::Tensor& B_sc,
+    const at::Tensor& B_sg_chunks,
+    at::Tensor& D
+) {
+    using G = nvfp4_gemm::globals<C>;
+    auto one = get_unit_scale_tensor(A);
+    G g {
+        .A = kittens::py::tensor_to_gl<typename G::A_fp4x2_gl>(A),
+        .A_sc = kittens::py::tensor_to_gl<typename G::A_sc_gl, false>(
+            A_sc, 1, A_sc.size(0), A_sc.size(1), 256),
+        .A_sc_global = kittens::py::tensor_to_gl<typename G::A_sc_global_gl>(one),
+        .B = kittens::py::tensor_to_gl<typename G::B_fp4x2_gl>(B),
+        .B_sc = kittens::py::tensor_to_gl<typename G::B_sc_gl, false>(
+            B_sc, 1, B_sc.size(0), B_sc.size(1), 256),
+        .B_sc_global = kittens::py::tensor_to_gl<typename G::B_sc_global_gl>(one),
+        .D = kittens::py::tensor_to_gl<typename G::D_gl>(D),
+        .D_K = kittens::py::tensor_to_gl<typename G::D_gl>(D),
+        .D_V = kittens::py::tensor_to_gl<typename G::D_gl>(D),
+        .q_dim = 0,
+        .k_dim = 0,
+        .v_dim = 0,
+        .use_split_D = false,
+        .a_sg_per_tile = A_sg_chunks.data_ptr<float>(),
+        .a_sg_stride = -static_cast<int>(A_sg_chunks.size(1)),
+        .b_sg_per_tile = B_sg_chunks.data_ptr<float>(),
+        .b_sg_stride = -static_cast<int>(B_sg_chunks.size(1)),
+        .silu_dim = 0
+    };
+    kittens::py::launch_kernel<C, G, nvfp4_gemm::kernel_chunk_grid<C>>(g);
+}
+
+template <typename C>
+void launch_fast_grouped_gemm_sg_with_config(
+    const at::Tensor& A,
+    const at::Tensor& A_sc,
+    const at::Tensor& A_sg_chunks,
+    const at::Tensor& B,
+    const at::Tensor& B_sc,
+    const at::Tensor& B_sg_chunks,
+    at::Tensor& D,
+    std::optional<at::Tensor> D_K_opt,
+    std::optional<at::Tensor> D_V_opt,
+    int silu_dim
+) {
+    using G = nvfp4_gemm::globals<C>;
+    const bool use_split_D = D_K_opt.has_value();
+    const int v_dim = D_V_opt.has_value() ? static_cast<int>(D_V_opt.value().size(1)) : 0;
+    auto one = get_unit_scale_tensor(A);
+
+    G g {
+        .A = kittens::py::tensor_to_gl<typename G::A_fp4x2_gl>(A),
+        .A_sc = kittens::py::tensor_to_gl<typename G::A_sc_gl, false>(
+            A_sc, 1, A_sc.size(0), A_sc.size(1), 256),
+        .A_sc_global = kittens::py::tensor_to_gl<typename G::A_sc_global_gl>(one),
+        .B = kittens::py::tensor_to_gl<typename G::B_fp4x2_gl>(B),
+        .B_sc = kittens::py::tensor_to_gl<typename G::B_sc_gl, false>(
+            B_sc, 1, B_sc.size(0), B_sc.size(1), 256),
+        .B_sc_global = kittens::py::tensor_to_gl<typename G::B_sc_global_gl>(one),
+        .D = kittens::py::tensor_to_gl<typename G::D_gl>(D),
+        .D_K = use_split_D ? kittens::py::tensor_to_gl<typename G::D_gl>(D_K_opt.value())
+                           : kittens::py::tensor_to_gl<typename G::D_gl>(D),
+        .D_V = D_V_opt.has_value() ? kittens::py::tensor_to_gl<typename G::D_gl>(D_V_opt.value())
+                                   : (use_split_D ? kittens::py::tensor_to_gl<typename G::D_gl>(D_K_opt.value())
+                                                  : kittens::py::tensor_to_gl<typename G::D_gl>(D)),
+        .q_dim = use_split_D ? static_cast<int>(D.size(1)) : 0,
+        .k_dim = use_split_D ? static_cast<int>(D_K_opt.value().size(1)) : 0,
+        .v_dim = use_split_D ? v_dim : 0,
+        .use_split_D = use_split_D,
+        .a_sg_per_tile = A_sg_chunks.data_ptr<float>(),
+        .a_sg_stride = -static_cast<int>(A_sg_chunks.size(1)),
+        .b_sg_per_tile = B_sg_chunks.data_ptr<float>(),
+        .b_sg_stride = -static_cast<int>(B_sg_chunks.size(1)),
+        .silu_dim = silu_dim
+    };
+    kittens::py::launch_kernel<C, G, nvfp4_gemm::kernel_chunk_grid<C>>(g);
 }
 
 void launch_fast_regular_gemm(
@@ -428,6 +647,90 @@ void launch_fast_grouped_gemm(
     }
     launch_fast_grouped_gemm_with_config<localcta_fast_grouped_config>(
         A, A_sc_prepared, B, B_sc_prepared, D, D_K_opt, D_V_opt, silu_dim);
+}
+
+void launch_fast_regular_gemm_outer_sg(
+    const at::Tensor& A,
+    const at::Tensor& A_sc,
+    const at::Tensor& A_sg,
+    const at::Tensor& B,
+    const at::Tensor& B_sc,
+    const at::Tensor& B_sg,
+    at::Tensor& D
+) {
+    const int64_t K = A.size(1) * 2;
+    if (K <= 2048) {
+        launch_fast_gemm_outer_sg_with_config<localcta_fast_smallk_config>(
+            A, A_sc, A_sg, B, B_sc, B_sg, D);
+    } else {
+        launch_fast_gemm_outer_sg_with_config<localcta_fast_largek_config>(
+            A, A_sc, A_sg, B, B_sc, B_sg, D);
+    }
+}
+
+void launch_fast_grouped_gemm_outer_sg(
+    const at::Tensor& A,
+    const at::Tensor& A_sc,
+    const at::Tensor& A_sg,
+    const at::Tensor& B,
+    const at::Tensor& B_sc,
+    const at::Tensor& B_sg,
+    at::Tensor& D,
+    std::optional<at::Tensor> D_K_opt,
+    std::optional<at::Tensor> D_V_opt,
+    int silu_dim
+) {
+    const bool use_split_D = D_K_opt.has_value();
+    const int64_t reduction_k = A.size(1) * 2;
+    if (!use_split_D && reduction_k > 2048) {
+        launch_fast_grouped_gemm_outer_sg_with_config<localcta_fast_largek_config>(
+            A, A_sc, A_sg, B, B_sc, B_sg, D, D_K_opt, D_V_opt, silu_dim);
+        return;
+    }
+    launch_fast_grouped_gemm_outer_sg_with_config<localcta_fast_grouped_config>(
+        A, A_sc, A_sg, B, B_sc, B_sg, D, D_K_opt, D_V_opt, silu_dim);
+}
+
+void launch_fast_regular_gemm_sg(
+    const at::Tensor& A,
+    const at::Tensor& A_sc,
+    const at::Tensor& A_sg_chunks,
+    const at::Tensor& B,
+    const at::Tensor& B_sc,
+    const at::Tensor& B_sg_chunks,
+    at::Tensor& D
+) {
+    const int64_t K = A.size(1) * 2;
+    if (K <= 2048) {
+        launch_fast_gemm_sg_with_config<localcta_fast_chunkgrid_smallk_config>(
+            A, A_sc, A_sg_chunks, B, B_sc, B_sg_chunks, D);
+    } else {
+        launch_fast_gemm_sg_with_config<localcta_fast_chunkgrid_largek_config>(
+            A, A_sc, A_sg_chunks, B, B_sc, B_sg_chunks, D);
+    }
+}
+
+void launch_fast_grouped_gemm_sg(
+    const at::Tensor& A,
+    const at::Tensor& A_sc,
+    const at::Tensor& A_sg_chunks,
+    const at::Tensor& B,
+    const at::Tensor& B_sc,
+    const at::Tensor& B_sg_chunks,
+    at::Tensor& D,
+    std::optional<at::Tensor> D_K_opt,
+    std::optional<at::Tensor> D_V_opt,
+    int silu_dim
+) {
+    const bool use_split_D = D_K_opt.has_value();
+    const int64_t reduction_k = A.size(1) * 2;
+    if (!use_split_D && reduction_k > 2048) {
+        launch_fast_grouped_gemm_sg_with_config<localcta_fast_chunkgrid_largek_config>(
+            A, A_sc, A_sg_chunks, B, B_sc, B_sg_chunks, D, D_K_opt, D_V_opt, silu_dim);
+        return;
+    }
+    launch_fast_grouped_gemm_sg_with_config<localcta_fast_chunkgrid_grouped_config>(
+        A, A_sc, A_sg_chunks, B, B_sc, B_sg_chunks, D, D_K_opt, D_V_opt, silu_dim);
 }
 
 void check_batched_inputs(
@@ -486,6 +789,29 @@ void check_fast_batched_inputs(
                 "all fast batched input lists must have the same length");
     for (int i = 0; i < n; ++i) {
         check_fast_gemm_inputs(A_list[i], A_sc_prepared_list[i], B_list[i], B_sc_prepared_list[i]);
+    }
+}
+
+void check_fast_batched_outer_sg_inputs(
+    const std::vector<at::Tensor>& A_list,
+    const std::vector<at::Tensor>& A_sc_list,
+    const std::vector<at::Tensor>& A_sg_list,
+    const std::vector<at::Tensor>& B_list,
+    const std::vector<at::Tensor>& B_sc_list,
+    const std::vector<at::Tensor>& B_sg_list
+) {
+    const int n = static_cast<int>(A_list.size());
+    TORCH_CHECK(n > 0, "batched outer-SG GEMM requires at least one batch");
+    TORCH_CHECK(n == static_cast<int>(A_sc_list.size()) &&
+                n == static_cast<int>(A_sg_list.size()) &&
+                n == static_cast<int>(B_list.size()) &&
+                n == static_cast<int>(B_sc_list.size()) &&
+                n == static_cast<int>(B_sg_list.size()),
+                "all batched outer-SG input lists must have the same length");
+    for (int i = 0; i < n; ++i) {
+        check_fast_gemm_outer_sg_inputs(
+            A_list[i], A_sc_list[i], A_sg_list[i],
+            B_list[i], B_sc_list[i], B_sg_list[i]);
     }
 }
 
@@ -760,6 +1086,74 @@ void launch_fast_batched_accum_gemm_with_config(
 
         g_host.A_sg[i] = one_ptr;
         g_host.B_sg[i] = one_ptr;
+    }
+
+    auto d_gl = kittens::py::tensor_to_gl<typename G::D_gl>(D_out);
+    memcpy(&g_host.D_tma, &d_gl.tma_descs.tma_desc, sizeof(CUtensorMap));
+
+    kittens::py::launch_kernel<C, G, nvfp4_accum_gemm::kernel<C>>(g_host);
+}
+
+template <typename C>
+void launch_fast_batched_accum_gemm_outer_sg_with_config(
+    const std::vector<at::Tensor>& A_list,
+    const std::vector<at::Tensor>& A_sc_list,
+    const std::vector<at::Tensor>& A_sg_list,
+    const std::vector<at::Tensor>& B_list,
+    const std::vector<at::Tensor>& B_sc_list,
+    const std::vector<at::Tensor>& B_sg_list,
+    at::Tensor& D_out
+) {
+    using G = nvfp4_accum_gemm::globals<C>;
+    G g_host;
+    memset(&g_host, 0, sizeof(G));
+
+    const int n = static_cast<int>(A_list.size());
+    const int64_t M = D_out.size(0);
+    const int64_t N_out = D_out.size(1);
+
+    g_host.num_batches = n;
+    g_host.num_row_blocks = static_cast<int>(M / C::Mb);
+    g_host.num_col_blocks = static_cast<int>(N_out / C::Nb);
+    g_host.num_red_blocks = static_cast<int>((2 * A_list[0].size(1)) / C::Kb);
+    const int num_tiles = g_host.num_row_blocks * 2 * g_host.num_col_blocks;
+
+    static thread_local std::vector<at::Tensor> tile_done_cache;
+    const int device_index = A_list[0].get_device();
+    if (device_index >= static_cast<int>(tile_done_cache.size())) {
+        tile_done_cache.resize(device_index + 1);
+    }
+    auto& tile_done_buf = tile_done_cache[device_index];
+    if (!tile_done_buf.defined() || tile_done_buf.numel() < num_tiles) {
+        tile_done_buf = torch::zeros({num_tiles}, torch::dtype(torch::kInt32).device(A_list[0].device()));
+    } else {
+        tile_done_buf.narrow(0, 0, num_tiles).zero_();
+    }
+    g_host.tile_done = tile_done_buf.data_ptr<int>();
+
+    for (int i = 0; i < n; ++i) {
+        auto a_gl = kittens::py::tensor_to_gl<typename G::A_fp4x2_gl>(A_list[i]);
+        auto a_sc_gl = kittens::py::tensor_to_gl<typename G::A_sc_gl, false>(
+            A_sc_list[i], 1,
+            A_sc_list[i].dim() == 2 ? A_sc_list[i].size(0) / 128 : A_sc_list[i].size(0),
+            A_sc_list[i].dim() == 2 ? A_sc_list[i].size(1) / 4 : A_sc_list[i].size(1),
+            256);
+        auto b_gl = kittens::py::tensor_to_gl<typename G::B_fp4x2_gl>(B_list[i]);
+        auto b_sc_gl = kittens::py::tensor_to_gl<typename G::B_sc_gl, false>(
+            B_sc_list[i], 1,
+            B_sc_list[i].dim() == 2 ? B_sc_list[i].size(0) / 128 : B_sc_list[i].size(0),
+            B_sc_list[i].dim() == 2 ? B_sc_list[i].size(1) / 4 : B_sc_list[i].size(1),
+            256);
+
+        memcpy(&g_host.A_tma[i], &a_gl.tma_descs.tma_desc, sizeof(CUtensorMap));
+        memcpy(&g_host.A_sc_tma[i], &a_sc_gl.tma_descs.tma_desc, sizeof(CUtensorMap));
+        memcpy(&g_host.B_tma[i], &b_gl.tma_descs.tma_desc, sizeof(CUtensorMap));
+        memcpy(&g_host.B_sc_tma[i], &b_sc_gl.tma_descs.tma_desc, sizeof(CUtensorMap));
+
+        g_host.A_sg[i] = A_sg_list[i].data_ptr<float>();
+        g_host.A_sg_stride[i] = outer_sg_stride(A_sg_list[i], A_list[i].size(0) / 256);
+        g_host.B_sg[i] = B_sg_list[i].data_ptr<float>();
+        g_host.B_sg_stride[i] = outer_sg_stride(B_sg_list[i], B_list[i].size(0) / 256);
     }
 
     auto d_gl = kittens::py::tensor_to_gl<typename G::D_gl>(D_out);
@@ -1269,6 +1663,36 @@ void launch_fast_batched_accum_gemm(
         A_list, A_sc_prepared_list, B_list, B_sc_prepared_list, D_out);
 }
 
+void launch_fast_batched_accum_gemm_outer_sg(
+    const std::vector<at::Tensor>& A_list,
+    const std::vector<at::Tensor>& A_sc_list,
+    const std::vector<at::Tensor>& A_sg_list,
+    const std::vector<at::Tensor>& B_list,
+    const std::vector<at::Tensor>& B_sc_list,
+    const std::vector<at::Tensor>& B_sg_list,
+    at::Tensor& D_out
+) {
+    if (A_list.size() == 1) {
+        launch_fast_regular_gemm_outer_sg(
+            A_list[0], A_sc_list[0], A_sg_list[0],
+            B_list[0], B_sc_list[0], B_sg_list[0],
+            D_out);
+        return;
+    }
+    const int64_t reduction_k = A_list[0].size(1) * 2;
+    if (A_list.size() == 2 && reduction_k >= 4096) {
+        launch_fast_batched_accum_gemm_outer_sg_with_config<localcta_fast_largek_config>(
+            A_list, A_sc_list, A_sg_list,
+            B_list, B_sc_list, B_sg_list,
+            D_out);
+        return;
+    }
+    launch_fast_batched_accum_gemm_outer_sg_with_config<localcta_fast_batched_config>(
+        A_list, A_sc_list, A_sg_list,
+        B_list, B_sc_list, B_sg_list,
+        D_out);
+}
+
 void launch_fast_split3_dgrad_gemm(
     const std::vector<at::Tensor>& A_list,
     const std::vector<at::Tensor>& A_sc_prepared_list,
@@ -1334,6 +1758,60 @@ void launch_fast_split2_dgrad_gemm_onepass_with_config(
     kittens::py::launch_kernel<C, G, nvfp4_split2_accum_gemm::kernel<C>>(g_host);
 }
 
+template <typename C>
+void launch_fast_split2_dgrad_gemm_onepass_sg_with_config(
+    const std::vector<at::Tensor>& A_list,
+    const std::vector<at::Tensor>& A_sc_list,
+    const std::vector<at::Tensor>& A_sg_chunks_list,
+    const std::vector<at::Tensor>& B_list,
+    const std::vector<at::Tensor>& B_sc_list,
+    const std::vector<at::Tensor>& B_sg_chunks_list,
+    at::Tensor& D_out
+) {
+    using G = nvfp4_split2_accum_gemm::globals<C>;
+    G g_host;
+    memset(&g_host, 0, sizeof(G));
+
+    TORCH_CHECK(A_list.size() == 2, "one-pass split2 dgrad expects 2 A batches");
+    TORCH_CHECK(A_sc_list.size() == 2, "one-pass split2 dgrad expects 2 A scale batches");
+    TORCH_CHECK(A_sg_chunks_list.size() == 2, "one-pass split2 dgrad expects 2 A SG batches");
+    TORCH_CHECK(B_list.size() == 2, "one-pass split2 dgrad expects 2 B batches");
+    TORCH_CHECK(B_sc_list.size() == 2, "one-pass split2 dgrad expects 2 B scale batches");
+    TORCH_CHECK(B_sg_chunks_list.size() == 2, "one-pass split2 dgrad expects 2 B SG batches");
+
+    const int64_t M = D_out.size(0);
+    const int64_t N_out = D_out.size(1);
+    g_host.num_row_blocks = static_cast<int>(M / C::Mb);
+    g_host.num_col_blocks = static_cast<int>(N_out / C::Nb);
+
+    for (int i = 0; i < 2; ++i) {
+        g_host.num_red_blocks[i] = static_cast<int>((2 * A_list[i].size(1)) / C::Kb);
+
+        auto a_gl = kittens::py::tensor_to_gl<typename G::A_fp4x2_gl>(A_list[i]);
+        auto a_sc_gl = kittens::py::tensor_to_gl<typename G::A_sc_gl, false>(
+            A_sc_list[i], 1, A_sc_list[i].size(0), A_sc_list[i].size(1), 256);
+        auto b_gl = kittens::py::tensor_to_gl<typename G::B_fp4x2_gl>(B_list[i]);
+        auto b_sc_gl = kittens::py::tensor_to_gl<typename G::B_sc_gl, false>(
+            B_sc_list[i], 1, B_sc_list[i].size(0), B_sc_list[i].size(1), 256);
+
+        memcpy(&g_host.A_tma[i], &a_gl.tma_descs.tma_desc, sizeof(CUtensorMap));
+        memcpy(&g_host.A_sc_tma[i], &a_sc_gl.tma_descs.tma_desc, sizeof(CUtensorMap));
+        memcpy(&g_host.B_tma[i], &b_gl.tma_descs.tma_desc, sizeof(CUtensorMap));
+        memcpy(&g_host.B_sc_tma[i], &b_sc_gl.tma_descs.tma_desc, sizeof(CUtensorMap));
+        g_host.A_sg[i] = A_sg_chunks_list[i].data_ptr<float>();
+        g_host.B_sg[i] = B_sg_chunks_list[i].data_ptr<float>();
+        // Negative stride marks strict v4 chunk-grid SG. The split2 kernel
+        // keeps positive strides for the older outer-scale epilogue contract.
+        g_host.A_sg_stride[i] = -static_cast<int>(A_sg_chunks_list[i].size(1));
+        g_host.B_sg_stride[i] = -static_cast<int>(B_sg_chunks_list[i].size(1));
+    }
+
+    auto d_gl = kittens::py::tensor_to_gl<typename G::D_gl>(D_out);
+    memcpy(&g_host.D_tma, &d_gl.tma_descs.tma_desc, sizeof(CUtensorMap));
+
+    kittens::py::launch_kernel<C, G, nvfp4_split2_accum_gemm::kernel_chunk_grid<C>>(g_host);
+}
+
 void launch_fast_split2_dgrad_gemm_onepass(
     const std::vector<at::Tensor>& A_list,
     const std::vector<at::Tensor>& A_sc_prepared_list,
@@ -1367,6 +1845,47 @@ void launch_fast_split2_dgrad_gemm_onepass(
         case 5:
             launch_fast_split2_dgrad_gemm_onepass_with_config<localcta_onepass_cfg5>(
                 A_list, A_sc_prepared_list, B_list, B_sc_prepared_list, D_out);
+            break;
+        default:
+            TORCH_CHECK(false, "Unknown one-pass split2 config_idx=", resolved_idx);
+    }
+}
+
+void launch_fast_split2_dgrad_gemm_onepass_sg(
+    const std::vector<at::Tensor>& A_list,
+    const std::vector<at::Tensor>& A_sc_list,
+    const std::vector<at::Tensor>& A_sg_chunks_list,
+    const std::vector<at::Tensor>& B_list,
+    const std::vector<at::Tensor>& B_sc_list,
+    const std::vector<at::Tensor>& B_sg_chunks_list,
+    at::Tensor& D_out,
+    int config_idx
+) {
+    int resolved_idx = config_idx;
+    if (resolved_idx < 0) {
+        resolved_idx = 5;
+    }
+    switch (resolved_idx) {
+        case 0:
+            TORCH_CHECK(false, "one-pass split2 config_idx=0 is not legal with CLUSTER_SIZE=1 on this kernel");
+            break;
+        case 1:
+            launch_fast_split2_dgrad_gemm_onepass_sg_with_config<localcta_onepass_sg_cfg1>(
+                A_list, A_sc_list, A_sg_chunks_list, B_list, B_sc_list, B_sg_chunks_list, D_out);
+            break;
+        case 2:
+            TORCH_CHECK(false, "one-pass split2 config_idx=2 is not legal with CLUSTER_SIZE=1 on this kernel");
+            break;
+        case 3:
+            launch_fast_split2_dgrad_gemm_onepass_sg_with_config<localcta_onepass_sg_cfg3>(
+                A_list, A_sc_list, A_sg_chunks_list, B_list, B_sc_list, B_sg_chunks_list, D_out);
+            break;
+        case 4:
+            TORCH_CHECK(false, "one-pass split2 config_idx=4 is not legal with CLUSTER_SIZE=1 on this kernel");
+            break;
+        case 5:
+            launch_fast_split2_dgrad_gemm_onepass_sg_with_config<localcta_onepass_sg_cfg5>(
+                A_list, A_sc_list, A_sg_chunks_list, B_list, B_sc_list, B_sg_chunks_list, D_out);
             break;
         default:
             TORCH_CHECK(false, "Unknown one-pass split2 config_idx=", resolved_idx);
@@ -1571,6 +2090,20 @@ void nvfp4_localcta_fast_gemm_entrypoint(
     launch_fast_regular_gemm(A, A_sc_prepared, B, B_sc_prepared, D);
 }
 
+void nvfp4_localcta_fast_gemm_sg_entrypoint(
+    const at::Tensor& A,
+    const at::Tensor& A_sc,
+    const at::Tensor& A_sg_chunks,
+    const at::Tensor& B,
+    const at::Tensor& B_sc,
+    const at::Tensor& B_sg_chunks,
+    at::Tensor& D
+) {
+    check_gemm_inputs(A, A_sc, A_sg_chunks, B, B_sc, B_sg_chunks);
+    check_output_matrix(D, "D", A.size(0), B.size(0));
+    launch_fast_regular_gemm_sg(A, A_sc, A_sg_chunks, B, B_sc, B_sg_chunks, D);
+}
+
 void nvfp4_localcta_grouped_gemm_entrypoint(
     const at::Tensor& A,
     const at::Tensor& A_sc,
@@ -1628,6 +2161,81 @@ void nvfp4_localcta_fast_grouped_gemm_entrypoint(
 
     launch_fast_grouped_gemm(
         A, A_sc_prepared, B, B_sc_prepared, D, D_K_opt, D_V_opt, silu_dim);
+}
+
+void nvfp4_localcta_fast_gemm_outer_sg_entrypoint(
+    const at::Tensor& A,
+    const at::Tensor& A_sc,
+    const at::Tensor& A_sg,
+    const at::Tensor& B,
+    const at::Tensor& B_sc,
+    const at::Tensor& B_sg,
+    at::Tensor& D
+) {
+    check_fast_gemm_outer_sg_inputs(A, A_sc, A_sg, B, B_sc, B_sg);
+    TORCH_CHECK(D.is_cuda() && D.is_contiguous() && D.scalar_type() == at::kBFloat16,
+                "D must be a contiguous CUDA bf16 tensor");
+    launch_fast_regular_gemm_outer_sg(A, A_sc, A_sg, B, B_sc, B_sg, D);
+}
+
+void nvfp4_localcta_fast_grouped_gemm_outer_sg_entrypoint(
+    const at::Tensor& A,
+    const at::Tensor& A_sc,
+    const at::Tensor& A_sg,
+    const at::Tensor& B,
+    const at::Tensor& B_sc,
+    const at::Tensor& B_sg,
+    at::Tensor& D,
+    std::optional<at::Tensor> D_K_opt = std::nullopt,
+    std::optional<at::Tensor> D_V_opt = std::nullopt,
+    int silu_dim = 0
+) {
+    check_fast_gemm_outer_sg_inputs(A, A_sc, A_sg, B, B_sc, B_sg);
+    TORCH_CHECK(D.is_cuda() && D.is_contiguous() && D.scalar_type() == at::kBFloat16,
+                "D must be a contiguous CUDA bf16 tensor");
+    if (D_K_opt.has_value()) {
+        TORCH_CHECK(D_K_opt.value().is_cuda() && D_K_opt.value().is_contiguous() &&
+                    D_K_opt.value().scalar_type() == at::kBFloat16,
+                    "D_K must be a contiguous CUDA bf16 tensor");
+    }
+    if (D_V_opt.has_value()) {
+        TORCH_CHECK(D_V_opt.value().is_cuda() && D_V_opt.value().is_contiguous() &&
+                    D_V_opt.value().scalar_type() == at::kBFloat16,
+                    "D_V must be a contiguous CUDA bf16 tensor");
+    }
+
+    launch_fast_grouped_gemm_outer_sg(
+        A, A_sc, A_sg, B, B_sc, B_sg, D, D_K_opt, D_V_opt, silu_dim);
+}
+
+void nvfp4_localcta_fast_grouped_gemm_sg_entrypoint(
+    const at::Tensor& A,
+    const at::Tensor& A_sc,
+    const at::Tensor& A_sg_chunks,
+    const at::Tensor& B,
+    const at::Tensor& B_sc,
+    const at::Tensor& B_sg_chunks,
+    at::Tensor& D,
+    std::optional<at::Tensor> D_K_opt = std::nullopt,
+    std::optional<at::Tensor> D_V_opt = std::nullopt,
+    int silu_dim = 0
+) {
+    check_gemm_inputs(A, A_sc, A_sg_chunks, B, B_sc, B_sg_chunks);
+    TORCH_CHECK(D.is_cuda() && D.is_contiguous() && D.scalar_type() == at::kBFloat16,
+                "D must be a contiguous CUDA bf16 tensor");
+    if (D_K_opt.has_value()) {
+        TORCH_CHECK(D_K_opt.value().is_cuda() && D_K_opt.value().is_contiguous() &&
+                    D_K_opt.value().scalar_type() == at::kBFloat16,
+                    "D_K must be a contiguous CUDA bf16 tensor");
+    }
+    if (D_V_opt.has_value()) {
+        TORCH_CHECK(D_V_opt.value().is_cuda() && D_V_opt.value().is_contiguous() &&
+                    D_V_opt.value().scalar_type() == at::kBFloat16,
+                    "D_V must be a contiguous CUDA bf16 tensor");
+    }
+
+    launch_fast_grouped_gemm_sg(
+        A, A_sc, A_sg_chunks, B, B_sc, B_sg_chunks, D, D_K_opt, D_V_opt, silu_dim);
 }
 
 void nvfp4_localcta_batched_gemm_entrypoint(
@@ -1812,6 +2420,28 @@ void nvfp4_localcta_fast_batched_accum_gemm_entrypoint(
         A_list, A_sc_prepared_list, B_list, B_sc_prepared_list, D_out);
 }
 
+void nvfp4_localcta_fast_batched_accum_gemm_outer_sg_entrypoint(
+    const std::vector<at::Tensor>& A_list,
+    const std::vector<at::Tensor>& A_sc_list,
+    const std::vector<at::Tensor>& A_sg_list,
+    const std::vector<at::Tensor>& B_list,
+    const std::vector<at::Tensor>& B_sc_list,
+    const std::vector<at::Tensor>& B_sg_list,
+    at::Tensor& D_out
+) {
+    check_fast_batched_outer_sg_inputs(
+        A_list, A_sc_list, A_sg_list,
+        B_list, B_sc_list, B_sg_list);
+    const int n = static_cast<int>(A_list.size());
+    TORCH_CHECK(n <= 4, "num_batches must be 1..4");
+    check_output_matrix(D_out, "D_out", A_list[0].size(0), B_list[0].size(0));
+
+    launch_fast_batched_accum_gemm_outer_sg(
+        A_list, A_sc_list, A_sg_list,
+        B_list, B_sc_list, B_sg_list,
+        D_out);
+}
+
 void nvfp4_localcta_fast_split3_dgrad_gemm_entrypoint(
     const std::vector<at::Tensor>& A_list,
     const std::vector<at::Tensor>& A_sc_prepared_list,
@@ -1841,6 +2471,26 @@ void nvfp4_localcta_fast_split2_dgrad_onepass_gemm_entrypoint(
     check_output_matrix(D_out, "D_out", A_list[0].size(0), B_list[0].size(0));
     launch_fast_split2_dgrad_gemm_onepass(
         A_list, A_sc_prepared_list, B_list, B_sc_prepared_list,
+        D_out, static_cast<int>(config_idx));
+}
+
+void nvfp4_localcta_fast_split2_dgrad_onepass_gemm_sg_entrypoint(
+    const std::vector<at::Tensor>& A_list,
+    const std::vector<at::Tensor>& A_sc_list,
+    const std::vector<at::Tensor>& A_sg_chunks_list,
+    const std::vector<at::Tensor>& B_list,
+    const std::vector<at::Tensor>& B_sc_list,
+    const std::vector<at::Tensor>& B_sg_chunks_list,
+    at::Tensor& D_out,
+    int64_t config_idx
+) {
+    check_batched_inputs(A_list, A_sc_list, A_sg_chunks_list, B_list, B_sc_list, B_sg_chunks_list);
+    TORCH_CHECK(A_list.size() == 2, "split2 one-pass dgrad expects exactly 2 A batches");
+    TORCH_CHECK(B_list.size() == 2, "split2 one-pass dgrad expects exactly 2 B batches");
+    check_output_matrix(D_out, "D_out", A_list[0].size(0), B_list[0].size(0));
+    launch_fast_split2_dgrad_gemm_onepass_sg(
+        A_list, A_sc_list, A_sg_chunks_list,
+        B_list, B_sc_list, B_sg_chunks_list,
         D_out, static_cast<int>(config_idx));
 }
 
@@ -2083,6 +2733,14 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           pybind11::arg("A"), pybind11::arg("A_sc_prepared"),
           pybind11::arg("B"), pybind11::arg("B_sc_prepared"),
           pybind11::arg("D"));
+    m.def("nvfp4_localcta_fast_gemm_outer_sg", &nvfp4_localcta_fast_gemm_outer_sg_entrypoint,
+          pybind11::arg("A"), pybind11::arg("A_sc"), pybind11::arg("A_sg"),
+          pybind11::arg("B"), pybind11::arg("B_sc"), pybind11::arg("B_sg"),
+          pybind11::arg("D"));
+    m.def("nvfp4_localcta_fast_gemm_sg", &nvfp4_localcta_fast_gemm_sg_entrypoint,
+          pybind11::arg("A"), pybind11::arg("A_sc"), pybind11::arg("A_sg_chunks"),
+          pybind11::arg("B"), pybind11::arg("B_sc"), pybind11::arg("B_sg_chunks"),
+          pybind11::arg("D"));
     m.def("nvfp4_localcta_grouped_gemm", &nvfp4_localcta_grouped_gemm_entrypoint,
           pybind11::arg("A"), pybind11::arg("A_sc"), pybind11::arg("A_sg_chunks"),
           pybind11::arg("B"), pybind11::arg("B_sc"), pybind11::arg("B_sg_chunks"),
@@ -2091,6 +2749,16 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("nvfp4_localcta_fast_grouped_gemm", &nvfp4_localcta_fast_grouped_gemm_entrypoint,
           pybind11::arg("A"), pybind11::arg("A_sc_prepared"),
           pybind11::arg("B"), pybind11::arg("B_sc_prepared"),
+          pybind11::arg("D"), pybind11::arg("D_K") = std::nullopt,
+          pybind11::arg("D_V") = std::nullopt, pybind11::arg("silu_dim") = 0);
+    m.def("nvfp4_localcta_fast_grouped_gemm_outer_sg", &nvfp4_localcta_fast_grouped_gemm_outer_sg_entrypoint,
+          pybind11::arg("A"), pybind11::arg("A_sc"), pybind11::arg("A_sg"),
+          pybind11::arg("B"), pybind11::arg("B_sc"), pybind11::arg("B_sg"),
+          pybind11::arg("D"), pybind11::arg("D_K") = std::nullopt,
+          pybind11::arg("D_V") = std::nullopt, pybind11::arg("silu_dim") = 0);
+    m.def("nvfp4_localcta_fast_grouped_gemm_sg", &nvfp4_localcta_fast_grouped_gemm_sg_entrypoint,
+          pybind11::arg("A"), pybind11::arg("A_sc"), pybind11::arg("A_sg_chunks"),
+          pybind11::arg("B"), pybind11::arg("B_sc"), pybind11::arg("B_sg_chunks"),
           pybind11::arg("D"), pybind11::arg("D_K") = std::nullopt,
           pybind11::arg("D_V") = std::nullopt, pybind11::arg("silu_dim") = 0);
     m.def("nvfp4_localcta_batched_gemm", &nvfp4_localcta_batched_gemm_entrypoint,
@@ -2125,6 +2793,12 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           pybind11::arg("A_list"), pybind11::arg("A_sc_prepared_list"),
           pybind11::arg("B_list"), pybind11::arg("B_sc_prepared_list"),
           pybind11::arg("D_out"));
+    m.def("nvfp4_localcta_fast_batched_accum_gemm_outer_sg",
+          &nvfp4_localcta_fast_batched_accum_gemm_outer_sg_entrypoint,
+          pybind11::arg("A_list"), pybind11::arg("A_sc_list"),
+          pybind11::arg("A_sg_list"), pybind11::arg("B_list"),
+          pybind11::arg("B_sc_list"), pybind11::arg("B_sg_list"),
+          pybind11::arg("D_out"));
     m.def("nvfp4_localcta_fast_split3_dgrad_gemm", &nvfp4_localcta_fast_split3_dgrad_gemm_entrypoint,
           pybind11::arg("A_list"), pybind11::arg("A_sc_prepared_list"),
           pybind11::arg("B_list"), pybind11::arg("B_sc_prepared_list"),
@@ -2133,6 +2807,12 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           &nvfp4_localcta_fast_split2_dgrad_onepass_gemm_entrypoint,
           pybind11::arg("A_list"), pybind11::arg("A_sc_prepared_list"),
           pybind11::arg("B_list"), pybind11::arg("B_sc_prepared_list"),
+          pybind11::arg("D_out"), pybind11::arg("config_idx") = -1);
+    m.def("nvfp4_localcta_fast_split2_dgrad_onepass_gemm_sg",
+          &nvfp4_localcta_fast_split2_dgrad_onepass_gemm_sg_entrypoint,
+          pybind11::arg("A_list"), pybind11::arg("A_sc_list"),
+          pybind11::arg("A_sg_chunks_list"), pybind11::arg("B_list"),
+          pybind11::arg("B_sc_list"), pybind11::arg("B_sg_chunks_list"),
           pybind11::arg("D_out"), pybind11::arg("config_idx") = -1);
     m.def("nvfp4_localcta_fast_split3_dgrad_strided_gemm",
           &nvfp4_localcta_fast_split3_dgrad_strided_gemm_entrypoint,

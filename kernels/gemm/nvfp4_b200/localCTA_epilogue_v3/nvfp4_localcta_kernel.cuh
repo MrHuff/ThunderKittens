@@ -683,11 +683,24 @@ __device__ inline void kernel_reduction_scaled(const globals<C> &g) {
                 warpgroup::sync(1);
                 warpgroup::tma::cluster::arrive(outputs_finished, 0, 1);
 
-                const float a_sg = g.A_sg_chunks[row_block_idx * g.A_sg_stride + i];
+                float a_sg;
+                if constexpr (C::Kb == 128) {
+                    const int a_chunk_row = row_block_idx * C::CLUSTER_SIZE + cta_id;
+                    a_sg = g.A_sg_chunks[a_chunk_row * g.A_sg_stride + i];
+                } else {
+                    a_sg = g.A_sg_chunks[row_block_idx * g.A_sg_stride + i];
+                }
 
                 #pragma unroll
                 for (int epi = 0; epi < C::EPI_PIPE_DEPTH; ++epi) {
-                    const float b_sg = g.B_sg_chunks[i * g.B_sg_stride + col_block_idx];
+                    float b_sg;
+                    if constexpr (C::Kb == 128) {
+                        constexpr int cols_per_epi = C::Nb / C::EPI_PIPE_DEPTH;
+                        const int b_chunk_col = col_block_idx * (C::Nb / 128) + (epi * cols_per_epi) / 128;
+                        b_sg = g.B_sg_chunks[b_chunk_col * g.B_sg_stride + i];
+                    } else {
+                        b_sg = g.B_sg_chunks[i * g.B_sg_stride + col_block_idx];
+                    }
                     const float gs = a_sg * b_sg;
                     warp::mul(D_reg_fl[epi], D_reg_fl[epi], gs);
                     if (i == 0) {
