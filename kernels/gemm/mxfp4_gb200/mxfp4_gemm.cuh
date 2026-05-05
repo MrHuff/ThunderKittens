@@ -12,7 +12,7 @@ using namespace kittens;
 
 namespace mxfp4_gemm {
 
-template <int _Nb, int _LOAD_PIPE_DEPTH, int _EPI_PIPE_DEPTH, int _SUPERGROUP_SIZE, int _NUM_D_TILES, bool _OVERLAP_EPI>
+template <int _Nb, int _LOAD_PIPE_DEPTH, int _EPI_PIPE_DEPTH, int _SUPERGROUP_SIZE, int _NUM_D_TILES, bool _OVERLAP_EPI, bool _ROPE_LIVE64_RHT32 = false>
 struct config {
     static_assert(_Nb == 128 || _Nb == 256, "Nb must be 128 or 256");
     static_assert(_LOAD_PIPE_DEPTH > 0 && _LOAD_PIPE_DEPTH <= 5, "LOAD_PIPE_DEPTH must be greater than 0 and at most 5");
@@ -33,6 +33,7 @@ struct config {
     static constexpr int LOAD_PIPE_DEPTH = _LOAD_PIPE_DEPTH;
     static constexpr int EPI_PIPE_DEPTH = _EPI_PIPE_DEPTH;
     static constexpr bool OVERLAP_EPI = _OVERLAP_EPI;
+    static constexpr bool ROPE_LIVE64_RHT32 = _ROPE_LIVE64_RHT32;
 
     static constexpr int SUPERGROUP_SIZE = _SUPERGROUP_SIZE;
     static constexpr int Mb = 256;
@@ -299,12 +300,21 @@ __device__ inline void kernel(const globals<C> &g) {
                     }
                     warp::mul(D_reg_fl, D_reg_fl, MXFP4_ALPHA);
                     if (g.rope_live64.enabled()) {
-                        mxfp4_rope_epilogue::apply_inplace_live64(
-                            D_reg_fl,
-                            g.rope_live64,
-                            (row_block_idx * 2 + cta_id) * (C::Mb / 2),
-                            (col_block_idx * C::EPI_PIPE_DEPTH + i) * (C::Nb / C::EPI_PIPE_DEPTH)
-                        );
+                        if constexpr (C::ROPE_LIVE64_RHT32) {
+                            mxfp4_rope_epilogue::apply_inplace_live64_rht32(
+                                D_reg_fl,
+                                g.rope_live64,
+                                (row_block_idx * 2 + cta_id) * (C::Mb / 2),
+                                (col_block_idx * C::EPI_PIPE_DEPTH + i) * (C::Nb / C::EPI_PIPE_DEPTH)
+                            );
+                        } else {
+                            mxfp4_rope_epilogue::apply_inplace_live64(
+                                D_reg_fl,
+                                g.rope_live64,
+                                (row_block_idx * 2 + cta_id) * (C::Mb / 2),
+                                (col_block_idx * C::EPI_PIPE_DEPTH + i) * (C::Nb / C::EPI_PIPE_DEPTH)
+                            );
+                        }
                     } else {
                         mxfp4_rope_epilogue::apply_inplace(
                             D_reg_fl,
@@ -329,12 +339,21 @@ __device__ inline void kernel(const globals<C> &g) {
                     warpgroup::load_async(D_reg_fl, out_tm.template subtile<full_tt_fl<C::Nb / C::EPI_PIPE_DEPTH>>(0, C::Nb / C::EPI_PIPE_DEPTH * i));
                     warp::mul(D_reg_fl, D_reg_fl, MXFP4_ALPHA);
                     if (g.rope_live64.enabled()) {
-                        mxfp4_rope_epilogue::apply_inplace_live64(
-                            D_reg_fl,
-                            g.rope_live64,
-                            (row_block_idx * 2 + cta_id) * (C::Mb / 2),
-                            (col_block_idx * C::EPI_PIPE_DEPTH + i) * (C::Nb / C::EPI_PIPE_DEPTH)
-                        );
+                        if constexpr (C::ROPE_LIVE64_RHT32) {
+                            mxfp4_rope_epilogue::apply_inplace_live64_rht32(
+                                D_reg_fl,
+                                g.rope_live64,
+                                (row_block_idx * 2 + cta_id) * (C::Mb / 2),
+                                (col_block_idx * C::EPI_PIPE_DEPTH + i) * (C::Nb / C::EPI_PIPE_DEPTH)
+                            );
+                        } else {
+                            mxfp4_rope_epilogue::apply_inplace_live64(
+                                D_reg_fl,
+                                g.rope_live64,
+                                (row_block_idx * 2 + cta_id) * (C::Mb / 2),
+                                (col_block_idx * C::EPI_PIPE_DEPTH + i) * (C::Nb / C::EPI_PIPE_DEPTH)
+                            );
+                        }
                     } else {
                         mxfp4_rope_epilogue::apply_inplace(
                             D_reg_fl,

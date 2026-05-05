@@ -7,6 +7,7 @@
 #include "mxfp4_batched_gemm.cuh"
 #include "mxfp4_split2_accum_gemm.cuh"
 #include "mxfp4_split3_accum_gemm.cuh"
+#include <cstdlib>
 #include <cstdint>
 #include <cstring>
 #include <optional>
@@ -255,6 +256,28 @@ void check_rope_live64_args(
     check_rope_live64_tensor(rope_cs, "rope_cs", rope_seq_len);
     kittens::py::device_check(D, rope_cs);
 }
+
+static bool use_rope_live64_rht32() {
+    return std::getenv("MXFP4_GEMM_ROPE_LIVE64_RHT32") != nullptr;
+}
+
+template <typename C>
+static void check_rope_live64_rht32_config(bool enabled) {
+    if (enabled) {
+        TORCH_CHECK((C::Nb / C::EPI_PIPE_DEPTH) % 32 == 0,
+                    "MXFP4_GEMM_ROPE_LIVE64_RHT32 requires epilogue fragments divisible by 32 columns");
+    }
+}
+
+template <typename C>
+using rope_live64_rht32_config = mxfp4_gemm::config<
+    C::Nb,
+    C::LOAD_PIPE_DEPTH,
+    C::EPI_PIPE_DEPTH,
+    C::SUPERGROUP_SIZE,
+    C::NUM_D_TILES,
+    C::OVERLAP_EPI,
+    true>;
 
 void check_mxfp4_scale_tensor(
     const at::Tensor& t,
@@ -730,7 +753,7 @@ static void run_gemm_with_config_rope(
 }
 
 template <typename C>
-static void run_gemm_with_config_rope_live64(
+static void run_gemm_with_config_rope_live64_impl(
     const at::Tensor &A, const at::Tensor &A_sc,
     const at::Tensor &B, const at::Tensor &B_sc,
     at::Tensor &D,
@@ -751,6 +774,24 @@ static void run_gemm_with_config_rope_live64(
         },
     };
     kittens::py::launch_kernel<C, G, mxfp4_gemm::kernel<C>>(g);
+}
+
+template <typename C>
+static void run_gemm_with_config_rope_live64(
+    const at::Tensor &A, const at::Tensor &A_sc,
+    const at::Tensor &B, const at::Tensor &B_sc,
+    at::Tensor &D,
+    const at::Tensor &rope_cs,
+    int64_t rope_seq_len
+) {
+    if (use_rope_live64_rht32()) {
+        check_rope_live64_rht32_config<C>(true);
+        run_gemm_with_config_rope_live64_impl<rope_live64_rht32_config<C>>(
+            A, A_sc, B, B_sc, D, rope_cs, rope_seq_len);
+    } else {
+        run_gemm_with_config_rope_live64_impl<C>(
+            A, A_sc, B, B_sc, D, rope_cs, rope_seq_len);
+    }
 }
 
 void mxfp4_gemm_config_entrypoint(
@@ -1038,10 +1079,23 @@ void mxfp4_batched_gemm_rope_live64_entrypoint(
         kittens::py::launch_kernel<C, G, mxfp4_batched_gemm::kernel<C>>(g_host);
     };
 
+    const bool apply_rht32 = use_rope_live64_rht32();
     if (N_out <= 4096) {
-        build_and_launch.template operator()<mxfp4_gemm::config<256, 5, 8, 4, 2, false>>();
+        using Base = mxfp4_gemm::config<256, 5, 8, 4, 2, false>;
+        if (apply_rht32) {
+            check_rope_live64_rht32_config<Base>(true);
+            build_and_launch.template operator()<rope_live64_rht32_config<Base>>();
+        } else {
+            build_and_launch.template operator()<Base>();
+        }
     } else {
-        build_and_launch.template operator()<mxfp4_gemm::config<256, 4, 16, 4, 2, false>>();
+        using Base = mxfp4_gemm::config<256, 4, 16, 4, 2, false>;
+        if (apply_rht32) {
+            check_rope_live64_rht32_config<Base>(true);
+            build_and_launch.template operator()<rope_live64_rht32_config<Base>>();
+        } else {
+            build_and_launch.template operator()<Base>();
+        }
     }
 }
 
