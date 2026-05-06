@@ -5,12 +5,25 @@
 // ================================================================
 
 #include "kittens.cuh"
+#include "nvfp4_rope_epilogue.cuh"
 
 using namespace kittens;
 
 namespace nvfp4_gemm {
 
-template <int _Nb, int _LOAD_PIPE_DEPTH, int _EPI_PIPE_DEPTH, int _SUPERGROUP_SIZE, int _NUM_D_TILES, bool _OVERLAP_EPI, int _Mb = 256, bool _USE_PDL = true, int _CLUSTER_SIZE = 2, int _Kb = 256>
+template <
+    int _Nb,
+    int _LOAD_PIPE_DEPTH,
+    int _EPI_PIPE_DEPTH,
+    int _SUPERGROUP_SIZE,
+    int _NUM_D_TILES,
+    bool _OVERLAP_EPI,
+    int _Mb = 256,
+    bool _USE_PDL = true,
+    int _CLUSTER_SIZE = 2,
+    int _Kb = 256,
+    bool _ROPE_LIVE64 = false
+>
 struct config {
     static_assert(_Nb == 128 || _Nb == 256, "Nb must be 128 or 256");
     static_assert(_Mb == 256 || _Mb == 512, "Mb must be 256 or 512");
@@ -42,6 +55,7 @@ struct config {
     static constexpr int MMA_PER_TILE = Kb/64;
 
     static constexpr int NUM_D_TILES = _NUM_D_TILES;
+    static constexpr bool ROPE_LIVE64 = _ROPE_LIVE64;
 
     // Output cache policy for TMA stores
     static constexpr auto D_CACHE_POLICY = cache_policy::EVICT_FIRST;
@@ -89,6 +103,9 @@ struct globals {
     // SiLU epilogue: apply silu(x) = x * sigmoid(x) to output columns [0, silu_dim).
     // 0 = disabled. Used for SwiGLU FFN where W1 output needs SiLU.
     int silu_dim;
+
+    // Optional live64 RoPE epilogue. Used for Q/K split-output QKV forward only.
+    nvfp4_rope_epilogue::rope_live64_desc rope_live64;
 
     struct input_tiles_t {
         A_fp4x2_tile A;
@@ -148,6 +165,30 @@ __device__ inline void add_scaled_inplace(RT &dst, const RT &src, float scale) {
                 d.y = __fmaf_rn(s.y, scale, d.y);
             }
         }
+    }
+}
+
+template <typename C, typename RT>
+__device__ inline void apply_rope_live64_if_enabled(
+    RT &D_reg,
+    const globals<C> &g,
+    int row_block_idx,
+    int cta_id,
+    int col_offset_elems
+) {
+    if constexpr (C::ROPE_LIVE64) {
+        if (!g.rope_live64.enabled()) {
+            return;
+        }
+        if (g.use_split_D && col_offset_elems >= g.q_dim + g.k_dim) {
+            return;
+        }
+        nvfp4_rope_epilogue::apply_inplace_live64(
+            D_reg,
+            g.rope_live64,
+            (row_block_idx * 2 + cta_id) * (C::Mb / 2),
+            col_offset_elems
+        );
     }
 }
 
@@ -425,13 +466,14 @@ __device__ inline void kernel_impl(const globals<C> &g) {
                         warpgroup::tma::cluster::arrive(outputs_finished, 0, 1); // signal CTA 0
                     }
                     warp::mul(D_reg, D_reg, gs);
+                    int col_offset_elems = (C::EPI_PIPE_DEPTH*col_block_idx + i) * C::Nb/C::EPI_PIPE_DEPTH;
                     // SiLU epilogue: apply to tiles in [0, silu_dim) columns
                     if (g.silu_dim > 0) {
-                        int col_offset_elems = (C::EPI_PIPE_DEPTH*col_block_idx + i) * C::Nb/C::EPI_PIPE_DEPTH;
                         if (col_offset_elems < g.silu_dim) {
                             apply_silu_inplace(D_reg);
                         }
                     }
+                    apply_rope_live64_if_enabled(D_reg, g, row_block_idx, cta_id, col_offset_elems);
                     warpgroup::tma::store_async_read_wait<C::NUM_D_TILES-1>();
                     warpgroup::sync(1);
                     warpgroup::store(output_tiles.D[i%C::NUM_D_TILES], D_reg);
@@ -460,13 +502,14 @@ __device__ inline void kernel_impl(const globals<C> &g) {
                     rt_fl<C::Mb / 8, C::Nb/C::EPI_PIPE_DEPTH> D_reg_fl;
                     warpgroup::load_async(D_reg_fl, out_tm.template subtile<full_tt_fl<C::Nb/C::EPI_PIPE_DEPTH>>(0, C::Nb/C::EPI_PIPE_DEPTH*i));
                     warp::mul(D_reg_fl, D_reg_fl, gs);
+                    int col_offset_elems = (C::EPI_PIPE_DEPTH*col_block_idx + i) * C::Nb/C::EPI_PIPE_DEPTH;
                     // SiLU epilogue: apply to tiles in [0, silu_dim) columns
                     if (g.silu_dim > 0) {
-                        int col_offset_elems = (C::EPI_PIPE_DEPTH*col_block_idx + i) * C::Nb/C::EPI_PIPE_DEPTH;
                         if (col_offset_elems < g.silu_dim) {
                             apply_silu_inplace(D_reg_fl);
                         }
                     }
+                    apply_rope_live64_if_enabled(D_reg_fl, g, row_block_idx, cta_id, col_offset_elems);
                     warp::copy(D_reg[i], D_reg_fl);
                 }
                 tensor_load_wait();
@@ -764,12 +807,13 @@ __device__ inline void kernel_chunk_grid(const globals<C> &g) {
 
             #pragma unroll
             for (int i = 0; i < C::EPI_PIPE_DEPTH; ++i) {
+                int col_offset_elems = (C::EPI_PIPE_DEPTH*col_block_idx + i) * C::Nb/C::EPI_PIPE_DEPTH;
                 if (g.silu_dim > 0) {
-                    int col_offset_elems = (C::EPI_PIPE_DEPTH*col_block_idx + i) * C::Nb/C::EPI_PIPE_DEPTH;
                     if (col_offset_elems < g.silu_dim) {
                         apply_silu_inplace(D_acc[i]);
                     }
                 }
+                apply_rope_live64_if_enabled(D_acc[i], g, row_block_idx, cta_id, col_offset_elems);
                 rt_bf<C::Mb / 8, C::Nb/C::EPI_PIPE_DEPTH> D_reg;
                 warp::copy(D_reg, D_acc[i]);
                 warpgroup::tma::store_async_read_wait<C::NUM_D_TILES-1>();
