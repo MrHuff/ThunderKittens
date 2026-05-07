@@ -99,6 +99,10 @@ struct globals {
     int          a_sg_stride;
     const float* b_sg_per_tile;
     int          b_sg_stride;
+    const float* a_sg_chunk_grid;
+    int          a_sg_chunk_stride;
+    const float* b_sg_chunk_grid;
+    int          b_sg_chunk_stride;
 
     // SiLU epilogue: apply silu(x) = x * sigmoid(x) to output columns [0, silu_dim).
     // 0 = disabled. Used for SwiGLU FFN where W1 output needs SiLU.
@@ -221,30 +225,49 @@ __device__ inline void apply_chunk_scales_to_stage(
     typename globals<C>::B_sc_tile (&B_sc_tiles)[C::B_SC_SIZE],
     const float *A_sg_chunks,
     int A_sg_stride,
+    const float *A_sg_final,
+    int A_sg_final_stride,
     const float *B_sg_chunks,
     int B_sg_stride,
+    const float *B_sg_final,
+    int B_sg_final_stride,
     int a_chunk_row,
     int b_chunk_row_0,
+    int row_block_idx,
+    int col_block_idx,
     int chunk_base
 ) {
     #pragma unroll
     for (int ii = 0; ii < C::MMA_PER_TILE; ++ii) {
         const int chunk_k = chunk_base + ii / 2;
-        const float a_chunk_sg = A_sg_chunks[a_chunk_row * A_sg_stride + chunk_k];
-        auto &A_sc_sm_subtile = *reinterpret_cast<st_fp8e4m3<32, 16, false> *>(
-            reinterpret_cast<uint64_t>(&A_sc_tile.data[0]) + 16 * 32 * ii);
-        scale_shared_fp8_tile(A_sc_sm_subtile, a_chunk_sg);
+        if (A_sg_chunks != nullptr) {
+            const float a_chunk_sg = A_sg_chunks[a_chunk_row * A_sg_stride + chunk_k];
+            const float a_final_sg = (A_sg_final != nullptr)
+                ? fmaxf(A_sg_final[row_block_idx * A_sg_final_stride], 1.0e-12f)
+                : 1.0f;
+            const float a_scale = a_chunk_sg / a_final_sg;
+            auto &A_sc_sm_subtile = *reinterpret_cast<st_fp8e4m3<32, 16, false> *>(
+                reinterpret_cast<uint64_t>(&A_sc_tile.data[0]) + 16 * 32 * ii);
+            scale_shared_fp8_tile(A_sc_sm_subtile, a_scale);
+        }
 
-        const float b_chunk_sg_0 = B_sg_chunks[b_chunk_row_0 * B_sg_stride + chunk_k];
-        auto &B_sc_sm_subtile_0 = *reinterpret_cast<st_fp8e4m3<32, 16, false> *>(
-            reinterpret_cast<uint64_t>(&B_sc_tiles[0].data[0]) + 16 * 32 * ii);
-        scale_shared_fp8_tile(B_sc_sm_subtile_0, b_chunk_sg_0);
+        if (B_sg_chunks != nullptr) {
+            const float b_chunk_sg_0 = B_sg_chunks[b_chunk_row_0 * B_sg_stride + chunk_k];
+            const float b_final_sg = (B_sg_final != nullptr)
+                ? fmaxf(B_sg_final[col_block_idx * B_sg_final_stride], 1.0e-12f)
+                : 1.0f;
+            const float b_scale_0 = b_chunk_sg_0 / b_final_sg;
+            auto &B_sc_sm_subtile_0 = *reinterpret_cast<st_fp8e4m3<32, 16, false> *>(
+                reinterpret_cast<uint64_t>(&B_sc_tiles[0].data[0]) + 16 * 32 * ii);
+            scale_shared_fp8_tile(B_sc_sm_subtile_0, b_scale_0);
 
-        if constexpr (C::B_SC_SIZE == 2) {
-            const float b_chunk_sg_1 = B_sg_chunks[(b_chunk_row_0 + 1) * B_sg_stride + chunk_k];
-            auto &B_sc_sm_subtile_1 = *reinterpret_cast<st_fp8e4m3<32, 16, false> *>(
-                reinterpret_cast<uint64_t>(&B_sc_tiles[1].data[0]) + 16 * 32 * ii);
-            scale_shared_fp8_tile(B_sc_sm_subtile_1, b_chunk_sg_1);
+            if constexpr (C::B_SC_SIZE == 2) {
+                const float b_chunk_sg_1 = B_sg_chunks[(b_chunk_row_0 + 1) * B_sg_stride + chunk_k];
+                const float b_scale_1 = b_chunk_sg_1 / b_final_sg;
+                auto &B_sc_sm_subtile_1 = *reinterpret_cast<st_fp8e4m3<32, 16, false> *>(
+                    reinterpret_cast<uint64_t>(&B_sc_tiles[1].data[0]) + 16 * 32 * ii);
+                scale_shared_fp8_tile(B_sc_sm_subtile_1, b_scale_1);
+            }
         }
     }
 }
@@ -294,6 +317,8 @@ __device__ inline void kernel_impl(const globals<C> &g) {
     __shared__ semaphore tmem_provisioned, tmem_finished;
     __shared__ semaphore tiles_arrived[C::LOAD_PIPE_DEPTH];
     __shared__ semaphore scales_arrived[C::LOAD_PIPE_DEPTH];
+    __shared__ semaphore scale_tiles_ready[C::LOAD_PIPE_DEPTH];
+    __shared__ semaphore scales_prepared[C::LOAD_PIPE_DEPTH];
     __shared__ semaphore inputs_finished[C::LOAD_PIPE_DEPTH];
     __shared__ semaphore outputs_arrived;
     __shared__ semaphore outputs_finished;
@@ -304,6 +329,8 @@ __device__ inline void kernel_impl(const globals<C> &g) {
         for (int i = 0; i < C::LOAD_PIPE_DEPTH; ++i) {
             init_semaphore(tiles_arrived[i], 0, 1);
             init_semaphore(scales_arrived[i], 0, 1);
+            init_semaphore(scale_tiles_ready[i], 0, 1);
+            init_semaphore(scales_prepared[i], 0, C::CLUSTER_SIZE);
             init_semaphore(inputs_finished[i], 0, 1);
         }
         init_semaphore(outputs_arrived, 0, 1);
@@ -312,10 +339,11 @@ __device__ inline void kernel_impl(const globals<C> &g) {
     everyone::tma::cluster::arrive_aligned();
 
     // Main divergence
-    if (warpgroup_id >= C::CONSUMER_WARPGROUPS && warp::elect_leader()) {
+    if (warpgroup_id >= C::CONSUMER_WARPGROUPS) {
         // Producer group
         int warp_id = group<WARPGROUP_WARPS*C::PRODUCER_WARPGROUPS>::warpid();
-        if (warp_id == 3) {
+        const int lane = threadIdx.x % WARP_THREADS;
+        if (warp_id == 3 && warp::elect_leader()) {
             // Load input tiles to shared memory
             if constexpr (C::USE_PDL) pdl::wait();
             everyone::tma::cluster::wait();
@@ -335,7 +363,7 @@ __device__ inline void kernel_impl(const globals<C> &g) {
                     stage = (stage + 1) % C::LOAD_PIPE_DEPTH;
                 }
             }
-        } else if (warp_id == 2) {
+        } else if (warp_id == 2 && warp::elect_leader()) {
             // Load input scales to shared memory
             if constexpr (C::USE_PDL) pdl::wait();
             everyone::tma::cluster::wait();
@@ -356,7 +384,62 @@ __device__ inline void kernel_impl(const globals<C> &g) {
                     stage = (stage + 1) % C::LOAD_PIPE_DEPTH;
                 }
             }
-        } else if (cta_id == 0 && warp_id == 0) {
+        } else if (warp_id == 1) {
+            if constexpr (USE_CHUNK_GRID_SCALE) {
+                everyone::tma::cluster::wait();
+                uint32_t ready_phasebits = 0;
+                for (int block_idx = cluster_id; block_idx < num_blocks; block_idx += gridDim.x / C::CLUSTER_SIZE) {
+                    int supergroup_idx = block_idx / num_blocks_per_supergroup;
+                    int idx_within_supergroup = block_idx % num_blocks_per_supergroup;
+                    int rows_in_supergroup = min(C::SUPERGROUP_SIZE, num_row_blocks - supergroup_idx * C::SUPERGROUP_SIZE);
+                    int row_within_supergroup = idx_within_supergroup % rows_in_supergroup;
+                    int row_block_idx = supergroup_idx * C::SUPERGROUP_SIZE + row_within_supergroup;
+                    int col_block_idx = idx_within_supergroup / rows_in_supergroup;
+
+                    for (int i = 0; i < num_red_blocks; ++i) {
+                        if (cta_id == 0) {
+                            if (lane == 0) {
+                                tma::expect_bytes(scales_arrived[stage], 2*sizeof(G::input_scales_t));
+                                wait(scales_arrived[stage], get_phasebit<0>(phasebits, stage));
+                                arrive(scale_tiles_ready[stage], 1);
+                                tma::cluster::arrive(scale_tiles_ready[stage], 1, 1);
+                                update_phasebit<0>(phasebits, stage);
+                            }
+                        } else if (lane == 0) {
+                            wait(scale_tiles_ready[stage], get_phasebit<0>(ready_phasebits, stage));
+                            update_phasebit<0>(ready_phasebits, stage);
+                        }
+                        __syncwarp();
+
+                        const int chunk_base = i * (C::Kb / 128);
+                        const int a_chunk_row = row_block_idx * 2 + cta_id;
+                        const int b_chunk_row_0 = col_block_idx * C::B_SC_SIZE;
+                        const int A_sg_stride = g.a_sg_chunk_stride < 0 ? -g.a_sg_chunk_stride : g.a_sg_chunk_stride;
+                        const int B_sg_stride = g.b_sg_chunk_stride < 0 ? -g.b_sg_chunk_stride : g.b_sg_chunk_stride;
+                        apply_chunk_scales_to_stage<C>(
+                            input_scales[stage].A, input_scales[stage].B,
+                            g.a_sg_chunk_grid, A_sg_stride,
+                            g.a_sg_per_tile, g.a_sg_stride,
+                            g.b_sg_chunk_grid, B_sg_stride,
+                            g.b_sg_per_tile, g.b_sg_stride,
+                            a_chunk_row, b_chunk_row_0,
+                            row_block_idx, col_block_idx, chunk_base);
+
+                        __syncwarp();
+                        __threadfence_block();
+                        asm volatile("fence.proxy.async.shared::cta;\n" ::: "memory");
+                        if (lane == 0) {
+                            if (cta_id == 0) {
+                                arrive(scales_prepared[stage], 1);
+                            } else {
+                                tma::cluster::arrive(scales_prepared[stage], 0, 1);
+                            }
+                        }
+                        stage = (stage + 1) % C::LOAD_PIPE_DEPTH;
+                    }
+                }
+            }
+        } else if (cta_id == 0 && warp_id == 0 && warp::elect_leader()) {
             // Launch tensor core matrix multiplies
             everyone::tma::cluster::wait();
             wait(tmem_provisioned, 0);
@@ -364,6 +447,7 @@ __device__ inline void kernel_impl(const globals<C> &g) {
             auto out_tm  = tm_allocator.template allocate<full_tt_fl<C::Nb>>(0);
             auto A_sc_tm = tm_allocator.template allocate<full_tt_fp8e4m3<16*C::MMA_PER_TILE*C::LOAD_PIPE_DEPTH>>(256);
             auto B_sc_tm = tm_allocator.template allocate<full_tt_fp8e4m3<32*C::MMA_PER_TILE*C::LOAD_PIPE_DEPTH>>(256+4*C::MMA_PER_TILE*C::LOAD_PIPE_DEPTH);
+            uint32_t prepared_phasebits = 0;
             for (int block_idx = cluster_id; block_idx < num_blocks; block_idx += gridDim.x / C::CLUSTER_SIZE) {
                 int supergroup_idx = block_idx / num_blocks_per_supergroup;
                 int idx_within_supergroup = block_idx % num_blocks_per_supergroup;
@@ -374,22 +458,11 @@ __device__ inline void kernel_impl(const globals<C> &g) {
                 wait(outputs_finished, get_phasebit<1>(phasebits, 0));
                 tensor_after_thread_sync();
                 for (int i = 0; i < num_red_blocks; i++) {
-                    tma::expect_bytes(scales_arrived[stage], 2*sizeof(G::input_scales_t));
-                    wait(scales_arrived[stage], get_phasebit<0>(phasebits, stage));
                     if constexpr (USE_CHUNK_GRID_SCALE) {
-                        const int chunk_base = i * (C::Kb / 128);
-                        const int a_chunk_row = row_block_idx * 2 + cta_id;
-                        const int b_chunk_row_0 = col_block_idx * C::B_SC_SIZE;
-                        const int A_sg_stride = g.a_sg_stride < 0 ? -g.a_sg_stride : g.a_sg_stride;
-                        const int B_sg_stride = g.b_sg_stride < 0 ? -g.b_sg_stride : g.b_sg_stride;
-                        apply_chunk_scales_to_stage<C>(
-                            input_scales[stage].A, input_scales[stage].B,
-                            g.a_sg_per_tile, A_sg_stride,
-                            g.b_sg_per_tile, B_sg_stride,
-                            a_chunk_row, b_chunk_row_0, chunk_base);
-                        __syncwarp();
-                        __threadfence_block();
-                        asm volatile("fence.proxy.async.shared::cta;\n" ::: "memory");
+                        wait(scales_prepared[stage], get_phasebit<0>(prepared_phasebits, stage));
+                    } else {
+                        tma::expect_bytes(scales_arrived[stage], 2*sizeof(G::input_scales_t));
+                        wait(scales_arrived[stage], get_phasebit<0>(phasebits, stage));
                     }
                     #pragma unroll
                     for (int ii = 0; ii < C::MMA_PER_TILE; ii++) {
@@ -404,6 +477,9 @@ __device__ inline void kernel_impl(const globals<C> &g) {
                             auto &B_sc_sm_subtile_1 = *reinterpret_cast<st_fp8e4m3<32, 16, false> *>(reinterpret_cast<uint64_t>(&input_scales[stage].B[1].data[0])+16*32*ii);
                             load_mxnv_scale_async2(B_sc_tm_subtile_1, B_sc_sm_subtile_1);
                         }
+                    }
+                    if constexpr (USE_CHUNK_GRID_SCALE) {
+                        update_phasebit<0>(prepared_phasebits, stage);
                     }
                     tma::expect_bytes(tiles_arrived[stage], 2*sizeof(G::input_tiles_t));
                     wait(tiles_arrived[stage], get_phasebit<0>(phasebits, stage));
@@ -442,10 +518,12 @@ __device__ inline void kernel_impl(const globals<C> &g) {
             int row_within_supergroup = idx_within_supergroup % rows_in_supergroup;
             int row_block_idx = supergroup_idx * C::SUPERGROUP_SIZE + row_within_supergroup;
             int col_block_idx = idx_within_supergroup / rows_in_supergroup;
-            const float a_sg = (!USE_CHUNK_GRID_SCALE && g.a_sg_per_tile != nullptr)
+            const bool use_outer_tile_scales =
+                (!USE_CHUNK_GRID_SCALE || g.a_sg_chunk_grid != nullptr || g.b_sg_chunk_grid != nullptr);
+            const float a_sg = (use_outer_tile_scales && g.a_sg_per_tile != nullptr)
                 ? g.a_sg_per_tile[row_block_idx * g.a_sg_stride]
                 : default_a_sg;
-            const float b_sg = (!USE_CHUNK_GRID_SCALE && g.b_sg_per_tile != nullptr)
+            const float b_sg = (use_outer_tile_scales && g.b_sg_per_tile != nullptr)
                 ? g.b_sg_per_tile[col_block_idx * g.b_sg_stride]
                 : default_b_sg;
             const float gs = a_sg * b_sg;
@@ -560,6 +638,11 @@ __device__ inline void kernel_impl(const globals<C> &g) {
 template <typename C>
 __device__ inline void kernel(const globals<C> &g) {
     kernel_impl<C, false>(g);
+}
+
+template <typename C>
+__device__ inline void kernel_virtual_rescale(const globals<C> &g) {
+    kernel_impl<C, true>(g);
 }
 
 template <typename C>

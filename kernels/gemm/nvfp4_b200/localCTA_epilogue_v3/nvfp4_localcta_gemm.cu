@@ -1124,6 +1124,181 @@ void launch_fast_grouped_gemm_with_config(
     kittens::py::launch_kernel<C, G, nvfp4_gemm::kernel<C>>(g);
 }
 
+bool has_virtual_rescale_chunk_grid(
+    const at::Tensor& t,
+    const char* name,
+    int64_t rows,
+    int64_t cols
+) {
+    if (!t.defined() || t.numel() == 0) {
+        return false;
+    }
+    check_chunk_grid(t, name, rows, cols);
+    return true;
+}
+
+template <typename C>
+void launch_fast_gemm_virtual_rescale_with_config(
+    const at::Tensor& A,
+    const at::Tensor& A_sc,
+    const at::Tensor& A_sg_tiles,
+    const at::Tensor& A_sg_chunks,
+    const at::Tensor& B,
+    const at::Tensor& B_sc,
+    const at::Tensor& B_sg_tiles,
+    const at::Tensor& B_sg_chunks,
+    at::Tensor& D
+) {
+    using G = nvfp4_gemm::globals<C>;
+    check_fast_gemm_inputs(A, A_sc, B, B_sc);
+    outer_scale_desc a_sg_desc = check_outer_scale_tiles(A_sg_tiles, "A_sg_tiles", A.size(0) / C::Mb, true);
+    outer_scale_desc b_sg_desc = check_outer_scale_tiles(B_sg_tiles, "B_sg_tiles", B.size(0) / C::Nb, false);
+    const bool has_a_chunks = has_virtual_rescale_chunk_grid(
+        A_sg_chunks, "A_sg_chunks", A.size(0), A.size(1) * 2);
+    const bool has_b_chunks = has_virtual_rescale_chunk_grid(
+        B_sg_chunks, "B_sg_chunks", B.size(0), B.size(1) * 2);
+    TORCH_CHECK(has_a_chunks || has_b_chunks,
+                "virtual-rescale GEMM requires at least one chunk SG grid");
+    kittens::py::device_check(A, A_sc, A_sg_tiles, B, B_sc, B_sg_tiles);
+    auto one = get_unit_scale_tensor(A);
+    G g {
+        .A = kittens::py::tensor_to_gl<typename G::A_fp4x2_gl>(A),
+        .A_sc = kittens::py::tensor_to_gl<typename G::A_sc_gl, false>(
+            A_sc, 1, A_sc.size(0), A_sc.size(1), 256),
+        .A_sc_global = kittens::py::tensor_to_gl<typename G::A_sc_global_gl>(one),
+        .B = kittens::py::tensor_to_gl<typename G::B_fp4x2_gl>(B),
+        .B_sc = kittens::py::tensor_to_gl<typename G::B_sc_gl, false>(
+            B_sc, 1, B_sc.size(0), B_sc.size(1), 256),
+        .B_sc_global = kittens::py::tensor_to_gl<typename G::B_sc_global_gl>(one),
+        .D = kittens::py::tensor_to_gl<typename G::D_gl>(D),
+        .D_K = kittens::py::tensor_to_gl<typename G::D_gl>(D),
+        .D_V = kittens::py::tensor_to_gl<typename G::D_gl>(D),
+        .q_dim = 0,
+        .k_dim = 0,
+        .v_dim = 0,
+        .use_split_D = false,
+        .a_sg_per_tile = a_sg_desc.ptr,
+        .a_sg_stride = a_sg_desc.stride,
+        .b_sg_per_tile = b_sg_desc.ptr,
+        .b_sg_stride = b_sg_desc.stride,
+        .a_sg_chunk_grid = has_a_chunks ? A_sg_chunks.data_ptr<float>() : nullptr,
+        .a_sg_chunk_stride = has_a_chunks ? static_cast<int>(A_sg_chunks.size(1)) : 1,
+        .b_sg_chunk_grid = has_b_chunks ? B_sg_chunks.data_ptr<float>() : nullptr,
+        .b_sg_chunk_stride = has_b_chunks ? static_cast<int>(B_sg_chunks.size(1)) : 1,
+        .silu_dim = 0
+    };
+    kittens::py::launch_kernel<C, G, nvfp4_gemm::kernel_virtual_rescale<C>>(g);
+}
+
+template <typename C>
+void launch_fast_grouped_gemm_virtual_rescale_with_config(
+    const at::Tensor& A,
+    const at::Tensor& A_sc,
+    const at::Tensor& A_sg_tiles,
+    const at::Tensor& A_sg_chunks,
+    const at::Tensor& B,
+    const at::Tensor& B_sc,
+    const at::Tensor& B_sg_tiles,
+    const at::Tensor& B_sg_chunks,
+    at::Tensor& D,
+    std::optional<at::Tensor> D_K_opt,
+    std::optional<at::Tensor> D_V_opt,
+    int silu_dim
+) {
+    using G = nvfp4_gemm::globals<C>;
+    const bool use_split_D = D_K_opt.has_value();
+    const int v_dim = D_V_opt.has_value() ? static_cast<int>(D_V_opt.value().size(1)) : 0;
+    check_fast_gemm_inputs(A, A_sc, B, B_sc);
+    outer_scale_desc a_sg_desc = check_outer_scale_tiles(A_sg_tiles, "A_sg_tiles", A.size(0) / C::Mb, true);
+    outer_scale_desc b_sg_desc = check_outer_scale_tiles(B_sg_tiles, "B_sg_tiles", B.size(0) / C::Nb, false);
+    const bool has_a_chunks = has_virtual_rescale_chunk_grid(
+        A_sg_chunks, "A_sg_chunks", A.size(0), A.size(1) * 2);
+    const bool has_b_chunks = has_virtual_rescale_chunk_grid(
+        B_sg_chunks, "B_sg_chunks", B.size(0), B.size(1) * 2);
+    TORCH_CHECK(has_a_chunks || has_b_chunks,
+                "virtual-rescale grouped GEMM requires at least one chunk SG grid");
+    kittens::py::device_check(A, A_sc, A_sg_tiles, B, B_sc, B_sg_tiles);
+    auto one = get_unit_scale_tensor(A);
+    G g {
+        .A = kittens::py::tensor_to_gl<typename G::A_fp4x2_gl>(A),
+        .A_sc = kittens::py::tensor_to_gl<typename G::A_sc_gl, false>(
+            A_sc, 1, A_sc.size(0), A_sc.size(1), 256),
+        .A_sc_global = kittens::py::tensor_to_gl<typename G::A_sc_global_gl>(one),
+        .B = kittens::py::tensor_to_gl<typename G::B_fp4x2_gl>(B),
+        .B_sc = kittens::py::tensor_to_gl<typename G::B_sc_gl, false>(
+            B_sc, 1, B_sc.size(0), B_sc.size(1), 256),
+        .B_sc_global = kittens::py::tensor_to_gl<typename G::B_sc_global_gl>(one),
+        .D = kittens::py::tensor_to_gl<typename G::D_gl>(D),
+        .D_K = use_split_D ? kittens::py::tensor_to_gl<typename G::D_gl>(D_K_opt.value())
+                           : kittens::py::tensor_to_gl<typename G::D_gl>(D),
+        .D_V = D_V_opt.has_value() ? kittens::py::tensor_to_gl<typename G::D_gl>(D_V_opt.value())
+                                   : (use_split_D ? kittens::py::tensor_to_gl<typename G::D_gl>(D_K_opt.value())
+                                                  : kittens::py::tensor_to_gl<typename G::D_gl>(D)),
+        .q_dim = use_split_D ? static_cast<int>(D.size(1)) : 0,
+        .k_dim = use_split_D ? static_cast<int>(D_K_opt.value().size(1)) : 0,
+        .v_dim = use_split_D ? v_dim : 0,
+        .use_split_D = use_split_D,
+        .a_sg_per_tile = a_sg_desc.ptr,
+        .a_sg_stride = a_sg_desc.stride,
+        .b_sg_per_tile = b_sg_desc.ptr,
+        .b_sg_stride = b_sg_desc.stride,
+        .a_sg_chunk_grid = has_a_chunks ? A_sg_chunks.data_ptr<float>() : nullptr,
+        .a_sg_chunk_stride = has_a_chunks ? static_cast<int>(A_sg_chunks.size(1)) : 1,
+        .b_sg_chunk_grid = has_b_chunks ? B_sg_chunks.data_ptr<float>() : nullptr,
+        .b_sg_chunk_stride = has_b_chunks ? static_cast<int>(B_sg_chunks.size(1)) : 1,
+        .silu_dim = silu_dim
+    };
+    kittens::py::launch_kernel<C, G, nvfp4_gemm::kernel_virtual_rescale<C>>(g);
+}
+
+void launch_fast_regular_gemm_virtual_rescale(
+    const at::Tensor& A,
+    const at::Tensor& A_sc,
+    const at::Tensor& A_sg_tiles,
+    const at::Tensor& A_sg_chunks,
+    const at::Tensor& B,
+    const at::Tensor& B_sc,
+    const at::Tensor& B_sg_tiles,
+    const at::Tensor& B_sg_chunks,
+    at::Tensor& D
+) {
+    const int64_t reduction_k = A.size(1) * 2;
+    if (reduction_k > 2048) {
+        launch_fast_gemm_virtual_rescale_with_config<localcta_fast_largek_config>(
+            A, A_sc, A_sg_tiles, A_sg_chunks, B, B_sc, B_sg_tiles, B_sg_chunks, D);
+        return;
+    }
+    launch_fast_gemm_virtual_rescale_with_config<localcta_fast_smallk_config>(
+        A, A_sc, A_sg_tiles, A_sg_chunks, B, B_sc, B_sg_tiles, B_sg_chunks, D);
+}
+
+void launch_fast_grouped_gemm_virtual_rescale(
+    const at::Tensor& A,
+    const at::Tensor& A_sc,
+    const at::Tensor& A_sg_tiles,
+    const at::Tensor& A_sg_chunks,
+    const at::Tensor& B,
+    const at::Tensor& B_sc,
+    const at::Tensor& B_sg_tiles,
+    const at::Tensor& B_sg_chunks,
+    at::Tensor& D,
+    std::optional<at::Tensor> D_K_opt,
+    std::optional<at::Tensor> D_V_opt,
+    int silu_dim
+) {
+    const bool use_split_D = D_K_opt.has_value();
+    const int64_t reduction_k = A.size(1) * 2;
+    if (!use_split_D && reduction_k > 2048) {
+        launch_fast_grouped_gemm_virtual_rescale_with_config<localcta_fast_largek_config>(
+            A, A_sc, A_sg_tiles, A_sg_chunks, B, B_sc, B_sg_tiles, B_sg_chunks,
+            D, D_K_opt, D_V_opt, silu_dim);
+        return;
+    }
+    launch_fast_grouped_gemm_virtual_rescale_with_config<localcta_fast_grouped_config>(
+        A, A_sc, A_sg_tiles, A_sg_chunks, B, B_sc, B_sg_tiles, B_sg_chunks,
+        D, D_K_opt, D_V_opt, silu_dim);
+}
+
 void launch_fast_regular_gemm(
     const at::Tensor& A,
     const at::Tensor& A_sc_prepared,
@@ -3030,6 +3205,24 @@ void nvfp4_localcta_fast_gemm_sg_entrypoint(
     launch_fast_regular_gemm_chunkgrid_sg(A, A_sc, A_sg_chunkgrid, B, B_sc, B_sg_chunkgrid, D);
 }
 
+void nvfp4_localcta_fast_gemm_virtual_rescale_entrypoint(
+    const at::Tensor& A,
+    const at::Tensor& A_sc,
+    const at::Tensor& A_sg_tiles,
+    const at::Tensor& A_sg_chunks,
+    const at::Tensor& B,
+    const at::Tensor& B_sc,
+    const at::Tensor& B_sg_tiles,
+    const at::Tensor& B_sg_chunks,
+    at::Tensor& D
+) {
+    check_output_matrix(D, "D", A.size(0), B.size(0));
+    launch_fast_regular_gemm_virtual_rescale(
+        A, A_sc, A_sg_tiles, A_sg_chunks,
+        B, B_sc, B_sg_tiles, B_sg_chunks,
+        D);
+}
+
 void nvfp4_localcta_grouped_gemm_entrypoint(
     const at::Tensor& A,
     const at::Tensor& A_sc,
@@ -3223,6 +3416,38 @@ void nvfp4_localcta_fast_grouped_gemm_sg_entrypoint(
     }
     launch_fast_grouped_gemm_chunkgrid_sg(
         A, A_sc, A_sg_chunkgrid, B, B_sc, B_sg_chunkgrid, D, D_K_opt, D_V_opt, silu_dim);
+}
+
+void nvfp4_localcta_fast_grouped_gemm_virtual_rescale_entrypoint(
+    const at::Tensor& A,
+    const at::Tensor& A_sc,
+    const at::Tensor& A_sg_tiles,
+    const at::Tensor& A_sg_chunks,
+    const at::Tensor& B,
+    const at::Tensor& B_sc,
+    const at::Tensor& B_sg_tiles,
+    const at::Tensor& B_sg_chunks,
+    at::Tensor& D,
+    std::optional<at::Tensor> D_K_opt = std::nullopt,
+    std::optional<at::Tensor> D_V_opt = std::nullopt,
+    int silu_dim = 0
+) {
+    TORCH_CHECK(D.is_cuda() && D.is_contiguous() && D.scalar_type() == at::kBFloat16,
+                "D must be a contiguous CUDA bf16 tensor");
+    if (D_K_opt.has_value()) {
+        TORCH_CHECK(D_K_opt.value().is_cuda() && D_K_opt.value().is_contiguous() &&
+                    D_K_opt.value().scalar_type() == at::kBFloat16,
+                    "D_K must be a contiguous CUDA bf16 tensor");
+    }
+    if (D_V_opt.has_value()) {
+        TORCH_CHECK(D_V_opt.value().is_cuda() && D_V_opt.value().is_contiguous() &&
+                    D_V_opt.value().scalar_type() == at::kBFloat16,
+                    "D_V must be a contiguous CUDA bf16 tensor");
+    }
+    launch_fast_grouped_gemm_virtual_rescale(
+        A, A_sc, A_sg_tiles, A_sg_chunks,
+        B, B_sc, B_sg_tiles, B_sg_chunks,
+        D, D_K_opt, D_V_opt, silu_dim);
 }
 
 void nvfp4_localcta_batched_gemm_entrypoint(
@@ -4027,6 +4252,11 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           pybind11::arg("A"), pybind11::arg("A_sc_prepared"), pybind11::arg("A_sg_chunks"),
           pybind11::arg("B"), pybind11::arg("B_sc_prepared"), pybind11::arg("B_sg_chunks"),
           pybind11::arg("D"));
+    m.def("nvfp4_localcta_fast_gemm_virtual_rescale",
+          &nvfp4_localcta_fast_gemm_virtual_rescale_entrypoint,
+          pybind11::arg("A"), pybind11::arg("A_sc"), pybind11::arg("A_sg_tiles"),
+          pybind11::arg("A_sg_chunks"), pybind11::arg("B"), pybind11::arg("B_sc"),
+          pybind11::arg("B_sg_tiles"), pybind11::arg("B_sg_chunks"), pybind11::arg("D"));
     m.def("nvfp4_localcta_grouped_gemm", &nvfp4_localcta_grouped_gemm_entrypoint,
           pybind11::arg("A"), pybind11::arg("A_sc"), pybind11::arg("A_sg_chunks"),
           pybind11::arg("B"), pybind11::arg("B_sc"), pybind11::arg("B_sg_chunks"),
@@ -4050,6 +4280,13 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("nvfp4_localcta_fast_grouped_gemm_sg", &nvfp4_localcta_fast_grouped_gemm_sg_entrypoint,
           pybind11::arg("A"), pybind11::arg("A_sc_prepared"), pybind11::arg("A_sg_chunks"),
           pybind11::arg("B"), pybind11::arg("B_sc_prepared"), pybind11::arg("B_sg_chunks"),
+          pybind11::arg("D"), pybind11::arg("D_K") = std::nullopt,
+          pybind11::arg("D_V") = std::nullopt, pybind11::arg("silu_dim") = 0);
+    m.def("nvfp4_localcta_fast_grouped_gemm_virtual_rescale",
+          &nvfp4_localcta_fast_grouped_gemm_virtual_rescale_entrypoint,
+          pybind11::arg("A"), pybind11::arg("A_sc"), pybind11::arg("A_sg_tiles"),
+          pybind11::arg("A_sg_chunks"), pybind11::arg("B"), pybind11::arg("B_sc"),
+          pybind11::arg("B_sg_tiles"), pybind11::arg("B_sg_chunks"),
           pybind11::arg("D"), pybind11::arg("D_K") = std::nullopt,
           pybind11::arg("D_V") = std::nullopt, pybind11::arg("silu_dim") = 0);
     m.def("nvfp4_localcta_batched_gemm", &nvfp4_localcta_batched_gemm_entrypoint,
