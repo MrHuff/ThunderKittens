@@ -523,6 +523,58 @@ at::Tensor fold_sg_into_prepared_sc_tensor(
     return (sc_raw.to(torch::kFloat32) * sg_prepared).contiguous().to(torch::kFloat8_e4m3fn);
 }
 
+__global__ void fold_outer_sg_into_prepared_sc_kernel(
+    const __nv_fp8_e4m3* __restrict__ sc_raw,
+    __nv_fp8_e4m3* __restrict__ sc_out,
+    const float* __restrict__ sg_outer,
+    int64_t scale_cols,
+    int64_t elems
+) {
+    const int64_t idx = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (idx >= elems) return;
+
+    const int64_t row_tile = idx / (scale_cols * kScaleBytesPerTile);
+    const float scale = sg_outer[row_tile >> 1];
+    sc_out[idx] = __nv_fp8_e4m3(static_cast<float>(sc_raw[idx]) * scale);
+}
+
+at::Tensor fold_outer_sg_into_prepared_sc_tensor(
+    const at::Tensor& sc_raw,
+    const at::Tensor& sg,
+    int64_t rows,
+    int64_t cols
+) {
+    TORCH_CHECK(sc_raw.defined(), "sc_raw must be defined");
+    TORCH_CHECK(sc_raw.is_cuda(), "sc_raw must be CUDA");
+    TORCH_CHECK(sc_raw.is_contiguous(), "sc_raw must be contiguous");
+    TORCH_CHECK(sc_raw.scalar_type() == at::kFloat8_e4m3fn,
+                "sc_raw must be fp8 e4m3fn prepared scales");
+    TORCH_CHECK(sc_raw.dim() == 3, "sc_raw must be rank-3 prepared scales");
+    TORCH_CHECK(rows % 256 == 0, "outer-SG prepared-scale folding requires rows multiple of 256");
+    TORCH_CHECK(cols % 64 == 0, "prepared-scale folding requires cols multiple of 64");
+    TORCH_CHECK(sc_raw.size(0) == rows / 128, "sc_raw first dim must be rows / 128");
+    TORCH_CHECK(sc_raw.size(1) == cols / 64, "sc_raw second dim must be cols / 64");
+    TORCH_CHECK(sc_raw.size(2) == kScaleBytesPerTile, "sc_raw scale-byte dim mismatch");
+
+    auto sg_outer = normalize_outer_scale_tiles_tensor(sg, rows / 256, true)
+        .contiguous()
+        .view({rows / 256});
+    auto out = at::empty_like(sc_raw);
+
+    const int threads = 256;
+    const int64_t elems = sc_raw.numel();
+    const int blocks = static_cast<int>((elems + threads - 1) / threads);
+    auto stream = at::cuda::getCurrentCUDAStream();
+    fold_outer_sg_into_prepared_sc_kernel<<<blocks, threads, 0, stream>>>(
+        reinterpret_cast<const __nv_fp8_e4m3*>(sc_raw.data_ptr()),
+        reinterpret_cast<__nv_fp8_e4m3*>(out.data_ptr()),
+        sg_outer.data_ptr<float>(),
+        sc_raw.size(1),
+        elems);
+    CUDACHECK(cudaGetLastError());
+    return out;
+}
+
 bool is_tilegrid256_tensor_shape(
     const at::Tensor& t,
     int64_t rows,
@@ -4239,6 +4291,15 @@ at::Tensor nvfp4_localcta_fold_sg_into_prepared_sc_entrypoint(
     return fold_sg_into_prepared_sc_tensor(sc_raw, sg, rows, cols);
 }
 
+at::Tensor nvfp4_localcta_fold_outer_sg_into_prepared_sc_entrypoint(
+    const at::Tensor& sc_raw,
+    const at::Tensor& sg,
+    int64_t rows,
+    int64_t cols
+) {
+    return fold_outer_sg_into_prepared_sc_tensor(sc_raw, sg, rows, cols);
+}
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("nvfp4_localcta_gemm", &nvfp4_localcta_gemm_entrypoint,
           pybind11::arg("A"), pybind11::arg("A_sc"), pybind11::arg("A_sg_chunks"),
@@ -4417,5 +4478,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("nvfp4_localcta_prepare_w2_dgrad_b_sg", &nvfp4_localcta_prepare_w2_dgrad_b_sg_entrypoint,
           pybind11::arg("sg"), pybind11::arg("tiles"), pybind11::arg("scale"));
     m.def("nvfp4_localcta_fold_sg_into_prepared_sc", &nvfp4_localcta_fold_sg_into_prepared_sc_entrypoint,
+          pybind11::arg("sc_raw"), pybind11::arg("sg"), pybind11::arg("rows"), pybind11::arg("cols"));
+    m.def("nvfp4_localcta_fold_outer_sg_into_prepared_sc", &nvfp4_localcta_fold_outer_sg_into_prepared_sc_entrypoint,
           pybind11::arg("sc_raw"), pybind11::arg("sg"), pybind11::arg("rows"), pybind11::arg("cols"));
 }
