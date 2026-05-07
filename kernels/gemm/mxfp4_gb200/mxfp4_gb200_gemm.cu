@@ -902,7 +902,6 @@ void mxfp4_gemm_config_entrypoint(
     at::Tensor &D, int config_id
 ) {
     //                     Nb   LOAD EPI  SG  DT  OVERLAP
-    // Trimmed to 10 configs for faster compile with Kb=256
     switch (config_id) {
     // Defaults (used by mxfp4_gemm_entrypoint)
     case 0:  run_gemm_with_config<mxfp4_gemm::config<256, 5,  8,  4, 2, false>>(A, A_sc, B, B_sc, D); break;
@@ -917,8 +916,9 @@ void mxfp4_gemm_config_entrypoint(
     case 7:  run_gemm_with_config<mxfp4_gemm::config<256, 5,  8,  4, 4, false>>(A, A_sc, B, B_sc, D); break;
     case 8:  run_gemm_with_config<mxfp4_gemm::config<256, 4, 16, 12, 2, false>>(A, A_sc, B, B_sc, D); break;
     case 9:  run_gemm_with_config<mxfp4_gemm::config<256, 5,  8,  4, 2, true >>(A, A_sc, B, B_sc, D); break;
+    case 10: run_gemm_with_config<mxfp4_gemm::config<256, 5,  4, 12, 2, false>>(A, A_sc, B, B_sc, D); break;
 
-    default: TORCH_CHECK(false, "Invalid config_id: ", config_id, " (valid: 0-9)");
+    default: TORCH_CHECK(false, "Invalid config_id: ", config_id, " (valid: 0-10)");
     }
 }
 
@@ -954,7 +954,8 @@ void mxfp4_gemm_rope_live64_config_entrypoint(
     case 7:  run_gemm_with_config_rope_live64<mxfp4_gemm::config<256, 5,  8,  4, 4, false>>(A, A_sc, B, B_sc, D, rope_cs, rope_seq_len); break;
     case 8:  run_gemm_with_config_rope_live64<mxfp4_gemm::config<256, 4, 16, 12, 2, false>>(A, A_sc, B, B_sc, D, rope_cs, rope_seq_len); break;
     case 9:  run_gemm_with_config_rope_live64<mxfp4_gemm::config<256, 5,  8,  4, 2, true >>(A, A_sc, B, B_sc, D, rope_cs, rope_seq_len); break;
-    default: TORCH_CHECK(false, "Invalid config_id: ", config_id, " (valid: 0-9)");
+    case 10: run_gemm_with_config_rope_live64<mxfp4_gemm::config<256, 5,  4, 12, 2, false>>(A, A_sc, B, B_sc, D, rope_cs, rope_seq_len); break;
+    default: TORCH_CHECK(false, "Invalid config_id: ", config_id, " (valid: 0-10)");
     }
 }
 
@@ -996,7 +997,8 @@ void mxfp4_gemm_rope_config_entrypoint(
     case 7:  run_gemm_with_config_rope<mxfp4_gemm::config<256, 5,  8,  4, 4, false>>(A, A_sc, B, B_sc, D, rope_cos, rope_sin, rope_seq_len, rope_head_dim, rope_rotary_dim); break;
     case 8:  run_gemm_with_config_rope<mxfp4_gemm::config<256, 4, 16, 12, 2, false>>(A, A_sc, B, B_sc, D, rope_cos, rope_sin, rope_seq_len, rope_head_dim, rope_rotary_dim); break;
     case 9:  run_gemm_with_config_rope<mxfp4_gemm::config<256, 5,  8,  4, 2, true >>(A, A_sc, B, B_sc, D, rope_cos, rope_sin, rope_seq_len, rope_head_dim, rope_rotary_dim); break;
-    default: TORCH_CHECK(false, "Invalid config_id: ", config_id, " (valid: 0-9)");
+    case 10: run_gemm_with_config_rope<mxfp4_gemm::config<256, 5,  4, 12, 2, false>>(A, A_sc, B, B_sc, D, rope_cos, rope_sin, rope_seq_len, rope_head_dim, rope_rotary_dim); break;
+    default: TORCH_CHECK(false, "Invalid config_id: ", config_id, " (valid: 0-10)");
     }
 }
 
@@ -1331,7 +1333,8 @@ void mxfp4_batched_gemm_rope_live64_config_entrypoint(
     case 7:  build_selected.template operator()<mxfp4_gemm::config<256, 5,  8,  4, 4, false>>(); break;
     case 8:  build_selected.template operator()<mxfp4_gemm::config<256, 4, 16, 12, 2, false>>(); break;
     case 9:  build_selected.template operator()<mxfp4_gemm::config<256, 5,  8,  4, 2, true >>(); break;
-    default: TORCH_CHECK(false, "Invalid config_id: ", config_id, " (valid: 0-9)");
+    case 10: build_selected.template operator()<mxfp4_gemm::config<256, 5,  4, 12, 2, false>>(); break;
+    default: TORCH_CHECK(false, "Invalid config_id: ", config_id, " (valid: 0-10)");
     }
 }
 
