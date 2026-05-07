@@ -309,12 +309,21 @@ __device__ inline void kernel(const globals<C> &g) {
             #pragma unroll
             for (int i = 0; i < C::EPI_PIPE_DEPTH; i++) {
                 if (g.rope_live64[batch].enabled()) {
-                    mxfp4_rope_epilogue::apply_inplace_live64(
-                        D_reg[i],
-                        g.rope_live64[batch],
-                        (row_block_idx * 2 + cta_id) * (C::Mb / 2),
-                        (col_block_idx * C::EPI_PIPE_DEPTH + i) * (C::Nb / C::EPI_PIPE_DEPTH)
-                    );
+                    if constexpr (C::ROPE_LIVE64_RHT32) {
+                        mxfp4_rope_epilogue::apply_inplace_live64_rht32(
+                            D_reg[i],
+                            g.rope_live64[batch],
+                            (row_block_idx * 2 + cta_id) * (C::Mb / 2),
+                            (col_block_idx * C::EPI_PIPE_DEPTH + i) * (C::Nb / C::EPI_PIPE_DEPTH)
+                        );
+                    } else {
+                        mxfp4_rope_epilogue::apply_inplace_live64(
+                            D_reg[i],
+                            g.rope_live64[batch],
+                            (row_block_idx * 2 + cta_id) * (C::Mb / 2),
+                            (col_block_idx * C::EPI_PIPE_DEPTH + i) * (C::Nb / C::EPI_PIPE_DEPTH)
+                        );
+                    }
                 } else {
                     mxfp4_rope_epilogue::apply_inplace(
                         D_reg[i],
