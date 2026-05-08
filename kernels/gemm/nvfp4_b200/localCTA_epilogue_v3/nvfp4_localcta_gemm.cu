@@ -527,15 +527,22 @@ __global__ void fold_outer_sg_into_prepared_sc_kernel(
     const __nv_fp8_e4m3* __restrict__ sc_raw,
     __nv_fp8_e4m3* __restrict__ sc_out,
     const float* __restrict__ sg_outer,
+    int64_t stride0,
+    int64_t stride1,
     int64_t scale_cols,
     int64_t elems
 ) {
     const int64_t idx = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     if (idx >= elems) return;
 
-    const int64_t row_tile = idx / (scale_cols * kScaleBytesPerTile);
+    const int64_t tile_elems = scale_cols * kScaleBytesPerTile;
+    const int64_t row_tile = idx / tile_elems;
+    const int64_t rem = idx - row_tile * tile_elems;
+    const int64_t col_tile = rem / kScaleBytesPerTile;
+    const int64_t byte_idx = rem - col_tile * kScaleBytesPerTile;
     const float scale = sg_outer[row_tile >> 1];
-    sc_out[idx] = __nv_fp8_e4m3(static_cast<float>(sc_raw[idx]) * scale);
+    const int64_t src_idx = row_tile * stride0 + col_tile * stride1 + byte_idx;
+    sc_out[idx] = __nv_fp8_e4m3(static_cast<float>(sc_raw[src_idx]) * scale);
 }
 
 at::Tensor fold_outer_sg_into_prepared_sc_tensor(
@@ -546,7 +553,6 @@ at::Tensor fold_outer_sg_into_prepared_sc_tensor(
 ) {
     TORCH_CHECK(sc_raw.defined(), "sc_raw must be defined");
     TORCH_CHECK(sc_raw.is_cuda(), "sc_raw must be CUDA");
-    TORCH_CHECK(sc_raw.is_contiguous(), "sc_raw must be contiguous");
     TORCH_CHECK(sc_raw.scalar_type() == at::kFloat8_e4m3fn,
                 "sc_raw must be fp8 e4m3fn prepared scales");
     TORCH_CHECK(sc_raw.dim() == 3, "sc_raw must be rank-3 prepared scales");
@@ -555,6 +561,9 @@ at::Tensor fold_outer_sg_into_prepared_sc_tensor(
     TORCH_CHECK(sc_raw.size(0) == rows / 128, "sc_raw first dim must be rows / 128");
     TORCH_CHECK(sc_raw.size(1) == cols / 64, "sc_raw second dim must be cols / 64");
     TORCH_CHECK(sc_raw.size(2) == kScaleBytesPerTile, "sc_raw scale-byte dim mismatch");
+    TORCH_CHECK(sc_raw.stride(2) == 1, "sc_raw scale-byte dim must be contiguous");
+    TORCH_CHECK(sc_raw.stride(1) == kScaleBytesPerTile,
+                "sc_raw second-dim stride must equal 512 bytes");
 
     auto sg_outer = normalize_outer_scale_tiles_tensor(sg, rows / 256, true)
         .contiguous()
@@ -569,6 +578,8 @@ at::Tensor fold_outer_sg_into_prepared_sc_tensor(
         reinterpret_cast<const __nv_fp8_e4m3*>(sc_raw.data_ptr()),
         reinterpret_cast<__nv_fp8_e4m3*>(out.data_ptr()),
         sg_outer.data_ptr<float>(),
+        sc_raw.stride(0),
+        sc_raw.stride(1),
         sc_raw.size(1),
         elems);
     CUDACHECK(cudaGetLastError());
@@ -2378,6 +2389,206 @@ void launch_fast_split3_dgrad_gemm_strided_onepass_with_config(
 }
 
 template <typename C>
+void encode_fp4_col_slice_tensor_map(
+    CUtensorMap* desc,
+    const at::Tensor& full,
+    int64_t col_offset,
+    int64_t col_width,
+    const char* name
+) {
+    check_fp4_matrix(full, name);
+    TORCH_CHECK(col_offset >= 0, name, " col_offset must be non-negative");
+    TORCH_CHECK(col_width > 0, name, " col_width must be positive");
+    TORCH_CHECK(col_offset + col_width <= full.size(1), name, " slice exceeds packed width");
+    TORCH_CHECK((2 * col_width) % C::Kb == 0,
+                name, " reduction width must be aligned to Kb=", C::Kb);
+
+    constexpr int64_t swizzle_elements = 128;
+    const int64_t rows = full.size(0);
+    const int64_t row_stride = full.size(1);
+    const uint8_t* base = reinterpret_cast<const uint8_t*>(full.data_ptr());
+    const void* data_ptr = base + col_offset;
+
+    uint64_t gmem_shape[5] = {
+        static_cast<uint64_t>(swizzle_elements),
+        static_cast<uint64_t>(rows),
+        static_cast<uint64_t>((col_width + swizzle_elements - 1) / swizzle_elements),
+        1, 1
+    };
+    uint64_t gmem_stride[4] = {
+        static_cast<uint64_t>(row_stride),
+        128,
+        static_cast<uint64_t>(rows * row_stride),
+        static_cast<uint64_t>(rows * row_stride)
+    };
+    uint32_t smem_shape[5] = {
+        static_cast<uint32_t>(swizzle_elements),
+        static_cast<uint32_t>(C::Nb / 2),
+        1, 1, 1
+    };
+    uint32_t smem_stride[5] = {1, 1, 1, 1, 1};
+
+    CUresult result = cuTensorMapEncodeTiled(
+        desc,
+        CU_TENSOR_MAP_DATA_TYPE_UINT8,
+        5,
+        const_cast<void*>(data_ptr),
+        gmem_shape,
+        gmem_stride,
+        smem_shape,
+        smem_stride,
+        CU_TENSOR_MAP_INTERLEAVE_NONE,
+        CU_TENSOR_MAP_SWIZZLE_128B,
+        CU_TENSOR_MAP_L2_PROMOTION_NONE,
+        CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE
+    );
+    TORCH_CHECK(result == CUDA_SUCCESS, name, " FP4 slice TMA creation failed");
+}
+
+template <typename C>
+void launch_fast_split3_dgrad_gemm_strided_onepass_full_b_with_config(
+    const at::Tensor& A_full,
+    const std::vector<at::Tensor>& A_sc_prepared_list,
+    const std::vector<int64_t>& A_col_offsets,
+    const std::vector<int64_t>& A_col_widths,
+    const at::Tensor& B_full,
+    const at::Tensor& B_sc_prepared_full,
+    at::Tensor& D_out
+) {
+    using G = nvfp4_split3_accum_gemm::globals<C>;
+    G g_host;
+    memset(&g_host, 0, sizeof(G));
+
+    TORCH_CHECK(A_sc_prepared_list.size() == 3, "one-pass split3 full-B dgrad expects 3 A scale batches");
+    TORCH_CHECK(A_col_offsets.size() == 3, "one-pass split3 full-B dgrad expects 3 A offsets");
+    TORCH_CHECK(A_col_widths.size() == 3, "one-pass split3 full-B dgrad expects 3 A widths");
+    check_fp4_matrix(A_full, "A_full");
+    check_fp4_matrix(B_full, "B_full");
+    TORCH_CHECK(A_full.size(1) == B_full.size(1), "A_full and B_full must share packed reduction width");
+    TORCH_CHECK(D_out.size(0) == A_full.size(0), "D_out row mismatch");
+    TORCH_CHECK(D_out.size(1) == B_full.size(0), "D_out col mismatch");
+    check_scale_tensor_tma_compatible(
+        B_sc_prepared_full, "B_sc_prepared_full", B_full.size(0), B_full.size(1) * 2);
+
+    const int64_t M = D_out.size(0);
+    const int64_t N_out = D_out.size(1);
+    const int64_t K_total_fp4 = A_full.size(1);
+    const uint8_t* a_base = reinterpret_cast<const uint8_t*>(A_full.data_ptr());
+    const int64_t a_full_row_stride = K_total_fp4;
+
+    g_host.num_row_blocks = static_cast<int>(M / C::Mb);
+    g_host.num_col_blocks = static_cast<int>(N_out / C::Nb);
+
+    for (int i = 0; i < 3; ++i) {
+        constexpr int64_t swizzle_elements = 128;
+        const int64_t fp4_cols = A_col_widths[i];
+        const int64_t fp4_offset = A_col_offsets[i];
+        const void* data_ptr = a_base + fp4_offset;
+
+        TORCH_CHECK(fp4_cols > 0, "A_col_widths must be positive");
+        TORCH_CHECK((2 * fp4_cols) % C::Kb == 0,
+                    "one-pass split3 full-B dgrad expects reduction widths aligned to Kb=", C::Kb);
+        TORCH_CHECK(fp4_offset % 32 == 0,
+                    "one-pass split3 full-B dgrad expects packed offsets aligned to scale tiles");
+        g_host.num_red_blocks[i] = static_cast<int>((2 * fp4_cols) / C::Kb);
+
+        uint64_t gmem_shape[5] = {
+            static_cast<uint64_t>(swizzle_elements),
+            static_cast<uint64_t>(M),
+            static_cast<uint64_t>((fp4_cols + swizzle_elements - 1) / swizzle_elements),
+            1, 1
+        };
+        uint64_t gmem_stride[4] = {
+            static_cast<uint64_t>(a_full_row_stride),
+            128,
+            static_cast<uint64_t>(M * a_full_row_stride),
+            static_cast<uint64_t>(M * a_full_row_stride)
+        };
+        uint32_t smem_shape[5] = {
+            static_cast<uint32_t>(swizzle_elements),
+            static_cast<uint32_t>(C::Mb / 2),
+            1, 1, 1
+        };
+        uint32_t smem_stride[5] = {1, 1, 1, 1, 1};
+
+        CUresult result = cuTensorMapEncodeTiled(
+            &g_host.A_tma[i],
+            CU_TENSOR_MAP_DATA_TYPE_UINT8,
+            5,
+            const_cast<void*>(data_ptr),
+            gmem_shape,
+            gmem_stride,
+            smem_shape,
+            smem_stride,
+            CU_TENSOR_MAP_INTERLEAVE_NONE,
+            CU_TENSOR_MAP_SWIZZLE_128B,
+            CU_TENSOR_MAP_L2_PROMOTION_NONE,
+            CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE
+        );
+        TORCH_CHECK(result == CUDA_SUCCESS,
+                    "One-pass split3 full-B localCTA A TMA creation failed for batch ", i);
+
+        encode_fp4_col_slice_tensor_map<C>(
+            &g_host.B_tma[i], B_full, fp4_offset, fp4_cols, "B_full");
+
+        const int64_t sc_offset = fp4_offset / 32;
+        const int64_t sc_width = fp4_cols / 32;
+        auto B_sc_view = B_sc_prepared_full.narrow(1, sc_offset, sc_width);
+
+        encode_prepared_scale_tensor_map<typename G::A_sc_tile>(
+            &g_host.A_sc_tma[i], A_sc_prepared_list[i], "A_sc_prepared_list[i]");
+        encode_prepared_scale_tensor_map<typename G::B_sc_tile>(
+            &g_host.B_sc_tma[i], B_sc_view, "B_sc_prepared_full_slice");
+    }
+
+    auto d_gl = kittens::py::tensor_to_gl<typename G::D_gl>(D_out);
+    memcpy(&g_host.D_tma, &d_gl.tma_descs.tma_desc, sizeof(CUtensorMap));
+
+    kittens::py::launch_kernel<C, G, nvfp4_split3_accum_gemm::kernel<C>>(g_host);
+}
+
+void launch_fast_split3_dgrad_gemm_strided_onepass_full_b(
+    const at::Tensor& A_full,
+    const std::vector<at::Tensor>& A_sc_prepared_list,
+    const std::vector<int64_t>& A_col_offsets,
+    const std::vector<int64_t>& A_col_widths,
+    const at::Tensor& B_full,
+    const at::Tensor& B_sc_prepared_full,
+    at::Tensor& D_out,
+    int config_idx
+) {
+    int resolved_idx = config_idx;
+    if (resolved_idx < 0) {
+        resolved_idx = 5;
+    }
+    switch (resolved_idx) {
+        case 0:
+            TORCH_CHECK(false, "one-pass split3 full-B config_idx=0 is not legal with CLUSTER_SIZE=1 on this kernel");
+            break;
+        case 1:
+            launch_fast_split3_dgrad_gemm_strided_onepass_full_b_with_config<localcta_onepass_cfg1>(
+                A_full, A_sc_prepared_list, A_col_offsets, A_col_widths, B_full, B_sc_prepared_full, D_out);
+            break;
+        case 2:
+            TORCH_CHECK(false, "one-pass split3 full-B config_idx=2 is not legal with CLUSTER_SIZE=1 on this kernel");
+            break;
+        case 3:
+            launch_fast_split3_dgrad_gemm_strided_onepass_full_b_with_config<localcta_onepass_cfg3>(
+                A_full, A_sc_prepared_list, A_col_offsets, A_col_widths, B_full, B_sc_prepared_full, D_out);
+            break;
+        case 4:
+            TORCH_CHECK(false, "one-pass split3 full-B config_idx=4 is not legal with CLUSTER_SIZE=1 on this kernel");
+            break;
+        case 5:
+            launch_fast_split3_dgrad_gemm_strided_onepass_full_b_with_config<localcta_onepass_cfg5>(
+                A_full, A_sc_prepared_list, A_col_offsets, A_col_widths, B_full, B_sc_prepared_full, D_out);
+            break;
+        default:
+            TORCH_CHECK(false, "Unknown one-pass split3 full-B config_idx=", resolved_idx);
+    }
+}
+
+template <typename C>
 void launch_fast_split2_dgrad_gemm_strided_onepass_with_config(
     const at::Tensor& A_full,
     const std::vector<at::Tensor>& A_sc_prepared_list,
@@ -4082,6 +4293,22 @@ void nvfp4_localcta_fast_split3_dgrad_strided_onepass_gemm_entrypoint(
         B_list, B_sc_prepared_list, D_out, static_cast<int>(config_idx));
 }
 
+void nvfp4_localcta_fast_split3_dgrad_strided_onepass_full_b_gemm_entrypoint(
+    const at::Tensor& A_full,
+    const std::vector<at::Tensor>& A_sc_prepared_list,
+    const std::vector<int64_t>& A_col_offsets,
+    const std::vector<int64_t>& A_col_widths,
+    const at::Tensor& B_full,
+    const at::Tensor& B_sc_prepared_full,
+    at::Tensor& D_out,
+    int64_t config_idx
+) {
+    check_output_matrix(D_out, "D_out", A_full.size(0), B_full.size(0));
+    launch_fast_split3_dgrad_gemm_strided_onepass_full_b(
+        A_full, A_sc_prepared_list, A_col_offsets, A_col_widths,
+        B_full, B_sc_prepared_full, D_out, static_cast<int>(config_idx));
+}
+
 void nvfp4_localcta_fast_split2_dgrad_strided_sum_gemm_entrypoint(
     const at::Tensor& A_full,
     const std::vector<at::Tensor>& A_sc_prepared_list,
@@ -4445,6 +4672,12 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           pybind11::arg("B_list"),
           pybind11::arg("B_sc_prepared_list"), pybind11::arg("D_out"),
           pybind11::arg("config_idx") = -1);
+    m.def("nvfp4_localcta_fast_split3_dgrad_strided_onepass_full_b_gemm",
+          &nvfp4_localcta_fast_split3_dgrad_strided_onepass_full_b_gemm_entrypoint,
+          pybind11::arg("A_full"), pybind11::arg("A_sc_prepared_list"),
+          pybind11::arg("A_col_offsets"), pybind11::arg("A_col_widths"),
+          pybind11::arg("B_full"), pybind11::arg("B_sc_prepared_full"),
+          pybind11::arg("D_out"), pybind11::arg("config_idx") = -1);
     m.def("nvfp4_localcta_fast_split2_dgrad_strided_sum_gemm",
           &nvfp4_localcta_fast_split2_dgrad_strided_sum_gemm_entrypoint,
           pybind11::arg("A_full"), pybind11::arg("A_sc_prepared_list"),
