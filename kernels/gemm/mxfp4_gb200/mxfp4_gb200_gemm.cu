@@ -182,6 +182,13 @@ void check_output_matrix(const at::Tensor& t, const char* name, int64_t rows, in
     TORCH_CHECK(t.size(0) == rows && t.size(1) == cols, name, " shape mismatch");
 }
 
+void check_output_scale_tensor(const at::Tensor& t, const char* name) {
+    TORCH_CHECK(t.is_cuda(), name, " must be CUDA");
+    TORCH_CHECK(t.is_contiguous(), name, " must be contiguous");
+    TORCH_CHECK(t.scalar_type() == at::kFloat, name, " must be fp32");
+    TORCH_CHECK(t.numel() == 1, name, " must contain exactly one scalar");
+}
+
 void check_tilemask(
     const at::Tensor& t,
     const char* name,
@@ -439,9 +446,13 @@ static void launch_mxfp4_gemm_dense(
     const at::Tensor &A_sc,
     const at::Tensor &B,
     const at::Tensor &B_sc,
-    at::Tensor &D
+    at::Tensor &D,
+    const at::Tensor* output_scale = nullptr
 ) {
     using G = mxfp4_gemm::globals<C>;
+    if (output_scale != nullptr) {
+        check_output_scale_tensor(*output_scale, "output_scale");
+    }
     G g {
         .A = kittens::py::tensor_to_gl<typename G::A_fp4x2_gl>(A),
         .A_sc = kittens::py::tensor_to_gl<typename G::A_sc_gl>(A_sc),
@@ -451,7 +462,9 @@ static void launch_mxfp4_gemm_dense(
         .tilemask_ptr = nullptr,
         .tilemask_rows = 0,
         .tilemask_cols = 0,
-        .tilemask_transposed = false
+        .tilemask_transposed = false,
+        .output_scale_ptr = output_scale == nullptr ? nullptr : output_scale->data_ptr<float>(),
+        .output_scale = 1.0f
     };
     kittens::py::launch_kernel<C, G, mxfp4_gemm::kernel<C>>(g);
 }
@@ -476,7 +489,9 @@ static void launch_mxfp4_gemm_masked(
         .tilemask_ptr = tilemask.data_ptr<uint8_t>(),
         .tilemask_rows = static_cast<int>(tilemask.size(0)),
         .tilemask_cols = static_cast<int>(tilemask.size(1)),
-        .tilemask_transposed = tilemask_transposed
+        .tilemask_transposed = tilemask_transposed,
+        .output_scale_ptr = nullptr,
+        .output_scale = 1.0f
     };
     kittens::py::launch_kernel<C, G, mxfp4_gemm::kernel<C>>(g);
 }
@@ -504,6 +519,32 @@ void mxfp4_gemm_k128_entrypoint(
     // reduction granularity matches a single 128-column tile.
     launch_mxfp4_gemm_dense<mxfp4_gemm::config<256, 5, 8, 4, 2, false, 128>>(A, A_sc, B, B_sc, D);
 }
+
+void mxfp4_gemm_scaled_entrypoint(
+    const at::Tensor &A,
+    const at::Tensor &A_sc,
+    const at::Tensor &B,
+    const at::Tensor &B_sc,
+    at::Tensor &D,
+    const at::Tensor &output_scale
+) {
+    // Same kernel as mxfp4_gemm, with an extra device scalar fused into the epilogue.
+    launch_mxfp4_gemm_dense<mxfp4_gemm::config<256, 5, 8, 4, 2, false, 256>>(
+        A, A_sc, B, B_sc, D, &output_scale);
+}
+
+void mxfp4_gemm_k128_scaled_entrypoint(
+    const at::Tensor &A,
+    const at::Tensor &A_sc,
+    const at::Tensor &B,
+    const at::Tensor &B_sc,
+    at::Tensor &D,
+    const at::Tensor &output_scale
+) {
+    launch_mxfp4_gemm_dense<mxfp4_gemm::config<256, 5, 8, 4, 2, false, 128>>(
+        A, A_sc, B, B_sc, D, &output_scale);
+}
+
 
 void mxfp4_gemm_masked_entrypoint(
     const at::Tensor &A,
@@ -559,7 +600,9 @@ static void run_gemm_with_config(
         .tilemask_ptr = nullptr,
         .tilemask_rows = 0,
         .tilemask_cols = 0,
-        .tilemask_transposed = false
+        .tilemask_transposed = false,
+        .output_scale_ptr = nullptr,
+        .output_scale = 1.0f
     };
     kittens::py::launch_kernel<C, G, mxfp4_gemm::kernel<C>>(g);
 }
@@ -672,6 +715,14 @@ void mxfp4_split2_dgrad_strided_onepass_gemm_entrypoint(
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("mxfp4_gemm", &mxfp4_gemm_entrypoint);
     m.def("mxfp4_gemm_k128", &mxfp4_gemm_k128_entrypoint);
+    m.def("mxfp4_gemm_scaled", &mxfp4_gemm_scaled_entrypoint,
+          pybind11::arg("A"), pybind11::arg("A_sc"),
+          pybind11::arg("B"), pybind11::arg("B_sc"),
+          pybind11::arg("D"), pybind11::arg("output_scale"));
+    m.def("mxfp4_gemm_k128_scaled", &mxfp4_gemm_k128_scaled_entrypoint,
+          pybind11::arg("A"), pybind11::arg("A_sc"),
+          pybind11::arg("B"), pybind11::arg("B_sc"),
+          pybind11::arg("D"), pybind11::arg("output_scale"));
     m.def("mxfp4_gemm_masked", &mxfp4_gemm_masked_entrypoint,
           pybind11::arg("A"), pybind11::arg("A_sc"),
           pybind11::arg("B"), pybind11::arg("B_sc"),
