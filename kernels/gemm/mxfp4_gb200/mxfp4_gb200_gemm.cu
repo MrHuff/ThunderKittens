@@ -675,7 +675,8 @@ static void launch_mxfp4_gemm_dense(
     const at::Tensor &A_sc,
     const at::Tensor &B,
     const at::Tensor &B_sc,
-    at::Tensor &D
+    at::Tensor &D,
+    const at::Tensor* output_scale = nullptr
 ) {
     using G = mxfp4_gemm::globals<C>;
     G g {
@@ -684,6 +685,7 @@ static void launch_mxfp4_gemm_dense(
         .B = kittens::py::tensor_to_gl<typename G::B_fp4x2_gl>(B),
         .B_sc = kittens::py::tensor_to_gl<typename G::B_sc_gl>(B_sc),
         .D = kittens::py::tensor_to_gl<typename G::D_gl>(D),
+        .output_scale = output_scale == nullptr ? nullptr : output_scale->data_ptr<float>(),
         .tilemask_ptr = nullptr,
         .tilemask_rows = 0,
         .tilemask_cols = 0,
@@ -753,6 +755,21 @@ void mxfp4_gemm_entrypoint(
     // Single config that works for all shapes with Kb=256.
     // config<256,5,8,4,2,false> = Nb=256, LOAD_PIPE=5, EPI=8, SG=4, DT=2, no overlap
     launch_mxfp4_gemm_dense<mxfp4_gemm::config<256, 5, 8, 4, 2, false, 256>>(A, A_sc, B, B_sc, D);
+}
+
+void mxfp4_gemm_scaled_entrypoint(
+    const at::Tensor &A,
+    const at::Tensor &A_sc,
+    const at::Tensor &B,
+    const at::Tensor &B_sc,
+    at::Tensor &D,
+    const at::Tensor &output_scale
+) {
+    TORCH_CHECK(output_scale.is_cuda(), "output_scale must be a CUDA scalar tensor");
+    TORCH_CHECK(output_scale.scalar_type() == at::kFloat, "output_scale must be float32");
+    TORCH_CHECK(output_scale.numel() == 1, "output_scale must contain one element");
+    launch_mxfp4_gemm_dense<mxfp4_gemm::config<256, 5, 8, 4, 2, false, 256, false, true>>(
+        A, A_sc, B, B_sc, D, &output_scale);
 }
 
 void mxfp4_gemm_residual_entrypoint(
@@ -1365,6 +1382,11 @@ void mxfp4_split3_dgrad_strided_onepass_gemm_entrypoint(
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("mxfp4_gemm", &mxfp4_gemm_entrypoint);
+    m.def("mxfp4_gemm_scaled", &mxfp4_gemm_scaled_entrypoint,
+          "MXFP4 GEMM with an extra CUDA scalar epilogue multiplier",
+          pybind11::arg("A"), pybind11::arg("A_sc"),
+          pybind11::arg("B"), pybind11::arg("B_sc"),
+          pybind11::arg("D"), pybind11::arg("output_scale"));
     m.def("mxfp4_gemm_residual", &mxfp4_gemm_residual_entrypoint,
           "Dense GEMM with fused bf16 residual add in the epilogue",
           pybind11::arg("A"), pybind11::arg("A_sc"),

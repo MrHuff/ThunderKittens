@@ -20,7 +20,8 @@ template <
     int _NUM_D_TILES,
     bool _OVERLAP_EPI,
     int _Kb = 256,
-    bool _FUSE_RESIDUAL = false
+    bool _FUSE_RESIDUAL = false,
+    bool _OUTPUT_SCALE = false
 >
 struct config {
     static_assert(_Nb == 128 || _Nb == 256, "Nb must be 128 or 256");
@@ -49,6 +50,7 @@ struct config {
     static constexpr int Nb = _Nb;
     static constexpr int Kb = _Kb;
     static constexpr bool FUSE_RESIDUAL = _FUSE_RESIDUAL;
+    static constexpr bool OUTPUT_SCALE = _OUTPUT_SCALE;
     static constexpr int B_SC_SIZE = Nb/128;
     static constexpr int MMA_PER_TILE = Kb/128;
 
@@ -106,6 +108,7 @@ struct globals {
     CUtensorMap R_tma;   // optional residual descriptor, M x N
     mxfp4_rope_epilogue::rope_desc rope;
     mxfp4_rope_epilogue::rope_live64_desc rope_live64;
+    const float* output_scale;     // optional scalar epilogue multiplier
     const uint8_t* tilemask_ptr;   // optional [mask_rows, mask_cols] activity mask
     int            tilemask_rows;
     int            tilemask_cols;
@@ -435,6 +438,10 @@ __device__ inline void kernel(const globals<C> &g) {
             // Load the output from tensor memory into registers and store to HBM
             // Apply MXFP4 alpha scaling (1/36) in-register before store.
             constexpr float MXFP4_ALPHA = 1.0f / 36.0f;
+            float gemm_scale = MXFP4_ALPHA;
+            if constexpr (C::OUTPUT_SCALE) {
+                gemm_scale *= *g.output_scale;
+            }
             if (!block_has_active) {
                 if constexpr (C::OVERLAP_EPI) {
                     #pragma unroll
@@ -487,7 +494,7 @@ __device__ inline void kernel(const globals<C> &g) {
                         warpgroup::sync(1);
                         warpgroup::tma::cluster::arrive(outputs_finished, 0, 1);
                     }
-                    warp::mul(D_reg_fl, D_reg_fl, MXFP4_ALPHA);
+                    warp::mul(D_reg_fl, D_reg_fl, gemm_scale);
                     if (g.rope_live64.enabled()) {
                         mxfp4_rope_epilogue::apply_inplace_live64(
                             D_reg_fl,
@@ -522,7 +529,7 @@ __device__ inline void kernel(const globals<C> &g) {
                 for (int i = 0; i < C::EPI_PIPE_DEPTH; i++) {
                     rt_fl<C::Mb / 8, C::Nb / C::EPI_PIPE_DEPTH> D_reg_fl;
                     warpgroup::load_async(D_reg_fl, out_tm.template subtile<full_tt_fl<C::Nb / C::EPI_PIPE_DEPTH>>(0, C::Nb / C::EPI_PIPE_DEPTH * i));
-                    warp::mul(D_reg_fl, D_reg_fl, MXFP4_ALPHA);
+                    warp::mul(D_reg_fl, D_reg_fl, gemm_scale);
                     if (g.rope_live64.enabled()) {
                         mxfp4_rope_epilogue::apply_inplace_live64(
                             D_reg_fl,
