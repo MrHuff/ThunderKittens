@@ -12,7 +12,16 @@ using namespace kittens;
 
 namespace mxfp4_gemm {
 
-template <int _Nb, int _LOAD_PIPE_DEPTH, int _EPI_PIPE_DEPTH, int _SUPERGROUP_SIZE, int _NUM_D_TILES, bool _OVERLAP_EPI, int _Kb = 256>
+template <
+    int _Nb,
+    int _LOAD_PIPE_DEPTH,
+    int _EPI_PIPE_DEPTH,
+    int _SUPERGROUP_SIZE,
+    int _NUM_D_TILES,
+    bool _OVERLAP_EPI,
+    int _Kb = 256,
+    bool _FUSE_RESIDUAL = false
+>
 struct config {
     static_assert(_Nb == 128 || _Nb == 256, "Nb must be 128 or 256");
     static_assert(_Kb == 128 || _Kb == 256, "Kb must be 128 or 256");
@@ -39,10 +48,37 @@ struct config {
     static constexpr int Mb = 256;
     static constexpr int Nb = _Nb;
     static constexpr int Kb = _Kb;
+    static constexpr bool FUSE_RESIDUAL = _FUSE_RESIDUAL;
     static constexpr int B_SC_SIZE = Nb/128;
     static constexpr int MMA_PER_TILE = Kb/128;
 
     static constexpr int NUM_D_TILES = _NUM_D_TILES;
+};
+
+template <typename _GL>
+struct tma_dev_proxy {
+    using identifier = ducks::gl::identifier;
+    using T = typename _GL::T;
+    using T2 = typename _GL::T2;
+    using dtype = typename _GL::dtype;
+    static constexpr int __b__ = _GL::__b__;
+    static constexpr int __d__ = _GL::__d__;
+    static constexpr int __r__ = _GL::__r__;
+    static constexpr int __c__ = _GL::__c__;
+
+    const CUtensorMap* dev_tma;
+
+    __device__ explicit tma_dev_proxy(const CUtensorMap* _dev_tma) : dev_tma(_dev_tma) {}
+
+    template<int axis> __device__ inline size_t shape() const { return 0; }
+    template<int axis> __device__ inline size_t stride() const { return 0; }
+
+    template<typename U, int axis> __device__ inline const CUtensorMap* get_tma() const {
+        return dev_tma;
+    }
+    __device__ inline void prefetch() const {
+        asm volatile("{prefetch.tensormap [%0];}" :: "l"(reinterpret_cast<uint64_t>(dev_tma)) : "memory");
+    }
 };
 
 template <typename C>
@@ -67,6 +103,7 @@ struct globals {
     B_fp4x2_gl B;       // N x (K/2)
     B_sc_gl    B_sc;    // (N/128) x (K/128) x 32 x 16
     D_gl       D;       // M x N
+    CUtensorMap R_tma;   // optional residual descriptor, M x N
     mxfp4_rope_epilogue::rope_desc rope;
     mxfp4_rope_epilogue::rope_live64_desc rope_live64;
     const uint8_t* tilemask_ptr;   // optional [mask_rows, mask_cols] activity mask
@@ -136,6 +173,37 @@ __device__ inline bool reduction_iter_active(
 }
 
 template <typename C>
+__device__ inline void maybe_add_residual_tile(
+    const globals<C> &g,
+    typename globals<C>::D_tile &smem_tile,
+    rt_bf<C::Mb / 8, C::Nb / C::EPI_PIPE_DEPTH> &D_reg,
+    semaphore &residual_load_arrived,
+    uint32_t &residual_load_phase,
+    int row_tile,
+    int col_tile
+) {
+    if constexpr (!C::FUSE_RESIDUAL) {
+        return;
+    }
+
+    else {
+        tma_dev_proxy<typename globals<C>::D_gl> R_proxy(&g.R_tma);
+        if (warpgroup::warpid() == 0 && warp::laneid() == 0) {
+            tma::expect_bytes(residual_load_arrived, sizeof(typename globals<C>::D_tile));
+            tma::load_async(smem_tile, R_proxy, {row_tile, col_tile}, residual_load_arrived);
+        }
+        wait(residual_load_arrived, residual_load_phase);
+        residual_load_phase ^= 1;
+        warpgroup::sync(1);
+
+        rt_bf<C::Mb / 8, C::Nb / C::EPI_PIPE_DEPTH> R_reg;
+        warpgroup::load(R_reg, smem_tile);
+        warpgroup::sync(1);
+        warp::add(D_reg, D_reg, R_reg);
+    }
+}
+
+template <typename C>
 __device__ inline void kernel(const globals<C> &g) {
     using G = globals<C>;
 
@@ -145,6 +213,9 @@ __device__ inline void kernel(const globals<C> &g) {
         g.B.template prefetch_tma<typename G::B_fp4x2_tile>();
         g.B_sc.template prefetch_tma<typename G::B_sc_tile>();
         g.D.template prefetch_tma<typename G::D_tile>();
+        if constexpr (C::FUSE_RESIDUAL) {
+            asm volatile("{prefetch.tensormap [%0];}" :: "l"(reinterpret_cast<uint64_t>(&g.R_tma)) : "memory");
+        }
     }
 
     const int warpgroup_id = warpgroup::groupid();
@@ -176,6 +247,7 @@ __device__ inline void kernel(const globals<C> &g) {
     __shared__ semaphore inputs_finished[C::LOAD_PIPE_DEPTH];
     __shared__ semaphore outputs_arrived;
     __shared__ semaphore outputs_finished;
+    __shared__ semaphore residual_load_arrived;
     if (threadIdx.x == 32) {
         init_semaphore(tmem_provisioned, 0, 1);
         #pragma unroll
@@ -186,6 +258,9 @@ __device__ inline void kernel(const globals<C> &g) {
         }
         init_semaphore(outputs_arrived, 0, 1);
         init_semaphore(outputs_finished, 0, C::CLUSTER_SIZE);
+        if constexpr (C::FUSE_RESIDUAL) {
+            init_semaphore(residual_load_arrived, 0, 1);
+        }
     }
     everyone::tma::cluster::arrive_aligned();
 
@@ -339,6 +414,7 @@ __device__ inline void kernel(const globals<C> &g) {
         wait(tmem_provisioned, 0);
         tm_allocator.set_addr(tmem_addr);
         auto out_tm = tm_allocator.template allocate<full_tt_fl<C::Nb>>(0);
+        uint32_t residual_load_phase = 0;
         for (int block_idx = cluster_id; block_idx < num_blocks; block_idx += gridDim.x / C::CLUSTER_SIZE) {
             int supergroup_idx = block_idx / num_blocks_per_supergroup;
             int idx_within_supergroup = block_idx % num_blocks_per_supergroup;
@@ -363,6 +439,7 @@ __device__ inline void kernel(const globals<C> &g) {
                 if constexpr (C::OVERLAP_EPI) {
                     #pragma unroll
                     for (int i = 0; i < C::EPI_PIPE_DEPTH; i++) {
+                        const int smem_slot = i % C::NUM_D_TILES;
                         rt_bf<C::Mb / 8, C::Nb / C::EPI_PIPE_DEPTH> D_reg {};
                         if (i == C::EPI_PIPE_DEPTH - 1) {
                             warpgroup::sync(1);
@@ -370,9 +447,14 @@ __device__ inline void kernel(const globals<C> &g) {
                         }
                         warpgroup::tma::store_async_read_wait<C::NUM_D_TILES-1>();
                         warpgroup::sync(1);
-                        warpgroup::store(output_tiles.D[i%C::NUM_D_TILES], D_reg);
+                        maybe_add_residual_tile<C>(
+                            g, output_tiles.D[smem_slot], D_reg,
+                            residual_load_arrived, residual_load_phase,
+                            row_block_idx * 2 + cta_id,
+                            col_block_idx * C::EPI_PIPE_DEPTH + i);
+                        warpgroup::store(output_tiles.D[smem_slot], D_reg);
                         warpgroup::sync(1);
-                        warpgroup::tma::store_async<dim::ROW, cache_policy::EVICT_FIRST>(g.D, output_tiles.D[i%C::NUM_D_TILES], {row_block_idx * 2 + cta_id, col_block_idx * C::EPI_PIPE_DEPTH + i});
+                        warpgroup::tma::store_async<dim::ROW, cache_policy::EVICT_FIRST>(g.D, output_tiles.D[smem_slot], {row_block_idx * 2 + cta_id, col_block_idx * C::EPI_PIPE_DEPTH + i});
                     }
                 } else {
                     rt_bf<C::Mb / 8, C::Nb / C::EPI_PIPE_DEPTH> D_reg[C::EPI_PIPE_DEPTH] {};
@@ -380,16 +462,23 @@ __device__ inline void kernel(const globals<C> &g) {
                     warpgroup::tma::cluster::arrive(outputs_finished, 0, 1);
                     #pragma unroll
                     for (int i = 0; i < C::EPI_PIPE_DEPTH; i++) {
+                        const int smem_slot = i % C::NUM_D_TILES;
                         warpgroup::tma::store_async_read_wait<C::NUM_D_TILES-1>();
                         warpgroup::sync(1);
-                        warpgroup::store(output_tiles.D[i%C::NUM_D_TILES], D_reg[i]);
+                        maybe_add_residual_tile<C>(
+                            g, output_tiles.D[smem_slot], D_reg[i],
+                            residual_load_arrived, residual_load_phase,
+                            row_block_idx * 2 + cta_id,
+                            col_block_idx * C::EPI_PIPE_DEPTH + i);
+                        warpgroup::store(output_tiles.D[smem_slot], D_reg[i]);
                         warpgroup::sync(1);
-                        warpgroup::tma::store_async<dim::ROW, cache_policy::EVICT_FIRST>(g.D, output_tiles.D[i%C::NUM_D_TILES], {row_block_idx * 2 + cta_id, col_block_idx * C::EPI_PIPE_DEPTH + i});
+                        warpgroup::tma::store_async<dim::ROW, cache_policy::EVICT_FIRST>(g.D, output_tiles.D[smem_slot], {row_block_idx * 2 + cta_id, col_block_idx * C::EPI_PIPE_DEPTH + i});
                     }
                 }
             } else if constexpr (C::OVERLAP_EPI) {
                 #pragma unroll
                 for (int i = 0; i < C::EPI_PIPE_DEPTH; i++) {
+                    const int smem_slot = i % C::NUM_D_TILES;
                     rt_fl<C::Mb / 8, C::Nb / C::EPI_PIPE_DEPTH> D_reg_fl;
                     warpgroup::load_async(D_reg_fl, out_tm.template subtile<full_tt_fl<C::Nb / C::EPI_PIPE_DEPTH>>(0, C::Nb / C::EPI_PIPE_DEPTH * i));
                     if (i == C::EPI_PIPE_DEPTH - 1) {
@@ -418,9 +507,14 @@ __device__ inline void kernel(const globals<C> &g) {
                     warp::copy(D_reg, D_reg_fl);
                     warpgroup::tma::store_async_read_wait<C::NUM_D_TILES-1>();
                     warpgroup::sync(1);
-                    warpgroup::store(output_tiles.D[i%C::NUM_D_TILES], D_reg);
+                    maybe_add_residual_tile<C>(
+                        g, output_tiles.D[smem_slot], D_reg,
+                        residual_load_arrived, residual_load_phase,
+                        row_block_idx * 2 + cta_id,
+                        col_block_idx * C::EPI_PIPE_DEPTH + i);
+                    warpgroup::store(output_tiles.D[smem_slot], D_reg);
                     warpgroup::sync(1);
-                    warpgroup::tma::store_async<dim::ROW, cache_policy::EVICT_FIRST>(g.D, output_tiles.D[i%C::NUM_D_TILES], {row_block_idx * 2 + cta_id, col_block_idx * C::EPI_PIPE_DEPTH + i});
+                    warpgroup::tma::store_async<dim::ROW, cache_policy::EVICT_FIRST>(g.D, output_tiles.D[smem_slot], {row_block_idx * 2 + cta_id, col_block_idx * C::EPI_PIPE_DEPTH + i});
                 }
             } else {
                 rt_bf<C::Mb / 8, C::Nb / C::EPI_PIPE_DEPTH> D_reg[C::EPI_PIPE_DEPTH];
@@ -452,11 +546,17 @@ __device__ inline void kernel(const globals<C> &g) {
                 warpgroup::tma::cluster::arrive(outputs_finished, 0, 1);
                 #pragma unroll
                 for (int i = 0; i < C::EPI_PIPE_DEPTH; i++) {
+                    const int smem_slot = i % C::NUM_D_TILES;
                     warpgroup::tma::store_async_read_wait<C::NUM_D_TILES-1>();
                     warpgroup::sync(1);
-                    warpgroup::store(output_tiles.D[i%C::NUM_D_TILES], D_reg[i]);
+                    maybe_add_residual_tile<C>(
+                        g, output_tiles.D[smem_slot], D_reg[i],
+                        residual_load_arrived, residual_load_phase,
+                        row_block_idx * 2 + cta_id,
+                        col_block_idx * C::EPI_PIPE_DEPTH + i);
+                    warpgroup::store(output_tiles.D[smem_slot], D_reg[i]);
                     warpgroup::sync(1);
-                    warpgroup::tma::store_async<dim::ROW, cache_policy::EVICT_FIRST>(g.D, output_tiles.D[i%C::NUM_D_TILES], {row_block_idx * 2 + cta_id, col_block_idx * C::EPI_PIPE_DEPTH + i});
+                    warpgroup::tma::store_async<dim::ROW, cache_policy::EVICT_FIRST>(g.D, output_tiles.D[smem_slot], {row_block_idx * 2 + cta_id, col_block_idx * C::EPI_PIPE_DEPTH + i});
                 }
             }
             update_phasebit<0>(phasebits, 0);

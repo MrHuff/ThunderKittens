@@ -693,6 +693,32 @@ static void launch_mxfp4_gemm_dense(
 }
 
 template <typename C>
+static void launch_mxfp4_gemm_dense_residual(
+    const at::Tensor &A,
+    const at::Tensor &A_sc,
+    const at::Tensor &B,
+    const at::Tensor &B_sc,
+    const at::Tensor &R,
+    at::Tensor &D
+) {
+    using G = mxfp4_gemm::globals<C>;
+    G g {
+        .A = kittens::py::tensor_to_gl<typename G::A_fp4x2_gl>(A),
+        .A_sc = kittens::py::tensor_to_gl<typename G::A_sc_gl>(A_sc),
+        .B = kittens::py::tensor_to_gl<typename G::B_fp4x2_gl>(B),
+        .B_sc = kittens::py::tensor_to_gl<typename G::B_sc_gl>(B_sc),
+        .D = kittens::py::tensor_to_gl<typename G::D_gl>(D),
+        .tilemask_ptr = nullptr,
+        .tilemask_rows = 0,
+        .tilemask_cols = 0,
+        .tilemask_transposed = false
+    };
+    auto r_gl = kittens::py::tensor_to_gl<typename G::D_gl>(R);
+    memcpy(&g.R_tma, &r_gl.tma_descs.tma_desc, sizeof(CUtensorMap));
+    kittens::py::launch_kernel<C, G, mxfp4_gemm::kernel<C>>(g);
+}
+
+template <typename C>
 static void launch_mxfp4_gemm_masked(
     const at::Tensor &A,
     const at::Tensor &A_sc,
@@ -727,6 +753,20 @@ void mxfp4_gemm_entrypoint(
     // Single config that works for all shapes with Kb=256.
     // config<256,5,8,4,2,false> = Nb=256, LOAD_PIPE=5, EPI=8, SG=4, DT=2, no overlap
     launch_mxfp4_gemm_dense<mxfp4_gemm::config<256, 5, 8, 4, 2, false, 256>>(A, A_sc, B, B_sc, D);
+}
+
+void mxfp4_gemm_residual_entrypoint(
+    const at::Tensor &A,
+    const at::Tensor &A_sc,
+    const at::Tensor &B,
+    const at::Tensor &B_sc,
+    const at::Tensor &R,
+    at::Tensor &D
+) {
+    check_output_matrix(R, "R", D.size(0), D.size(1));
+    kittens::py::device_check(A, A_sc, B, B_sc, R, D);
+    launch_mxfp4_gemm_dense_residual<mxfp4_gemm::config<256, 5, 8, 4, 2, false, 256, true>>(
+        A, A_sc, B, B_sc, R, D);
 }
 
 void mxfp4_gemm_k128_entrypoint(
@@ -1325,6 +1365,11 @@ void mxfp4_split3_dgrad_strided_onepass_gemm_entrypoint(
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("mxfp4_gemm", &mxfp4_gemm_entrypoint);
+    m.def("mxfp4_gemm_residual", &mxfp4_gemm_residual_entrypoint,
+          "Dense GEMM with fused bf16 residual add in the epilogue",
+          pybind11::arg("A"), pybind11::arg("A_sc"),
+          pybind11::arg("B"), pybind11::arg("B_sc"),
+          pybind11::arg("R"), pybind11::arg("D"));
     m.def("mxfp4_gemm_k128", &mxfp4_gemm_k128_entrypoint);
     m.def("mxfp4_gemm_masked", &mxfp4_gemm_masked_entrypoint,
           pybind11::arg("A"), pybind11::arg("A_sc"),
