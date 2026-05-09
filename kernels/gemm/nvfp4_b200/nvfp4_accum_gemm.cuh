@@ -52,6 +52,8 @@ struct globals {
 
     const float* A_sg[MAX_BATCHES];
     const float* B_sg[MAX_BATCHES];
+    int          A_sg_stride[MAX_BATCHES];
+    int          B_sg_stride[MAX_BATCHES];
 
     int       num_red_blocks;
     int       num_batches;
@@ -252,8 +254,6 @@ __device__ inline void kernel(const globals<C> &g) {
         wait(tmem_provisioned, 0);
         tm_allocator.set_addr(tmem_addr);
         auto out_tm = tm_allocator.template allocate<full_tt_fl<C::Nb>>(0);
-        const float global_scale = *g.A_sg[batch] * *g.B_sg[batch];
-
         int accum_mbar_phase = 0;
 
         for (int block_idx = cluster_id; block_idx < num_blocks; block_idx += gridDim.x / C::CLUSTER_SIZE) {
@@ -263,6 +263,9 @@ __device__ inline void kernel(const globals<C> &g) {
             int row_within_supergroup = idx_within_supergroup % rows_in_supergroup;
             int row_block_idx = supergroup_idx * C::SUPERGROUP_SIZE + row_within_supergroup;
             int col_block_idx = idx_within_supergroup / rows_in_supergroup;
+            const float global_scale =
+                g.A_sg[batch][row_block_idx * g.A_sg_stride[batch]] *
+                g.B_sg[batch][col_block_idx * g.B_sg_stride[batch]];
 
             wait(outputs_arrived, get_phasebit<0>(phasebits, 0));
 
