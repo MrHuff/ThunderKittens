@@ -53,6 +53,10 @@ struct globals {
     CUtensorMap A_sc_tma[NUM_SPLITS];
     CUtensorMap B_tma[NUM_SPLITS];
     CUtensorMap B_sc_tma[NUM_SPLITS];
+    const float* A_sg[NUM_SPLITS];
+    const float* B_sg[NUM_SPLITS];
+    int A_sg_stride[NUM_SPLITS];
+    int B_sg_stride[NUM_SPLITS];
     CUtensorMap D_tma;
 
     int num_red_blocks[NUM_SPLITS];
@@ -87,11 +91,38 @@ struct globals {
     }
 };
 
+template <int ROWS, int COLS>
+__device__ inline void scale_shared_fp8_tile(st_fp8e4m3<ROWS, COLS, false> &tile, float scale) {
+    auto *vals = reinterpret_cast<fp8e4m3*>(&tile.data[0]);
+    const int lane = threadIdx.x % WARP_THREADS;
+    constexpr int kPackElems = 4;
+    constexpr int kNumPacks = (ROWS * COLS) / kPackElems;
+    static_assert((ROWS * COLS) % kPackElems == 0, "FP8 tile must be packable by 4");
+
+    #pragma unroll
+    for (int pack_idx = lane; pack_idx < kNumPacks; pack_idx += WARP_THREADS) {
+        const int elem_idx = pack_idx * kPackElems;
+        fp8e4m3_4 packed_in = *reinterpret_cast<fp8e4m3_4*>(vals + elem_idx);
+        float4 unpacked = base_types::convertor<float4, fp8e4m3_4>::convert(packed_in);
+        unpacked.x *= scale;
+        unpacked.y *= scale;
+        unpacked.z *= scale;
+        unpacked.w *= scale;
+        const fp8e4m3_4 packed_out = base_types::convertor<fp8e4m3_4, float4>::convert(unpacked);
+        const uint32_t smem_addr = static_cast<uint32_t>(__cvta_generic_to_shared(vals + elem_idx));
+        asm volatile("{st.shared.b32 [%0], %1;}" :: "r"(smem_addr), "r"(*reinterpret_cast<const uint32_t*>(&packed_out)));
+    }
+}
+
 template <typename C>
 __device__ inline void kernel(const globals<C> &g) {
     using G = globals<C>;
 
     const int num_blocks = g.num_row_blocks * g.num_col_blocks;
+    const bool use_outer_sg =
+        g.A_sg[0] != nullptr && g.B_sg[0] != nullptr &&
+        g.A_sg[1] != nullptr && g.B_sg[1] != nullptr &&
+        g.A_sg[2] != nullptr && g.B_sg[2] != nullptr;
 
     if (threadIdx.x == 0) {
         #pragma unroll
@@ -123,6 +154,8 @@ __device__ inline void kernel(const globals<C> &g) {
     __shared__ semaphore tmem_provisioned;
     __shared__ semaphore tiles_arrived[C::LOAD_PIPE_DEPTH];
     __shared__ semaphore scales_arrived[C::LOAD_PIPE_DEPTH];
+    __shared__ semaphore scale_tiles_ready[C::LOAD_PIPE_DEPTH];
+    __shared__ semaphore scales_prepared[C::LOAD_PIPE_DEPTH];
     __shared__ semaphore inputs_finished[C::LOAD_PIPE_DEPTH];
     __shared__ semaphore outputs_arrived;
     __shared__ semaphore outputs_finished;
@@ -132,6 +165,8 @@ __device__ inline void kernel(const globals<C> &g) {
         for (int i = 0; i < C::LOAD_PIPE_DEPTH; ++i) {
             init_semaphore(tiles_arrived[i], 0, 1);
             init_semaphore(scales_arrived[i], 0, 1);
+            init_semaphore(scale_tiles_ready[i], 0, 1);
+            init_semaphore(scales_prepared[i], 0, C::CLUSTER_SIZE);
             init_semaphore(inputs_finished[i], 0, 1);
         }
         init_semaphore(outputs_arrived, 0, 1);
@@ -141,9 +176,10 @@ __device__ inline void kernel(const globals<C> &g) {
 
     tma_dev_proxy<typename G::D_gl> proxy_D(&g.D_tma);
 
-    if (warpgroup_id >= C::CONSUMER_WARPGROUPS && warp::elect_leader()) {
+    if (warpgroup_id >= C::CONSUMER_WARPGROUPS) {
         int warp_id = group<WARPGROUP_WARPS * C::PRODUCER_WARPGROUPS>::warpid();
-        if (warp_id == 3) {
+        const int lane = threadIdx.x % WARP_THREADS;
+        if (warp_id == 3 && warp::elect_leader()) {
             if constexpr (C::USE_PDL) pdl::wait();
             everyone::tma::cluster::wait();
 
@@ -168,7 +204,7 @@ __device__ inline void kernel(const globals<C> &g) {
                     }
                 }
             }
-        } else if (warp_id == 2) {
+        } else if (warp_id == 2 && warp::elect_leader()) {
             if constexpr (C::USE_PDL) pdl::wait();
             everyone::tma::cluster::wait();
 
@@ -198,15 +234,88 @@ __device__ inline void kernel(const globals<C> &g) {
                     }
                 }
             }
-        } else if (cta_id == 0 && warp_id == 0) {
+        } else if (warp_id == 1) {
+            if (use_outer_sg) {
+                everyone::tma::cluster::wait();
+                uint32_t ready_phasebits = 0;
+
+                for (int block_idx = cluster_id; block_idx < num_blocks; block_idx += gridDim.x / C::CLUSTER_SIZE) {
+                    int supergroup_idx = block_idx / num_blocks_per_supergroup;
+                    int idx_within_supergroup = block_idx % num_blocks_per_supergroup;
+                    int rows_in_supergroup = min(C::SUPERGROUP_SIZE, g.num_row_blocks - supergroup_idx * C::SUPERGROUP_SIZE);
+                    int row_within_supergroup = idx_within_supergroup % rows_in_supergroup;
+                    int row_block_idx = supergroup_idx * C::SUPERGROUP_SIZE + row_within_supergroup;
+                    int col_block_idx = idx_within_supergroup / rows_in_supergroup;
+                    const int row_sg_idx = (row_block_idx * C::Mb) / 256;
+                    const int col_sg_idx = (col_block_idx * C::Nb) / 256;
+
+                    #pragma unroll
+                    for (int batch = 0; batch < NUM_SPLITS; ++batch) {
+                        for (int i = 0; i < g.num_red_blocks[batch]; ++i) {
+                            if (cta_id == 0) {
+                                if (lane == 0) {
+                                    tma::expect_bytes(scales_arrived[stage], 2 * sizeof(typename G::input_scales_t));
+                                    wait(scales_arrived[stage], get_phasebit<0>(phasebits, stage));
+                                    arrive(scale_tiles_ready[stage], 1);
+                                    tma::cluster::arrive(scale_tiles_ready[stage], 1, 1);
+                                    update_phasebit<0>(phasebits, stage);
+                                }
+                            } else if (lane == 0) {
+                                wait(scale_tiles_ready[stage], get_phasebit<0>(ready_phasebits, stage));
+                                update_phasebit<0>(ready_phasebits, stage);
+                            }
+                            __syncwarp();
+
+                            const float a_sg = g.A_sg[batch][row_sg_idx * g.A_sg_stride[batch]];
+                            const float b_sg = g.B_sg[batch][col_sg_idx * g.B_sg_stride[batch]];
+                            #pragma unroll
+                            for (int ii = 0; ii < C::MMA_PER_TILE; ++ii) {
+                                auto &A_sc_sm_subtile = *reinterpret_cast<st_fp8e4m3<32, 16, false> *>(
+                                    reinterpret_cast<uint64_t>(&input_scales[stage].A.data[0]) + 16 * 32 * ii);
+                                scale_shared_fp8_tile(A_sc_sm_subtile, a_sg);
+
+                                auto &B_sc_sm_subtile_0 = *reinterpret_cast<st_fp8e4m3<32, 16, false> *>(
+                                    reinterpret_cast<uint64_t>(&input_scales[stage].B[0].data[0]) + 16 * 32 * ii);
+                                scale_shared_fp8_tile(B_sc_sm_subtile_0, b_sg);
+
+                                if constexpr (C::B_SC_SIZE == 2) {
+                                    auto &B_sc_sm_subtile_1 = *reinterpret_cast<st_fp8e4m3<32, 16, false> *>(
+                                        reinterpret_cast<uint64_t>(&input_scales[stage].B[1].data[0]) + 16 * 32 * ii);
+                                    scale_shared_fp8_tile(B_sc_sm_subtile_1, b_sg);
+                                }
+                            }
+
+                            __syncwarp();
+                            __threadfence_block();
+                            asm volatile("fence.proxy.async.shared::cta;\n" ::: "memory");
+                            if (lane == 0) {
+                                if (cta_id == 0) {
+                                    arrive(scales_prepared[stage], 1);
+                                } else {
+                                    tma::cluster::arrive(scales_prepared[stage], 0, 1);
+                                }
+                            }
+                            stage = (stage + 1) % C::LOAD_PIPE_DEPTH;
+                        }
+                    }
+                }
+            }
+        } else if (cta_id == 0 && warp_id == 0 && warp::elect_leader()) {
             everyone::tma::cluster::wait();
             wait(tmem_provisioned, 0);
             tm_allocator.set_addr(tmem_addr);
             auto out_tm  = tm_allocator.template allocate<full_tt_fl<C::Nb>>(0);
             auto A_sc_tm = tm_allocator.template allocate<full_tt_fp8e4m3<16 * C::MMA_PER_TILE * C::LOAD_PIPE_DEPTH>>(256);
             auto B_sc_tm = tm_allocator.template allocate<full_tt_fp8e4m3<32 * C::MMA_PER_TILE * C::LOAD_PIPE_DEPTH>>(256 + 4 * C::MMA_PER_TILE * C::LOAD_PIPE_DEPTH);
+            uint32_t prepared_phasebits = 0;
 
             for (int block_idx = cluster_id; block_idx < num_blocks; block_idx += gridDim.x / C::CLUSTER_SIZE) {
+                int supergroup_idx = block_idx / num_blocks_per_supergroup;
+                int idx_within_supergroup = block_idx % num_blocks_per_supergroup;
+                int rows_in_supergroup = min(C::SUPERGROUP_SIZE, g.num_row_blocks - supergroup_idx * C::SUPERGROUP_SIZE);
+                int row_within_supergroup = idx_within_supergroup % rows_in_supergroup;
+                int row_block_idx = supergroup_idx * C::SUPERGROUP_SIZE + row_within_supergroup;
+                int col_block_idx = idx_within_supergroup / rows_in_supergroup;
                 wait(outputs_finished, get_phasebit<1>(phasebits, 0));
                 tensor_after_thread_sync();
                 bool first_mma = true;
@@ -214,8 +323,12 @@ __device__ inline void kernel(const globals<C> &g) {
                 #pragma unroll
                 for (int batch = 0; batch < NUM_SPLITS; ++batch) {
                     for (int i = 0; i < g.num_red_blocks[batch]; ++i) {
-                        tma::expect_bytes(scales_arrived[stage], 2 * sizeof(typename G::input_scales_t));
-                        wait(scales_arrived[stage], get_phasebit<0>(phasebits, stage));
+                        if (use_outer_sg) {
+                            wait(scales_prepared[stage], get_phasebit<0>(prepared_phasebits, stage));
+                        } else {
+                            tma::expect_bytes(scales_arrived[stage], 2 * sizeof(typename G::input_scales_t));
+                            wait(scales_arrived[stage], get_phasebit<0>(phasebits, stage));
+                        }
                         #pragma unroll
                         for (int ii = 0; ii < C::MMA_PER_TILE; ++ii) {
                             auto A_sc_tm_subtile = A_sc_tm.template subtile<full_tt_fp8e4m3<16>>(stage * C::MMA_PER_TILE * 16 + ii * 16);
@@ -245,6 +358,9 @@ __device__ inline void kernel(const globals<C> &g) {
                                      inputs_finished[stage]);
                         }
                         update_phasebit<0>(phasebits, stage);
+                        if (use_outer_sg) {
+                            update_phasebit<0>(prepared_phasebits, stage);
+                        }
                         stage = (stage + 1) % C::LOAD_PIPE_DEPTH;
                     }
                 }

@@ -158,6 +158,14 @@ bool use_v3_split2_onepass() {
     return std::strcmp(value, "0") != 0;
 }
 
+bool use_v4_pack4_fold_outer_sg() {
+    const char* value = std::getenv("USE_TK_LOCALCTA_V4_PACK4_FOLD_OUTER_SG");
+    if (value == nullptr) {
+        return true;
+    }
+    return std::strcmp(value, "0") != 0;
+}
+
 int get_chunkgrid_gemm_config_idx() {
     const char* value = std::getenv("USE_TK_LOCALCTA_V4_CHUNKGRID_GEMM_CONFIG");
     if (value == nullptr) {
@@ -545,6 +553,37 @@ __global__ void fold_outer_sg_into_prepared_sc_kernel(
     sc_out[idx] = __nv_fp8_e4m3(static_cast<float>(sc_raw[src_idx]) * scale);
 }
 
+__global__ void fold_outer_sg_into_prepared_sc_pack4_kernel(
+    const __nv_fp8_e4m3* __restrict__ sc_raw,
+    __nv_fp8_e4m3* __restrict__ sc_out,
+    const float* __restrict__ sg_outer,
+    int64_t stride0,
+    int64_t stride1,
+    int64_t scale_cols,
+    int64_t packs
+) {
+    const int64_t pack_idx = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (pack_idx >= packs) return;
+
+    const int64_t idx = pack_idx * 4;
+    const int64_t tile_elems = scale_cols * kScaleBytesPerTile;
+    const int64_t row_tile = idx / tile_elems;
+    const int64_t rem = idx - row_tile * tile_elems;
+    const int64_t col_tile = rem / kScaleBytesPerTile;
+    const int64_t byte_idx = rem - col_tile * kScaleBytesPerTile;
+    const float scale = sg_outer[row_tile >> 1];
+    const int64_t src_idx = row_tile * stride0 + col_tile * stride1 + byte_idx;
+
+    const fp8e4m3_4 packed_in = *reinterpret_cast<const fp8e4m3_4*>(sc_raw + src_idx);
+    float4 unpacked = base_types::convertor<float4, fp8e4m3_4>::convert(packed_in);
+    unpacked.x *= scale;
+    unpacked.y *= scale;
+    unpacked.z *= scale;
+    unpacked.w *= scale;
+    const fp8e4m3_4 packed_out = base_types::convertor<fp8e4m3_4, float4>::convert(unpacked);
+    *reinterpret_cast<fp8e4m3_4*>(sc_out + idx) = packed_out;
+}
+
 at::Tensor fold_outer_sg_into_prepared_sc_tensor(
     const at::Tensor& sc_raw,
     const at::Tensor& sg,
@@ -572,16 +611,36 @@ at::Tensor fold_outer_sg_into_prepared_sc_tensor(
 
     const int threads = 256;
     const int64_t elems = sc_raw.numel();
-    const int blocks = static_cast<int>((elems + threads - 1) / threads);
     auto stream = at::cuda::getCurrentCUDAStream();
-    fold_outer_sg_into_prepared_sc_kernel<<<blocks, threads, 0, stream>>>(
-        reinterpret_cast<const __nv_fp8_e4m3*>(sc_raw.data_ptr()),
-        reinterpret_cast<__nv_fp8_e4m3*>(out.data_ptr()),
-        sg_outer.data_ptr<float>(),
-        sc_raw.stride(0),
-        sc_raw.stride(1),
-        sc_raw.size(1),
-        elems);
+    const bool pack4_safe =
+        use_v4_pack4_fold_outer_sg() &&
+        (elems % 4 == 0) &&
+        (sc_raw.stride(0) % 4 == 0) &&
+        (sc_raw.stride(1) % 4 == 0) &&
+        ((reinterpret_cast<uintptr_t>(sc_raw.data_ptr()) & 0x3) == 0) &&
+        ((reinterpret_cast<uintptr_t>(out.data_ptr()) & 0x3) == 0);
+    if (pack4_safe) {
+        const int64_t packs = elems / 4;
+        const int blocks = static_cast<int>((packs + threads - 1) / threads);
+        fold_outer_sg_into_prepared_sc_pack4_kernel<<<blocks, threads, 0, stream>>>(
+            reinterpret_cast<const __nv_fp8_e4m3*>(sc_raw.data_ptr()),
+            reinterpret_cast<__nv_fp8_e4m3*>(out.data_ptr()),
+            sg_outer.data_ptr<float>(),
+            sc_raw.stride(0),
+            sc_raw.stride(1),
+            sc_raw.size(1),
+            packs);
+    } else {
+        const int blocks = static_cast<int>((elems + threads - 1) / threads);
+        fold_outer_sg_into_prepared_sc_kernel<<<blocks, threads, 0, stream>>>(
+            reinterpret_cast<const __nv_fp8_e4m3*>(sc_raw.data_ptr()),
+            reinterpret_cast<__nv_fp8_e4m3*>(out.data_ptr()),
+            sg_outer.data_ptr<float>(),
+            sc_raw.stride(0),
+            sc_raw.stride(1),
+            sc_raw.size(1),
+            elems);
+    }
     CUDACHECK(cudaGetLastError());
     return out;
 }
@@ -2449,10 +2508,12 @@ template <typename C>
 void launch_fast_split3_dgrad_gemm_strided_onepass_full_b_with_config(
     const at::Tensor& A_full,
     const std::vector<at::Tensor>& A_sc_prepared_list,
+    const std::vector<at::Tensor>& A_sg_tiles_list,
     const std::vector<int64_t>& A_col_offsets,
     const std::vector<int64_t>& A_col_widths,
     const at::Tensor& B_full,
     const at::Tensor& B_sc_prepared_full,
+    const at::Tensor& B_sg_tiles_full,
     at::Tensor& D_out
 ) {
     using G = nvfp4_split3_accum_gemm::globals<C>;
@@ -2462,6 +2523,10 @@ void launch_fast_split3_dgrad_gemm_strided_onepass_full_b_with_config(
     TORCH_CHECK(A_sc_prepared_list.size() == 3, "one-pass split3 full-B dgrad expects 3 A scale batches");
     TORCH_CHECK(A_col_offsets.size() == 3, "one-pass split3 full-B dgrad expects 3 A offsets");
     TORCH_CHECK(A_col_widths.size() == 3, "one-pass split3 full-B dgrad expects 3 A widths");
+    const bool has_outer_sg = !A_sg_tiles_list.empty() && B_sg_tiles_full.defined() && B_sg_tiles_full.numel() > 0;
+    if (has_outer_sg) {
+        TORCH_CHECK(A_sg_tiles_list.size() == 3, "one-pass split3 full-B direct SG expects 3 A SG batches");
+    }
     check_fp4_matrix(A_full, "A_full");
     check_fp4_matrix(B_full, "B_full");
     TORCH_CHECK(A_full.size(1) == B_full.size(1), "A_full and B_full must share packed reduction width");
@@ -2478,6 +2543,19 @@ void launch_fast_split3_dgrad_gemm_strided_onepass_full_b_with_config(
 
     g_host.num_row_blocks = static_cast<int>(M / C::Mb);
     g_host.num_col_blocks = static_cast<int>(N_out / C::Nb);
+
+    std::vector<at::Tensor> A_sg_outer_list;
+    at::Tensor B_sg_outer;
+    if (has_outer_sg) {
+        A_sg_outer_list.reserve(3);
+        for (int i = 0; i < 3; ++i) {
+            A_sg_outer_list.push_back(
+                normalize_outer_scale_tiles_tensor(A_sg_tiles_list[i], M / 256, true)
+                    .contiguous());
+        }
+        B_sg_outer = normalize_outer_scale_tiles_tensor(
+            B_sg_tiles_full, B_full.size(0) / 256, true).contiguous();
+    }
 
     for (int i = 0; i < 3; ++i) {
         constexpr int64_t swizzle_elements = 128;
@@ -2539,6 +2617,16 @@ void launch_fast_split3_dgrad_gemm_strided_onepass_full_b_with_config(
             &g_host.A_sc_tma[i], A_sc_prepared_list[i], "A_sc_prepared_list[i]");
         encode_prepared_scale_tensor_map<typename G::B_sc_tile>(
             &g_host.B_sc_tma[i], B_sc_view, "B_sc_prepared_full_slice");
+        if (has_outer_sg) {
+            auto a_sg_desc = check_outer_scale_tiles(
+                A_sg_outer_list[i], "A_sg_tiles_list[i]", M / 256, true);
+            auto b_sg_desc = check_outer_scale_tiles(
+                B_sg_outer, "B_sg_tiles_full", B_full.size(0) / 256, true);
+            g_host.A_sg[i] = a_sg_desc.ptr;
+            g_host.B_sg[i] = b_sg_desc.ptr;
+            g_host.A_sg_stride[i] = a_sg_desc.stride;
+            g_host.B_sg_stride[i] = b_sg_desc.stride;
+        }
     }
 
     auto d_gl = kittens::py::tensor_to_gl<typename G::D_gl>(D_out);
@@ -2567,24 +2655,73 @@ void launch_fast_split3_dgrad_gemm_strided_onepass_full_b(
             break;
         case 1:
             launch_fast_split3_dgrad_gemm_strided_onepass_full_b_with_config<localcta_onepass_cfg1>(
-                A_full, A_sc_prepared_list, A_col_offsets, A_col_widths, B_full, B_sc_prepared_full, D_out);
+                A_full, A_sc_prepared_list, std::vector<at::Tensor>(), A_col_offsets, A_col_widths,
+                B_full, B_sc_prepared_full, at::Tensor(), D_out);
             break;
         case 2:
             TORCH_CHECK(false, "one-pass split3 full-B config_idx=2 is not legal with CLUSTER_SIZE=1 on this kernel");
             break;
         case 3:
             launch_fast_split3_dgrad_gemm_strided_onepass_full_b_with_config<localcta_onepass_cfg3>(
-                A_full, A_sc_prepared_list, A_col_offsets, A_col_widths, B_full, B_sc_prepared_full, D_out);
+                A_full, A_sc_prepared_list, std::vector<at::Tensor>(), A_col_offsets, A_col_widths,
+                B_full, B_sc_prepared_full, at::Tensor(), D_out);
             break;
         case 4:
             TORCH_CHECK(false, "one-pass split3 full-B config_idx=4 is not legal with CLUSTER_SIZE=1 on this kernel");
             break;
         case 5:
             launch_fast_split3_dgrad_gemm_strided_onepass_full_b_with_config<localcta_onepass_cfg5>(
-                A_full, A_sc_prepared_list, A_col_offsets, A_col_widths, B_full, B_sc_prepared_full, D_out);
+                A_full, A_sc_prepared_list, std::vector<at::Tensor>(), A_col_offsets, A_col_widths,
+                B_full, B_sc_prepared_full, at::Tensor(), D_out);
             break;
         default:
             TORCH_CHECK(false, "Unknown one-pass split3 full-B config_idx=", resolved_idx);
+    }
+}
+
+void launch_fast_split3_dgrad_gemm_strided_onepass_full_b_sg(
+    const at::Tensor& A_full,
+    const std::vector<at::Tensor>& A_sc_prepared_list,
+    const std::vector<at::Tensor>& A_sg_tiles_list,
+    const std::vector<int64_t>& A_col_offsets,
+    const std::vector<int64_t>& A_col_widths,
+    const at::Tensor& B_full,
+    const at::Tensor& B_sc_prepared_full,
+    const at::Tensor& B_sg_tiles_full,
+    at::Tensor& D_out,
+    int config_idx
+) {
+    int resolved_idx = config_idx;
+    if (resolved_idx < 0) {
+        resolved_idx = 5;
+    }
+    switch (resolved_idx) {
+        case 0:
+            TORCH_CHECK(false, "one-pass split3 full-B direct-SG config_idx=0 is not legal with CLUSTER_SIZE=1 on this kernel");
+            break;
+        case 1:
+            launch_fast_split3_dgrad_gemm_strided_onepass_full_b_with_config<localcta_onepass_cfg1>(
+                A_full, A_sc_prepared_list, A_sg_tiles_list, A_col_offsets, A_col_widths,
+                B_full, B_sc_prepared_full, B_sg_tiles_full, D_out);
+            break;
+        case 2:
+            TORCH_CHECK(false, "one-pass split3 full-B direct-SG config_idx=2 is not legal with CLUSTER_SIZE=1 on this kernel");
+            break;
+        case 3:
+            launch_fast_split3_dgrad_gemm_strided_onepass_full_b_with_config<localcta_onepass_cfg3>(
+                A_full, A_sc_prepared_list, A_sg_tiles_list, A_col_offsets, A_col_widths,
+                B_full, B_sc_prepared_full, B_sg_tiles_full, D_out);
+            break;
+        case 4:
+            TORCH_CHECK(false, "one-pass split3 full-B direct-SG config_idx=4 is not legal with CLUSTER_SIZE=1 on this kernel");
+            break;
+        case 5:
+            launch_fast_split3_dgrad_gemm_strided_onepass_full_b_with_config<localcta_onepass_cfg5>(
+                A_full, A_sc_prepared_list, A_sg_tiles_list, A_col_offsets, A_col_widths,
+                B_full, B_sc_prepared_full, B_sg_tiles_full, D_out);
+            break;
+        default:
+            TORCH_CHECK(false, "Unknown one-pass split3 full-B direct-SG config_idx=", resolved_idx);
     }
 }
 
@@ -4309,6 +4446,24 @@ void nvfp4_localcta_fast_split3_dgrad_strided_onepass_full_b_gemm_entrypoint(
         B_full, B_sc_prepared_full, D_out, static_cast<int>(config_idx));
 }
 
+void nvfp4_localcta_fast_split3_dgrad_strided_onepass_full_b_gemm_sg_entrypoint(
+    const at::Tensor& A_full,
+    const std::vector<at::Tensor>& A_sc_prepared_list,
+    const std::vector<at::Tensor>& A_sg_tiles_list,
+    const std::vector<int64_t>& A_col_offsets,
+    const std::vector<int64_t>& A_col_widths,
+    const at::Tensor& B_full,
+    const at::Tensor& B_sc_prepared_full,
+    const at::Tensor& B_sg_tiles_full,
+    at::Tensor& D_out,
+    int64_t config_idx
+) {
+    check_output_matrix(D_out, "D_out", A_full.size(0), B_full.size(0));
+    launch_fast_split3_dgrad_gemm_strided_onepass_full_b_sg(
+        A_full, A_sc_prepared_list, A_sg_tiles_list, A_col_offsets, A_col_widths,
+        B_full, B_sc_prepared_full, B_sg_tiles_full, D_out, static_cast<int>(config_idx));
+}
+
 void nvfp4_localcta_fast_split2_dgrad_strided_sum_gemm_entrypoint(
     const at::Tensor& A_full,
     const std::vector<at::Tensor>& A_sc_prepared_list,
@@ -4677,6 +4832,13 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           pybind11::arg("A_full"), pybind11::arg("A_sc_prepared_list"),
           pybind11::arg("A_col_offsets"), pybind11::arg("A_col_widths"),
           pybind11::arg("B_full"), pybind11::arg("B_sc_prepared_full"),
+          pybind11::arg("D_out"), pybind11::arg("config_idx") = -1);
+    m.def("nvfp4_localcta_fast_split3_dgrad_strided_onepass_full_b_gemm_sg",
+          &nvfp4_localcta_fast_split3_dgrad_strided_onepass_full_b_gemm_sg_entrypoint,
+          pybind11::arg("A_full"), pybind11::arg("A_sc_prepared_list"),
+          pybind11::arg("A_sg_tiles_list"), pybind11::arg("A_col_offsets"),
+          pybind11::arg("A_col_widths"), pybind11::arg("B_full"),
+          pybind11::arg("B_sc_prepared_full"), pybind11::arg("B_sg_tiles_full"),
           pybind11::arg("D_out"), pybind11::arg("config_idx") = -1);
     m.def("nvfp4_localcta_fast_split2_dgrad_strided_sum_gemm",
           &nvfp4_localcta_fast_split2_dgrad_strided_sum_gemm_entrypoint,
