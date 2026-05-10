@@ -35,6 +35,8 @@ using localcta_parity_config = nvfp4_localcta_gemm::config<256, 5, 8, 4, 2, fals
 using localcta_tilegrid256_config = nvfp4_localcta_gemm::config<256, 5, 8, 12, 2, false, 256, true, 2, 256>;
 using localcta_fast_smallk_config = nvfp4_gemm::config<256, 5, 8, 4, 2, false>;
 using localcta_fast_largek_config = nvfp4_gemm::config<256, 5, 8, 12, 2, false>;
+using localcta_fast_smallk_residual_config = nvfp4_gemm::config<256, 5, 8, 4, 2, false, 256, true, 2, 256, false, true>;
+using localcta_fast_largek_residual_config = nvfp4_gemm::config<256, 5, 8, 12, 2, false, 256, true, 2, 256, false, true>;
 using localcta_fast_grouped_config = nvfp4_gemm::config<256, 5, 8, 4, 2, false>;
 using localcta_fast_largek_rope_config = nvfp4_gemm::config<256, 5, 8, 12, 2, false, 256, true, 2, 256, true>;
 using localcta_fast_grouped_rope_config = nvfp4_gemm::config<256, 5, 8, 4, 2, false, 256, true, 2, 256, true>;
@@ -1192,6 +1194,54 @@ void launch_fast_gemm_with_config(
 }
 
 template <typename C>
+void launch_fast_gemm_with_config_residual(
+    const at::Tensor& A,
+    const at::Tensor& A_sc_prepared,
+    const at::Tensor& A_sg_tiles,
+    const at::Tensor& B,
+    const at::Tensor& B_sc_prepared,
+    const at::Tensor& B_sg_tiles,
+    const at::Tensor& R,
+    at::Tensor& D
+) {
+    using G = nvfp4_gemm::globals<C>;
+    auto one = get_unit_scale_tensor(A);
+    const bool has_tile_scales = A_sg_tiles.defined() && B_sg_tiles.defined();
+    outer_scale_desc a_sg_desc{nullptr, 1};
+    outer_scale_desc b_sg_desc{nullptr, 1};
+    if (has_tile_scales) {
+        a_sg_desc = check_outer_scale_tiles(A_sg_tiles, "A_sg_tiles", A.size(0) / C::Mb, true);
+        b_sg_desc = check_outer_scale_tiles(B_sg_tiles, "B_sg_tiles", B.size(0) / C::Nb, false);
+    }
+    check_output_matrix(R, "R", D.size(0), D.size(1));
+    G g {
+        .A = kittens::py::tensor_to_gl<typename G::A_fp4x2_gl>(A),
+        .A_sc = kittens::py::tensor_to_gl<typename G::A_sc_gl, false>(
+            A_sc_prepared, 1, A_sc_prepared.size(0), A_sc_prepared.size(1), 256),
+        .A_sc_global = kittens::py::tensor_to_gl<typename G::A_sc_global_gl>(one),
+        .B = kittens::py::tensor_to_gl<typename G::B_fp4x2_gl>(B),
+        .B_sc = kittens::py::tensor_to_gl<typename G::B_sc_gl, false>(
+            B_sc_prepared, 1, B_sc_prepared.size(0), B_sc_prepared.size(1), 256),
+        .B_sc_global = kittens::py::tensor_to_gl<typename G::B_sc_global_gl>(one),
+        .D = kittens::py::tensor_to_gl<typename G::D_gl>(D),
+        .D_K = kittens::py::tensor_to_gl<typename G::D_gl>(D),
+        .D_V = kittens::py::tensor_to_gl<typename G::D_gl>(D),
+        .q_dim = 0,
+        .k_dim = 0,
+        .v_dim = 0,
+        .use_split_D = false,
+        .a_sg_per_tile = has_tile_scales ? a_sg_desc.ptr : nullptr,
+        .a_sg_stride = has_tile_scales ? a_sg_desc.stride : 1,
+        .b_sg_per_tile = has_tile_scales ? b_sg_desc.ptr : nullptr,
+        .b_sg_stride = has_tile_scales ? b_sg_desc.stride : 1,
+        .silu_dim = 0
+    };
+    auto r_gl = kittens::py::tensor_to_gl<typename G::D_gl>(R);
+    std::memcpy(&g.R_tma, &r_gl.tma_descs.tma_desc, sizeof(CUtensorMap));
+    kittens::py::launch_kernel<C, G, nvfp4_gemm::kernel<C>>(g);
+}
+
+template <typename C>
 void launch_fast_grouped_gemm_with_config(
     const at::Tensor& A,
     const at::Tensor& A_sc_prepared,
@@ -1437,6 +1487,26 @@ void launch_fast_regular_gemm(
     } else {
         launch_fast_gemm_with_config<localcta_fast_largek_config>(
             A, A_sc_prepared, A_sg_tiles, B, B_sc_prepared, B_sg_tiles, D);
+    }
+}
+
+void launch_fast_regular_gemm_residual(
+    const at::Tensor& A,
+    const at::Tensor& A_sc_prepared,
+    const at::Tensor& A_sg_tiles,
+    const at::Tensor& B,
+    const at::Tensor& B_sc_prepared,
+    const at::Tensor& B_sg_tiles,
+    const at::Tensor& R,
+    at::Tensor& D
+) {
+    const int64_t K = A.size(1) * 2;
+    if (K <= 2048) {
+        launch_fast_gemm_with_config_residual<localcta_fast_smallk_residual_config>(
+            A, A_sc_prepared, A_sg_tiles, B, B_sc_prepared, B_sg_tiles, R, D);
+    } else {
+        launch_fast_gemm_with_config_residual<localcta_fast_largek_residual_config>(
+            A, A_sc_prepared, A_sg_tiles, B, B_sc_prepared, B_sg_tiles, R, D);
     }
 }
 
@@ -3577,6 +3647,33 @@ void nvfp4_localcta_gemm_entrypoint(
     launch_fast_regular_gemm(A, A_sc, A_sg_outer, B, B_sc, B_sg_outer, D);
 }
 
+void nvfp4_localcta_gemm_residual_entrypoint(
+    const at::Tensor& A,
+    const at::Tensor& A_sc,
+    const at::Tensor& A_sg_chunks,
+    const at::Tensor& B,
+    const at::Tensor& B_sc,
+    const at::Tensor& B_sg_chunks,
+    const at::Tensor& R,
+    at::Tensor& D
+) {
+    const auto sg_contract = infer_regular_sg_contract(A, A_sg_chunks, B, B_sg_chunks);
+    TORCH_CHECK(
+        sg_contract != SGContractMode::ChunkGrid128,
+        "nvfp4_localcta_gemm_residual only supports prepared TileGrid256 or outer-SG contracts");
+    if (sg_contract == SGContractMode::TileGrid256) {
+        check_v3_tilegrid256_gemm_inputs(A, A_sc, A_sg_chunks, B, B_sc, B_sg_chunks);
+        check_output_matrix(D, "D", A.size(0), B.size(0));
+        launch_fast_regular_gemm_residual(A, A_sc, torch::Tensor(), B, B_sc, torch::Tensor(), R, D);
+        return;
+    }
+    auto A_sg_outer = normalize_outer_scale_tiles_tensor(A_sg_chunks, A.size(0) / 256, true);
+    auto B_sg_outer = normalize_outer_scale_tiles_tensor(B_sg_chunks, B.size(0) / 256, false);
+    check_v3_fast_gemm_inputs(A, A_sc, A_sg_outer, B, B_sc, B_sg_outer);
+    check_output_matrix(D, "D", A.size(0), B.size(0));
+    launch_fast_regular_gemm_residual(A, A_sc, A_sg_outer, B, B_sc, B_sg_outer, R, D);
+}
+
 void nvfp4_localcta_fast_gemm_entrypoint(
     const at::Tensor& A,
     const at::Tensor& A_sc_prepared,
@@ -3587,6 +3684,19 @@ void nvfp4_localcta_fast_gemm_entrypoint(
     check_fast_gemm_inputs(A, A_sc_prepared, B, B_sc_prepared);
     check_output_matrix(D, "D", A.size(0), B.size(0));
     launch_fast_regular_gemm(A, A_sc_prepared, torch::Tensor(), B, B_sc_prepared, torch::Tensor(), D);
+}
+
+void nvfp4_localcta_fast_gemm_residual_entrypoint(
+    const at::Tensor& A,
+    const at::Tensor& A_sc_prepared,
+    const at::Tensor& B,
+    const at::Tensor& B_sc_prepared,
+    const at::Tensor& R,
+    at::Tensor& D
+) {
+    check_fast_gemm_inputs(A, A_sc_prepared, B, B_sc_prepared);
+    check_output_matrix(D, "D", A.size(0), B.size(0));
+    launch_fast_regular_gemm_residual(A, A_sc_prepared, torch::Tensor(), B, B_sc_prepared, torch::Tensor(), R, D);
 }
 
 void nvfp4_localcta_fast_gemm_sg_entrypoint(
@@ -4687,10 +4797,18 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           pybind11::arg("A"), pybind11::arg("A_sc"), pybind11::arg("A_sg_chunks"),
           pybind11::arg("B"), pybind11::arg("B_sc"), pybind11::arg("B_sg_chunks"),
           pybind11::arg("D"));
+    m.def("nvfp4_localcta_gemm_residual", &nvfp4_localcta_gemm_residual_entrypoint,
+          pybind11::arg("A"), pybind11::arg("A_sc"), pybind11::arg("A_sg_chunks"),
+          pybind11::arg("B"), pybind11::arg("B_sc"), pybind11::arg("B_sg_chunks"),
+          pybind11::arg("R"), pybind11::arg("D"));
     m.def("nvfp4_localcta_fast_gemm", &nvfp4_localcta_fast_gemm_entrypoint,
           pybind11::arg("A"), pybind11::arg("A_sc_prepared"),
           pybind11::arg("B"), pybind11::arg("B_sc_prepared"),
           pybind11::arg("D"));
+    m.def("nvfp4_localcta_fast_gemm_residual", &nvfp4_localcta_fast_gemm_residual_entrypoint,
+          pybind11::arg("A"), pybind11::arg("A_sc_prepared"),
+          pybind11::arg("B"), pybind11::arg("B_sc_prepared"),
+          pybind11::arg("R"), pybind11::arg("D"));
     m.def("nvfp4_localcta_fast_gemm_sg", &nvfp4_localcta_fast_gemm_sg_entrypoint,
           pybind11::arg("A"), pybind11::arg("A_sc_prepared"), pybind11::arg("A_sg_chunks"),
           pybind11::arg("B"), pybind11::arg("B_sc_prepared"), pybind11::arg("B_sg_chunks"),
