@@ -504,6 +504,43 @@ static void run_gemm_with_config(
     kittens::py::launch_kernel<C, G, nvfp4_gemm::kernel<C>>(g);
 }
 
+template <typename C>
+static void run_grouped_gemm_with_config(
+    const at::Tensor &A, const at::Tensor &A_sc, const at::Tensor &A_sc_global,
+    const at::Tensor &B, const at::Tensor &B_sc, const at::Tensor &B_sg_per_tile,
+    at::Tensor &D,
+    std::optional<at::Tensor> D_K_opt = std::nullopt,
+    std::optional<at::Tensor> D_V_opt = std::nullopt,
+    int silu_dim = 0
+) {
+    static thread_local at::Tensor dummy_bsg;
+    if (!dummy_bsg.defined()) {
+        dummy_bsg = at::zeros({1}, at::dtype(at::kFloat).device(at::kCUDA));
+    }
+    const bool use_split_D = D_K_opt.has_value();
+    using G = nvfp4_gemm::globals<C>;
+    G g {
+        .A = kittens::py::tensor_to_gl<typename G::A_fp4x2_gl>(A),
+        .A_sc = kittens::py::tensor_to_gl<typename G::A_sc_gl, false>(A_sc, 1, A_sc.dim() == 2 ? A_sc.size(0)/128 : A_sc.size(0), A_sc.dim() == 2 ? A_sc.size(1)/4 : A_sc.size(1), 256),
+        .A_sc_global = kittens::py::tensor_to_gl<typename G::A_sc_global_gl>(A_sc_global),
+        .B = kittens::py::tensor_to_gl<typename G::B_fp4x2_gl>(B),
+        .B_sc = kittens::py::tensor_to_gl<typename G::B_sc_gl, false>(B_sc, 1, B_sc.dim() == 2 ? B_sc.size(0)/128 : B_sc.size(0), B_sc.dim() == 2 ? B_sc.size(1)/4 : B_sc.size(1), 256),
+        .B_sc_global = kittens::py::tensor_to_gl<typename G::B_sc_global_gl>(dummy_bsg),
+        .D = kittens::py::tensor_to_gl<typename G::D_gl>(D),
+        .D_K = use_split_D ? kittens::py::tensor_to_gl<typename G::D_gl>(D_K_opt.value()) : kittens::py::tensor_to_gl<typename G::D_gl>(D),
+        .D_V = D_V_opt.has_value() ? kittens::py::tensor_to_gl<typename G::D_gl>(D_V_opt.value())
+                                   : (use_split_D ? kittens::py::tensor_to_gl<typename G::D_gl>(D_K_opt.value())
+                                                  : kittens::py::tensor_to_gl<typename G::D_gl>(D)),
+        .q_dim = use_split_D ? static_cast<int>(D.size(1)) : 0,
+        .k_dim = use_split_D ? static_cast<int>(D_K_opt.value().size(1)) : 0,
+        .v_dim = D_V_opt.has_value() ? static_cast<int>(D_V_opt.value().size(1)) : 0,
+        .use_split_D = use_split_D,
+        .b_sg_per_tile = B_sg_per_tile.data_ptr<float>(),
+        .silu_dim = silu_dim
+    };
+    kittens::py::launch_kernel<C, G, nvfp4_gemm::kernel<C>>(g);
+}
+
 #define NVFP4_GEMM_CONFIG_CASES(X) \
     X(0,  256, 4, 16,  1, 2, false) \
     X(1,  256, 4, 16,  4, 2, false) \
@@ -559,6 +596,9 @@ static void run_gemm_with_config(
 #define NVFP4_GEMM_DISPATCH_NOPDL_CASE(ID, NB, LP, EP, SG, DT, OVERLAP) \
     case ID: run_gemm_with_config<nvfp4_gemm::config<NB, LP, EP, SG, DT, OVERLAP, 256, false, 2>>(A, A_sc, A_sc_global, B, B_sc, B_sc_global, D); break;
 
+#define NVFP4_GROUPED_GEMM_DISPATCH_NOPDL_CASE(ID, NB, LP, EP, SG, DT, OVERLAP) \
+    case ID: run_grouped_gemm_with_config<nvfp4_gemm::config<NB, LP, EP, SG, DT, OVERLAP, 256, false, 2>>(A, A_sc, A_sc_global, B, B_sc, B_sg_per_tile, D, D_K_opt, D_V_opt, silu_dim); break;
+
 void nvfp4_gemm_config_entrypoint(
     const at::Tensor &A, const at::Tensor &A_sc, const at::Tensor &A_sc_global,
     const at::Tensor &B, const at::Tensor &B_sc, const at::Tensor &B_sc_global,
@@ -582,6 +622,22 @@ void nvfp4_gemm_config_nopdl_entrypoint(
     }
 }
 
+void nvfp4_grouped_gemm_config_nopdl_entrypoint(
+    const at::Tensor &A, const at::Tensor &A_sc, const at::Tensor &A_sc_global,
+    const at::Tensor &B, const at::Tensor &B_sc, const at::Tensor &B_sg_per_tile,
+    at::Tensor &D,
+    std::optional<at::Tensor> D_K_opt,
+    std::optional<at::Tensor> D_V_opt,
+    int silu_dim,
+    int config_id
+) {
+    switch (config_id) {
+        NVFP4_GEMM_CONFIG_CASES(NVFP4_GROUPED_GEMM_DISPATCH_NOPDL_CASE)
+        default: TORCH_CHECK(false, "Invalid grouped config_id: ", config_id, " (valid: 0-46)");
+    }
+}
+
+#undef NVFP4_GROUPED_GEMM_DISPATCH_NOPDL_CASE
 #undef NVFP4_GEMM_DISPATCH_NOPDL_CASE
 #undef NVFP4_GEMM_DISPATCH_CASE
 #undef NVFP4_GEMM_CONFIG_CASES
@@ -1510,6 +1566,12 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           pybind11::arg("B"), pybind11::arg("B_sc"), pybind11::arg("B_sg_per_tile"),
           pybind11::arg("D"), pybind11::arg("D_K_opt") = std::nullopt, pybind11::arg("D_V_opt") = std::nullopt,
           pybind11::arg("silu_dim") = 0);
+    m.def("nvfp4_grouped_gemm_config_nopdl", &nvfp4_grouped_gemm_config_nopdl_entrypoint,
+          "Non-PDL grouped GEMM with selectable tile config",
+          pybind11::arg("A"), pybind11::arg("A_sc"), pybind11::arg("A_sc_global"),
+          pybind11::arg("B"), pybind11::arg("B_sc"), pybind11::arg("B_sg_per_tile"),
+          pybind11::arg("D"), pybind11::arg("D_K_opt") = std::nullopt, pybind11::arg("D_V_opt") = std::nullopt,
+          pybind11::arg("silu_dim") = 0, pybind11::arg("config_id") = 5);
     m.def("nvfp4_split_dgrad_sum", &nvfp4_split_dgrad_sum,
           "Fused split dgrad: slice concatenated row-quantized gradient → batched GEMM + accumulation",
           pybind11::arg("A_fp4_cat"), pybind11::arg("A_sc_cat"), pybind11::arg("A_sg_list"),
