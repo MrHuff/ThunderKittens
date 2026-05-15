@@ -327,6 +327,7 @@ void nvfp4_grouped_gemm_entrypoint(
             .v_dim = D_V_opt.has_value() ? static_cast<int>(D_V_opt.value().size(1)) : 0,
             .use_split_D = use_split_D,
             .b_sg_per_tile = B_sg_per_tile.data_ptr<float>(),
+            .b_sg_stride = 1,
             .silu_dim = silu_dim
         };
         kittens::py::launch_kernel<C, G, nvfp4_gemm::kernel<C>>(g);
@@ -351,6 +352,7 @@ void nvfp4_grouped_gemm_entrypoint(
             .v_dim = D_V_opt.has_value() ? static_cast<int>(D_V_opt.value().size(1)) : 0,
             .use_split_D = use_split_D,
             .b_sg_per_tile = B_sg_per_tile.data_ptr<float>(),
+            .b_sg_stride = 1,
             .silu_dim = silu_dim
         };
         kittens::py::launch_kernel<C, G, nvfp4_gemm::kernel<C>>(g);
@@ -403,11 +405,127 @@ void nvfp4_grouped_gemm_nopdl_entrypoint(
         .v_dim = D_V_opt.has_value() ? static_cast<int>(D_V_opt.value().size(1)) : 0,
         .use_split_D = use_split_D,
         .b_sg_per_tile = B_sg_per_tile.data_ptr<float>(),
+        .b_sg_stride = 1,
         .silu_dim = silu_dim
     };
     kittens::py::launch_kernel<C, G, nvfp4_gemm::kernel<C>>(g);
 }
 
+static bool nvfp4_is_power_of_two_i64(int64_t value) {
+    return value > 0 && (value & (value - 1)) == 0;
+}
+
+static void nvfp4_check_rope_live64_tensor(
+    const at::Tensor &t,
+    const char *name,
+    int64_t seq_len
+) {
+    TORCH_CHECK(t.is_cuda(), name, " must be CUDA");
+    TORCH_CHECK(t.is_contiguous(), name, " must be contiguous");
+    TORCH_CHECK(t.dim() == 3, name, " must be 3D");
+    TORCH_CHECK(t.scalar_type() == at::kFloat, name, " must be float32");
+    TORCH_CHECK(t.size(0) == seq_len, name, " seq_len mismatch");
+    TORCH_CHECK(t.size(1) == 32, name, " second dim must equal 32");
+    TORCH_CHECK(t.size(2) == 2, name, " third dim must equal 2");
+}
+
+static void nvfp4_check_rope_live64_qkv_args(
+    const at::Tensor &D,
+    const at::Tensor &D_K,
+    const at::Tensor &D_V,
+    const at::Tensor &rope_cs,
+    int64_t rope_seq_len
+) {
+    TORCH_CHECK(rope_seq_len > 0, "rope_seq_len must be positive");
+    TORCH_CHECK(nvfp4_is_power_of_two_i64(rope_seq_len), "rope_seq_len must be a power of two");
+    TORCH_CHECK(D.is_cuda() && D.is_contiguous() && D.scalar_type() == at::kBFloat16, "D must be contiguous CUDA bf16");
+    TORCH_CHECK(D_K.is_cuda() && D_K.is_contiguous() && D_K.scalar_type() == at::kBFloat16, "D_K must be contiguous CUDA bf16");
+    TORCH_CHECK(D_V.is_cuda() && D_V.is_contiguous() && D_V.scalar_type() == at::kBFloat16, "D_V must be contiguous CUDA bf16");
+    TORCH_CHECK(D.dim() == 2 && D_K.dim() == 2 && D_V.dim() == 2, "Q/K/V outputs must be 2D");
+    TORCH_CHECK(D.size(0) == D_K.size(0) && D.size(0) == D_V.size(0), "Q/K/V output rows must match");
+    TORCH_CHECK(D.size(0) % rope_seq_len == 0, "Q output rows must be divisible by rope_seq_len");
+    TORCH_CHECK(D_K.size(0) % rope_seq_len == 0, "K output rows must be divisible by rope_seq_len");
+    TORCH_CHECK(D.size(1) % 64 == 0, "Q output cols must be divisible by 64");
+    TORCH_CHECK(D_K.size(1) % 64 == 0, "K output cols must be divisible by 64");
+    TORCH_CHECK(D_V.size(1) % 128 == 0, "V output cols must be divisible by 128");
+    nvfp4_check_rope_live64_tensor(rope_cs, "rope_cs", rope_seq_len);
+    kittens::py::device_check(D, D_K, D_V, rope_cs);
+}
+
+template <typename C>
+static void run_grouped_gemm_rope_live64_with_config(
+    const at::Tensor &A,
+    const at::Tensor &A_sc,
+    const at::Tensor &A_sc_global,
+    const at::Tensor &B,
+    const at::Tensor &B_sc,
+    const at::Tensor &B_sg_per_tile,
+    at::Tensor &D,
+    at::Tensor &D_K,
+    at::Tensor &D_V,
+    const nvfp4_rope_epilogue::rope_live64_desc &rope_live64,
+    int silu_dim = 0
+) {
+    static thread_local at::Tensor dummy_bsg;
+    if (!dummy_bsg.defined()) {
+        dummy_bsg = at::zeros({1}, at::dtype(at::kFloat).device(at::kCUDA));
+    }
+
+    using G = nvfp4_gemm::globals<C>;
+    G g {
+        .A = kittens::py::tensor_to_gl<typename G::A_fp4x2_gl>(A),
+        .A_sc = kittens::py::tensor_to_gl<typename G::A_sc_gl, false>(A_sc, 1, A_sc.dim() == 2 ? A_sc.size(0)/128 : A_sc.size(0), A_sc.dim() == 2 ? A_sc.size(1)/4 : A_sc.size(1), 256),
+        .A_sc_global = kittens::py::tensor_to_gl<typename G::A_sc_global_gl>(A_sc_global),
+        .B = kittens::py::tensor_to_gl<typename G::B_fp4x2_gl>(B),
+        .B_sc = kittens::py::tensor_to_gl<typename G::B_sc_gl, false>(B_sc, 1, B_sc.dim() == 2 ? B_sc.size(0)/128 : B_sc.size(0), B_sc.dim() == 2 ? B_sc.size(1)/4 : B_sc.size(1), 256),
+        .B_sc_global = kittens::py::tensor_to_gl<typename G::B_sc_global_gl>(dummy_bsg),
+        .D = kittens::py::tensor_to_gl<typename G::D_gl>(D),
+        .D_K = kittens::py::tensor_to_gl<typename G::D_gl>(D_K),
+        .D_V = kittens::py::tensor_to_gl<typename G::D_gl>(D_V),
+        .q_dim = static_cast<int>(D.size(1)),
+        .k_dim = static_cast<int>(D_K.size(1)),
+        .v_dim = static_cast<int>(D_V.size(1)),
+        .use_split_D = true,
+        .b_sg_per_tile = B_sg_per_tile.data_ptr<float>(),
+        .b_sg_stride = 1,
+        .silu_dim = silu_dim,
+        .rope_live64 = rope_live64
+    };
+    kittens::py::launch_kernel<C, G, nvfp4_gemm::kernel<C>>(g);
+}
+
+void nvfp4_grouped_gemm_rope_live64_entrypoint(
+    const at::Tensor &A,
+    const at::Tensor &A_sc,
+    const at::Tensor &A_sc_global,
+    const at::Tensor &B,
+    const at::Tensor &B_sc,
+    const at::Tensor &B_sg_per_tile,
+    at::Tensor &D,
+    at::Tensor &D_K,
+    at::Tensor &D_V,
+    const at::Tensor &rope_cs,
+    int64_t rope_seq_len,
+    int silu_dim = 0
+) {
+    TORCH_CHECK(D.size(0) == A.size(0), "Q output rows must match A rows");
+    TORCH_CHECK(D_K.size(0) == A.size(0), "K output rows must match A rows");
+    TORCH_CHECK(D_V.size(0) == A.size(0), "V output rows must match A rows");
+    TORCH_CHECK(D.size(1) + D_K.size(1) + D_V.size(1) == B.size(0),
+                "Q/K/V output columns must sum to B rows");
+    nvfp4_check_rope_live64_qkv_args(D, D_K, D_V, rope_cs, rope_seq_len);
+
+    nvfp4_rope_epilogue::rope_live64_desc rope_live64 {
+        .cs = reinterpret_cast<const float2*>(rope_cs.data_ptr<float>()),
+        .seq_len = static_cast<int>(rope_seq_len),
+        .seq_mask = static_cast<int>(rope_seq_len - 1),
+    };
+
+    using C = nvfp4_gemm::config<256, 5, 8, 4, 2, false, 256, true, 2, 256, true>;
+    run_grouped_gemm_rope_live64_with_config<C>(
+        A, A_sc, A_sc_global, B, B_sc, B_sg_per_tile,
+        D, D_K, D_V, rope_live64, silu_dim);
+}
 
 void nvfp4_quantize_entrypoint(
     const at::Tensor &A_bf16,
@@ -536,6 +654,7 @@ static void run_grouped_gemm_with_config(
         .v_dim = D_V_opt.has_value() ? static_cast<int>(D_V_opt.value().size(1)) : 0,
         .use_split_D = use_split_D,
         .b_sg_per_tile = B_sg_per_tile.data_ptr<float>(),
+        .b_sg_stride = 1,
         .silu_dim = silu_dim
     };
     kittens::py::launch_kernel<C, G, nvfp4_gemm::kernel<C>>(g);
@@ -1559,6 +1678,13 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           pybind11::arg("A"), pybind11::arg("A_sc"), pybind11::arg("A_sc_global"),
           pybind11::arg("B"), pybind11::arg("B_sc"), pybind11::arg("B_sg_per_tile"),
           pybind11::arg("D"), pybind11::arg("D_K_opt") = std::nullopt, pybind11::arg("D_V_opt") = std::nullopt,
+          pybind11::arg("silu_dim") = 0);
+    m.def("nvfp4_grouped_gemm_rope_live64", &nvfp4_grouped_gemm_rope_live64_entrypoint,
+          "Grouped GEMM with split Q/K/V outputs and fused live64 RoPE on Q/K",
+          pybind11::arg("A"), pybind11::arg("A_sc"), pybind11::arg("A_sc_global"),
+          pybind11::arg("B"), pybind11::arg("B_sc"), pybind11::arg("B_sg_per_tile"),
+          pybind11::arg("D"), pybind11::arg("D_K"), pybind11::arg("D_V"),
+          pybind11::arg("rope_cs"), pybind11::arg("rope_seq_len"),
           pybind11::arg("silu_dim") = 0);
     m.def("nvfp4_grouped_gemm_nopdl", &nvfp4_grouped_gemm_nopdl_entrypoint,
           "Non-PDL grouped GEMM for multi-stream and CUDA graph usage",
