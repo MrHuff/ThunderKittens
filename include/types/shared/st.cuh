@@ -230,7 +230,7 @@ struct st_subtile {
             const int swizzle = ((addr % swizzle_repeat) >> 7) << 4;
             return (T*)(addr ^ swizzle);
         } else {
-            return &ptr[r*cols + c];
+            return &ptr[r*underlying_cols + c];
         }
     }
     __device__ inline uint32_t idx(uint32_t ptr, const int2 coord) const { // naive row-major coord default
@@ -243,7 +243,7 @@ struct st_subtile {
             const int swizzle = ((addr % swizzle_repeat) >> 7) << 4;
             return (addr ^ swizzle);
         } else {
-            return ptr + sizeof(T)*(r*cols + c);
+            return ptr + sizeof(T)*(r*underlying_cols + c);
         }
     }
     /**
@@ -280,7 +280,7 @@ __device__ inline st_subtile<st<_T, _rows, _cols, _swizzle, _swizzle_bytes>, sub
 st<_T, _rows, _cols, _swizzle, _swizzle_bytes>::subtile(int2 rowcol) // Qualified function name and parameters
 {
     // Type aliases for convenience within the function body
-    using ST_t = st<_T, _rows, _cols>; // Alias for the parent tile type
+    using ST_t = st<_T, _rows, _cols, _swizzle, _swizzle_bytes>; // Alias for the parent tile type
     using dtype = typename ST_t::dtype;  // Alias for the data type
 
     // Static assertions (as provided in the initial request)

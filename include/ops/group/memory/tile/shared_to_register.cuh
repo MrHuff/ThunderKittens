@@ -78,21 +78,33 @@ __device__ inline static void load(RT &dst, const ST &src) {
                 }
                 int blit = sizeof(typename ST::dtype) * ((warp_laneid%4) / 2);
                 U2 tmp[4];
-                static constexpr int swizzle_repeat = ST::swizzle_bytes * 8;
-                static constexpr int subtile_cols   = ST::swizzle_bytes / sizeof(U);
-                const int outer_idx = col/subtile_cols;
-                const uint32_t addr_1 = shared_addr + sizeof(U)*(outer_idx*ST::underlying_rows*subtile_cols + (row+0)*subtile_cols + col%subtile_cols);
-                const uint32_t addr_2 = shared_addr + sizeof(U)*(outer_idx*ST::underlying_rows*subtile_cols + (row+8)*subtile_cols + col%subtile_cols);
-                const int swizzle_1 = blit ^ ((addr_1 % swizzle_repeat) >> 7) << 4;
-                const int swizzle_2 = blit ^ ((addr_2 % swizzle_repeat) >> 7) << 4;
-                move<U>::lds(tmp[0].x, (addr_1+ 0)^swizzle_1);
-                move<U>::lds(tmp[0].y, (addr_1+ 4)^swizzle_1);
-                move<U>::lds(tmp[2].x, (addr_1+32)^swizzle_1);
-                move<U>::lds(tmp[2].y, (addr_1+36)^swizzle_1);
-                move<U>::lds(tmp[1].x, (addr_2+ 0)^swizzle_2);
-                move<U>::lds(tmp[1].y, (addr_2+ 4)^swizzle_2);
-                move<U>::lds(tmp[3].x, (addr_2+32)^swizzle_2);
-                move<U>::lds(tmp[3].y, (addr_2+36)^swizzle_2);
+                if constexpr (ST::swizzle) {
+                    static constexpr int swizzle_repeat = ST::swizzle_bytes * 8;
+                    static constexpr int subtile_cols   = ST::swizzle_bytes / sizeof(U);
+                    const int outer_idx = col/subtile_cols;
+                    const uint32_t addr_1 = shared_addr + sizeof(U)*(outer_idx*ST::underlying_rows*subtile_cols + (row+0)*subtile_cols + col%subtile_cols);
+                    const uint32_t addr_2 = shared_addr + sizeof(U)*(outer_idx*ST::underlying_rows*subtile_cols + (row+8)*subtile_cols + col%subtile_cols);
+                    const int swizzle_1 = blit ^ ((addr_1 % swizzle_repeat) >> 7) << 4;
+                    const int swizzle_2 = blit ^ ((addr_2 % swizzle_repeat) >> 7) << 4;
+                    move<U>::lds(tmp[0].x, (addr_1+ 0)^swizzle_1);
+                    move<U>::lds(tmp[0].y, (addr_1+ 4)^swizzle_1);
+                    move<U>::lds(tmp[2].x, (addr_1+32)^swizzle_1);
+                    move<U>::lds(tmp[2].y, (addr_1+36)^swizzle_1);
+                    move<U>::lds(tmp[1].x, (addr_2+ 0)^swizzle_2);
+                    move<U>::lds(tmp[1].y, (addr_2+ 4)^swizzle_2);
+                    move<U>::lds(tmp[3].x, (addr_2+32)^swizzle_2);
+                    move<U>::lds(tmp[3].y, (addr_2+36)^swizzle_2);
+                }
+                else {
+                    move<U>::lds(tmp[0].x, shared_addr + sizeof(U) * ((row + 0) * ST::underlying_cols + (col + 0)));
+                    move<U>::lds(tmp[0].y, shared_addr + sizeof(U) * ((row + 0) * ST::underlying_cols + (col + 1)));
+                    move<U>::lds(tmp[2].x, shared_addr + sizeof(U) * ((row + 0) * ST::underlying_cols + (col + 8)));
+                    move<U>::lds(tmp[2].y, shared_addr + sizeof(U) * ((row + 0) * ST::underlying_cols + (col + 9)));
+                    move<U>::lds(tmp[1].x, shared_addr + sizeof(U) * ((row + 8) * ST::underlying_cols + (col + 0)));
+                    move<U>::lds(tmp[1].y, shared_addr + sizeof(U) * ((row + 8) * ST::underlying_cols + (col + 1)));
+                    move<U>::lds(tmp[3].x, shared_addr + sizeof(U) * ((row + 8) * ST::underlying_cols + (col + 8)));
+                    move<U>::lds(tmp[3].y, shared_addr + sizeof(U) * ((row + 8) * ST::underlying_cols + (col + 9)));
+                }
                 dst.tiles[i][j].data[0] = base_types::convertor<T2, U2>::convert(tmp[0]);
                 dst.tiles[i][j].data[1] = base_types::convertor<T2, U2>::convert(tmp[1]);
                 dst.tiles[i][j].data[2] = base_types::convertor<T2, U2>::convert(tmp[2]);
@@ -243,21 +255,33 @@ __device__ inline static void store(ST &dst, const RT &src) {
                 tmp[1] = base_types::convertor<U2, T2>::convert(reg_tmp[1]);
                 tmp[2] = base_types::convertor<U2, T2>::convert(reg_tmp[2]);
                 tmp[3] = base_types::convertor<U2, T2>::convert(reg_tmp[3]);
-                static constexpr int swizzle_repeat = ST::swizzle_bytes * 8;
-                static constexpr int subtile_cols   = ST::swizzle_bytes / sizeof(U);
-                const int outer_idx = col/subtile_cols;
-                const uint32_t addr_1 = shared_addr + sizeof(U)*(outer_idx*ST::underlying_rows*subtile_cols + (row+0)*subtile_cols + col%subtile_cols);
-                const uint32_t addr_2 = shared_addr + sizeof(U)*(outer_idx*ST::underlying_rows*subtile_cols + (row+8)*subtile_cols + col%subtile_cols);
-                const int swizzle_1 = blit ^ ((addr_1 % swizzle_repeat) >> 7) << 4;
-                const int swizzle_2 = blit ^ ((addr_2 % swizzle_repeat) >> 7) << 4;
-                move<U>::sts((addr_1+ 0)^swizzle_1, tmp[0].x);
-                move<U>::sts((addr_1+ 4)^swizzle_1, tmp[0].y);
-                move<U>::sts((addr_1+32)^swizzle_1, tmp[2].x);
-                move<U>::sts((addr_1+36)^swizzle_1, tmp[2].y);
-                move<U>::sts((addr_2+ 0)^swizzle_2, tmp[1].x);
-                move<U>::sts((addr_2+ 4)^swizzle_2, tmp[1].y);
-                move<U>::sts((addr_2+32)^swizzle_2, tmp[3].x);
-                move<U>::sts((addr_2+36)^swizzle_2, tmp[3].y);
+                if constexpr (ST::swizzle) {
+                    static constexpr int swizzle_repeat = ST::swizzle_bytes * 8;
+                    static constexpr int subtile_cols   = ST::swizzle_bytes / sizeof(U);
+                    const int outer_idx = col/subtile_cols;
+                    const uint32_t addr_1 = shared_addr + sizeof(U)*(outer_idx*ST::underlying_rows*subtile_cols + (row+0)*subtile_cols + col%subtile_cols);
+                    const uint32_t addr_2 = shared_addr + sizeof(U)*(outer_idx*ST::underlying_rows*subtile_cols + (row+8)*subtile_cols + col%subtile_cols);
+                    const int swizzle_1 = blit ^ ((addr_1 % swizzle_repeat) >> 7) << 4;
+                    const int swizzle_2 = blit ^ ((addr_2 % swizzle_repeat) >> 7) << 4;
+                    move<U>::sts((addr_1+ 0)^swizzle_1, tmp[0].x);
+                    move<U>::sts((addr_1+ 4)^swizzle_1, tmp[0].y);
+                    move<U>::sts((addr_1+32)^swizzle_1, tmp[2].x);
+                    move<U>::sts((addr_1+36)^swizzle_1, tmp[2].y);
+                    move<U>::sts((addr_2+ 0)^swizzle_2, tmp[1].x);
+                    move<U>::sts((addr_2+ 4)^swizzle_2, tmp[1].y);
+                    move<U>::sts((addr_2+32)^swizzle_2, tmp[3].x);
+                    move<U>::sts((addr_2+36)^swizzle_2, tmp[3].y);
+                }
+                else {
+                    move<U>::sts(shared_addr + sizeof(U) * ((row + 0) * ST::underlying_cols + (col + 0)), tmp[0].x);
+                    move<U>::sts(shared_addr + sizeof(U) * ((row + 0) * ST::underlying_cols + (col + 1)), tmp[0].y);
+                    move<U>::sts(shared_addr + sizeof(U) * ((row + 0) * ST::underlying_cols + (col + 8)), tmp[2].x);
+                    move<U>::sts(shared_addr + sizeof(U) * ((row + 0) * ST::underlying_cols + (col + 9)), tmp[2].y);
+                    move<U>::sts(shared_addr + sizeof(U) * ((row + 8) * ST::underlying_cols + (col + 0)), tmp[1].x);
+                    move<U>::sts(shared_addr + sizeof(U) * ((row + 8) * ST::underlying_cols + (col + 1)), tmp[1].y);
+                    move<U>::sts(shared_addr + sizeof(U) * ((row + 8) * ST::underlying_cols + (col + 8)), tmp[3].x);
+                    move<U>::sts(shared_addr + sizeof(U) * ((row + 8) * ST::underlying_cols + (col + 9)), tmp[3].y);
+                }
             }
             else {
                 // handle the column-major layout
