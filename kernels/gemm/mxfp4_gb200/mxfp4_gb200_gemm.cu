@@ -226,6 +226,77 @@ GL tensor_to_gl_tma_view(const at::Tensor& t, const char* name) {
     return kittens::make_gl<GL>(reinterpret_cast<uint64_t>(t.data_ptr()), b, d, r, c);
 }
 
+template <typename GL>
+GL tensor_to_gl_tma_2d_slice(
+    const at::Tensor& t,
+    const char* name,
+    int64_t row_start,
+    int64_t col_start,
+    int64_t rows,
+    int64_t cols
+) {
+    TORCH_CHECK(t.is_cuda(), name, " must be CUDA");
+    TORCH_CHECK(t.dim() == 2, name, " must be 2D");
+    TORCH_CHECK(t.stride(1) == 1, name, " slice must have unit inner stride");
+    TORCH_CHECK(row_start >= 0 && col_start >= 0 && rows > 0 && cols > 0, name, " invalid slice");
+    TORCH_CHECK(row_start + rows <= t.size(0), name, " row slice exceeds tensor");
+    TORCH_CHECK(col_start + cols <= t.stride(0), name, " col slice exceeds leading stride");
+
+    if constexpr (std::is_same_v<typename GL::dtype, kittens::fp4e2m1_2>) {
+        TORCH_CHECK(t.scalar_type() == at::kFloat4_e2m1fn_x2, name, " must be fp4x2");
+    } else if constexpr (std::is_same_v<typename GL::dtype, kittens::bf16>) {
+        TORCH_CHECK(t.scalar_type() == at::kBFloat16, name, " must be bf16");
+    } else {
+        TORCH_CHECK(false, name, " unsupported 2D sliced TMA dtype");
+    }
+
+    const int64_t element_offset = row_start * t.stride(0) + col_start;
+    const auto* ptr = static_cast<const char*>(t.data_ptr()) + element_offset * t.element_size();
+    return kittens::make_gl<GL>(
+        reinterpret_cast<uint64_t>(ptr),
+        1,
+        1,
+        static_cast<int>(rows),
+        static_cast<int>(t.stride(0)));
+}
+
+template <typename GL>
+GL tensor_to_gl_tma_scale_slice(
+    const at::Tensor& t,
+    const char* name,
+    int64_t row_start,
+    int64_t k_start,
+    int64_t rows,
+    int64_t k_size
+) {
+    TORCH_CHECK(t.is_cuda(), name, " must be CUDA");
+    TORCH_CHECK(t.dim() == 4, name, " must be 4D");
+    TORCH_CHECK(t.scalar_type() == at::kFloat8_e8m0fnu || t.scalar_type() == at::kByte,
+                name, " must be fp8e8m0/uint8");
+    TORCH_CHECK(t.stride(3) == 1, name, " last stride must be contiguous");
+    TORCH_CHECK(t.stride(2) == t.size(3), name, " inner tile stride mismatch");
+    TORCH_CHECK(t.stride(1) == t.size(2) * t.size(3), name, " depth stride mismatch");
+    TORCH_CHECK(t.stride(0) % t.stride(1) == 0, name, " batch stride mismatch");
+    TORCH_CHECK(row_start >= 0 && k_start >= 0 && rows > 0 && k_size > 0, name, " invalid scale slice");
+    TORCH_CHECK(row_start % 128 == 0 && k_start % 128 == 0 && rows % 128 == 0 && k_size % 128 == 0,
+                name, " scale slices must be 128-aligned");
+    const int64_t row_block_start = row_start / 128;
+    const int64_t k_block_start = k_start / 128;
+    const int64_t row_blocks = rows / 128;
+    const int64_t k_blocks = k_size / 128;
+    TORCH_CHECK(row_block_start + row_blocks <= t.size(0), name, " row scale slice exceeds tensor");
+    TORCH_CHECK(k_block_start + k_blocks <= t.size(1), name, " K scale slice exceeds tensor");
+
+    const int64_t element_offset = row_block_start * t.stride(0) + k_block_start * t.stride(1);
+    const auto* ptr = static_cast<const char*>(t.data_ptr()) + element_offset * t.element_size();
+    return kittens::make_gl<GL>(
+        reinterpret_cast<uint64_t>(ptr),
+        static_cast<int>(row_blocks),
+        static_cast<int>(t.stride(0) / t.stride(1)),
+        static_cast<int>(t.size(2)),
+        static_cast<int>(t.size(3)));
+}
+
 void check_tilemask(
     const at::Tensor& t,
     const char* name,
@@ -1358,6 +1429,140 @@ void mxfp4_grouped_gemm_strided_entrypoint(
     }
 }
 
+void mxfp4_batched_gemm_slices_entrypoint(
+    const at::Tensor &A,
+    const at::Tensor &A_sc,
+    const at::Tensor &B,
+    const at::Tensor &B_sc,
+    at::Tensor &D,
+    const std::vector<int64_t> &A_row_starts,
+    const std::vector<int64_t> &A_k_starts,
+    const std::vector<int64_t> &B_row_starts,
+    const std::vector<int64_t> &B_k_starts,
+    const std::vector<int64_t> &D_row_starts,
+    const std::vector<int64_t> &D_col_starts,
+    const std::vector<int64_t> &M_list,
+    const std::vector<int64_t> &N_list,
+    const std::vector<int64_t> &K_list,
+    int config_id = -1
+) {
+    const int n = static_cast<int>(M_list.size());
+    TORCH_CHECK(n > 0 && n <= mxfp4_batched_gemm::MAX_BATCHES,
+                "num_batches must be 1..", mxfp4_batched_gemm::MAX_BATCHES);
+    TORCH_CHECK(
+        A_row_starts.size() == M_list.size() &&
+        A_k_starts.size() == M_list.size() &&
+        B_row_starts.size() == M_list.size() &&
+        B_k_starts.size() == M_list.size() &&
+        D_row_starts.size() == M_list.size() &&
+        D_col_starts.size() == M_list.size() &&
+        N_list.size() == M_list.size() &&
+        K_list.size() == M_list.size(),
+        "all sliced batched GEMM metadata lists must have equal length");
+    TORCH_CHECK(A.is_cuda() && A_sc.is_cuda() && B.is_cuda() && B_sc.is_cuda() && D.is_cuda(),
+                "mxfp4_batched_gemm_slices expects CUDA tensors");
+    TORCH_CHECK(A.dim() == 2 && B.dim() == 2 && D.dim() == 2,
+                "A, B, and D must be 2D");
+    TORCH_CHECK(A_sc.dim() == 4 && B_sc.dim() == 4, "scale tensors must be 4D");
+    TORCH_CHECK(D.scalar_type() == at::kBFloat16, "D must be bf16");
+    TORCH_CHECK(D.stride(1) == 1, "D must have unit inner stride");
+
+    auto build_and_launch = [&]<typename C>() {
+        using G = mxfp4_batched_gemm::globals<C>;
+        G g_host {};
+        g_host.num_batches = n;
+        g_host.num_row_blocks = (int)(M_list[0] / C::Mb);
+        g_host.num_col_blocks = (int)(N_list[0] / C::Nb);
+        g_host.num_red_blocks = (int)(K_list[0] / C::Kb);
+        g_host.tile_offsets[0] = 0;
+        g_host.total_spatial_tiles = 0;
+        g_host.uniform_strided = false;
+
+        for (int i = 0; i < n; ++i) {
+            TORCH_CHECK(M_list[i] > 0 && N_list[i] > 0 && K_list[i] > 0,
+                        "sliced batched GEMM dimensions must be positive");
+            TORCH_CHECK(M_list[i] % C::Mb == 0, "D rows must be a multiple of ", C::Mb);
+            TORCH_CHECK(N_list[i] % C::Nb == 0, "D cols must be a multiple of ", C::Nb);
+            TORCH_CHECK(K_list[i] % C::Kb == 0, "K must be a multiple of ", C::Kb);
+            TORCH_CHECK(A_k_starts[i] % C::Kb == 0 && B_k_starts[i] % C::Kb == 0,
+                        "K starts must align to selected K tile");
+            TORCH_CHECK(D_row_starts[i] >= 0 && D_col_starts[i] >= 0,
+                        "D starts must be non-negative");
+            TORCH_CHECK(D_row_starts[i] + M_list[i] <= D.size(0), "D row slice exceeds tensor");
+            TORCH_CHECK(D_col_starts[i] + N_list[i] <= D.stride(0), "D col slice exceeds leading stride");
+
+            const int row_blocks = (int)(M_list[i] / C::Mb);
+            const int col_blocks = (int)(N_list[i] / C::Nb);
+            const int red_blocks = (int)(K_list[i] / C::Kb);
+            g_host.num_row_blocks_by_batch[i] = row_blocks;
+            g_host.num_col_blocks_by_batch[i] = col_blocks;
+            g_host.num_red_blocks_by_batch[i] = red_blocks;
+            g_host.total_spatial_tiles += row_blocks * col_blocks;
+            g_host.tile_offsets[i + 1] = g_host.total_spatial_tiles;
+
+            auto a_gl = tensor_to_gl_tma_2d_slice<typename G::A_fp4x2_gl>(
+                A, "A", A_row_starts[i], A_k_starts[i] / 2, M_list[i], K_list[i] / 2);
+            auto a_sc_gl = tensor_to_gl_tma_scale_slice<typename G::A_sc_gl>(
+                A_sc, "A_sc", A_row_starts[i], A_k_starts[i], M_list[i], K_list[i]);
+            auto b_gl = tensor_to_gl_tma_2d_slice<typename G::B_fp4x2_gl>(
+                B, "B", B_row_starts[i], B_k_starts[i] / 2, N_list[i], K_list[i] / 2);
+            auto b_sc_gl = tensor_to_gl_tma_scale_slice<typename G::B_sc_gl>(
+                B_sc, "B_sc", B_row_starts[i], B_k_starts[i], N_list[i], K_list[i]);
+            auto d_gl = tensor_to_gl_tma_2d_slice<typename G::D_gl>(
+                D, "D", D_row_starts[i], D_col_starts[i], M_list[i], N_list[i]);
+
+            memcpy(&g_host.A_tma[i], &a_gl.tma_descs.tma_desc, sizeof(CUtensorMap));
+            memcpy(&g_host.A_sc_tma[i], &a_sc_gl.tma_descs.tma_desc, sizeof(CUtensorMap));
+            memcpy(&g_host.B_tma[i], &b_gl.tma_descs.tma_desc, sizeof(CUtensorMap));
+            memcpy(&g_host.B_sc_tma[i], &b_sc_gl.tma_descs.tma_desc, sizeof(CUtensorMap));
+            memcpy(&g_host.D_tma[i], &d_gl.tma_descs.tma_desc, sizeof(CUtensorMap));
+        }
+        kittens::py::launch_kernel<C, G, mxfp4_batched_gemm::kernel<C>>(g_host);
+    };
+
+    const int64_t N_out = N_list[0];
+    const int64_t K0 = K_list[0];
+    auto run_auto = [&]() {
+        if (N_out % 256 != 0 && N_out % 128 == 0) {
+            if (K0 % 256 == 0) {
+                build_and_launch.template operator()<mxfp4_gemm::config<128, 5, 8, 4, 2, false, 256>>();
+            } else {
+                build_and_launch.template operator()<mxfp4_gemm::config<128, 5, 8, 4, 2, false, 128>>();
+            }
+        } else if (N_out <= 4096) {
+            if (K0 % 256 == 0) {
+                build_and_launch.template operator()<mxfp4_gemm::config<256, 5, 8, 4, 2, false, 256>>();
+            } else {
+                build_and_launch.template operator()<mxfp4_gemm::config<256, 5, 8, 4, 2, false, 128>>();
+            }
+        } else {
+            if (K0 % 256 == 0) {
+                build_and_launch.template operator()<mxfp4_gemm::config<256, 4, 16, 4, 2, false, 256>>();
+            } else {
+                build_and_launch.template operator()<mxfp4_gemm::config<256, 4, 16, 4, 2, false, 128>>();
+            }
+        }
+    };
+
+    if (config_id < 0) {
+        run_auto();
+        return;
+    }
+    switch (config_id) {
+    case 0:  build_and_launch.template operator()<mxfp4_gemm::config<256, 5,  8,  4, 2, false>>(); break;
+    case 1:  build_and_launch.template operator()<mxfp4_gemm::config<256, 4, 16,  4, 2, false>>(); break;
+    case 2:  build_and_launch.template operator()<mxfp4_gemm::config<256, 5,  8,  8, 2, true >>(); break;
+    case 3:  build_and_launch.template operator()<mxfp4_gemm::config<256, 5,  8, 12, 4, true >>(); break;
+    case 4:  build_and_launch.template operator()<mxfp4_gemm::config<256, 5,  8, 12, 2, false>>(); break;
+    case 5:  build_and_launch.template operator()<mxfp4_gemm::config<256, 5, 16,  4, 2, true >>(); break;
+    case 6:  build_and_launch.template operator()<mxfp4_gemm::config<256, 4,  8, 12, 2, false>>(); break;
+    case 7:  build_and_launch.template operator()<mxfp4_gemm::config<256, 5,  8,  4, 4, false>>(); break;
+    case 8:  build_and_launch.template operator()<mxfp4_gemm::config<256, 4, 16, 12, 2, false>>(); break;
+    case 9:  build_and_launch.template operator()<mxfp4_gemm::config<256, 5,  8,  4, 2, true >>(); break;
+    default: TORCH_CHECK(false, "Invalid config_id: ", config_id, " (valid: 0-9)");
+    }
+}
+
 void mxfp4_batched_gemm_config_entrypoint(
     const std::vector<at::Tensor> &A_list,
     const std::vector<at::Tensor> &A_sc_list,
@@ -1784,6 +1989,16 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           pybind11::arg("A_list"), pybind11::arg("A_sc_list"),
           pybind11::arg("B_list"), pybind11::arg("B_sc_list"),
           pybind11::arg("D_out_list"));
+    m.def("mxfp4_batched_gemm_slices", &mxfp4_batched_gemm_slices_entrypoint,
+          "True Batched GEMM from bulk tensors plus per-batch row/K/output slices",
+          pybind11::arg("A"), pybind11::arg("A_sc"),
+          pybind11::arg("B"), pybind11::arg("B_sc"),
+          pybind11::arg("D"),
+          pybind11::arg("A_row_starts"), pybind11::arg("A_k_starts"),
+          pybind11::arg("B_row_starts"), pybind11::arg("B_k_starts"),
+          pybind11::arg("D_row_starts"), pybind11::arg("D_col_starts"),
+          pybind11::arg("M_list"), pybind11::arg("N_list"), pybind11::arg("K_list"),
+          pybind11::arg("config_id") = -1);
     m.def("mxfp4_grouped_gemm_strided", &mxfp4_grouped_gemm_strided_entrypoint,
           "Uniform grouped GEMM over flat packed tensors using one TMA descriptor per operand",
           pybind11::arg("A"), pybind11::arg("A_sc"),
