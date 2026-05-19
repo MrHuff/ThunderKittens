@@ -810,6 +810,35 @@ void mxfp4_gemm_residual_entrypoint(
         A, A_sc, B, B_sc, R, D);
 }
 
+void mxfp4_gemm_residual_config_entrypoint(
+    const at::Tensor &A,
+    const at::Tensor &A_sc,
+    const at::Tensor &B,
+    const at::Tensor &B_sc,
+    const at::Tensor &R,
+    at::Tensor &D,
+    int config_id
+) {
+    check_output_matrix(R, "R", D.size(0), D.size(1));
+    kittens::py::device_check(A, A_sc, B, B_sc, R, D);
+
+    //                     Nb   LOAD EPI  SG  DT  OVERLAP Kb   RHT   RESIDUAL
+    switch (config_id) {
+    case 0:  launch_mxfp4_gemm_dense_residual<mxfp4_gemm::config<256, 5,  8,  4, 2, false, 256, false, true>>(A, A_sc, B, B_sc, R, D); break;
+    case 1:  launch_mxfp4_gemm_dense_residual<mxfp4_gemm::config<256, 4, 16,  4, 2, false, 256, false, true>>(A, A_sc, B, B_sc, R, D); break;
+    case 2:  launch_mxfp4_gemm_dense_residual<mxfp4_gemm::config<256, 5,  8,  8, 2, true,  256, false, true>>(A, A_sc, B, B_sc, R, D); break;
+    case 3:  launch_mxfp4_gemm_dense_residual<mxfp4_gemm::config<256, 5,  8, 12, 4, true,  256, false, true>>(A, A_sc, B, B_sc, R, D); break;
+    case 4:  launch_mxfp4_gemm_dense_residual<mxfp4_gemm::config<256, 5,  8, 12, 2, false, 256, false, true>>(A, A_sc, B, B_sc, R, D); break;
+    case 5:  launch_mxfp4_gemm_dense_residual<mxfp4_gemm::config<256, 5, 16,  4, 2, true,  256, false, true>>(A, A_sc, B, B_sc, R, D); break;
+    case 6:  launch_mxfp4_gemm_dense_residual<mxfp4_gemm::config<256, 4,  8, 12, 2, false, 256, false, true>>(A, A_sc, B, B_sc, R, D); break;
+    case 7:  launch_mxfp4_gemm_dense_residual<mxfp4_gemm::config<256, 5,  8,  4, 4, false, 256, false, true>>(A, A_sc, B, B_sc, R, D); break;
+    case 8:  launch_mxfp4_gemm_dense_residual<mxfp4_gemm::config<256, 4, 16, 12, 2, false, 256, false, true>>(A, A_sc, B, B_sc, R, D); break;
+    case 9:  launch_mxfp4_gemm_dense_residual<mxfp4_gemm::config<256, 5,  8,  4, 2, true,  256, false, true>>(A, A_sc, B, B_sc, R, D); break;
+    case 10: launch_mxfp4_gemm_dense_residual<mxfp4_gemm::config<256, 5,  4, 12, 2, false, 256, false, true>>(A, A_sc, B, B_sc, R, D); break;
+    default: TORCH_CHECK(false, "Invalid residual config_id: ", config_id, " (valid: 0-10)");
+    }
+}
+
 void mxfp4_gemm_k128_entrypoint(
     const at::Tensor &A,
     const at::Tensor &A_sc,
@@ -1458,6 +1487,12 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           pybind11::arg("A"), pybind11::arg("A_sc"),
           pybind11::arg("B"), pybind11::arg("B_sc"),
           pybind11::arg("R"), pybind11::arg("D"));
+    m.def("mxfp4_gemm_residual_config", &mxfp4_gemm_residual_config_entrypoint,
+          "Dense GEMM with fused bf16 residual add and explicit kernel config",
+          pybind11::arg("A"), pybind11::arg("A_sc"),
+          pybind11::arg("B"), pybind11::arg("B_sc"),
+          pybind11::arg("R"), pybind11::arg("D"),
+          pybind11::arg("config_id"));
     m.def("mxfp4_gemm_k128", &mxfp4_gemm_k128_entrypoint);
     m.def("mxfp4_gemm_masked", &mxfp4_gemm_masked_entrypoint,
           pybind11::arg("A"), pybind11::arg("A_sc"),
