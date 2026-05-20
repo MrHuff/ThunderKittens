@@ -17,7 +17,7 @@
 // ================================================================
 namespace mxfp4_batched_gemm {
 
-static constexpr int MAX_BATCHES = 8;
+static constexpr int MAX_BATCHES = 32;
 
 // ---- tma_dev_proxy: gl-like wrapper that returns a device-global CUtensorMap* ----
 template <typename _GL>
@@ -69,6 +69,17 @@ struct globals {
     int       num_batches;
     int       num_row_blocks;
     int       num_col_blocks;
+    int       num_red_blocks_by_batch[MAX_BATCHES];
+    int       num_row_blocks_by_batch[MAX_BATCHES];
+    int       num_col_blocks_by_batch[MAX_BATCHES];
+    int       tile_offsets[MAX_BATCHES + 1];
+    int       total_spatial_tiles;
+    bool      uniform_strided;
+    int       a_row_block_stride;
+    int       a_k_block_stride;
+    int       b_row_block_stride;
+    int       b_k_block_stride;
+    int       d_row_block_stride;
 
     struct input_tiles_t {
         A_fp4x2_tile A;
@@ -83,8 +94,18 @@ struct globals {
     };
 
     __host__ inline dim3 grid() const {
-        int spatial_tiles = num_row_blocks * num_col_blocks;
-        return dim3(min(spatial_tiles, num_sms()), 1, num_batches);
+        int spatial_tiles = total_spatial_tiles > 0
+            ? total_spatial_tiles
+            : num_row_blocks * num_col_blocks;
+        int x = min(spatial_tiles, num_sms());
+        if constexpr (C::CLUSTER_SIZE > 1) {
+            int rem = x % C::CLUSTER_SIZE;
+            if (rem != 0) {
+                x += C::CLUSTER_SIZE - rem;
+            }
+        }
+        int z = total_spatial_tiles > 0 ? 1 : num_batches;
+        return dim3(x, 1, z);
     }
     __host__ inline dim3 block() const { return dim3(C::NUM_THREADS); }
     __host__ inline int dynamic_shared_memory() const {
@@ -97,26 +118,91 @@ struct globals {
 };
 
 template <typename C>
+__device__ inline void resolve_problem_tile(
+    const globals<C> &g,
+    int flat_block_idx,
+    int legacy_batch,
+    int &batch,
+    int &block_idx,
+    int &num_row_blocks,
+    int &num_col_blocks,
+    int &num_red_blocks
+) {
+    if (g.total_spatial_tiles > 0) {
+        int selected = 0;
+        #pragma unroll
+        for (int i = 0; i < MAX_BATCHES; ++i) {
+            if (i < g.num_batches && flat_block_idx >= g.tile_offsets[i]) {
+                selected = i;
+            }
+        }
+        batch = selected;
+        block_idx = flat_block_idx - g.tile_offsets[selected];
+        num_row_blocks = g.num_row_blocks_by_batch[selected];
+        num_col_blocks = g.num_col_blocks_by_batch[selected];
+        num_red_blocks = g.num_red_blocks_by_batch[selected];
+    } else {
+        batch = legacy_batch;
+        block_idx = flat_block_idx;
+        num_row_blocks = g.num_row_blocks;
+        num_col_blocks = g.num_col_blocks;
+        num_red_blocks = g.num_red_blocks;
+    }
+}
+
+template <typename C>
+__device__ inline void resolve_block_coords(
+    int block_idx,
+    int num_row_blocks,
+    int num_col_blocks,
+    int &row_block_idx,
+    int &col_block_idx
+) {
+    const int num_blocks_per_supergroup = C::SUPERGROUP_SIZE * num_col_blocks;
+    int supergroup_idx = block_idx / num_blocks_per_supergroup;
+    int idx_within_supergroup = block_idx % num_blocks_per_supergroup;
+    int rows_in_supergroup = min(C::SUPERGROUP_SIZE, num_row_blocks - supergroup_idx * C::SUPERGROUP_SIZE);
+    int row_within_supergroup = idx_within_supergroup % rows_in_supergroup;
+    row_block_idx = supergroup_idx * C::SUPERGROUP_SIZE + row_within_supergroup;
+    col_block_idx = idx_within_supergroup / rows_in_supergroup;
+}
+
+template <typename C>
 __device__ inline void kernel(const globals<C> &g) {
     using G = globals<C>;
 
-    const int batch = blockIdx.z;
-    const int num_blocks = g.num_row_blocks * g.num_col_blocks;
+    const int legacy_batch = blockIdx.z;
+    const int num_blocks = g.total_spatial_tiles > 0 ? g.total_spatial_tiles : g.num_row_blocks * g.num_col_blocks;
 
     // Prefetch this batch's TMA descriptors
     if (threadIdx.x == 0) {
-        asm volatile("{prefetch.tensormap [%0];}" :: "l"(reinterpret_cast<uint64_t>(&g.A_tma[batch])) : "memory");
-        asm volatile("{prefetch.tensormap [%0];}" :: "l"(reinterpret_cast<uint64_t>(&g.A_sc_tma[batch])) : "memory");
-        asm volatile("{prefetch.tensormap [%0];}" :: "l"(reinterpret_cast<uint64_t>(&g.B_tma[batch])) : "memory");
-        asm volatile("{prefetch.tensormap [%0];}" :: "l"(reinterpret_cast<uint64_t>(&g.B_sc_tma[batch])) : "memory");
-        asm volatile("{prefetch.tensormap [%0];}" :: "l"(reinterpret_cast<uint64_t>(&g.D_tma[batch])) : "memory");
+        if (g.uniform_strided) {
+            asm volatile("{prefetch.tensormap [%0];}" :: "l"(reinterpret_cast<uint64_t>(&g.A_tma[0])) : "memory");
+            asm volatile("{prefetch.tensormap [%0];}" :: "l"(reinterpret_cast<uint64_t>(&g.A_sc_tma[0])) : "memory");
+            asm volatile("{prefetch.tensormap [%0];}" :: "l"(reinterpret_cast<uint64_t>(&g.B_tma[0])) : "memory");
+            asm volatile("{prefetch.tensormap [%0];}" :: "l"(reinterpret_cast<uint64_t>(&g.B_sc_tma[0])) : "memory");
+            asm volatile("{prefetch.tensormap [%0];}" :: "l"(reinterpret_cast<uint64_t>(&g.D_tma[0])) : "memory");
+        } else if (g.total_spatial_tiles > 0) {
+            for (int b = 0; b < g.num_batches; ++b) {
+                asm volatile("{prefetch.tensormap [%0];}" :: "l"(reinterpret_cast<uint64_t>(&g.A_tma[b])) : "memory");
+                asm volatile("{prefetch.tensormap [%0];}" :: "l"(reinterpret_cast<uint64_t>(&g.A_sc_tma[b])) : "memory");
+                asm volatile("{prefetch.tensormap [%0];}" :: "l"(reinterpret_cast<uint64_t>(&g.B_tma[b])) : "memory");
+                asm volatile("{prefetch.tensormap [%0];}" :: "l"(reinterpret_cast<uint64_t>(&g.B_sc_tma[b])) : "memory");
+                asm volatile("{prefetch.tensormap [%0];}" :: "l"(reinterpret_cast<uint64_t>(&g.D_tma[b])) : "memory");
+            }
+        } else {
+            asm volatile("{prefetch.tensormap [%0];}" :: "l"(reinterpret_cast<uint64_t>(&g.A_tma[legacy_batch])) : "memory");
+            asm volatile("{prefetch.tensormap [%0];}" :: "l"(reinterpret_cast<uint64_t>(&g.A_sc_tma[legacy_batch])) : "memory");
+            asm volatile("{prefetch.tensormap [%0];}" :: "l"(reinterpret_cast<uint64_t>(&g.B_tma[legacy_batch])) : "memory");
+            asm volatile("{prefetch.tensormap [%0];}" :: "l"(reinterpret_cast<uint64_t>(&g.B_sc_tma[legacy_batch])) : "memory");
+            asm volatile("{prefetch.tensormap [%0];}" :: "l"(reinterpret_cast<uint64_t>(&g.D_tma[legacy_batch])) : "memory");
+        }
     }
 
     const int warpgroup_id = warpgroup::groupid();
     const int cta_id = cluster_ctarank();
     const int cluster_id = clusterIdx().x;
-    const int num_red_blocks = g.num_red_blocks;
-    const int num_blocks_per_supergroup = C::SUPERGROUP_SIZE * g.num_col_blocks;
+    const int cluster_stride = max(1, gridDim.x / C::CLUSTER_SIZE);
     uint32_t stage = 0;
     uint32_t phasebits = 0xFFFF0000;
 
@@ -148,13 +234,6 @@ __device__ inline void kernel(const globals<C> &g) {
     }
     everyone::tma::cluster::arrive_aligned();
 
-    // Create proxies for this batch's TMA descriptors
-    tma_dev_proxy<typename G::A_fp4x2_gl> proxy_A(&g.A_tma[batch]);
-    tma_dev_proxy<typename G::B_fp4x2_gl> proxy_B(&g.B_tma[batch]);
-    tma_dev_proxy<typename G::A_sc_gl>    proxy_A_sc(&g.A_sc_tma[batch]);
-    tma_dev_proxy<typename G::B_sc_gl>    proxy_B_sc(&g.B_sc_tma[batch]);
-    tma_dev_proxy<typename G::D_gl>       proxy_D(&g.D_tma[batch]);
-
     if (warpgroup_id >= C::CONSUMER_WARPGROUPS && warp::elect_leader()) {
         int warp_id = group<WARPGROUP_WARPS*C::PRODUCER_WARPGROUPS>::warpid();
         if (warp_id == 3) {
@@ -162,18 +241,23 @@ __device__ inline void kernel(const globals<C> &g) {
             pdl::wait();
             everyone::tma::cluster::wait();
 
-            for (int block_idx = cluster_id; block_idx < num_blocks; block_idx += gridDim.x / C::CLUSTER_SIZE) {
-                int supergroup_idx = block_idx / num_blocks_per_supergroup;
-                int idx_within_supergroup = block_idx % num_blocks_per_supergroup;
-                int rows_in_supergroup = min(C::SUPERGROUP_SIZE, g.num_row_blocks - supergroup_idx * C::SUPERGROUP_SIZE);
-                int row_within_supergroup = idx_within_supergroup % rows_in_supergroup;
-                int row_block_idx = supergroup_idx * C::SUPERGROUP_SIZE + row_within_supergroup;
-                int col_block_idx = idx_within_supergroup / rows_in_supergroup;
+            for (int flat_block_idx = cluster_id; flat_block_idx < num_blocks; flat_block_idx += cluster_stride) {
+                int batch, block_idx, num_row_blocks, num_col_blocks, num_red_blocks;
+                int row_block_idx, col_block_idx;
+                resolve_problem_tile<C>(g, flat_block_idx, legacy_batch, batch, block_idx, num_row_blocks, num_col_blocks, num_red_blocks);
+                resolve_block_coords<C>(block_idx, num_row_blocks, num_col_blocks, row_block_idx, col_block_idx);
+                const int tma_batch = g.uniform_strided ? 0 : batch;
+                const int a_row_block_base = g.uniform_strided ? batch * g.a_row_block_stride : 0;
+                const int a_k_block_base = g.uniform_strided ? batch * g.a_k_block_stride : 0;
+                const int b_row_block_base = g.uniform_strided ? batch * g.b_row_block_stride : 0;
+                const int b_k_block_base = g.uniform_strided ? batch * g.b_k_block_stride : 0;
+                tma_dev_proxy<typename G::A_fp4x2_gl> proxy_A(&g.A_tma[tma_batch]);
+                tma_dev_proxy<typename G::B_fp4x2_gl> proxy_B(&g.B_tma[tma_batch]);
 
                 for (int i = 0; i < num_red_blocks; ++i) {
                     wait(inputs_finished[stage], get_phasebit<1>(phasebits, stage));
-                    tma::cluster::load_async(input_tiles[stage].A, proxy_A, {row_block_idx*2 + cta_id, i}, tiles_arrived[stage], (uint16_t)(1<<cta_id), 0);
-                    tma::cluster::load_async(input_tiles[stage].B, proxy_B, {col_block_idx*2 + cta_id, i}, tiles_arrived[stage], (uint16_t)(1<<cta_id), 0);
+                    tma::cluster::load_async(input_tiles[stage].A, proxy_A, {a_row_block_base + row_block_idx*2 + cta_id, a_k_block_base + i}, tiles_arrived[stage], (uint16_t)(1<<cta_id), 0);
+                    tma::cluster::load_async(input_tiles[stage].B, proxy_B, {b_row_block_base + col_block_idx*2 + cta_id, b_k_block_base + i}, tiles_arrived[stage], (uint16_t)(1<<cta_id), 0);
                     update_phasebit<1>(phasebits, stage);
                     stage = (stage + 1) % C::LOAD_PIPE_DEPTH;
                 }
@@ -183,13 +267,18 @@ __device__ inline void kernel(const globals<C> &g) {
             pdl::wait();
             everyone::tma::cluster::wait();
 
-            for (int block_idx = cluster_id; block_idx < num_blocks; block_idx += gridDim.x / C::CLUSTER_SIZE) {
-                int supergroup_idx = block_idx / num_blocks_per_supergroup;
-                int idx_within_supergroup = block_idx % num_blocks_per_supergroup;
-                int rows_in_supergroup = min(C::SUPERGROUP_SIZE, g.num_row_blocks - supergroup_idx * C::SUPERGROUP_SIZE);
-                int row_within_supergroup = idx_within_supergroup % rows_in_supergroup;
-                int row_block_idx = supergroup_idx * C::SUPERGROUP_SIZE + row_within_supergroup;
-                int col_block_idx = idx_within_supergroup / rows_in_supergroup;
+            for (int flat_block_idx = cluster_id; flat_block_idx < num_blocks; flat_block_idx += cluster_stride) {
+                int batch, block_idx, num_row_blocks, num_col_blocks, num_red_blocks;
+                int row_block_idx, col_block_idx;
+                resolve_problem_tile<C>(g, flat_block_idx, legacy_batch, batch, block_idx, num_row_blocks, num_col_blocks, num_red_blocks);
+                resolve_block_coords<C>(block_idx, num_row_blocks, num_col_blocks, row_block_idx, col_block_idx);
+                const int tma_batch = g.uniform_strided ? 0 : batch;
+                const int a_row_block_base = g.uniform_strided ? batch * g.a_row_block_stride : 0;
+                const int a_sc_k_block_base = g.uniform_strided ? batch * g.a_k_block_stride * C::MMA_PER_TILE : 0;
+                const int b_sc_row_block_base = g.uniform_strided ? batch * g.b_row_block_stride : 0;
+                const int b_sc_k_block_base = g.uniform_strided ? batch * g.b_k_block_stride * C::MMA_PER_TILE : 0;
+                tma_dev_proxy<typename G::A_sc_gl> proxy_A_sc(&g.A_sc_tma[tma_batch]);
+                tma_dev_proxy<typename G::B_sc_gl> proxy_B_sc(&g.B_sc_tma[tma_batch]);
 
                 for (int i = 0; i < num_red_blocks; ++i) {
                     wait(inputs_finished[stage], get_phasebit<1>(phasebits, stage));
@@ -198,7 +287,7 @@ __device__ inline void kernel(const globals<C> &g) {
                         tma::cluster::load_async(
                             input_scales[stage].A[k],
                             proxy_A_sc,
-                            {row_block_idx*2 + cta_id, i * C::MMA_PER_TILE + k, 0, 0},
+                            {a_row_block_base + row_block_idx*2 + cta_id, a_sc_k_block_base + i * C::MMA_PER_TILE + k, 0, 0},
                             scales_arrived[stage],
                             (uint16_t)(1<<cta_id),
                             0
@@ -210,7 +299,7 @@ __device__ inline void kernel(const globals<C> &g) {
                             tma::cluster::load_async(
                                 input_scales[stage].B[cta_id * C::MMA_PER_TILE + k],
                                 proxy_B_sc,
-                                {col_block_idx*2 + cta_id, i * C::MMA_PER_TILE + k, 0, 0},
+                                {b_sc_row_block_base + col_block_idx*2 + cta_id, b_sc_k_block_base + i * C::MMA_PER_TILE + k, 0, 0},
                                 scales_arrived[stage],
                                 (uint16_t)(0b11),
                                 0
@@ -220,9 +309,9 @@ __device__ inline void kernel(const globals<C> &g) {
                         #pragma unroll
                         for (int k = 0; k < C::MMA_PER_TILE; ++k) {
                             tma::cluster::load_async(
-                                input_scales[stage].B[k],
-                                proxy_B_sc,
-                                {col_block_idx, i * C::MMA_PER_TILE + k, 0, 0},
+                            input_scales[stage].B[k],
+                            proxy_B_sc,
+                            {b_sc_row_block_base + col_block_idx, b_sc_k_block_base + i * C::MMA_PER_TILE + k, 0, 0},
                                 scales_arrived[stage],
                                 (uint16_t)(0b11),
                                 0
@@ -242,7 +331,9 @@ __device__ inline void kernel(const globals<C> &g) {
             auto A_sc_tm = tm_allocator.template allocate<full_tt_fp8e8m0<16*C::MMA_PER_TILE*C::LOAD_PIPE_DEPTH>>(256);
             auto B_sc_tm = tm_allocator.template allocate<full_tt_fp8e8m0<32*C::MMA_PER_TILE*C::LOAD_PIPE_DEPTH>>(256 + 4 * C::MMA_PER_TILE * C::LOAD_PIPE_DEPTH);
 
-            for (int block_idx = cluster_id; block_idx < num_blocks; block_idx += gridDim.x / C::CLUSTER_SIZE) {
+            for (int flat_block_idx = cluster_id; flat_block_idx < num_blocks; flat_block_idx += cluster_stride) {
+                int batch, block_idx, num_row_blocks, num_col_blocks, num_red_blocks;
+                resolve_problem_tile<C>(g, flat_block_idx, legacy_batch, batch, block_idx, num_row_blocks, num_col_blocks, num_red_blocks);
                 wait(outputs_finished, get_phasebit<1>(phasebits, 0));
                 tensor_after_thread_sync();
                 for (int i = 0; i < num_red_blocks; i++) {
@@ -287,59 +378,68 @@ __device__ inline void kernel(const globals<C> &g) {
         tm_allocator.set_addr(tmem_addr);
         auto out_tm = tm_allocator.template allocate<full_tt_fl<C::Nb>>(0);
 
-        for (int block_idx = cluster_id; block_idx < num_blocks; block_idx += gridDim.x / C::CLUSTER_SIZE) {
-            int supergroup_idx = block_idx / num_blocks_per_supergroup;
-            int idx_within_supergroup = block_idx % num_blocks_per_supergroup;
-            int rows_in_supergroup = min(C::SUPERGROUP_SIZE, g.num_row_blocks - supergroup_idx * C::SUPERGROUP_SIZE);
-            int row_within_supergroup = idx_within_supergroup % rows_in_supergroup;
-            int row_block_idx = supergroup_idx * C::SUPERGROUP_SIZE + row_within_supergroup;
-            int col_block_idx = idx_within_supergroup / rows_in_supergroup;
+        for (int flat_block_idx = cluster_id; flat_block_idx < num_blocks; flat_block_idx += cluster_stride) {
+            int batch, block_idx, num_row_blocks, num_col_blocks, num_red_blocks;
+            int row_block_idx, col_block_idx;
+            resolve_problem_tile<C>(g, flat_block_idx, legacy_batch, batch, block_idx, num_row_blocks, num_col_blocks, num_red_blocks);
+            resolve_block_coords<C>(block_idx, num_row_blocks, num_col_blocks, row_block_idx, col_block_idx);
+            const int tma_batch = g.uniform_strided ? 0 : batch;
+            const int d_row_block_base = g.uniform_strided ? batch * g.d_row_block_stride : 0;
+            const int rope_batch = g.uniform_strided ? 0 : batch;
+            tma_dev_proxy<typename G::D_gl> proxy_D(&g.D_tma[tma_batch]);
 
             wait(outputs_arrived, get_phasebit<0>(phasebits, 0));
 
-            // Non-overlapping epilogue: load all subtiles, convert, store
-            rt_bf<C::Mb / 8, C::Nb/C::EPI_PIPE_DEPTH> D_reg[C::EPI_PIPE_DEPTH];
+            // Non-overlapping epilogue: load all subtiles, apply the same
+            // MXFP4 dequant correction as the single-GEMM kernel, then store.
+            constexpr float MXFP4_ALPHA = 1.0f / 36.0f;
+            rt_fl<C::Mb / 8, C::Nb/C::EPI_PIPE_DEPTH> D_reg_fl[C::EPI_PIPE_DEPTH];
             #pragma unroll
             for (int i = 0; i < C::EPI_PIPE_DEPTH; i++)
-                warpgroup::load_async(D_reg[i], out_tm.template subtile<full_tt_fl<C::Nb/C::EPI_PIPE_DEPTH>>(0, C::Nb/C::EPI_PIPE_DEPTH*i));
+                warpgroup::load_async(D_reg_fl[i], out_tm.template subtile<full_tt_fl<C::Nb/C::EPI_PIPE_DEPTH>>(0, C::Nb/C::EPI_PIPE_DEPTH*i));
             tensor_load_wait();
             tensor_before_thread_sync();
             warpgroup::sync(1);
             warpgroup::tma::cluster::arrive(outputs_finished, 0, 1);
             #pragma unroll
             for (int i = 0; i < C::EPI_PIPE_DEPTH; i++) {
-                if (g.rope_live64[batch].enabled()) {
+                warp::mul(D_reg_fl[i], D_reg_fl[i], MXFP4_ALPHA);
+                if (g.rope_live64[rope_batch].enabled()) {
                     if constexpr (C::ROPE_LIVE64_RHT32) {
                         mxfp4_rope_epilogue::apply_inplace_live64_rht32(
-                            D_reg[i],
-                            g.rope_live64[batch],
+                            D_reg_fl[i],
+                            g.rope_live64[rope_batch],
                             (row_block_idx * 2 + cta_id) * (C::Mb / 2),
                             (col_block_idx * C::EPI_PIPE_DEPTH + i) * (C::Nb / C::EPI_PIPE_DEPTH)
                         );
                     } else {
                         mxfp4_rope_epilogue::apply_inplace_live64(
-                            D_reg[i],
-                            g.rope_live64[batch],
+                            D_reg_fl[i],
+                            g.rope_live64[rope_batch],
                             (row_block_idx * 2 + cta_id) * (C::Mb / 2),
                             (col_block_idx * C::EPI_PIPE_DEPTH + i) * (C::Nb / C::EPI_PIPE_DEPTH)
                         );
                     }
                 } else {
                     mxfp4_rope_epilogue::apply_inplace(
-                        D_reg[i],
-                        g.rope[batch],
+                        D_reg_fl[i],
+                        g.rope[rope_batch],
                         (row_block_idx * 2 + cta_id) * (C::Mb / 2),
                         (col_block_idx * C::EPI_PIPE_DEPTH + i) * (C::Nb / C::EPI_PIPE_DEPTH)
                     );
                 }
             }
+            rt_bf<C::Mb / 8, C::Nb/C::EPI_PIPE_DEPTH> D_reg[C::EPI_PIPE_DEPTH];
+            #pragma unroll
+            for (int i = 0; i < C::EPI_PIPE_DEPTH; i++)
+                warp::copy(D_reg[i], D_reg_fl[i]);
             #pragma unroll
             for (int i = 0; i < C::EPI_PIPE_DEPTH; i++) {
                 warpgroup::tma::store_async_read_wait<C::NUM_D_TILES-1>();
                 warpgroup::sync(1);
                 warpgroup::store(output_tiles.D[i%C::NUM_D_TILES], D_reg[i]);
                 warpgroup::sync(1);
-                warpgroup::tma::store_async<dim::ROW, cache_policy::EVICT_FIRST>(proxy_D, output_tiles.D[i%C::NUM_D_TILES], {row_block_idx*2 + cta_id, C::EPI_PIPE_DEPTH*col_block_idx + i});
+                warpgroup::tma::store_async<dim::ROW, cache_policy::EVICT_FIRST>(proxy_D, output_tiles.D[i%C::NUM_D_TILES], {d_row_block_base + row_block_idx*2 + cta_id, C::EPI_PIPE_DEPTH*col_block_idx + i});
             }
             update_phasebit<0>(phasebits, 0);
         }
