@@ -7,6 +7,7 @@
 #include "mxfp4_batched_gemm.cuh"
 #include "mxfp4_split2_accum_gemm.cuh"
 #include "mxfp4_split3_accum_gemm.cuh"
+#include <algorithm>
 #include <cstdlib>
 #include <cstdint>
 #include <cstring>
@@ -400,52 +401,54 @@ __global__ void deepseek_mla_inverse_rope_pack_grad_kernel(
     int padded_n,
     int seq_len
 ) {
-    int64_t linear = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-    if (linear >= total) {
-        return;
-    }
+    const int64_t stride = static_cast<int64_t>(blockDim.x) * gridDim.x;
+    for (
+        int64_t linear = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+        linear < total;
+        linear += stride
+    ) {
+        const int row = static_cast<int>(linear / padded_n);
+        const int col = static_cast<int>(linear - static_cast<int64_t>(row) * padded_n);
+        const int kpe_base = q_dim + kv_pad_dim;
+        __nv_bfloat16 value = __float2bfloat16_rn(0.0f);
 
-    const int row = static_cast<int>(linear / padded_n);
-    const int col = static_cast<int>(linear - static_cast<int64_t>(row) * padded_n);
-    const int kpe_base = q_dim + kv_pad_dim;
-    __nv_bfloat16 value = __float2bfloat16_rn(0.0f);
-
-    if (col < q_dim) {
-        const int head_col = col % qk_head_dim;
-        if (head_col < rope_dim) {
-            const int pair_col = col - head_col + ((head_col / 2) * 2);
-            const float x = __bfloat162float(grad_q[static_cast<int64_t>(row) * q_dim + pair_col]);
-            const float y = __bfloat162float(grad_q[static_cast<int64_t>(row) * q_dim + pair_col + 1]);
-            const int rope_offset = (row % seq_len) * (rope_dim / 2) + (head_col / 2);
-            const float c = rope_cos[rope_offset];
-            const float s = rope_sin[rope_offset];
-            const float rotated = (head_col & 1) == 0 ? (x * c + y * s) : (y * c - x * s);
-            value = __float2bfloat16_rn(rotated);
+        if (col < q_dim) {
+            const int head_col = col % qk_head_dim;
+            if (head_col < rope_dim) {
+                const int pair_col = col - head_col + ((head_col / 2) * 2);
+                const float x = __bfloat162float(grad_q[static_cast<int64_t>(row) * q_dim + pair_col]);
+                const float y = __bfloat162float(grad_q[static_cast<int64_t>(row) * q_dim + pair_col + 1]);
+                const int rope_offset = (row % seq_len) * (rope_dim / 2) + (head_col / 2);
+                const float c = rope_cos[rope_offset];
+                const float s = rope_sin[rope_offset];
+                const float rotated = (head_col & 1) == 0 ? (x * c + y * s) : (y * c - x * s);
+                value = __float2bfloat16_rn(rotated);
+            } else {
+                value = grad_q[static_cast<int64_t>(row) * q_dim + col];
+            }
+        } else if (col < kpe_base) {
+            const int kv_col = col - q_dim;
+            if (kv_col < kv_lora_rank) {
+                value = grad_kv[static_cast<int64_t>(row) * kv_lora_rank + kv_col];
+            }
         } else {
-            value = grad_q[static_cast<int64_t>(row) * q_dim + col];
+            const int kpe_col = col - kpe_base;
+            if (kpe_col < rope_dim) {
+                const int pair_col = (kpe_col / 2) * 2;
+                const float x = __bfloat162float(grad_kpe[static_cast<int64_t>(row) * rope_dim + pair_col]);
+                const float y = __bfloat162float(grad_kpe[static_cast<int64_t>(row) * rope_dim + pair_col + 1]);
+                const int rope_offset = (row % seq_len) * (rope_dim / 2) + (kpe_col / 2);
+                const float c = rope_cos[rope_offset];
+                const float s = rope_sin[rope_offset];
+                const float rotated = (kpe_col & 1) == 0 ? (x * c + y * s) : (y * c - x * s);
+                value = __float2bfloat16_rn(rotated);
+            } else if (kpe_col < kpe_pad_dim) {
+                value = __float2bfloat16_rn(0.0f);
+            }
         }
-    } else if (col < kpe_base) {
-        const int kv_col = col - q_dim;
-        if (kv_col < kv_lora_rank) {
-            value = grad_kv[static_cast<int64_t>(row) * kv_lora_rank + kv_col];
-        }
-    } else {
-        const int kpe_col = col - kpe_base;
-        if (kpe_col < rope_dim) {
-            const int pair_col = (kpe_col / 2) * 2;
-            const float x = __bfloat162float(grad_kpe[static_cast<int64_t>(row) * rope_dim + pair_col]);
-            const float y = __bfloat162float(grad_kpe[static_cast<int64_t>(row) * rope_dim + pair_col + 1]);
-            const int rope_offset = (row % seq_len) * (rope_dim / 2) + (kpe_col / 2);
-            const float c = rope_cos[rope_offset];
-            const float s = rope_sin[rope_offset];
-            const float rotated = (kpe_col & 1) == 0 ? (x * c + y * s) : (y * c - x * s);
-            value = __float2bfloat16_rn(rotated);
-        } else if (kpe_col < kpe_pad_dim) {
-            value = __float2bfloat16_rn(0.0f);
-        }
-    }
 
-    out[linear] = value;
+        out[linear] = value;
+    }
 }
 
 void mxfp4_deepseek_mla_inverse_rope_pack_grad_entrypoint(
@@ -496,7 +499,12 @@ void mxfp4_deepseek_mla_inverse_rope_pack_grad_entrypoint(
 
     const int threads = 256;
     const int64_t total = M * padded_n;
-    const int blocks = static_cast<int>((total + threads - 1) / threads);
+    const int64_t needed_blocks = (total + threads - 1) / threads;
+    int max_blocks = 32768;
+    if (const char* env = std::getenv("MXFP4_DEEPSEEK_MLA_PACK_GRAD_BLOCKS")) {
+        max_blocks = std::max(1, std::atoi(env));
+    }
+    const int blocks = static_cast<int>(needed_blocks < max_blocks ? needed_blocks : max_blocks);
     deepseek_mla_inverse_rope_pack_grad_kernel<<<blocks, threads, 0, c10::cuda::getCurrentCUDAStream()>>>(
         reinterpret_cast<const __nv_bfloat16*>(grad_q.data_ptr<at::BFloat16>()),
         reinterpret_cast<const __nv_bfloat16*>(grad_kv.data_ptr<at::BFloat16>()),
@@ -1862,7 +1870,42 @@ void mxfp4_batched_gemm_rope_entrypoint(
         kittens::py::launch_kernel<C, G, mxfp4_batched_gemm::kernel<C>>(g_host);
     };
 
-    if (N_out <= 4096) {
+    int forced_config = -1;
+    if (const char* env = std::getenv("MXFP4_BATCHED_GEMM_ROPE_CONFIG_ID")) {
+        forced_config = std::atoi(env);
+    }
+    if (forced_config >= 0) {
+        switch (forced_config) {
+        case 0:  build_and_launch.template operator()<mxfp4_gemm::config<256, 5,  8,  4, 2, false>>(); break;
+        case 1:  build_and_launch.template operator()<mxfp4_gemm::config<256, 4, 16,  4, 2, false>>(); break;
+        case 2:  build_and_launch.template operator()<mxfp4_gemm::config<256, 5,  8,  8, 2, true >>(); break;
+        case 3:  build_and_launch.template operator()<mxfp4_gemm::config<256, 5,  8, 12, 4, true >>(); break;
+        case 4:  build_and_launch.template operator()<mxfp4_gemm::config<256, 5,  8, 12, 2, false>>(); break;
+        case 5:  build_and_launch.template operator()<mxfp4_gemm::config<256, 5, 16,  4, 2, true >>(); break;
+        case 6:  build_and_launch.template operator()<mxfp4_gemm::config<256, 4,  8, 12, 2, false>>(); break;
+        case 7:  build_and_launch.template operator()<mxfp4_gemm::config<256, 5,  8,  4, 4, false>>(); break;
+        case 8:  build_and_launch.template operator()<mxfp4_gemm::config<256, 4, 16, 12, 2, false>>(); break;
+        case 9:  build_and_launch.template operator()<mxfp4_gemm::config<256, 5,  8,  4, 2, true >>(); break;
+        case 10: build_and_launch.template operator()<mxfp4_gemm::config<256, 5,  4, 12, 2, false>>(); break;
+        default: TORCH_CHECK(false, "Invalid MXFP4_BATCHED_GEMM_ROPE_CONFIG_ID: ", forced_config);
+        }
+        return;
+    }
+    const int64_t K = 2 * A_list[0].size(1);
+    if (
+        n == 3
+        && M >= 32768
+        && K == 2048
+        && D_out_list[0].size(1) == 3072
+        && D_out_list[1].size(1) == 512
+        && D_out_list[2].size(1) == 256
+        && rope_head_dim_list[0] == 192
+        && rope_rotary_dim_list[0] == 64
+        && rope_head_dim_list[2] == 64
+        && rope_rotary_dim_list[2] == 64
+    ) {
+        build_and_launch.template operator()<mxfp4_gemm::config<256, 5, 8, 12, 2, false>>();
+    } else if (N_out <= 4096) {
         build_and_launch.template operator()<mxfp4_gemm::config<256, 5, 8, 4, 2, false>>();
     } else {
         build_and_launch.template operator()<mxfp4_gemm::config<256, 4, 16, 4, 2, false>>();
