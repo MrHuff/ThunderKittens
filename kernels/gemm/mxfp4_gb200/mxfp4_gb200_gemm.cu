@@ -11,6 +11,8 @@
 #include <cstdint>
 #include <cstring>
 #include <optional>
+#include <c10/cuda/CUDAException.h>
+#include <c10/cuda/CUDAStream.h>
 
 #ifndef TORCH_COMPILE
 
@@ -379,6 +381,139 @@ void check_rope_live64_args(
     TORCH_CHECK(D.size(1) % 64 == 0, "output cols must be divisible by 64");
     check_rope_live64_tensor(rope_cs, "rope_cs", rope_seq_len);
     kittens::py::device_check(D, rope_cs);
+}
+
+__global__ void deepseek_mla_inverse_rope_pack_grad_kernel(
+    const __nv_bfloat16* __restrict__ grad_q,
+    const __nv_bfloat16* __restrict__ grad_kv,
+    const __nv_bfloat16* __restrict__ grad_kpe,
+    const float* __restrict__ rope_cos,
+    const float* __restrict__ rope_sin,
+    __nv_bfloat16* __restrict__ out,
+    int64_t total,
+    int q_dim,
+    int qk_head_dim,
+    int rope_dim,
+    int kv_lora_rank,
+    int kv_pad_dim,
+    int kpe_pad_dim,
+    int padded_n,
+    int seq_len
+) {
+    int64_t linear = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (linear >= total) {
+        return;
+    }
+
+    const int row = static_cast<int>(linear / padded_n);
+    const int col = static_cast<int>(linear - static_cast<int64_t>(row) * padded_n);
+    const int kpe_base = q_dim + kv_pad_dim;
+    __nv_bfloat16 value = __float2bfloat16_rn(0.0f);
+
+    if (col < q_dim) {
+        const int head_col = col % qk_head_dim;
+        if (head_col < rope_dim) {
+            const int pair_col = col - head_col + ((head_col / 2) * 2);
+            const float x = __bfloat162float(grad_q[static_cast<int64_t>(row) * q_dim + pair_col]);
+            const float y = __bfloat162float(grad_q[static_cast<int64_t>(row) * q_dim + pair_col + 1]);
+            const int rope_offset = (row % seq_len) * (rope_dim / 2) + (head_col / 2);
+            const float c = rope_cos[rope_offset];
+            const float s = rope_sin[rope_offset];
+            const float rotated = (head_col & 1) == 0 ? (x * c + y * s) : (y * c - x * s);
+            value = __float2bfloat16_rn(rotated);
+        } else {
+            value = grad_q[static_cast<int64_t>(row) * q_dim + col];
+        }
+    } else if (col < kpe_base) {
+        const int kv_col = col - q_dim;
+        if (kv_col < kv_lora_rank) {
+            value = grad_kv[static_cast<int64_t>(row) * kv_lora_rank + kv_col];
+        }
+    } else {
+        const int kpe_col = col - kpe_base;
+        if (kpe_col < rope_dim) {
+            const int pair_col = (kpe_col / 2) * 2;
+            const float x = __bfloat162float(grad_kpe[static_cast<int64_t>(row) * rope_dim + pair_col]);
+            const float y = __bfloat162float(grad_kpe[static_cast<int64_t>(row) * rope_dim + pair_col + 1]);
+            const int rope_offset = (row % seq_len) * (rope_dim / 2) + (kpe_col / 2);
+            const float c = rope_cos[rope_offset];
+            const float s = rope_sin[rope_offset];
+            const float rotated = (kpe_col & 1) == 0 ? (x * c + y * s) : (y * c - x * s);
+            value = __float2bfloat16_rn(rotated);
+        } else if (kpe_col < kpe_pad_dim) {
+            value = __float2bfloat16_rn(0.0f);
+        }
+    }
+
+    out[linear] = value;
+}
+
+void mxfp4_deepseek_mla_inverse_rope_pack_grad_entrypoint(
+    const at::Tensor& grad_q,
+    const at::Tensor& grad_kv,
+    const at::Tensor& grad_kpe,
+    const at::Tensor& rope_cos,
+    const at::Tensor& rope_sin,
+    at::Tensor& out,
+    int64_t seq_len,
+    int64_t n_heads,
+    int64_t qk_head_dim,
+    int64_t rope_dim,
+    int64_t kv_lora_rank,
+    int64_t kv_pad_dim,
+    int64_t kpe_pad_dim
+) {
+    TORCH_CHECK(grad_q.is_cuda() && grad_kv.is_cuda() && grad_kpe.is_cuda() && out.is_cuda(),
+                "DeepSeek MLA grad pack expects CUDA tensors");
+    TORCH_CHECK(grad_q.is_contiguous() && grad_kv.is_contiguous() &&
+                grad_kpe.is_contiguous() && out.is_contiguous(),
+                "DeepSeek MLA grad pack expects contiguous tensors");
+    TORCH_CHECK(grad_q.dim() == 2 && grad_kv.dim() == 2 && grad_kpe.dim() == 2 && out.dim() == 2,
+                "DeepSeek MLA grad pack expects 2D tensors");
+    TORCH_CHECK(grad_q.scalar_type() == at::kBFloat16 &&
+                grad_kv.scalar_type() == at::kBFloat16 &&
+                grad_kpe.scalar_type() == at::kBFloat16 &&
+                out.scalar_type() == at::kBFloat16,
+                "DeepSeek MLA grad pack tensors must be bf16");
+    TORCH_CHECK(seq_len > 0 && n_heads > 0 && qk_head_dim > 0 && rope_dim > 0,
+                "DeepSeek MLA grad pack received invalid dimensions");
+    TORCH_CHECK((rope_dim % 2) == 0 && rope_dim <= qk_head_dim,
+                "DeepSeek MLA grad pack requires an even rope_dim <= qk_head_dim");
+    const int64_t M = grad_q.size(0);
+    const int64_t q_dim = n_heads * qk_head_dim;
+    const int64_t padded_n = q_dim + kv_pad_dim + kpe_pad_dim;
+    TORCH_CHECK(M % seq_len == 0, "DeepSeek MLA grad pack rows must be divisible by seq_len");
+    TORCH_CHECK(grad_q.size(1) == q_dim, "DeepSeek MLA grad_q width mismatch");
+    TORCH_CHECK(grad_kv.size(0) == M && grad_kv.size(1) == kv_lora_rank,
+                "DeepSeek MLA grad_kv shape mismatch");
+    TORCH_CHECK(grad_kpe.size(0) == M && grad_kpe.size(1) == rope_dim,
+                "DeepSeek MLA grad_kpe shape mismatch");
+    TORCH_CHECK(out.size(0) == M && out.size(1) == padded_n,
+                "DeepSeek MLA packed grad output shape mismatch");
+    check_rope_tensor(rope_cos, "rope_cos", seq_len, rope_dim);
+    check_rope_tensor(rope_sin, "rope_sin", seq_len, rope_dim);
+    kittens::py::device_check(grad_q, grad_kv, grad_kpe, rope_cos, rope_sin, out);
+
+    const int threads = 256;
+    const int64_t total = M * padded_n;
+    const int blocks = static_cast<int>((total + threads - 1) / threads);
+    deepseek_mla_inverse_rope_pack_grad_kernel<<<blocks, threads, 0, c10::cuda::getCurrentCUDAStream()>>>(
+        reinterpret_cast<const __nv_bfloat16*>(grad_q.data_ptr<at::BFloat16>()),
+        reinterpret_cast<const __nv_bfloat16*>(grad_kv.data_ptr<at::BFloat16>()),
+        reinterpret_cast<const __nv_bfloat16*>(grad_kpe.data_ptr<at::BFloat16>()),
+        rope_cos.data_ptr<float>(),
+        rope_sin.data_ptr<float>(),
+        reinterpret_cast<__nv_bfloat16*>(out.data_ptr<at::BFloat16>()),
+        total,
+        static_cast<int>(q_dim),
+        static_cast<int>(qk_head_dim),
+        static_cast<int>(rope_dim),
+        static_cast<int>(kv_lora_rank),
+        static_cast<int>(kv_pad_dim),
+        static_cast<int>(kpe_pad_dim),
+        static_cast<int>(padded_n),
+        static_cast<int>(seq_len));
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
 static bool use_rope_live64_rht32() {
@@ -1675,8 +1810,28 @@ void mxfp4_batched_gemm_rope_entrypoint(
         g_host.num_row_blocks = (int)(M / C::Mb);
         g_host.num_col_blocks = (int)(N_out / C::Nb);
         g_host.num_red_blocks = (int)(2 * A_list[0].size(1) / C::Kb);
+        g_host.tile_offsets[0] = 0;
+        g_host.total_spatial_tiles = 0;
+        g_host.uniform_strided = false;
 
         for (int i = 0; i < n; ++i) {
+            const int row_blocks = (int)(D_out_list[i].size(0) / C::Mb);
+            const int col_blocks = (int)(D_out_list[i].size(1) / C::Nb);
+            const int red_blocks = (int)(2 * A_list[i].size(1) / C::Kb);
+            TORCH_CHECK(row_blocks > 0 && col_blocks > 0 && red_blocks > 0,
+                        "mxfp4_batched_gemm_rope expects positive tile counts");
+            TORCH_CHECK(D_out_list[i].size(0) % C::Mb == 0,
+                        "mxfp4_batched_gemm_rope D rows must be a multiple of ", C::Mb);
+            TORCH_CHECK(D_out_list[i].size(1) % C::Nb == 0,
+                        "mxfp4_batched_gemm_rope D cols must be a multiple of ", C::Nb);
+            TORCH_CHECK((2 * A_list[i].size(1)) % C::Kb == 0,
+                        "mxfp4_batched_gemm_rope K must be a multiple of ", C::Kb);
+            g_host.num_row_blocks_by_batch[i] = row_blocks;
+            g_host.num_col_blocks_by_batch[i] = col_blocks;
+            g_host.num_red_blocks_by_batch[i] = red_blocks;
+            g_host.total_spatial_tiles += row_blocks * col_blocks;
+            g_host.tile_offsets[i + 1] = g_host.total_spatial_tiles;
+
             auto a_gl = kittens::py::tensor_to_gl<typename G::A_fp4x2_gl>(A_list[i]);
             auto a_sc_gl = kittens::py::tensor_to_gl<typename G::A_sc_gl>(A_sc_list[i]);
             auto b_gl = kittens::py::tensor_to_gl<typename G::B_fp4x2_gl>(B_list[i]);
@@ -1743,8 +1898,28 @@ void mxfp4_batched_gemm_rope_live64_entrypoint(
         g_host.num_row_blocks = (int)(M / C::Mb);
         g_host.num_col_blocks = (int)(N_out / C::Nb);
         g_host.num_red_blocks = (int)(2 * A_list[0].size(1) / C::Kb);
+        g_host.tile_offsets[0] = 0;
+        g_host.total_spatial_tiles = 0;
+        g_host.uniform_strided = false;
 
         for (int i = 0; i < n; ++i) {
+            const int row_blocks = (int)(D_out_list[i].size(0) / C::Mb);
+            const int col_blocks = (int)(D_out_list[i].size(1) / C::Nb);
+            const int red_blocks = (int)(2 * A_list[i].size(1) / C::Kb);
+            TORCH_CHECK(row_blocks > 0 && col_blocks > 0 && red_blocks > 0,
+                        "mxfp4_batched_gemm_rope_live64 expects positive tile counts");
+            TORCH_CHECK(D_out_list[i].size(0) % C::Mb == 0,
+                        "mxfp4_batched_gemm_rope_live64 D rows must be a multiple of ", C::Mb);
+            TORCH_CHECK(D_out_list[i].size(1) % C::Nb == 0,
+                        "mxfp4_batched_gemm_rope_live64 D cols must be a multiple of ", C::Nb);
+            TORCH_CHECK((2 * A_list[i].size(1)) % C::Kb == 0,
+                        "mxfp4_batched_gemm_rope_live64 K must be a multiple of ", C::Kb);
+            g_host.num_row_blocks_by_batch[i] = row_blocks;
+            g_host.num_col_blocks_by_batch[i] = col_blocks;
+            g_host.num_red_blocks_by_batch[i] = red_blocks;
+            g_host.total_spatial_tiles += row_blocks * col_blocks;
+            g_host.tile_offsets[i + 1] = g_host.total_spatial_tiles;
+
             auto a_gl = kittens::py::tensor_to_gl<typename G::A_fp4x2_gl>(A_list[i]);
             auto a_sc_gl = kittens::py::tensor_to_gl<typename G::A_sc_gl>(A_sc_list[i]);
             auto b_gl = kittens::py::tensor_to_gl<typename G::B_fp4x2_gl>(B_list[i]);
@@ -1814,8 +1989,28 @@ void mxfp4_batched_gemm_rope_live64_config_entrypoint(
         g_host.num_row_blocks = (int)(M / C::Mb);
         g_host.num_col_blocks = (int)(N_out / C::Nb);
         g_host.num_red_blocks = (int)(2 * A_list[0].size(1) / C::Kb);
+        g_host.tile_offsets[0] = 0;
+        g_host.total_spatial_tiles = 0;
+        g_host.uniform_strided = false;
 
         for (int i = 0; i < n; ++i) {
+            const int row_blocks = (int)(D_out_list[i].size(0) / C::Mb);
+            const int col_blocks = (int)(D_out_list[i].size(1) / C::Nb);
+            const int red_blocks = (int)(2 * A_list[i].size(1) / C::Kb);
+            TORCH_CHECK(row_blocks > 0 && col_blocks > 0 && red_blocks > 0,
+                        "mxfp4_batched_gemm_rope_live64_config expects positive tile counts");
+            TORCH_CHECK(D_out_list[i].size(0) % C::Mb == 0,
+                        "mxfp4_batched_gemm_rope_live64_config D rows must be a multiple of ", C::Mb);
+            TORCH_CHECK(D_out_list[i].size(1) % C::Nb == 0,
+                        "mxfp4_batched_gemm_rope_live64_config D cols must be a multiple of ", C::Nb);
+            TORCH_CHECK((2 * A_list[i].size(1)) % C::Kb == 0,
+                        "mxfp4_batched_gemm_rope_live64_config K must be a multiple of ", C::Kb);
+            g_host.num_row_blocks_by_batch[i] = row_blocks;
+            g_host.num_col_blocks_by_batch[i] = col_blocks;
+            g_host.num_red_blocks_by_batch[i] = red_blocks;
+            g_host.total_spatial_tiles += row_blocks * col_blocks;
+            g_host.tile_offsets[i + 1] = g_host.total_spatial_tiles;
+
             auto a_gl = kittens::py::tensor_to_gl<typename G::A_fp4x2_gl>(A_list[i]);
             auto a_sc_gl = kittens::py::tensor_to_gl<typename G::A_sc_gl>(A_sc_list[i]);
             auto b_gl = kittens::py::tensor_to_gl<typename G::B_fp4x2_gl>(B_list[i]);
@@ -1983,6 +2178,22 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           pybind11::arg("rope_head_dim"),
           pybind11::arg("rope_rotary_dim"),
           pybind11::arg("config_id"));
+    m.def("mxfp4_deepseek_mla_inverse_rope_pack_grad",
+          &mxfp4_deepseek_mla_inverse_rope_pack_grad_entrypoint,
+          "DeepSeek MLA backward helper: inverse RoPE q/k_pe grads and pack padded dY",
+          pybind11::arg("grad_q"),
+          pybind11::arg("grad_kv"),
+          pybind11::arg("grad_kpe"),
+          pybind11::arg("rope_cos"),
+          pybind11::arg("rope_sin"),
+          pybind11::arg("out"),
+          pybind11::arg("seq_len"),
+          pybind11::arg("n_heads"),
+          pybind11::arg("qk_head_dim"),
+          pybind11::arg("rope_dim"),
+          pybind11::arg("kv_lora_rank"),
+          pybind11::arg("kv_pad_dim"),
+          pybind11::arg("kpe_pad_dim"));
 
     m.def("mxfp4_batched_gemm", &mxfp4_batched_gemm_entrypoint,
           "True Batched GEMM: D_i = A_i × B_i^T, independently per batch",
