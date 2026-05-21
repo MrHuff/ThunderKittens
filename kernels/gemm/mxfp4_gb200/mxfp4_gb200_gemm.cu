@@ -500,7 +500,16 @@ void mxfp4_deepseek_mla_inverse_rope_pack_grad_entrypoint(
     const int threads = 256;
     const int64_t total = M * padded_n;
     const int64_t needed_blocks = (total + threads - 1) / threads;
-    int max_blocks = 32768;
+    int max_blocks = 2048;
+    if (needed_blocks > 8192) {
+        max_blocks = 4096;
+    }
+    if (needed_blocks > 65536) {
+        max_blocks = 8192;
+    }
+    if (needed_blocks > 131072) {
+        max_blocks = 16384;
+    }
     if (const char* env = std::getenv("MXFP4_DEEPSEEK_MLA_PACK_GRAD_BLOCKS")) {
         max_blocks = std::max(1, std::atoi(env));
     }
