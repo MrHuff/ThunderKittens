@@ -890,6 +890,38 @@ void mxfp4_gemm_k128_entrypoint(
     launch_mxfp4_gemm_dense<mxfp4_gemm::config<256, 5, 8, 4, 2, false, 128>>(A, A_sc, B, B_sc, D);
 }
 
+void mxfp4_gemm_n128_entrypoint(
+    const at::Tensor &A,
+    const at::Tensor &A_sc,
+    const at::Tensor &B,
+    const at::Tensor &B_sc,
+    at::Tensor &D
+) {
+    // Attention PV with Dvo=128 only has one output-column tile. Avoid the
+    // default Nb=256 kernel shape that computes a second unused half tile.
+    launch_mxfp4_gemm_dense<mxfp4_gemm::config<128, 5, 4, 12, 2, true, 256>>(A, A_sc, B, B_sc, D);
+}
+
+void mxfp4_gemm_n128_config_entrypoint(
+    const at::Tensor &A,
+    const at::Tensor &A_sc,
+    const at::Tensor &B,
+    const at::Tensor &B_sc,
+    at::Tensor &D,
+    int config_id
+) {
+    switch (config_id) {
+    case 0: launch_mxfp4_gemm_dense<mxfp4_gemm::config<128, 5, 4,  4, 2, false, 256>>(A, A_sc, B, B_sc, D); break;
+    case 1: launch_mxfp4_gemm_dense<mxfp4_gemm::config<128, 5, 4,  8, 2, false, 256>>(A, A_sc, B, B_sc, D); break;
+    case 2: launch_mxfp4_gemm_dense<mxfp4_gemm::config<128, 5, 4, 12, 2, false, 256>>(A, A_sc, B, B_sc, D); break;
+    case 3: launch_mxfp4_gemm_dense<mxfp4_gemm::config<128, 5, 4, 12, 2, true,  256>>(A, A_sc, B, B_sc, D); break;
+    case 4: launch_mxfp4_gemm_dense<mxfp4_gemm::config<128, 4, 4,  4, 2, false, 256>>(A, A_sc, B, B_sc, D); break;
+    case 5: launch_mxfp4_gemm_dense<mxfp4_gemm::config<128, 5, 8,  4, 2, false, 256>>(A, A_sc, B, B_sc, D); break;
+    case 6: launch_mxfp4_gemm_dense<mxfp4_gemm::config<128, 4, 8, 12, 2, false, 256>>(A, A_sc, B, B_sc, D); break;
+    default: TORCH_CHECK(false, "Invalid n128 config_id: ", config_id, " (valid: 0-6)");
+    }
+}
+
 void mxfp4_gemm_masked_entrypoint(
     const at::Tensor &A,
     const at::Tensor &A_sc,
@@ -1729,6 +1761,12 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           pybind11::arg("R"), pybind11::arg("D"),
           pybind11::arg("config_id"));
     m.def("mxfp4_gemm_k128", &mxfp4_gemm_k128_entrypoint);
+    m.def("mxfp4_gemm_n128", &mxfp4_gemm_n128_entrypoint);
+    m.def("mxfp4_gemm_n128_config", &mxfp4_gemm_n128_config_entrypoint,
+          "N=128 MXFP4 GEMM with selectable tile config",
+          pybind11::arg("A"), pybind11::arg("A_sc"),
+          pybind11::arg("B"), pybind11::arg("B_sc"),
+          pybind11::arg("D"), pybind11::arg("config_id"));
     m.def("mxfp4_gemm_masked", &mxfp4_gemm_masked_entrypoint,
           pybind11::arg("A"), pybind11::arg("A_sc"),
           pybind11::arg("B"), pybind11::arg("B_sc"),
