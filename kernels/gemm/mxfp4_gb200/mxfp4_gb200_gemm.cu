@@ -1264,7 +1264,9 @@ void mxfp4_grouped_gemm_strided_entrypoint(
     int64_t b_row_stride,
     int64_t b_k_stride,
     int64_t d_row_stride,
-    int config_id = -1
+    int config_id = -1,
+    int64_t a_k_offset = 0,
+    int64_t b_k_offset = 0
 ) {
     TORCH_CHECK(num_batches > 0, "num_batches must be positive");
     TORCH_CHECK(A.is_cuda() && A_sc.is_cuda() && B.is_cuda() && B_sc.is_cuda() && D.is_cuda(),
@@ -1280,6 +1282,9 @@ void mxfp4_grouped_gemm_strided_entrypoint(
     const int64_t M = m_per_batch;
     const int64_t N_out = n_per_batch;
     const int64_t K0 = k_per_batch;
+    TORCH_CHECK(a_k_offset >= 0 && b_k_offset >= 0, "K offsets must be non-negative");
+    TORCH_CHECK(a_k_offset + K0 <= 2 * A.size(1), "A K offset plus K exceeds A width");
+    TORCH_CHECK(b_k_offset + K0 <= 2 * B.size(1), "B K offset plus K exceeds B width");
 
     auto build_and_launch = [&]<typename C>() {
         using G = mxfp4_batched_gemm::globals<C>;
@@ -1295,6 +1300,8 @@ void mxfp4_grouped_gemm_strided_entrypoint(
         TORCH_CHECK(M % C::Mb == 0, "mxfp4_grouped_gemm_strided M must be a multiple of ", C::Mb);
         TORCH_CHECK(N_out % C::Nb == 0, "mxfp4_grouped_gemm_strided N must be a multiple of ", C::Nb);
         TORCH_CHECK(K0 % C::Kb == 0, "mxfp4_grouped_gemm_strided K must be a multiple of ", C::Kb);
+        TORCH_CHECK(a_k_offset % C::Kb == 0 && b_k_offset % C::Kb == 0,
+                    "K offsets must be multiples of the selected K tile");
         TORCH_CHECK(a_row_stride % 128 == 0 && b_row_stride % 128 == 0 && d_row_stride % 128 == 0,
                     "row strides must be multiples of 128");
         TORCH_CHECK(a_k_stride % C::Kb == 0 && b_k_stride % C::Kb == 0,
@@ -1304,6 +1311,8 @@ void mxfp4_grouped_gemm_strided_entrypoint(
         g_host.b_row_block_stride = (int)(b_row_stride / 128);
         g_host.b_k_block_stride = (int)(b_k_stride / C::Kb);
         g_host.d_row_block_stride = (int)(d_row_stride / 128);
+        g_host.a_k_block_offset = (int)(a_k_offset / C::Kb);
+        g_host.b_k_block_offset = (int)(b_k_offset / C::Kb);
 
         auto a_gl = tensor_to_gl_tma_view<typename G::A_fp4x2_gl>(A, "A");
         auto a_sc_gl = tensor_to_gl_tma_view<typename G::A_sc_gl>(A_sc, "A_sc");
@@ -1836,7 +1845,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           pybind11::arg("b_row_stride"),
           pybind11::arg("b_k_stride"),
           pybind11::arg("d_row_stride"),
-          pybind11::arg("config_id") = -1);
+          pybind11::arg("config_id") = -1,
+          pybind11::arg("a_k_offset") = 0,
+          pybind11::arg("b_k_offset") = 0);
     m.def("mxfp4_batched_gemm_config", &mxfp4_batched_gemm_config_entrypoint,
           "True Batched GEMM with selectable tile config",
           pybind11::arg("A_list"), pybind11::arg("A_sc_list"),

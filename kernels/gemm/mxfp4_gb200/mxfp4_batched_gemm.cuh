@@ -80,6 +80,8 @@ struct globals {
     int       b_row_block_stride;
     int       b_k_block_stride;
     int       d_row_block_stride;
+    int       a_k_block_offset;
+    int       b_k_block_offset;
 
     struct input_tiles_t {
         A_fp4x2_tile A;
@@ -248,9 +250,9 @@ __device__ inline void kernel(const globals<C> &g) {
                 resolve_block_coords<C>(block_idx, num_row_blocks, num_col_blocks, row_block_idx, col_block_idx);
                 const int tma_batch = g.uniform_strided ? 0 : batch;
                 const int a_row_block_base = g.uniform_strided ? batch * g.a_row_block_stride : 0;
-                const int a_k_block_base = g.uniform_strided ? batch * g.a_k_block_stride : 0;
+                const int a_k_block_base = (g.uniform_strided ? batch * g.a_k_block_stride : 0) + g.a_k_block_offset;
                 const int b_row_block_base = g.uniform_strided ? batch * g.b_row_block_stride : 0;
-                const int b_k_block_base = g.uniform_strided ? batch * g.b_k_block_stride : 0;
+                const int b_k_block_base = (g.uniform_strided ? batch * g.b_k_block_stride : 0) + g.b_k_block_offset;
                 tma_dev_proxy<typename G::A_fp4x2_gl> proxy_A(&g.A_tma[tma_batch]);
                 tma_dev_proxy<typename G::B_fp4x2_gl> proxy_B(&g.B_tma[tma_batch]);
 
@@ -274,9 +276,9 @@ __device__ inline void kernel(const globals<C> &g) {
                 resolve_block_coords<C>(block_idx, num_row_blocks, num_col_blocks, row_block_idx, col_block_idx);
                 const int tma_batch = g.uniform_strided ? 0 : batch;
                 const int a_row_block_base = g.uniform_strided ? batch * g.a_row_block_stride : 0;
-                const int a_sc_k_block_base = g.uniform_strided ? batch * g.a_k_block_stride * C::MMA_PER_TILE : 0;
+                const int a_sc_k_block_base = (g.uniform_strided ? batch * g.a_k_block_stride : 0) * C::MMA_PER_TILE + g.a_k_block_offset * C::MMA_PER_TILE;
                 const int b_sc_row_block_base = g.uniform_strided ? batch * g.b_row_block_stride : 0;
-                const int b_sc_k_block_base = g.uniform_strided ? batch * g.b_k_block_stride * C::MMA_PER_TILE : 0;
+                const int b_sc_k_block_base = (g.uniform_strided ? batch * g.b_k_block_stride : 0) * C::MMA_PER_TILE + g.b_k_block_offset * C::MMA_PER_TILE;
                 tma_dev_proxy<typename G::A_sc_gl> proxy_A_sc(&g.A_sc_tma[tma_batch]);
                 tma_dev_proxy<typename G::B_sc_gl> proxy_B_sc(&g.B_sc_tma[tma_batch]);
 
