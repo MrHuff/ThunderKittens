@@ -1218,7 +1218,7 @@ void mxfp4_batched_gemm_entrypoint(
             memcpy(&g_host.B_tma[i], &b_gl.tma_descs.tma_desc, sizeof(CUtensorMap));
             memcpy(&g_host.B_sc_tma[i], &b_sc_gl.tma_descs.tma_desc, sizeof(CUtensorMap));
 
-            auto d_gl = kittens::py::tensor_to_gl<typename G::D_gl>(D_out_list[i]);
+            auto d_gl = tensor_to_gl_tma_view<typename G::D_gl>(D_out_list[i], "D_out_list");
             memcpy(&g_host.D_tma[i], &d_gl.tma_descs.tma_desc, sizeof(CUtensorMap));
         }
         kittens::py::launch_kernel<C, G, mxfp4_batched_gemm::kernel<C>>(g_host);
@@ -1455,7 +1455,7 @@ void mxfp4_batched_gemm_config_entrypoint(
             memcpy(&g_host.B_tma[i], &b_gl.tma_descs.tma_desc, sizeof(CUtensorMap));
             memcpy(&g_host.B_sc_tma[i], &b_sc_gl.tma_descs.tma_desc, sizeof(CUtensorMap));
 
-            auto d_gl = kittens::py::tensor_to_gl<typename G::D_gl>(D_out_list[i]);
+            auto d_gl = tensor_to_gl_tma_view<typename G::D_gl>(D_out_list[i], "D_out_list");
             memcpy(&g_host.D_tma[i], &d_gl.tma_descs.tma_desc, sizeof(CUtensorMap));
         }
         kittens::py::launch_kernel<C, G, mxfp4_batched_gemm::kernel<C>>(g_host);
