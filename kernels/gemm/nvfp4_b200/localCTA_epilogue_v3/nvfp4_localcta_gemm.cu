@@ -764,6 +764,48 @@ void check_rope_live64_qkv_args(
     kittens::py::device_check(D, D_K, D_V, rope_cs);
 }
 
+void check_rope_tensor(
+    const at::Tensor& t,
+    const char* name,
+    int64_t seq_len,
+    int64_t pair_dim
+) {
+    TORCH_CHECK(t.is_cuda(), name, " must be CUDA");
+    TORCH_CHECK(t.is_contiguous(), name, " must be contiguous");
+    TORCH_CHECK(t.dim() == 2, name, " must be 2D");
+    TORCH_CHECK(t.scalar_type() == at::kFloat, name, " must be float32");
+    TORCH_CHECK(t.size(0) == seq_len, name, " seq_len mismatch");
+    TORCH_CHECK(t.size(1) == pair_dim, name, " pair dim mismatch");
+}
+
+void check_rope_qkv_args(
+    const at::Tensor& D,
+    const at::Tensor& D_K,
+    const at::Tensor& D_V,
+    const at::Tensor& rope_cos,
+    const at::Tensor& rope_sin,
+    int64_t rope_seq_len,
+    int64_t rope_head_dim,
+    int64_t rope_rotary_dim
+) {
+    TORCH_CHECK(rope_seq_len > 0, "rope_seq_len must be positive");
+    TORCH_CHECK(rope_head_dim > 0, "rope_head_dim must be positive");
+    TORCH_CHECK(rope_rotary_dim > 0, "rope_rotary_dim must be positive");
+    TORCH_CHECK((rope_head_dim % 2) == 0, "rope_head_dim must be even");
+    TORCH_CHECK((rope_rotary_dim % 2) == 0, "rope_rotary_dim must be even");
+    TORCH_CHECK(rope_rotary_dim <= rope_head_dim,
+                "rope_rotary_dim must be <= rope_head_dim");
+    TORCH_CHECK(D.size(0) % rope_seq_len == 0, "Q output rows must be divisible by rope_seq_len");
+    TORCH_CHECK(D_K.size(0) % rope_seq_len == 0, "K output rows must be divisible by rope_seq_len");
+    TORCH_CHECK(D.size(1) % rope_head_dim == 0, "Q output cols must be divisible by rope_head_dim");
+    TORCH_CHECK(D_K.size(1) % rope_head_dim == 0, "K output cols must be divisible by rope_head_dim");
+    TORCH_CHECK(D_V.size(1) % 128 == 0, "V output cols must be divisible by 128");
+    const int64_t pair_dim = rope_rotary_dim / 2;
+    check_rope_tensor(rope_cos, "rope_cos", rope_seq_len, pair_dim);
+    check_rope_tensor(rope_sin, "rope_sin", rope_seq_len, pair_dim);
+    kittens::py::device_check(D, D_K, D_V, rope_cos, rope_sin);
+}
+
 void check_fast_gemm_inputs(
     const at::Tensor& A,
     const at::Tensor& A_sc_prepared,
@@ -1253,7 +1295,8 @@ void launch_fast_grouped_gemm_with_config(
     std::optional<at::Tensor> D_K_opt,
     std::optional<at::Tensor> D_V_opt,
     int silu_dim,
-    nvfp4_rope_epilogue::rope_live64_desc rope_live64 = {}
+    nvfp4_rope_epilogue::rope_live64_desc rope_live64 = {},
+    nvfp4_rope_epilogue::rope_desc rope = {}
 ) {
     using G = nvfp4_gemm::globals<C>;
     const bool use_split_D = D_K_opt.has_value();
@@ -1291,6 +1334,7 @@ void launch_fast_grouped_gemm_with_config(
         .b_sg_per_tile = has_tile_scales ? b_sg_desc.ptr : nullptr,
         .b_sg_stride = has_tile_scales ? b_sg_desc.stride : 1,
         .silu_dim = silu_dim,
+        .rope = rope,
         .rope_live64 = rope_live64
     };
     kittens::py::launch_kernel<C, G, nvfp4_gemm::kernel<C>>(g);
@@ -1560,6 +1604,32 @@ void launch_fast_grouped_gemm_rope_live64(
     launch_fast_grouped_gemm_with_config<localcta_fast_grouped_rope_config>(
         A, A_sc_prepared, A_sg_tiles, B, B_sc_prepared, B_sg_tiles,
         D, D_K_opt, D_V_opt, silu_dim, rope_live64);
+}
+
+void launch_fast_grouped_gemm_rope(
+    const at::Tensor& A,
+    const at::Tensor& A_sc_prepared,
+    const at::Tensor& A_sg_tiles,
+    const at::Tensor& B,
+    const at::Tensor& B_sc_prepared,
+    const at::Tensor& B_sg_tiles,
+    at::Tensor& D,
+    std::optional<at::Tensor> D_K_opt,
+    std::optional<at::Tensor> D_V_opt,
+    int silu_dim,
+    nvfp4_rope_epilogue::rope_desc rope
+) {
+    const bool use_split_D = D_K_opt.has_value();
+    const int64_t reduction_k = A.size(1) * 2;
+    if (!use_split_D && reduction_k > 2048) {
+        launch_fast_grouped_gemm_with_config<localcta_fast_largek_rope_config>(
+            A, A_sc_prepared, A_sg_tiles, B, B_sc_prepared, B_sg_tiles,
+            D, D_K_opt, D_V_opt, silu_dim, {}, rope);
+        return;
+    }
+    launch_fast_grouped_gemm_with_config<localcta_fast_grouped_rope_config>(
+        A, A_sc_prepared, A_sg_tiles, B, B_sc_prepared, B_sg_tiles,
+        D, D_K_opt, D_V_opt, silu_dim, {}, rope);
 }
 
 template <typename C>
@@ -4169,6 +4239,59 @@ void nvfp4_localcta_grouped_gemm_rope_live64_entrypoint(
         D, std::optional<at::Tensor>(D_K), std::optional<at::Tensor>(D_V), silu_dim, rope_live64);
 }
 
+void nvfp4_localcta_grouped_gemm_rope_entrypoint(
+    const at::Tensor& A,
+    const at::Tensor& A_sc,
+    const at::Tensor& A_sg_chunks,
+    const at::Tensor& B,
+    const at::Tensor& B_sc,
+    const at::Tensor& B_sg_chunks,
+    at::Tensor& D,
+    at::Tensor& D_K,
+    at::Tensor& D_V,
+    const at::Tensor& rope_cos,
+    const at::Tensor& rope_sin,
+    int64_t rope_seq_len,
+    int64_t rope_head_dim,
+    int64_t rope_rotary_dim,
+    int silu_dim = 0
+) {
+    const auto sg_contract = infer_regular_sg_contract(A, A_sg_chunks, B, B_sg_chunks);
+    TORCH_CHECK(sg_contract != SGContractMode::ChunkGrid128,
+                "generic RoPE epilogue is only implemented for fast outer-scale localCTA grouped GEMM");
+    TORCH_CHECK(D.size(1) + D_K.size(1) + D_V.size(1) == B.size(0),
+                "Q/K/V output columns must sum to B rows");
+
+    check_output_matrix(D, "D", A.size(0), D.size(1));
+    check_output_matrix(D_K, "D_K", A.size(0), D_K.size(1));
+    check_output_matrix(D_V, "D_V", A.size(0), D_V.size(1));
+    check_rope_qkv_args(D, D_K, D_V, rope_cos, rope_sin,
+                        rope_seq_len, rope_head_dim, rope_rotary_dim);
+
+    nvfp4_rope_epilogue::rope_desc rope {
+        .cos = rope_cos.data_ptr<float>(),
+        .sin = rope_sin.data_ptr<float>(),
+        .seq_len = static_cast<int>(rope_seq_len),
+        .head_dim = static_cast<int>(rope_head_dim),
+        .rotary_dim = static_cast<int>(rope_rotary_dim),
+    };
+
+    if (sg_contract == SGContractMode::TileGrid256) {
+        check_v3_tilegrid256_gemm_inputs(A, A_sc, A_sg_chunks, B, B_sc, B_sg_chunks);
+        launch_fast_grouped_gemm_rope(
+            A, A_sc, torch::Tensor(), B, B_sc, torch::Tensor(),
+            D, std::optional<at::Tensor>(D_K), std::optional<at::Tensor>(D_V), silu_dim, rope);
+        return;
+    }
+
+    auto A_sg_outer = normalize_outer_scale_tiles_tensor(A_sg_chunks, A.size(0) / 256, true);
+    auto B_sg_outer = normalize_outer_scale_tiles_tensor(B_sg_chunks, B.size(0) / 256, false);
+    check_v3_fast_gemm_inputs(A, A_sc, A_sg_outer, B, B_sc, B_sg_outer);
+    launch_fast_grouped_gemm_rope(
+        A, A_sc, A_sg_outer, B, B_sc, B_sg_outer,
+        D, std::optional<at::Tensor>(D_K), std::optional<at::Tensor>(D_V), silu_dim, rope);
+}
+
 void nvfp4_localcta_v3_regular_gemm_entrypoint(
     const at::Tensor& A,
     const at::Tensor& A_sc,
@@ -5215,6 +5338,13 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           pybind11::arg("D"), pybind11::arg("D_K"), pybind11::arg("D_V"),
           pybind11::arg("rope_cs"), pybind11::arg("rope_seq_len"),
           pybind11::arg("silu_dim") = 0);
+    m.def("nvfp4_localcta_grouped_gemm_rope", &nvfp4_localcta_grouped_gemm_rope_entrypoint,
+          pybind11::arg("A"), pybind11::arg("A_sc"), pybind11::arg("A_sg_chunks"),
+          pybind11::arg("B"), pybind11::arg("B_sc"), pybind11::arg("B_sg_chunks"),
+          pybind11::arg("D"), pybind11::arg("D_K"), pybind11::arg("D_V"),
+          pybind11::arg("rope_cos"), pybind11::arg("rope_sin"),
+          pybind11::arg("rope_seq_len"), pybind11::arg("rope_head_dim"),
+          pybind11::arg("rope_rotary_dim"), pybind11::arg("silu_dim") = 0);
     m.def("nvfp4_localcta_v3_regular_gemm", &nvfp4_localcta_v3_regular_gemm_entrypoint,
           pybind11::arg("A"), pybind11::arg("A_sc"), pybind11::arg("A_sg_chunks"),
           pybind11::arg("B"), pybind11::arg("B_sc"), pybind11::arg("B_sg_chunks"),

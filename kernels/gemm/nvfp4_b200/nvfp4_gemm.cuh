@@ -136,7 +136,8 @@ struct globals {
     // 0 = disabled. Used for SwiGLU FFN where W1 output needs SiLU.
     int silu_dim;
 
-    // Optional live64 RoPE epilogue. Used for Q/K split-output QKV forward only.
+    // Optional RoPE epilogue. Used for Q/K split-output QKV forward only.
+    nvfp4_rope_epilogue::rope_desc rope;
     nvfp4_rope_epilogue::rope_live64_desc rope_live64;
     CUtensorMap R_tma;   // optional residual descriptor, M x N
 
@@ -210,6 +211,18 @@ __device__ inline void apply_rope_live64_if_enabled(
     int col_offset_elems
 ) {
     if constexpr (C::ROPE_LIVE64) {
+        if (g.rope.enabled()) {
+            if (g.use_split_D && col_offset_elems >= g.q_dim + g.k_dim) {
+                return;
+            }
+            nvfp4_rope_epilogue::apply_inplace(
+                D_reg,
+                g.rope,
+                (row_block_idx * 2 + cta_id) * (C::Mb / 2),
+                col_offset_elems
+            );
+            return;
+        }
         if (!g.rope_live64.enabled()) {
             return;
         }
