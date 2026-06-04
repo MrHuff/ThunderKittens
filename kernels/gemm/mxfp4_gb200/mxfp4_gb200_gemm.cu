@@ -187,6 +187,45 @@ void check_output_matrix(const at::Tensor& t, const char* name, int64_t rows, in
     TORCH_CHECK(t.size(0) == rows && t.size(1) == cols, name, " shape mismatch");
 }
 
+template <typename GL>
+GL tensor_to_gl_tma_view(const at::Tensor& t, const char* name) {
+    TORCH_CHECK(t.is_cuda(), name, " must be CUDA");
+    TORCH_CHECK(t.dim() == 2 || t.dim() == 4, name, " must be 2D or 4D");
+
+    if constexpr (std::is_same_v<typename GL::dtype, kittens::fp4e2m1_2>) {
+        TORCH_CHECK(t.scalar_type() == at::kFloat4_e2m1fn_x2, name, " must be fp4x2");
+    } else if constexpr (std::is_same_v<typename GL::dtype, kittens::fp8e8m0>) {
+        TORCH_CHECK(t.scalar_type() == at::kFloat8_e8m0fnu || t.scalar_type() == at::kByte,
+                    name, " must be fp8e8m0/uint8");
+    } else if constexpr (std::is_same_v<typename GL::dtype, kittens::bf16>) {
+        TORCH_CHECK(t.scalar_type() == at::kBFloat16, name, " must be bf16");
+    }
+
+    int b = 1;
+    int d = 1;
+    int r = 1;
+    int c = 1;
+
+    if (t.dim() == 2) {
+        TORCH_CHECK(t.stride(1) == 1, name, " 2D TMA view must have unit inner stride");
+        TORCH_CHECK(t.stride(0) >= t.size(1), name, " 2D TMA leading stride is smaller than logical width");
+        r = static_cast<int>(t.size(0));
+        c = static_cast<int>(t.stride(0));
+    } else {
+        TORCH_CHECK(t.stride(3) == 1, name, " 4D TMA view must have unit innermost stride");
+        TORCH_CHECK(t.stride(2) == t.size(3), name, " 4D TMA inner tile stride mismatch");
+        TORCH_CHECK(t.stride(1) == t.size(2) * t.size(3), name, " 4D TMA depth stride mismatch");
+        TORCH_CHECK(t.stride(0) % t.stride(1) == 0, name, " 4D TMA batch stride mismatch");
+        b = static_cast<int>(t.size(0));
+        d = static_cast<int>(t.stride(0) / t.stride(1));
+        r = static_cast<int>(t.size(2));
+        c = static_cast<int>(t.size(3));
+        TORCH_CHECK(d >= t.size(1), name, " 4D TMA leading depth is smaller than logical depth");
+    }
+
+    return kittens::make_gl<GL>(reinterpret_cast<uint64_t>(t.data_ptr()), b, d, r, c);
+}
+
 void check_tilemask(
     const at::Tensor& t,
     const char* name,
@@ -1042,7 +1081,7 @@ void mxfp4_batched_gemm_entrypoint(
             memcpy(&g_host.B_tma[i], &b_gl.tma_descs.tma_desc, sizeof(CUtensorMap));
             memcpy(&g_host.B_sc_tma[i], &b_sc_gl.tma_descs.tma_desc, sizeof(CUtensorMap));
 
-            auto d_gl = kittens::py::tensor_to_gl<typename G::D_gl>(D_out_list[i]);
+            auto d_gl = tensor_to_gl_tma_view<typename G::D_gl>(D_out_list[i], "D_out_list");
             memcpy(&g_host.D_tma[i], &d_gl.tma_descs.tma_desc, sizeof(CUtensorMap));
         }
         kittens::py::launch_kernel<C, G, mxfp4_batched_gemm::kernel<C>>(g_host);
@@ -1093,7 +1132,7 @@ void mxfp4_batched_gemm_config_entrypoint(
             memcpy(&g_host.B_tma[i], &b_gl.tma_descs.tma_desc, sizeof(CUtensorMap));
             memcpy(&g_host.B_sc_tma[i], &b_sc_gl.tma_descs.tma_desc, sizeof(CUtensorMap));
 
-            auto d_gl = kittens::py::tensor_to_gl<typename G::D_gl>(D_out_list[i]);
+            auto d_gl = tensor_to_gl_tma_view<typename G::D_gl>(D_out_list[i], "D_out_list");
             memcpy(&g_host.D_tma[i], &d_gl.tma_descs.tma_desc, sizeof(CUtensorMap));
         }
         kittens::py::launch_kernel<C, G, mxfp4_batched_gemm::kernel<C>>(g_host);
