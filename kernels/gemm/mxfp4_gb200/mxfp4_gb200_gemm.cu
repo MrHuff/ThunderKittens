@@ -5,6 +5,7 @@
 #include "mxfp4_gemm.cuh"
 // mxfp4_quantize.cuh removed — use standalone mxfp4_v2 quantizer
 #include "mxfp4_batched_gemm.cuh"
+#include "mxfp4_atb_gemm.cuh"
 #include "mxfp4_split2_accum_gemm.cuh"
 #include "mxfp4_split3_accum_gemm.cuh"
 #include <cstdlib>
@@ -739,7 +740,8 @@ static void launch_mxfp4_gemm_dense(
     const at::Tensor &B,
     const at::Tensor &B_sc,
     at::Tensor &D,
-    const at::Tensor* output_scale = nullptr
+    const at::Tensor* output_scale = nullptr,
+    bool output_causal = false
 ) {
     using G = mxfp4_gemm::globals<C>;
     G g {
@@ -752,7 +754,8 @@ static void launch_mxfp4_gemm_dense(
         .tilemask_ptr = nullptr,
         .tilemask_rows = 0,
         .tilemask_cols = 0,
-        .tilemask_transposed = false
+        .tilemask_transposed = false,
+        .output_causal = output_causal
     };
     kittens::py::launch_kernel<C, G, mxfp4_gemm::kernel<C>>(g);
 }
@@ -890,6 +893,17 @@ void mxfp4_gemm_k128_entrypoint(
     launch_mxfp4_gemm_dense<mxfp4_gemm::config<256, 5, 8, 4, 2, false, 128>>(A, A_sc, B, B_sc, D);
 }
 
+void mxfp4_gemm_k128_output_causal_entrypoint(
+    const at::Tensor &A,
+    const at::Tensor &A_sc,
+    const at::Tensor &B,
+    const at::Tensor &B_sc,
+    at::Tensor &D
+) {
+    launch_mxfp4_gemm_dense<mxfp4_gemm::config<256, 5, 8, 4, 2, false, 128>>(
+        A, A_sc, B, B_sc, D, nullptr, true);
+}
+
 void mxfp4_gemm_n128_entrypoint(
     const at::Tensor &A,
     const at::Tensor &A_sc,
@@ -920,6 +934,96 @@ void mxfp4_gemm_n128_config_entrypoint(
     case 6: launch_mxfp4_gemm_dense<mxfp4_gemm::config<128, 4, 8, 12, 2, false, 256>>(A, A_sc, B, B_sc, D); break;
     default: TORCH_CHECK(false, "Invalid n128 config_id: ", config_id, " (valid: 0-6)");
     }
+}
+
+void mxfp4_gemm_atb_entrypoint(
+    const at::Tensor &A,
+    const at::Tensor &A_sc,
+    const at::Tensor &B,
+    const at::Tensor &B_sc,
+    at::Tensor &D
+) {
+    TORCH_CHECK(A.is_cuda() && A_sc.is_cuda() && B.is_cuda() && B_sc.is_cuda() && D.is_cuda(),
+                "mxfp4_gemm_atb expects CUDA tensors");
+    TORCH_CHECK(A.is_contiguous() && A_sc.is_contiguous() && B.is_contiguous() && B_sc.is_contiguous() && D.is_contiguous(),
+                "mxfp4_gemm_atb expects contiguous tensors");
+    TORCH_CHECK(A.dtype() == at::ScalarType::Float4_e2m1fn_x2, "A must be float4_e2m1fn_x2");
+    TORCH_CHECK(B.dtype() == at::ScalarType::Float4_e2m1fn_x2, "B must be float4_e2m1fn_x2");
+    TORCH_CHECK(A_sc.dtype() == at::ScalarType::Byte, "A_sc must be uint8 E8M0 scales");
+    TORCH_CHECK(B_sc.dtype() == at::ScalarType::Byte, "B_sc must be uint8 E8M0 scales");
+    TORCH_CHECK(D.dtype() == at::ScalarType::BFloat16, "D must be BF16");
+    TORCH_CHECK(A.dim() == 2 && B.dim() == 2 && D.dim() == 2,
+                "mxfp4_gemm_atb expects A/B/D rank-2 tensors");
+    TORCH_CHECK(A.size(0) == B.size(0), "A and B must share K rows");
+    const int64_t K = A.size(0);
+    const int64_t M = D.size(0);
+    const int64_t N = D.size(1);
+    TORCH_CHECK(2 * A.size(1) == M, "A packed columns must equal D rows");
+    TORCH_CHECK(2 * B.size(1) == N, "B packed columns must equal D cols");
+    TORCH_CHECK(M % 256 == 0 && N % 256 == 0 && K % 256 == 0,
+                "mxfp4_gemm_atb prototype expects M/N/K multiples of 256");
+    TORCH_CHECK(A_sc.dim() == 4 && A_sc.size(0) == M / 128 && A_sc.size(1) == K / 128 &&
+                A_sc.size(2) == 32 && A_sc.size(3) == 16,
+                "A_sc must have shape (M/128, K/128, 32, 16)");
+    TORCH_CHECK(B_sc.dim() == 4 && B_sc.size(0) == N / 128 && B_sc.size(1) == K / 128 &&
+                B_sc.size(2) == 32 && B_sc.size(3) == 16,
+                "B_sc must have shape (N/128, K/128, 32, 16)");
+
+    using C = mxfp4_gemm::config<256, 5, 8, 4, 2, false, 256>;
+    using G = mxfp4_atb_gemm::globals<C>;
+    G g {
+        .A = kittens::py::tensor_to_gl<typename G::A_fp4x2_gl>(A),
+        .A_sc = kittens::py::tensor_to_gl<typename G::A_sc_gl>(A_sc),
+        .B = kittens::py::tensor_to_gl<typename G::B_fp4x2_gl>(B),
+        .B_sc = kittens::py::tensor_to_gl<typename G::B_sc_gl>(B_sc),
+        .D = kittens::py::tensor_to_gl<typename G::D_gl>(D),
+    };
+    kittens::py::launch_kernel<C, G, mxfp4_atb_gemm::kernel<C>>(g);
+}
+
+void mxfp4_gemm_atbt_entrypoint(
+    const at::Tensor &A,
+    const at::Tensor &A_sc,
+    const at::Tensor &B,
+    const at::Tensor &B_sc,
+    at::Tensor &D
+) {
+    TORCH_CHECK(A.is_cuda() && A_sc.is_cuda() && B.is_cuda() && B_sc.is_cuda() && D.is_cuda(),
+                "mxfp4_gemm_atbt expects CUDA tensors");
+    TORCH_CHECK(A.is_contiguous() && A_sc.is_contiguous() && B.is_contiguous() && B_sc.is_contiguous() && D.is_contiguous(),
+                "mxfp4_gemm_atbt expects contiguous tensors");
+    TORCH_CHECK(A.dtype() == at::ScalarType::Float4_e2m1fn_x2, "A must be float4_e2m1fn_x2");
+    TORCH_CHECK(B.dtype() == at::ScalarType::Float4_e2m1fn_x2, "B must be float4_e2m1fn_x2");
+    TORCH_CHECK(A_sc.dtype() == at::ScalarType::Byte, "A_sc must be uint8 E8M0 scales");
+    TORCH_CHECK(B_sc.dtype() == at::ScalarType::Byte, "B_sc must be uint8 E8M0 scales");
+    TORCH_CHECK(D.dtype() == at::ScalarType::BFloat16, "D must be BF16");
+    TORCH_CHECK(A.dim() == 2 && B.dim() == 2 && D.dim() == 2,
+                "mxfp4_gemm_atbt expects A/B/D rank-2 tensors");
+    const int64_t K = A.size(0);
+    const int64_t M = D.size(0);
+    const int64_t N = D.size(1);
+    TORCH_CHECK(2 * A.size(1) == M, "A packed columns must equal D rows");
+    TORCH_CHECK(B.size(0) == N, "B rows must equal D cols");
+    TORCH_CHECK(2 * B.size(1) == K, "B packed columns must equal A rows");
+    TORCH_CHECK(M % 256 == 0 && N % 256 == 0 && K % 256 == 0,
+                "mxfp4_gemm_atbt prototype expects M/N/K multiples of 256");
+    TORCH_CHECK(A_sc.dim() == 4 && A_sc.size(0) == K / 128 && A_sc.size(1) == M / 128 &&
+                A_sc.size(2) == 32 && A_sc.size(3) == 16,
+                "A_sc must have shape (K/128, M/128, 32, 16)");
+    TORCH_CHECK(B_sc.dim() == 4 && B_sc.size(0) == N / 128 && B_sc.size(1) == K / 128 &&
+                B_sc.size(2) == 32 && B_sc.size(3) == 16,
+                "B_sc must have shape (N/128, K/128, 32, 16)");
+
+    using C = mxfp4_gemm::config<256, 5, 8, 4, 2, false, 256>;
+    using G = mxfp4_atb_gemm::globals<C>;
+    G g {
+        .A = kittens::py::tensor_to_gl<typename G::A_fp4x2_gl>(A),
+        .A_sc = kittens::py::tensor_to_gl<typename G::A_sc_gl>(A_sc),
+        .B = kittens::py::tensor_to_gl<typename G::B_fp4x2_gl>(B),
+        .B_sc = kittens::py::tensor_to_gl<typename G::B_sc_gl>(B_sc),
+        .D = kittens::py::tensor_to_gl<typename G::D_gl>(D),
+    };
+    kittens::py::launch_kernel<C, G, mxfp4_atb_gemm::kernel<C, true, true>>(g);
 }
 
 void mxfp4_gemm_masked_entrypoint(
@@ -1249,7 +1353,8 @@ void mxfp4_batched_gemm_entrypoint(
     }
 }
 
-void mxfp4_grouped_gemm_strided_entrypoint(
+template <bool ATBT = false>
+void mxfp4_grouped_gemm_strided_impl(
     const at::Tensor &A,
     const at::Tensor &A_sc,
     const at::Tensor &B,
@@ -1266,7 +1371,9 @@ void mxfp4_grouped_gemm_strided_entrypoint(
     int64_t d_row_stride,
     int config_id = -1,
     int64_t a_k_offset = 0,
-    int64_t b_k_offset = 0
+    int64_t b_k_offset = 0,
+    const at::Tensor *tilemask = nullptr,
+    bool tilemask_transposed = false
 ) {
     TORCH_CHECK(num_batches > 0, "num_batches must be positive");
     TORCH_CHECK(A.is_cuda() && A_sc.is_cuda() && B.is_cuda() && B_sc.is_cuda() && D.is_cuda(),
@@ -1283,48 +1390,79 @@ void mxfp4_grouped_gemm_strided_entrypoint(
     const int64_t N_out = n_per_batch;
     const int64_t K0 = k_per_batch;
     TORCH_CHECK(a_k_offset >= 0 && b_k_offset >= 0, "K offsets must be non-negative");
-    TORCH_CHECK(a_k_offset + K0 <= 2 * A.size(1), "A K offset plus K exceeds A width");
-    TORCH_CHECK(b_k_offset + K0 <= 2 * B.size(1), "B K offset plus K exceeds B width");
+    if constexpr (ATBT) {
+        TORCH_CHECK(a_k_offset == 0, "mxfp4_grouped_gemm_atbt_strided does not support A column offsets");
+        TORCH_CHECK(A.size(0) >= num_batches * K0, "A rows must cover num_batches * k_per_batch");
+        TORCH_CHECK(2 * A.size(1) >= M, "A width must cover m_per_batch");
+        TORCH_CHECK(b_k_offset + K0 <= 2 * B.size(1), "B K offset plus K exceeds B width");
+        TORCH_CHECK(K0 % 256 == 0, "mxfp4_grouped_gemm_atbt_strided requires K to be a multiple of 256");
+    } else {
+        TORCH_CHECK(a_k_offset + K0 <= 2 * A.size(1), "A K offset plus K exceeds A width");
+        TORCH_CHECK(b_k_offset + K0 <= 2 * B.size(1), "B K offset plus K exceeds B width");
+    }
+    if (tilemask != nullptr) {
+        TORCH_CHECK(tilemask->is_cuda(), "mxfp4_grouped_gemm_strided_masked expects a CUDA tilemask");
+        TORCH_CHECK(tilemask->is_contiguous(), "mxfp4_grouped_gemm_strided_masked expects a contiguous tilemask");
+        TORCH_CHECK(tilemask->dtype() == at::ScalarType::Byte, "mxfp4_grouped_gemm_strided_masked expects a uint8 tilemask");
+        const int64_t mask_rows = tilemask_transposed ? K0 / 128 : M / 128;
+        const int64_t mask_cols = tilemask_transposed ? M / 128 : K0 / 128;
+        check_tilemask(*tilemask, "tilemask", mask_rows, mask_cols);
+    }
 
     auto build_and_launch = [&]<typename C>() {
-        using G = mxfp4_batched_gemm::globals<C>;
-        G g_host {};
-        g_host.uniform_strided = true;
-        g_host.num_batches = (int)num_batches;
-        g_host.num_row_blocks = (int)(M / C::Mb);
-        g_host.num_col_blocks = (int)(N_out / C::Nb);
-        g_host.num_red_blocks = (int)(K0 / C::Kb);
-        g_host.total_spatial_tiles = 0;
-        TORCH_CHECK(g_host.num_row_blocks > 0 && g_host.num_col_blocks > 0 && g_host.num_red_blocks > 0,
-                    "mxfp4_grouped_gemm_strided expects positive tile counts");
-        TORCH_CHECK(M % C::Mb == 0, "mxfp4_grouped_gemm_strided M must be a multiple of ", C::Mb);
-        TORCH_CHECK(N_out % C::Nb == 0, "mxfp4_grouped_gemm_strided N must be a multiple of ", C::Nb);
-        TORCH_CHECK(K0 % C::Kb == 0, "mxfp4_grouped_gemm_strided K must be a multiple of ", C::Kb);
-        TORCH_CHECK(a_k_offset % C::Kb == 0 && b_k_offset % C::Kb == 0,
-                    "K offsets must be multiples of the selected K tile");
-        TORCH_CHECK(a_row_stride % 128 == 0 && b_row_stride % 128 == 0 && d_row_stride % 128 == 0,
-                    "row strides must be multiples of 128");
-        TORCH_CHECK(a_k_stride % C::Kb == 0 && b_k_stride % C::Kb == 0,
-                    "K strides must be multiples of the selected K tile");
-        g_host.a_row_block_stride = (int)(a_row_stride / 128);
-        g_host.a_k_block_stride = (int)(a_k_stride / C::Kb);
-        g_host.b_row_block_stride = (int)(b_row_stride / 128);
-        g_host.b_k_block_stride = (int)(b_k_stride / C::Kb);
-        g_host.d_row_block_stride = (int)(d_row_stride / 128);
-        g_host.a_k_block_offset = (int)(a_k_offset / C::Kb);
-        g_host.b_k_block_offset = (int)(b_k_offset / C::Kb);
+        if constexpr (ATBT && C::Kb != 256) {
+            TORCH_CHECK(false, "mxfp4_grouped_gemm_atbt_strided requires a Kb=256 config");
+        } else {
+            using G = mxfp4_batched_gemm::globals<C>;
+            G g_host {};
+            g_host.uniform_strided = true;
+            g_host.num_batches = (int)num_batches;
+            g_host.num_row_blocks = (int)(M / C::Mb);
+            g_host.num_col_blocks = (int)(N_out / C::Nb);
+            g_host.num_red_blocks = (int)(K0 / C::Kb);
+            g_host.total_spatial_tiles = 0;
+            TORCH_CHECK(g_host.num_row_blocks > 0 && g_host.num_col_blocks > 0 && g_host.num_red_blocks > 0,
+                        "mxfp4_grouped_gemm_strided expects positive tile counts");
+            TORCH_CHECK(M % C::Mb == 0, "mxfp4_grouped_gemm_strided M must be a multiple of ", C::Mb);
+            TORCH_CHECK(N_out % C::Nb == 0, "mxfp4_grouped_gemm_strided N must be a multiple of ", C::Nb);
+            TORCH_CHECK(K0 % C::Kb == 0, "mxfp4_grouped_gemm_strided K must be a multiple of ", C::Kb);
+            TORCH_CHECK(a_k_offset % C::Kb == 0 && b_k_offset % C::Kb == 0,
+                        "K offsets must be multiples of the selected K tile");
+            TORCH_CHECK(a_row_stride % 128 == 0 && b_row_stride % 128 == 0 && d_row_stride % 128 == 0,
+                        "row strides must be multiples of 128");
+            if constexpr (ATBT) {
+                TORCH_CHECK(a_k_stride % 128 == 0 && b_k_stride % C::Kb == 0,
+                            "AtBt A column stride must be a multiple of 128 and B K stride must be a multiple of the selected K tile");
+            } else {
+                TORCH_CHECK(a_k_stride % C::Kb == 0 && b_k_stride % C::Kb == 0,
+                            "K strides must be multiples of the selected K tile");
+            }
+            g_host.a_row_block_stride = (int)(a_row_stride / 128);
+            g_host.a_k_block_stride = (int)(a_k_stride / (ATBT ? 128 : C::Kb));
+            g_host.b_row_block_stride = (int)(b_row_stride / 128);
+            g_host.b_k_block_stride = (int)(b_k_stride / C::Kb);
+            g_host.d_row_block_stride = (int)(d_row_stride / 128);
+            g_host.a_k_block_offset = (int)(a_k_offset / (ATBT ? 128 : C::Kb));
+            g_host.b_k_block_offset = (int)(b_k_offset / C::Kb);
+            if (tilemask != nullptr) {
+                g_host.tilemask_ptr = tilemask->data_ptr<uint8_t>();
+                g_host.tilemask_rows = static_cast<int>(tilemask->size(0));
+                g_host.tilemask_cols = static_cast<int>(tilemask->size(1));
+                g_host.tilemask_transposed = tilemask_transposed;
+            }
 
-        auto a_gl = tensor_to_gl_tma_view<typename G::A_fp4x2_gl>(A, "A");
-        auto a_sc_gl = tensor_to_gl_tma_view<typename G::A_sc_gl>(A_sc, "A_sc");
-        auto b_gl = tensor_to_gl_tma_view<typename G::B_fp4x2_gl>(B, "B");
-        auto b_sc_gl = tensor_to_gl_tma_view<typename G::B_sc_gl>(B_sc, "B_sc");
-        auto d_gl = kittens::py::tensor_to_gl<typename G::D_gl>(D);
-        memcpy(&g_host.A_tma[0], &a_gl.tma_descs.tma_desc, sizeof(CUtensorMap));
-        memcpy(&g_host.A_sc_tma[0], &a_sc_gl.tma_descs.tma_desc, sizeof(CUtensorMap));
-        memcpy(&g_host.B_tma[0], &b_gl.tma_descs.tma_desc, sizeof(CUtensorMap));
-        memcpy(&g_host.B_sc_tma[0], &b_sc_gl.tma_descs.tma_desc, sizeof(CUtensorMap));
-        memcpy(&g_host.D_tma[0], &d_gl.tma_descs.tma_desc, sizeof(CUtensorMap));
-        kittens::py::launch_kernel<C, G, mxfp4_batched_gemm::kernel<C>>(g_host);
+            auto a_gl = tensor_to_gl_tma_view<typename G::A_fp4x2_gl>(A, "A");
+            auto a_sc_gl = tensor_to_gl_tma_view<typename G::A_sc_gl>(A_sc, "A_sc");
+            auto b_gl = tensor_to_gl_tma_view<typename G::B_fp4x2_gl>(B, "B");
+            auto b_sc_gl = tensor_to_gl_tma_view<typename G::B_sc_gl>(B_sc, "B_sc");
+            auto d_gl = kittens::py::tensor_to_gl<typename G::D_gl>(D);
+            memcpy(&g_host.A_tma[0], &a_gl.tma_descs.tma_desc, sizeof(CUtensorMap));
+            memcpy(&g_host.A_sc_tma[0], &a_sc_gl.tma_descs.tma_desc, sizeof(CUtensorMap));
+            memcpy(&g_host.B_tma[0], &b_gl.tma_descs.tma_desc, sizeof(CUtensorMap));
+            memcpy(&g_host.B_sc_tma[0], &b_sc_gl.tma_descs.tma_desc, sizeof(CUtensorMap));
+            memcpy(&g_host.D_tma[0], &d_gl.tma_descs.tma_desc, sizeof(CUtensorMap));
+            kittens::py::launch_kernel<C, G, mxfp4_batched_gemm::kernel<C, ATBT>>(g_host);
+        }
     };
 
     auto build_nb128_kb128 = [&](int cfg) {
@@ -1397,6 +1535,83 @@ void mxfp4_grouped_gemm_strided_entrypoint(
             build_and_launch.template operator()<mxfp4_gemm::config<256, 4, 16, 4, 2, false, 128>>();
         }
     }
+}
+
+void mxfp4_grouped_gemm_strided_entrypoint(
+    const at::Tensor &A,
+    const at::Tensor &A_sc,
+    const at::Tensor &B,
+    const at::Tensor &B_sc,
+    at::Tensor &D,
+    int64_t num_batches,
+    int64_t m_per_batch,
+    int64_t n_per_batch,
+    int64_t k_per_batch,
+    int64_t a_row_stride,
+    int64_t a_k_stride,
+    int64_t b_row_stride,
+    int64_t b_k_stride,
+    int64_t d_row_stride,
+    int config_id = -1,
+    int64_t a_k_offset = 0,
+    int64_t b_k_offset = 0
+) {
+    mxfp4_grouped_gemm_strided_impl<false>(
+        A, A_sc, B, B_sc, D, num_batches, m_per_batch, n_per_batch, k_per_batch,
+        a_row_stride, a_k_stride, b_row_stride, b_k_stride, d_row_stride,
+        config_id, a_k_offset, b_k_offset, nullptr, false);
+}
+
+void mxfp4_grouped_gemm_atbt_strided_entrypoint(
+    const at::Tensor &A,
+    const at::Tensor &A_sc,
+    const at::Tensor &B,
+    const at::Tensor &B_sc,
+    at::Tensor &D,
+    int64_t num_batches,
+    int64_t m_per_batch,
+    int64_t n_per_batch,
+    int64_t k_per_batch,
+    int64_t a_row_stride,
+    int64_t a_k_stride,
+    int64_t b_row_stride,
+    int64_t b_k_stride,
+    int64_t d_row_stride,
+    int config_id = -1,
+    int64_t a_k_offset = 0,
+    int64_t b_k_offset = 0
+) {
+    mxfp4_grouped_gemm_strided_impl<true>(
+        A, A_sc, B, B_sc, D, num_batches, m_per_batch, n_per_batch, k_per_batch,
+        a_row_stride, a_k_stride, b_row_stride, b_k_stride, d_row_stride,
+        config_id, a_k_offset, b_k_offset, nullptr, false);
+}
+
+void mxfp4_grouped_gemm_strided_masked_entrypoint(
+    const at::Tensor &A,
+    const at::Tensor &A_sc,
+    const at::Tensor &B,
+    const at::Tensor &B_sc,
+    const at::Tensor &tilemask,
+    bool tilemask_transposed,
+    at::Tensor &D,
+    int64_t num_batches,
+    int64_t m_per_batch,
+    int64_t n_per_batch,
+    int64_t k_per_batch,
+    int64_t a_row_stride,
+    int64_t a_k_stride,
+    int64_t b_row_stride,
+    int64_t b_k_stride,
+    int64_t d_row_stride,
+    int config_id = -1,
+    int64_t a_k_offset = 0,
+    int64_t b_k_offset = 0
+) {
+    mxfp4_grouped_gemm_strided_impl<false>(
+        A, A_sc, B, B_sc, D, num_batches, m_per_batch, n_per_batch, k_per_batch,
+        a_row_stride, a_k_stride, b_row_stride, b_k_stride, d_row_stride,
+        config_id, a_k_offset, b_k_offset, &tilemask, tilemask_transposed);
 }
 
 void mxfp4_batched_gemm_config_entrypoint(
@@ -1770,6 +1985,18 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           pybind11::arg("R"), pybind11::arg("D"),
           pybind11::arg("config_id"));
     m.def("mxfp4_gemm_k128", &mxfp4_gemm_k128_entrypoint);
+    m.def("mxfp4_gemm_k128_output_causal", &mxfp4_gemm_k128_output_causal_entrypoint,
+          "MXFP4 K128 GEMM that skips output tiles strictly above the causal diagonal");
+    m.def("mxfp4_gemm_atb", &mxfp4_gemm_atb_entrypoint,
+          "Prototype MXFP4 GEMM computing D = A^T x B for row-major packed operands",
+          pybind11::arg("A"), pybind11::arg("A_sc"),
+          pybind11::arg("B"), pybind11::arg("B_sc"),
+          pybind11::arg("D"));
+    m.def("mxfp4_gemm_atbt", &mxfp4_gemm_atbt_entrypoint,
+          "Prototype MXFP4 GEMM computing D = A^T x B^T for row-major/transposed packed operands",
+          pybind11::arg("A"), pybind11::arg("A_sc"),
+          pybind11::arg("B"), pybind11::arg("B_sc"),
+          pybind11::arg("D"));
     m.def("mxfp4_gemm_n128", &mxfp4_gemm_n128_entrypoint);
     m.def("mxfp4_gemm_n128_config", &mxfp4_gemm_n128_config_entrypoint,
           "N=128 MXFP4 GEMM with selectable tile config",
@@ -1835,6 +2062,42 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           "Uniform grouped GEMM over flat packed tensors using one TMA descriptor per operand",
           pybind11::arg("A"), pybind11::arg("A_sc"),
           pybind11::arg("B"), pybind11::arg("B_sc"),
+          pybind11::arg("D"),
+          pybind11::arg("num_batches"),
+          pybind11::arg("m_per_batch"),
+          pybind11::arg("n_per_batch"),
+          pybind11::arg("k_per_batch"),
+          pybind11::arg("a_row_stride"),
+          pybind11::arg("a_k_stride"),
+          pybind11::arg("b_row_stride"),
+          pybind11::arg("b_k_stride"),
+          pybind11::arg("d_row_stride"),
+          pybind11::arg("config_id") = -1,
+          pybind11::arg("a_k_offset") = 0,
+          pybind11::arg("b_k_offset") = 0);
+    m.def("mxfp4_grouped_gemm_atbt_strided", &mxfp4_grouped_gemm_atbt_strided_entrypoint,
+          "Uniform grouped AtBt GEMM over flat packed tensors using one TMA descriptor per operand",
+          pybind11::arg("A"), pybind11::arg("A_sc"),
+          pybind11::arg("B"), pybind11::arg("B_sc"),
+          pybind11::arg("D"),
+          pybind11::arg("num_batches"),
+          pybind11::arg("m_per_batch"),
+          pybind11::arg("n_per_batch"),
+          pybind11::arg("k_per_batch"),
+          pybind11::arg("a_row_stride"),
+          pybind11::arg("a_k_stride"),
+          pybind11::arg("b_row_stride"),
+          pybind11::arg("b_k_stride"),
+          pybind11::arg("d_row_stride"),
+          pybind11::arg("config_id") = -1,
+          pybind11::arg("a_k_offset") = 0,
+          pybind11::arg("b_k_offset") = 0);
+    m.def("mxfp4_grouped_gemm_strided_masked", &mxfp4_grouped_gemm_strided_masked_entrypoint,
+          "Uniform grouped GEMM with a shared per-GEMM tilemask for inactive reduction tiles",
+          pybind11::arg("A"), pybind11::arg("A_sc"),
+          pybind11::arg("B"), pybind11::arg("B_sc"),
+          pybind11::arg("tilemask"),
+          pybind11::arg("tilemask_transposed"),
           pybind11::arg("D"),
           pybind11::arg("num_batches"),
           pybind11::arg("m_per_batch"),

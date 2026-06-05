@@ -82,6 +82,10 @@ struct globals {
     int       d_row_block_stride;
     int       a_k_block_offset;
     int       b_k_block_offset;
+    const uint8_t* tilemask_ptr;
+    int       tilemask_rows;
+    int       tilemask_cols;
+    bool      tilemask_transposed;
 
     struct input_tiles_t {
         A_fp4x2_tile A;
@@ -118,6 +122,40 @@ struct globals {
         return _dynamic_shared_memory;
     }
 };
+
+template <typename C>
+__device__ inline bool reduction_iter_active(
+    const globals<C> &g,
+    int row_tile_128,
+    int red_iter
+) {
+    if (g.tilemask_ptr == nullptr) {
+        return true;
+    }
+
+    constexpr int RED_TILES_PER_ITER = C::Kb / 128;
+    const int red_tile_base = red_iter * RED_TILES_PER_ITER;
+
+    auto tile_active = [&](int red_tile_128) {
+        if (g.tilemask_transposed) {
+            if (red_tile_128 >= g.tilemask_rows || row_tile_128 >= g.tilemask_cols) {
+                return false;
+            }
+            return g.tilemask_ptr[red_tile_128 * g.tilemask_cols + row_tile_128] != 0;
+        }
+        if (row_tile_128 >= g.tilemask_rows || red_tile_128 >= g.tilemask_cols) {
+            return false;
+        }
+        return g.tilemask_ptr[row_tile_128 * g.tilemask_cols + red_tile_128] != 0;
+    };
+
+    bool active = false;
+    #pragma unroll
+    for (int red_tile_offset = 0; red_tile_offset < RED_TILES_PER_ITER; ++red_tile_offset) {
+        active = active || tile_active(red_tile_base + red_tile_offset);
+    }
+    return active;
+}
 
 template <typename C>
 __device__ inline void resolve_problem_tile(
@@ -169,7 +207,7 @@ __device__ inline void resolve_block_coords(
     col_block_idx = idx_within_supergroup / rows_in_supergroup;
 }
 
-template <typename C>
+template <typename C, bool ATBT = false>
 __device__ inline void kernel(const globals<C> &g) {
     using G = globals<C>;
 
@@ -253,12 +291,22 @@ __device__ inline void kernel(const globals<C> &g) {
                 const int a_k_block_base = (g.uniform_strided ? batch * g.a_k_block_stride : 0) + g.a_k_block_offset;
                 const int b_row_block_base = g.uniform_strided ? batch * g.b_row_block_stride : 0;
                 const int b_k_block_base = (g.uniform_strided ? batch * g.b_k_block_stride : 0) + g.b_k_block_offset;
+                const int row_tile_128_0 = row_block_idx * 2 + 0;
+                const int row_tile_128_1 = row_block_idx * 2 + 1;
                 tma_dev_proxy<typename G::A_fp4x2_gl> proxy_A(&g.A_tma[tma_batch]);
                 tma_dev_proxy<typename G::B_fp4x2_gl> proxy_B(&g.B_tma[tma_batch]);
 
                 for (int i = 0; i < num_red_blocks; ++i) {
+                    const bool block_iter_active =
+                        reduction_iter_active(g, row_tile_128_0, i) ||
+                        reduction_iter_active(g, row_tile_128_1, i);
+                    if (!block_iter_active) continue;
                     wait(inputs_finished[stage], get_phasebit<1>(phasebits, stage));
-                    tma::cluster::load_async(input_tiles[stage].A, proxy_A, {a_row_block_base + row_block_idx*2 + cta_id, a_k_block_base + i}, tiles_arrived[stage], (uint16_t)(1<<cta_id), 0);
+                    if constexpr (ATBT) {
+                        tma::cluster::load_async(input_tiles[stage].A, proxy_A, {a_row_block_base + i * C::CLUSTER_SIZE + cta_id, a_k_block_base + row_block_idx}, tiles_arrived[stage], (uint16_t)(1<<cta_id), 0);
+                    } else {
+                        tma::cluster::load_async(input_tiles[stage].A, proxy_A, {a_row_block_base + row_block_idx*2 + cta_id, a_k_block_base + i}, tiles_arrived[stage], (uint16_t)(1<<cta_id), 0);
+                    }
                     tma::cluster::load_async(input_tiles[stage].B, proxy_B, {b_row_block_base + col_block_idx*2 + cta_id, b_k_block_base + i}, tiles_arrived[stage], (uint16_t)(1<<cta_id), 0);
                     update_phasebit<1>(phasebits, stage);
                     stage = (stage + 1) % C::LOAD_PIPE_DEPTH;
@@ -276,24 +324,42 @@ __device__ inline void kernel(const globals<C> &g) {
                 resolve_block_coords<C>(block_idx, num_row_blocks, num_col_blocks, row_block_idx, col_block_idx);
                 const int tma_batch = g.uniform_strided ? 0 : batch;
                 const int a_row_block_base = g.uniform_strided ? batch * g.a_row_block_stride : 0;
+                const int a_sc_col_block_base = (g.uniform_strided ? batch * g.a_k_block_stride : 0) + g.a_k_block_offset;
                 const int a_sc_k_block_base = (g.uniform_strided ? batch * g.a_k_block_stride : 0) * C::MMA_PER_TILE + g.a_k_block_offset * C::MMA_PER_TILE;
                 const int b_sc_row_block_base = g.uniform_strided ? batch * g.b_row_block_stride : 0;
                 const int b_sc_k_block_base = (g.uniform_strided ? batch * g.b_k_block_stride : 0) * C::MMA_PER_TILE + g.b_k_block_offset * C::MMA_PER_TILE;
+                const int row_tile_128_0 = row_block_idx * 2 + 0;
+                const int row_tile_128_1 = row_block_idx * 2 + 1;
                 tma_dev_proxy<typename G::A_sc_gl> proxy_A_sc(&g.A_sc_tma[tma_batch]);
                 tma_dev_proxy<typename G::B_sc_gl> proxy_B_sc(&g.B_sc_tma[tma_batch]);
 
                 for (int i = 0; i < num_red_blocks; ++i) {
+                    const bool block_iter_active =
+                        reduction_iter_active(g, row_tile_128_0, i) ||
+                        reduction_iter_active(g, row_tile_128_1, i);
+                    if (!block_iter_active) continue;
                     wait(inputs_finished[stage], get_phasebit<1>(phasebits, stage));
                     #pragma unroll
                     for (int k = 0; k < C::MMA_PER_TILE; ++k) {
-                        tma::cluster::load_async(
-                            input_scales[stage].A[k],
-                            proxy_A_sc,
-                            {a_row_block_base + row_block_idx*2 + cta_id, a_sc_k_block_base + i * C::MMA_PER_TILE + k, 0, 0},
-                            scales_arrived[stage],
-                            (uint16_t)(1<<cta_id),
-                            0
-                        );
+                        if constexpr (ATBT) {
+                            tma::cluster::load_async(
+                                input_scales[stage].A[k],
+                                proxy_A_sc,
+                                {a_row_block_base + i * C::MMA_PER_TILE + k, a_sc_col_block_base + row_block_idx * C::CLUSTER_SIZE + cta_id, 0, 0},
+                                scales_arrived[stage],
+                                (uint16_t)(1<<cta_id),
+                                0
+                            );
+                        } else {
+                            tma::cluster::load_async(
+                                input_scales[stage].A[k],
+                                proxy_A_sc,
+                                {a_row_block_base + row_block_idx*2 + cta_id, a_sc_k_block_base + i * C::MMA_PER_TILE + k, 0, 0},
+                                scales_arrived[stage],
+                                (uint16_t)(1<<cta_id),
+                                0
+                            );
+                        }
                     }
                     if constexpr (C::B_SC_SIZE == 2) {
                         #pragma unroll
@@ -335,10 +401,19 @@ __device__ inline void kernel(const globals<C> &g) {
 
             for (int flat_block_idx = cluster_id; flat_block_idx < num_blocks; flat_block_idx += cluster_stride) {
                 int batch, block_idx, num_row_blocks, num_col_blocks, num_red_blocks;
+                int row_block_idx, col_block_idx;
                 resolve_problem_tile<C>(g, flat_block_idx, legacy_batch, batch, block_idx, num_row_blocks, num_col_blocks, num_red_blocks);
+                resolve_block_coords<C>(block_idx, num_row_blocks, num_col_blocks, row_block_idx, col_block_idx);
+                const int row_tile_128_0 = row_block_idx * 2 + 0;
+                const int row_tile_128_1 = row_block_idx * 2 + 1;
                 wait(outputs_finished, get_phasebit<1>(phasebits, 0));
                 tensor_after_thread_sync();
+                bool issued_mma = false;
                 for (int i = 0; i < num_red_blocks; i++) {
+                    const bool block_iter_active =
+                        reduction_iter_active(g, row_tile_128_0, i) ||
+                        reduction_iter_active(g, row_tile_128_1, i);
+                    if (!block_iter_active) continue;
                     tma::expect_bytes(scales_arrived[stage], 2*sizeof(G::input_scales_t));
                     wait(scales_arrived[stage], get_phasebit<0>(phasebits, stage));
                     #pragma unroll
@@ -354,14 +429,30 @@ __device__ inline void kernel(const globals<C> &g) {
                     }
                     tma::expect_bytes(tiles_arrived[stage], 2*sizeof(G::input_tiles_t));
                     wait(tiles_arrived[stage], get_phasebit<0>(phasebits, stage));
-                    if (i == 0) mm2_ABt(out_tm, input_tiles[stage].A, input_tiles[stage].B,
-                                        A_sc_tm.template subtile<full_tt_fp8e8m0<C::MMA_PER_TILE * 16>>(stage * C::MMA_PER_TILE * 16),
-                                        B_sc_tm.template subtile<full_tt_fp8e8m0<C::MMA_PER_TILE * 32>>(stage * C::MMA_PER_TILE * 32),
-                                        inputs_finished[stage]);
-                    else       mma2_ABt(out_tm, input_tiles[stage].A, input_tiles[stage].B,
-                                        A_sc_tm.template subtile<full_tt_fp8e8m0<C::MMA_PER_TILE * 16>>(stage * C::MMA_PER_TILE * 16),
-                                        B_sc_tm.template subtile<full_tt_fp8e8m0<C::MMA_PER_TILE * 32>>(stage * C::MMA_PER_TILE * 32),
-                                        inputs_finished[stage]);
+                    auto A_sc_subtile = A_sc_tm.template subtile<full_tt_fp8e8m0<C::MMA_PER_TILE * 16>>(stage * C::MMA_PER_TILE * 16);
+                    auto B_sc_subtile = B_sc_tm.template subtile<full_tt_fp8e8m0<C::MMA_PER_TILE * 32>>(stage * C::MMA_PER_TILE * 32);
+                    if (!issued_mma) {
+                        if constexpr (ATBT) {
+                            kittens::mma<transpose::T, transpose::T, decltype(out_tm), typename G::A_fp4x2_tile, typename G::B_fp4x2_tile, decltype(A_sc_subtile), decltype(B_sc_subtile), 0, C::CLUSTER_SIZE>(
+                                out_tm, input_tiles[stage].A, input_tiles[stage].B, A_sc_subtile, B_sc_subtile, inputs_finished[stage]);
+                        } else {
+                            mm2_ABt(out_tm, input_tiles[stage].A, input_tiles[stage].B,
+                                    A_sc_subtile,
+                                    B_sc_subtile,
+                                    inputs_finished[stage]);
+                        }
+                        issued_mma = true;
+                    } else {
+                        if constexpr (ATBT) {
+                            kittens::mma<transpose::T, transpose::T, decltype(out_tm), typename G::A_fp4x2_tile, typename G::B_fp4x2_tile, decltype(A_sc_subtile), decltype(B_sc_subtile), 1, C::CLUSTER_SIZE>(
+                                out_tm, input_tiles[stage].A, input_tiles[stage].B, A_sc_subtile, B_sc_subtile, inputs_finished[stage]);
+                        } else {
+                            mma2_ABt(out_tm, input_tiles[stage].A, input_tiles[stage].B,
+                                     A_sc_subtile,
+                                     B_sc_subtile,
+                                     inputs_finished[stage]);
+                        }
+                    }
                     update_phasebit<0>(phasebits, stage);
                     stage = (stage + 1) % C::LOAD_PIPE_DEPTH;
                 }

@@ -115,6 +115,7 @@ struct globals {
     int            tilemask_rows;
     int            tilemask_cols;
     bool           tilemask_transposed;
+    bool           output_causal = false;
 
     struct input_tiles_t {
         A_fp4x2_tile A;
@@ -175,6 +176,21 @@ __device__ inline bool reduction_iter_active(
         active = active || tile_active(red_tile_base + red_tile_offset);
     }
     return active;
+}
+
+template <typename C>
+__device__ inline bool output_block_active(
+    const globals<C> &g,
+    int row_block_idx,
+    int col_block_idx
+) {
+    if (!g.output_causal) {
+        return true;
+    }
+    // A spatial block covers 256 output rows and C::Nb output columns.  The
+    // dP path only consumes lower-triangular 128x128 score tiles, so any
+    // 256-column block strictly above the 256-row block can be skipped.
+    return col_block_idx <= row_block_idx;
 }
 
 template <typename C>
@@ -284,6 +300,9 @@ __device__ inline void kernel(const globals<C> &g) {
                 int row_within_supergroup = idx_within_supergroup % rows_in_supergroup;
                 int row_block_idx = supergroup_idx * C::SUPERGROUP_SIZE + row_within_supergroup;
                 int col_block_idx = idx_within_supergroup / rows_in_supergroup;
+                if (!output_block_active<C>(g, row_block_idx, col_block_idx)) {
+                    continue;
+                }
                 const int row_tile_128_0 = row_block_idx * 2 + 0;
                 const int row_tile_128_1 = row_block_idx * 2 + 1;
                 for (int i = 0; i < num_iters_per_block; ++i) {
@@ -310,6 +329,9 @@ __device__ inline void kernel(const globals<C> &g) {
                 int row_within_supergroup = idx_within_supergroup % rows_in_supergroup;
                 int row_block_idx = supergroup_idx * C::SUPERGROUP_SIZE + row_within_supergroup;
                 int col_block_idx = idx_within_supergroup / rows_in_supergroup;
+                if (!output_block_active<C>(g, row_block_idx, col_block_idx)) {
+                    continue;
+                }
                 const int row_tile_128_0 = row_block_idx * 2 + 0;
                 const int row_tile_128_1 = row_block_idx * 2 + 1;
 
@@ -363,7 +385,10 @@ __device__ inline void kernel(const globals<C> &g) {
                 int rows_in_supergroup = min(C::SUPERGROUP_SIZE, num_row_blocks - supergroup_idx * C::SUPERGROUP_SIZE);
                 int row_within_supergroup = idx_within_supergroup % rows_in_supergroup;
                 int row_block_idx = supergroup_idx * C::SUPERGROUP_SIZE + row_within_supergroup;
-                const int row_tile_128 = row_block_idx * 2 + cta_id;
+                int col_block_idx = idx_within_supergroup / rows_in_supergroup;
+                if (!output_block_active<C>(g, row_block_idx, col_block_idx)) {
+                    continue;
+                }
                 const int row_tile_128_0 = row_block_idx * 2 + 0;
                 const int row_tile_128_1 = row_block_idx * 2 + 1;
                 wait(outputs_finished, get_phasebit<1>(phasebits, 0));
@@ -427,11 +452,15 @@ __device__ inline void kernel(const globals<C> &g) {
             int row_within_supergroup = idx_within_supergroup % rows_in_supergroup;
             int row_block_idx = supergroup_idx * C::SUPERGROUP_SIZE + row_within_supergroup;
             int col_block_idx = idx_within_supergroup / rows_in_supergroup;
+            if (!output_block_active<C>(g, row_block_idx, col_block_idx)) {
+                continue;
+            }
             const int row_tile_128 = row_block_idx * 2 + cta_id;
             bool block_has_active = false;
             #pragma unroll
             for (int i = 0; i < num_iters_per_block; ++i) {
-                block_has_active = block_has_active || reduction_iter_active(g, row_tile_128, i);
+                block_has_active = block_has_active ||
+                    reduction_iter_active(g, row_tile_128, i);
             }
 
             // Wait for the last matmul to complete
