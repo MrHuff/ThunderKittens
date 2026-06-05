@@ -157,6 +157,25 @@ __device__ inline bool reduction_iter_active(
     return active;
 }
 
+template <typename C, bool ATBT>
+__device__ inline bool reduction_iter_active_for_output_tile(
+    const globals<C> &g,
+    int row_block_idx,
+    int col_block_idx,
+    int red_iter
+) {
+    if (g.tilemask_ptr == nullptr) {
+        return true;
+    }
+    const int mask_block_idx = ATBT ? col_block_idx : row_block_idx;
+    bool active = false;
+    #pragma unroll
+    for (int tile = 0; tile < C::CLUSTER_SIZE; ++tile) {
+        active = active || reduction_iter_active(g, mask_block_idx * C::CLUSTER_SIZE + tile, red_iter);
+    }
+    return active;
+}
+
 template <typename C>
 __device__ inline void resolve_problem_tile(
     const globals<C> &g,
@@ -298,8 +317,7 @@ __device__ inline void kernel(const globals<C> &g) {
 
                 for (int i = 0; i < num_red_blocks; ++i) {
                     const bool block_iter_active =
-                        reduction_iter_active(g, row_tile_128_0, i) ||
-                        reduction_iter_active(g, row_tile_128_1, i);
+                        reduction_iter_active_for_output_tile<C, ATBT>(g, row_block_idx, col_block_idx, i);
                     if (!block_iter_active) continue;
                     wait(inputs_finished[stage], get_phasebit<1>(phasebits, stage));
                     if constexpr (ATBT) {
@@ -335,8 +353,7 @@ __device__ inline void kernel(const globals<C> &g) {
 
                 for (int i = 0; i < num_red_blocks; ++i) {
                     const bool block_iter_active =
-                        reduction_iter_active(g, row_tile_128_0, i) ||
-                        reduction_iter_active(g, row_tile_128_1, i);
+                        reduction_iter_active_for_output_tile<C, ATBT>(g, row_block_idx, col_block_idx, i);
                     if (!block_iter_active) continue;
                     wait(inputs_finished[stage], get_phasebit<1>(phasebits, stage));
                     #pragma unroll
@@ -411,8 +428,7 @@ __device__ inline void kernel(const globals<C> &g) {
                 bool issued_mma = false;
                 for (int i = 0; i < num_red_blocks; i++) {
                     const bool block_iter_active =
-                        reduction_iter_active(g, row_tile_128_0, i) ||
-                        reduction_iter_active(g, row_tile_128_1, i);
+                        reduction_iter_active_for_output_tile<C, ATBT>(g, row_block_idx, col_block_idx, i);
                     if (!block_iter_active) continue;
                     tma::expect_bytes(scales_arrived[stage], 2*sizeof(G::input_scales_t));
                     wait(scales_arrived[stage], get_phasebit<0>(phasebits, stage));

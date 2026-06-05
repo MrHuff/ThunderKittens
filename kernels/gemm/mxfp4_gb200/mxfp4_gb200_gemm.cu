@@ -1404,8 +1404,9 @@ void mxfp4_grouped_gemm_strided_impl(
         TORCH_CHECK(tilemask->is_cuda(), "mxfp4_grouped_gemm_strided_masked expects a CUDA tilemask");
         TORCH_CHECK(tilemask->is_contiguous(), "mxfp4_grouped_gemm_strided_masked expects a contiguous tilemask");
         TORCH_CHECK(tilemask->dtype() == at::ScalarType::Byte, "mxfp4_grouped_gemm_strided_masked expects a uint8 tilemask");
-        const int64_t mask_rows = tilemask_transposed ? K0 / 128 : M / 128;
-        const int64_t mask_cols = tilemask_transposed ? M / 128 : K0 / 128;
+        const int64_t masked_output_tiles = ATBT ? N_out / 128 : M / 128;
+        const int64_t mask_rows = tilemask_transposed ? K0 / 128 : masked_output_tiles;
+        const int64_t mask_cols = tilemask_transposed ? masked_output_tiles : K0 / 128;
         check_tilemask(*tilemask, "tilemask", mask_rows, mask_cols);
     }
 
@@ -1585,6 +1586,33 @@ void mxfp4_grouped_gemm_atbt_strided_entrypoint(
         A, A_sc, B, B_sc, D, num_batches, m_per_batch, n_per_batch, k_per_batch,
         a_row_stride, a_k_stride, b_row_stride, b_k_stride, d_row_stride,
         config_id, a_k_offset, b_k_offset, nullptr, false);
+}
+
+void mxfp4_grouped_gemm_atbt_strided_masked_entrypoint(
+    const at::Tensor &A,
+    const at::Tensor &A_sc,
+    const at::Tensor &B,
+    const at::Tensor &B_sc,
+    const at::Tensor &tilemask,
+    bool tilemask_transposed,
+    at::Tensor &D,
+    int64_t num_batches,
+    int64_t m_per_batch,
+    int64_t n_per_batch,
+    int64_t k_per_batch,
+    int64_t a_row_stride,
+    int64_t a_k_stride,
+    int64_t b_row_stride,
+    int64_t b_k_stride,
+    int64_t d_row_stride,
+    int config_id = -1,
+    int64_t a_k_offset = 0,
+    int64_t b_k_offset = 0
+) {
+    mxfp4_grouped_gemm_strided_impl<true>(
+        A, A_sc, B, B_sc, D, num_batches, m_per_batch, n_per_batch, k_per_batch,
+        a_row_stride, a_k_stride, b_row_stride, b_k_stride, d_row_stride,
+        config_id, a_k_offset, b_k_offset, &tilemask, tilemask_transposed);
 }
 
 void mxfp4_grouped_gemm_strided_masked_entrypoint(
@@ -2079,6 +2107,25 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           "Uniform grouped AtBt GEMM over flat packed tensors using one TMA descriptor per operand",
           pybind11::arg("A"), pybind11::arg("A_sc"),
           pybind11::arg("B"), pybind11::arg("B_sc"),
+          pybind11::arg("D"),
+          pybind11::arg("num_batches"),
+          pybind11::arg("m_per_batch"),
+          pybind11::arg("n_per_batch"),
+          pybind11::arg("k_per_batch"),
+          pybind11::arg("a_row_stride"),
+          pybind11::arg("a_k_stride"),
+          pybind11::arg("b_row_stride"),
+          pybind11::arg("b_k_stride"),
+          pybind11::arg("d_row_stride"),
+          pybind11::arg("config_id") = -1,
+          pybind11::arg("a_k_offset") = 0,
+          pybind11::arg("b_k_offset") = 0);
+    m.def("mxfp4_grouped_gemm_atbt_strided_masked", &mxfp4_grouped_gemm_atbt_strided_masked_entrypoint,
+          "Uniform grouped AtBt GEMM with a shared per-GEMM tilemask for inactive reduction tiles",
+          pybind11::arg("A"), pybind11::arg("A_sc"),
+          pybind11::arg("B"), pybind11::arg("B_sc"),
+          pybind11::arg("tilemask"),
+          pybind11::arg("tilemask_transposed"),
           pybind11::arg("D"),
           pybind11::arg("num_batches"),
           pybind11::arg("m_per_batch"),
