@@ -24,6 +24,7 @@
 #include "../nvfp4_batched_gemm.cuh"
 #include "../nvfp4_split2_accum_gemm.cuh"
 #include "../nvfp4_split3_accum_gemm.cuh"
+#include "nvfp4_localcta_silu_dgrad_quant_gemm.cuh"  // fused W2-dgrad -> SiLU split2 quant producer
 
 namespace {
 
@@ -5301,6 +5302,136 @@ at::Tensor nvfp4_localcta_fold_outer_sg_into_prepared_sc_entrypoint(
     return fold_outer_sg_into_prepared_sc_tensor(sc_raw, sg, rows, cols);
 }
 
+template <typename C>
+void launch_localcta_silu_dgrad_quant_gemm_with_config(
+    const at::Tensor& A,
+    const at::Tensor& A_sc,
+    const at::Tensor& A_sg,
+    const at::Tensor& B,
+    const at::Tensor& B_sc,
+    const at::Tensor& B_sg,
+    const at::Tensor& h3,
+    const at::Tensor& h1_raw,
+    at::Tensor& row_fp4_cat,
+    at::Tensor& row_sc_prepared_cat,
+    at::Tensor& row_sg_cat,
+    at::Tensor& col_fp4_cat,
+    at::Tensor& col_sc_prepared_cat,
+    at::Tensor& col_sg_cat
+) {
+    using G = nvfp4_localcta_silu_dgrad_quant_gemm::globals<C>;
+    const int64_t M = A.size(0);
+    const int64_t H = B.size(0);
+    auto A_sg_outer = normalize_outer_scale_tiles_tensor(A_sg, M / C::Mb, true).contiguous();
+    auto B_sg_outer = normalize_outer_scale_tiles_tensor(B_sg, H / C::Nb, false).contiguous();
+
+    outer_scale_desc a_sg_desc = check_outer_scale_tiles(A_sg_outer, "A_sg_outer", M / C::Mb, true);
+    outer_scale_desc b_sg_desc = check_outer_scale_tiles(B_sg_outer, "B_sg_outer", H / C::Nb, false);
+
+    G g {
+        .A = kittens::py::tensor_to_gl<typename G::A_fp4x2_gl>(A),
+        .A_sc = kittens::py::tensor_to_gl<typename G::A_sc_gl, false>(
+            A_sc, 1, A_sc.size(0), A_sc.size(1), 256),
+        .B = kittens::py::tensor_to_gl<typename G::B_fp4x2_gl>(B),
+        .B_sc = kittens::py::tensor_to_gl<typename G::B_sc_gl, false>(
+            B_sc, 1, B_sc.size(0), B_sc.size(1), 256),
+        .A_sg = a_sg_desc.ptr,
+        .A_sg_stride = a_sg_desc.stride,
+        .B_sg = b_sg_desc.ptr,
+        .B_sg_stride = b_sg_desc.stride,
+        .h3 = reinterpret_cast<const bf16*>(h3.data_ptr<at::BFloat16>()),
+        .h1_raw = reinterpret_cast<const bf16*>(h1_raw.data_ptr<at::BFloat16>()),
+        .row_fp4 = reinterpret_cast<uint8_t*>(row_fp4_cat.data_ptr()),
+        .row_sc = reinterpret_cast<uint8_t*>(row_sc_prepared_cat.data_ptr()),
+        .row_sg = row_sg_cat.data_ptr<float>(),
+        .col_fp4 = reinterpret_cast<uint8_t*>(col_fp4_cat.data_ptr()),
+        .col_sc = reinterpret_cast<uint8_t*>(col_sc_prepared_cat.data_ptr()),
+        .col_sg = col_sg_cat.data_ptr<float>(),
+        .M = static_cast<int>(M),
+        .H = static_cast<int>(H),
+    };
+    kittens::py::launch_kernel<C, G, nvfp4_localcta_silu_dgrad_quant_gemm::kernel<C>>(g);
+}
+
+void nvfp4_localcta_w2_dgrad_silu_quant_gemm_entrypoint(
+    const at::Tensor& A,
+    const at::Tensor& A_sc,
+    const at::Tensor& A_sg,
+    const at::Tensor& B,
+    const at::Tensor& B_sc,
+    const at::Tensor& B_sg,
+    const at::Tensor& h3,
+    const at::Tensor& h1_raw,
+    at::Tensor& row_fp4_cat,
+    at::Tensor& row_sc_prepared_cat,
+    at::Tensor& row_sg_cat,
+    at::Tensor& col_fp4_cat,
+    at::Tensor& col_sc_prepared_cat,
+    at::Tensor& col_sg_cat,
+    int config_id = 4
+) {
+    check_fp4_matrix(A, "A");
+    check_fp4_matrix(B, "B");
+    TORCH_CHECK(A.size(1) == B.size(1), "A and B must share packed K");
+    const int64_t M = A.size(0);
+    const int64_t H = B.size(0);
+    const int64_t K = A.size(1) * 2;
+    TORCH_CHECK(M % 256 == 0 && H % 256 == 0 && K % 256 == 0,
+                "localCTA W2-dgrad SiLU producer requires M,H,K divisible by 256");
+    check_scale_tensor(A_sc, "A_sc", M, K);
+    check_scale_tensor(B_sc, "B_sc", H, K);
+    TORCH_CHECK(h3.is_cuda() && h3.is_contiguous() && h3.scalar_type() == at::kBFloat16,
+                "h3 must be contiguous CUDA bf16");
+    TORCH_CHECK(h1_raw.is_cuda() && h1_raw.is_contiguous() && h1_raw.scalar_type() == at::kBFloat16,
+                "h1_raw must be contiguous CUDA bf16");
+    TORCH_CHECK(h3.sizes() == torch::IntArrayRef({M, H}) &&
+                h1_raw.sizes() == torch::IntArrayRef({M, H}),
+                "h3 and h1_raw must have shape [M,H]");
+
+    const int64_t total_n = 2 * H;
+    TORCH_CHECK(row_fp4_cat.is_cuda() && row_fp4_cat.is_contiguous() &&
+                row_fp4_cat.scalar_type() == torch::kFloat4_e2m1fn_x2 &&
+                row_fp4_cat.sizes() == torch::IntArrayRef({M, total_n / 2}),
+                "row_fp4_cat must be contiguous CUDA fp4 [M,total_n/2]");
+    TORCH_CHECK(row_sc_prepared_cat.is_cuda() && row_sc_prepared_cat.is_contiguous() &&
+                row_sc_prepared_cat.scalar_type() == torch::kFloat8_e4m3fn &&
+                row_sc_prepared_cat.sizes() == torch::IntArrayRef({M / 128, total_n / 64, 512}),
+                "row_sc_prepared_cat must be contiguous CUDA fp8 [M/128,total_n/64,512]");
+    TORCH_CHECK(row_sg_cat.is_cuda() && row_sg_cat.is_contiguous() &&
+                row_sg_cat.scalar_type() == torch::kFloat32 &&
+                row_sg_cat.sizes() == torch::IntArrayRef({M / 128, total_n / 128}),
+                "row_sg_cat must be contiguous CUDA fp32 [M/128,total_n/128]");
+    TORCH_CHECK(col_fp4_cat.is_cuda() && col_fp4_cat.is_contiguous() &&
+                col_fp4_cat.scalar_type() == torch::kFloat4_e2m1fn_x2 &&
+                col_fp4_cat.sizes() == torch::IntArrayRef({total_n, M / 2}),
+                "col_fp4_cat must be contiguous CUDA fp4 [total_n,M/2]");
+    TORCH_CHECK(col_sc_prepared_cat.is_cuda() && col_sc_prepared_cat.is_contiguous() &&
+                col_sc_prepared_cat.scalar_type() == torch::kFloat8_e4m3fn &&
+                col_sc_prepared_cat.sizes() == torch::IntArrayRef({total_n / 128, M / 64, 512}),
+                "col_sc_prepared_cat must be contiguous CUDA fp8 [total_n/128,M/64,512]");
+    TORCH_CHECK(col_sg_cat.is_cuda() && col_sg_cat.is_contiguous() &&
+                col_sg_cat.scalar_type() == torch::kFloat32 &&
+                col_sg_cat.sizes() == torch::IntArrayRef({total_n / 128, M / 128}),
+                "col_sg_cat must be contiguous CUDA fp32 [total_n/128,M/128]");
+    kittens::py::device_check(A, A_sc, A_sg, B, B_sc, B_sg, h3, h1_raw,
+                              row_fp4_cat, row_sc_prepared_cat, row_sg_cat,
+                              col_fp4_cat, col_sc_prepared_cat, col_sg_cat);
+
+    if (config_id == 0) {
+        launch_localcta_silu_dgrad_quant_gemm_with_config<
+            nvfp4_localcta_silu_dgrad_quant_gemm::config<3, 4>>(
+            A, A_sc, A_sg, B, B_sc, B_sg, h3, h1_raw,
+            row_fp4_cat, row_sc_prepared_cat, row_sg_cat,
+            col_fp4_cat, col_sc_prepared_cat, col_sg_cat);
+    } else {
+        launch_localcta_silu_dgrad_quant_gemm_with_config<
+            nvfp4_localcta_silu_dgrad_quant_gemm::config<3, 12>>(
+            A, A_sc, A_sg, B, B_sc, B_sg, h3, h1_raw,
+            row_fp4_cat, row_sc_prepared_cat, row_sg_cat,
+            col_fp4_cat, col_sc_prepared_cat, col_sg_cat);
+    }
+}
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("nvfp4_localcta_gemm", &nvfp4_localcta_gemm_entrypoint,
           pybind11::arg("A"), pybind11::arg("A_sc"), pybind11::arg("A_sg_chunks"),
@@ -5524,4 +5655,13 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           pybind11::arg("sc_raw"), pybind11::arg("sg"), pybind11::arg("rows"), pybind11::arg("cols"));
     m.def("nvfp4_localcta_fold_outer_sg_into_prepared_sc", &nvfp4_localcta_fold_outer_sg_into_prepared_sc_entrypoint,
           pybind11::arg("sc_raw"), pybind11::arg("sg"), pybind11::arg("rows"), pybind11::arg("cols"));
+    m.def("nvfp4_localcta_w2_dgrad_silu_quant_gemm",
+          &nvfp4_localcta_w2_dgrad_silu_quant_gemm_entrypoint,
+          pybind11::arg("A"), pybind11::arg("A_sc"), pybind11::arg("A_sg"),
+          pybind11::arg("B"), pybind11::arg("B_sc"), pybind11::arg("B_sg"),
+          pybind11::arg("h3"), pybind11::arg("h1_raw"),
+          pybind11::arg("row_fp4_cat"), pybind11::arg("row_sc_prepared_cat"),
+          pybind11::arg("row_sg_cat"), pybind11::arg("col_fp4_cat"),
+          pybind11::arg("col_sc_prepared_cat"), pybind11::arg("col_sg_cat"),
+          pybind11::arg("config_id") = 4);
 }
