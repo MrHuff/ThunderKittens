@@ -1325,7 +1325,7 @@ void mxfp4_batched_gemm_entrypoint(
             auto d_gl = tensor_to_gl_tma_view<typename G::D_gl>(D_out_list[i], "D_out_list");
             memcpy(&g_host.D_tma[i], &d_gl.tma_descs.tma_desc, sizeof(CUtensorMap));
         }
-        kittens::py::launch_kernel<C, G, mxfp4_batched_gemm::kernel<C>>(g_host);
+        kittens::py::launch_kernel<C, G, mxfp4_batched_gemm::kernel<C, false, false>>(g_host);
     };
 
     // For batched GEMM, use MMA_PER_TILE-friendly configs to avoid resource overflow.
@@ -1462,7 +1462,7 @@ void mxfp4_grouped_gemm_strided_impl(
             memcpy(&g_host.B_tma[0], &b_gl.tma_descs.tma_desc, sizeof(CUtensorMap));
             memcpy(&g_host.B_sc_tma[0], &b_sc_gl.tma_descs.tma_desc, sizeof(CUtensorMap));
             memcpy(&g_host.D_tma[0], &d_gl.tma_descs.tma_desc, sizeof(CUtensorMap));
-            kittens::py::launch_kernel<C, G, mxfp4_batched_gemm::kernel<C, ATBT>>(g_host);
+            kittens::py::launch_kernel<C, G, mxfp4_batched_gemm::kernel<C, ATBT, false>>(g_host);
         }
     };
 
@@ -1701,7 +1701,7 @@ void mxfp4_batched_gemm_config_entrypoint(
             auto d_gl = tensor_to_gl_tma_view<typename G::D_gl>(D_out_list[i], "D_out_list");
             memcpy(&g_host.D_tma[i], &d_gl.tma_descs.tma_desc, sizeof(CUtensorMap));
         }
-        kittens::py::launch_kernel<C, G, mxfp4_batched_gemm::kernel<C>>(g_host);
+        kittens::py::launch_kernel<C, G, mxfp4_batched_gemm::kernel<C, false, false>>(g_host);
     };
 
     switch (config_id) {

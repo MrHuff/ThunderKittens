@@ -226,7 +226,7 @@ __device__ inline void resolve_block_coords(
     col_block_idx = idx_within_supergroup / rows_in_supergroup;
 }
 
-template <typename C, bool ATBT = false>
+template <typename C, bool ATBT = false, bool APPLY_ROPE = true>
 __device__ inline void kernel(const globals<C> &g) {
     using G = globals<C>;
 
@@ -513,29 +513,31 @@ __device__ inline void kernel(const globals<C> &g) {
             #pragma unroll
             for (int i = 0; i < C::EPI_PIPE_DEPTH; i++) {
                 warp::mul(D_reg_fl[i], D_reg_fl[i], MXFP4_ALPHA);
-                if (g.rope_live64[rope_batch].enabled()) {
-                    if constexpr (C::ROPE_LIVE64_RHT32) {
-                        mxfp4_rope_epilogue::apply_inplace_live64_rht32(
-                            D_reg_fl[i],
-                            g.rope_live64[rope_batch],
-                            (row_block_idx * 2 + cta_id) * (C::Mb / 2),
-                            (col_block_idx * C::EPI_PIPE_DEPTH + i) * (C::Nb / C::EPI_PIPE_DEPTH)
-                        );
+                if constexpr (APPLY_ROPE) {
+                    if (g.rope_live64[rope_batch].enabled()) {
+                        if constexpr (C::ROPE_LIVE64_RHT32) {
+                            mxfp4_rope_epilogue::apply_inplace_live64_rht32(
+                                D_reg_fl[i],
+                                g.rope_live64[rope_batch],
+                                (row_block_idx * 2 + cta_id) * (C::Mb / 2),
+                                (col_block_idx * C::EPI_PIPE_DEPTH + i) * (C::Nb / C::EPI_PIPE_DEPTH)
+                            );
+                        } else {
+                            mxfp4_rope_epilogue::apply_inplace_live64(
+                                D_reg_fl[i],
+                                g.rope_live64[rope_batch],
+                                (row_block_idx * 2 + cta_id) * (C::Mb / 2),
+                                (col_block_idx * C::EPI_PIPE_DEPTH + i) * (C::Nb / C::EPI_PIPE_DEPTH)
+                            );
+                        }
                     } else {
-                        mxfp4_rope_epilogue::apply_inplace_live64(
+                        mxfp4_rope_epilogue::apply_inplace(
                             D_reg_fl[i],
-                            g.rope_live64[rope_batch],
+                            g.rope[rope_batch],
                             (row_block_idx * 2 + cta_id) * (C::Mb / 2),
                             (col_block_idx * C::EPI_PIPE_DEPTH + i) * (C::Nb / C::EPI_PIPE_DEPTH)
                         );
                     }
-                } else {
-                    mxfp4_rope_epilogue::apply_inplace(
-                        D_reg_fl[i],
-                        g.rope[rope_batch],
-                        (row_block_idx * 2 + cta_id) * (C::Mb / 2),
-                        (col_block_idx * C::EPI_PIPE_DEPTH + i) * (C::Nb / C::EPI_PIPE_DEPTH)
-                    );
                 }
             }
             rt_bf<C::Mb / 8, C::Nb/C::EPI_PIPE_DEPTH> D_reg[C::EPI_PIPE_DEPTH];
