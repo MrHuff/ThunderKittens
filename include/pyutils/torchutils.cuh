@@ -2,6 +2,8 @@
 
 #include <ATen/cuda/CUDAContext.h>
 #include <ATen/core/Tensor.h>
+#include <atomic>
+#include <mutex>
 
 #include "kittens.cuh"
 #include "parallel_tensor.cuh"
@@ -199,10 +201,25 @@ __host__ static inline void launch_kernel(const Globals &G) {
     static_assert(Config::CLUSTER_SIZE <= 8, "Cluster size must be less than or equal to 8 for Hopper");
 #elif defined(KITTENS_BLACKWELL)
     static_assert(Config::CLUSTER_SIZE <= 16, "Cluster size must be less than or equal to 16 for Blackwell");
-    if constexpr (Config::CLUSTER_SIZE > 8)
-        CUDACHECK(cudaFuncSetAttribute(global_kernel<Config, Globals, Kernel>, cudaFuncAttributeNonPortableClusterSizeAllowed, 1));
+    if constexpr (Config::CLUSTER_SIZE > 8) {
+        static std::once_flag cluster_attr_once;
+        std::call_once(cluster_attr_once, []() {
+            CUDACHECK(cudaFuncSetAttribute(global_kernel<Config, Globals, Kernel>, cudaFuncAttributeNonPortableClusterSizeAllowed, 1));
+        });
+    }
 #endif
-    CUDACHECK(cudaFuncSetAttribute(global_kernel<Config, Globals, Kernel>, cudaFuncAttributeMaxDynamicSharedMemorySize, dynamic_shared_memory));
+    static std::atomic<int> max_dynamic_shared_memory_set{-1};
+    if (dynamic_shared_memory > max_dynamic_shared_memory_set.load(std::memory_order_acquire)) {
+        static std::mutex attr_mutex;
+        std::lock_guard<std::mutex> lock(attr_mutex);
+        if (dynamic_shared_memory > max_dynamic_shared_memory_set.load(std::memory_order_relaxed)) {
+            CUDACHECK(cudaFuncSetAttribute(
+                global_kernel<Config, Globals, Kernel>,
+                cudaFuncAttributeMaxDynamicSharedMemorySize,
+                dynamic_shared_memory));
+            max_dynamic_shared_memory_set.store(dynamic_shared_memory, std::memory_order_release);
+        }
+    }
 
     if constexpr (Config::CLUSTER_SIZE <= 1) {
         LaunchConfig<false, use_pdl<Config>> launch_config(grid, block, dynamic_shared_memory, stream);
