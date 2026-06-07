@@ -1486,7 +1486,8 @@ void mxfp4_grouped_gemm_strided_impl(
     int64_t a_k_offset = 0,
     int64_t b_k_offset = 0,
     const at::Tensor *tilemask = nullptr,
-    bool tilemask_transposed = false
+    bool tilemask_transposed = false,
+    bool output_causal = false
 ) {
     TORCH_CHECK(num_batches > 0, "num_batches must be positive");
     TORCH_CHECK(A.is_cuda() && A_sc.is_cuda() && B.is_cuda() && B_sc.is_cuda() && D.is_cuda(),
@@ -1558,6 +1559,7 @@ void mxfp4_grouped_gemm_strided_impl(
             g_host.d_row_block_stride = (int)(d_row_stride / 128);
             g_host.a_k_block_offset = (int)(a_k_offset / (ATBT ? 128 : C::Kb));
             g_host.b_k_block_offset = (int)(b_k_offset / C::Kb);
+            g_host.output_causal = output_causal;
             if (tilemask != nullptr) {
                 g_host.tilemask_ptr = tilemask->data_ptr<uint8_t>();
                 g_host.tilemask_rows = static_cast<int>(tilemask->size(0));
@@ -1673,7 +1675,32 @@ void mxfp4_grouped_gemm_strided_entrypoint(
     mxfp4_grouped_gemm_strided_impl<false>(
         A, A_sc, B, B_sc, D, num_batches, m_per_batch, n_per_batch, k_per_batch,
         a_row_stride, a_k_stride, b_row_stride, b_k_stride, d_row_stride,
-        config_id, a_k_offset, b_k_offset, nullptr, false);
+        config_id, a_k_offset, b_k_offset, nullptr, false, false);
+}
+
+void mxfp4_grouped_gemm_strided_output_causal_entrypoint(
+    const at::Tensor &A,
+    const at::Tensor &A_sc,
+    const at::Tensor &B,
+    const at::Tensor &B_sc,
+    at::Tensor &D,
+    int64_t num_batches,
+    int64_t m_per_batch,
+    int64_t n_per_batch,
+    int64_t k_per_batch,
+    int64_t a_row_stride,
+    int64_t a_k_stride,
+    int64_t b_row_stride,
+    int64_t b_k_stride,
+    int64_t d_row_stride,
+    int config_id = -1,
+    int64_t a_k_offset = 0,
+    int64_t b_k_offset = 0
+) {
+    mxfp4_grouped_gemm_strided_impl<false>(
+        A, A_sc, B, B_sc, D, num_batches, m_per_batch, n_per_batch, k_per_batch,
+        a_row_stride, a_k_stride, b_row_stride, b_k_stride, d_row_stride,
+        config_id, a_k_offset, b_k_offset, nullptr, false, true);
 }
 
 void mxfp4_grouped_gemm_atbt_strided_entrypoint(
@@ -1698,7 +1725,7 @@ void mxfp4_grouped_gemm_atbt_strided_entrypoint(
     mxfp4_grouped_gemm_strided_impl<true>(
         A, A_sc, B, B_sc, D, num_batches, m_per_batch, n_per_batch, k_per_batch,
         a_row_stride, a_k_stride, b_row_stride, b_k_stride, d_row_stride,
-        config_id, a_k_offset, b_k_offset, nullptr, false);
+        config_id, a_k_offset, b_k_offset, nullptr, false, false);
 }
 
 void mxfp4_grouped_gemm_atbt_strided_masked_entrypoint(
@@ -1725,7 +1752,7 @@ void mxfp4_grouped_gemm_atbt_strided_masked_entrypoint(
     mxfp4_grouped_gemm_strided_impl<true>(
         A, A_sc, B, B_sc, D, num_batches, m_per_batch, n_per_batch, k_per_batch,
         a_row_stride, a_k_stride, b_row_stride, b_k_stride, d_row_stride,
-        config_id, a_k_offset, b_k_offset, &tilemask, tilemask_transposed);
+        config_id, a_k_offset, b_k_offset, &tilemask, tilemask_transposed, false);
 }
 
 void mxfp4_grouped_gemm_strided_masked_entrypoint(
@@ -1752,7 +1779,7 @@ void mxfp4_grouped_gemm_strided_masked_entrypoint(
     mxfp4_grouped_gemm_strided_impl<false>(
         A, A_sc, B, B_sc, D, num_batches, m_per_batch, n_per_batch, k_per_batch,
         a_row_stride, a_k_stride, b_row_stride, b_k_stride, d_row_stride,
-        config_id, a_k_offset, b_k_offset, &tilemask, tilemask_transposed);
+        config_id, a_k_offset, b_k_offset, &tilemask, tilemask_transposed, false);
 }
 
 void mxfp4_batched_gemm_config_entrypoint(
@@ -2210,6 +2237,23 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           pybind11::arg("D_out_list"));
     m.def("mxfp4_grouped_gemm_strided", &mxfp4_grouped_gemm_strided_entrypoint,
           "Uniform grouped GEMM over flat packed tensors using one TMA descriptor per operand",
+          pybind11::arg("A"), pybind11::arg("A_sc"),
+          pybind11::arg("B"), pybind11::arg("B_sc"),
+          pybind11::arg("D"),
+          pybind11::arg("num_batches"),
+          pybind11::arg("m_per_batch"),
+          pybind11::arg("n_per_batch"),
+          pybind11::arg("k_per_batch"),
+          pybind11::arg("a_row_stride"),
+          pybind11::arg("a_k_stride"),
+          pybind11::arg("b_row_stride"),
+          pybind11::arg("b_k_stride"),
+          pybind11::arg("d_row_stride"),
+          pybind11::arg("config_id") = -1,
+          pybind11::arg("a_k_offset") = 0,
+          pybind11::arg("b_k_offset") = 0);
+    m.def("mxfp4_grouped_gemm_strided_output_causal", &mxfp4_grouped_gemm_strided_output_causal_entrypoint,
+          "Uniform grouped GEMM that skips output blocks above the causal diagonal",
           pybind11::arg("A"), pybind11::arg("A_sc"),
           pybind11::arg("B"), pybind11::arg("B_sc"),
           pybind11::arg("D"),

@@ -86,6 +86,7 @@ struct globals {
     int       tilemask_rows;
     int       tilemask_cols;
     bool      tilemask_transposed;
+    bool      output_causal;
 
     struct input_tiles_t {
         A_fp4x2_tile A;
@@ -174,6 +175,18 @@ __device__ inline bool reduction_iter_active_for_output_tile(
         active = active || reduction_iter_active(g, mask_block_idx * C::CLUSTER_SIZE + tile, red_iter);
     }
     return active;
+}
+
+template <typename C>
+__device__ inline bool output_block_active(
+    const globals<C> &g,
+    int row_block_idx,
+    int col_block_idx
+) {
+    if (!g.output_causal) {
+        return true;
+    }
+    return col_block_idx <= row_block_idx;
 }
 
 template <typename C>
@@ -305,6 +318,9 @@ __device__ inline void kernel(const globals<C> &g) {
                 int row_block_idx, col_block_idx;
                 resolve_problem_tile<C>(g, flat_block_idx, legacy_batch, batch, block_idx, num_row_blocks, num_col_blocks, num_red_blocks);
                 resolve_block_coords<C>(block_idx, num_row_blocks, num_col_blocks, row_block_idx, col_block_idx);
+                if (!output_block_active<C>(g, row_block_idx, col_block_idx)) {
+                    continue;
+                }
                 const int tma_batch = g.uniform_strided ? 0 : batch;
                 const int a_row_block_base = g.uniform_strided ? batch * g.a_row_block_stride : 0;
                 const int a_k_block_base = (g.uniform_strided ? batch * g.a_k_block_stride : 0) + g.a_k_block_offset;
@@ -340,6 +356,9 @@ __device__ inline void kernel(const globals<C> &g) {
                 int row_block_idx, col_block_idx;
                 resolve_problem_tile<C>(g, flat_block_idx, legacy_batch, batch, block_idx, num_row_blocks, num_col_blocks, num_red_blocks);
                 resolve_block_coords<C>(block_idx, num_row_blocks, num_col_blocks, row_block_idx, col_block_idx);
+                if (!output_block_active<C>(g, row_block_idx, col_block_idx)) {
+                    continue;
+                }
                 const int tma_batch = g.uniform_strided ? 0 : batch;
                 const int a_row_block_base = g.uniform_strided ? batch * g.a_row_block_stride : 0;
                 const int a_sc_col_block_base = (g.uniform_strided ? batch * g.a_k_block_stride : 0) + g.a_k_block_offset;
@@ -421,6 +440,9 @@ __device__ inline void kernel(const globals<C> &g) {
                 int row_block_idx, col_block_idx;
                 resolve_problem_tile<C>(g, flat_block_idx, legacy_batch, batch, block_idx, num_row_blocks, num_col_blocks, num_red_blocks);
                 resolve_block_coords<C>(block_idx, num_row_blocks, num_col_blocks, row_block_idx, col_block_idx);
+                if (!output_block_active<C>(g, row_block_idx, col_block_idx)) {
+                    continue;
+                }
                 const int row_tile_128_0 = row_block_idx * 2 + 0;
                 const int row_tile_128_1 = row_block_idx * 2 + 1;
                 wait(outputs_finished, get_phasebit<1>(phasebits, 0));
@@ -492,6 +514,9 @@ __device__ inline void kernel(const globals<C> &g) {
             int row_block_idx, col_block_idx;
             resolve_problem_tile<C>(g, flat_block_idx, legacy_batch, batch, block_idx, num_row_blocks, num_col_blocks, num_red_blocks);
             resolve_block_coords<C>(block_idx, num_row_blocks, num_col_blocks, row_block_idx, col_block_idx);
+            if (!output_block_active<C>(g, row_block_idx, col_block_idx)) {
+                continue;
+            }
             const int tma_batch = g.uniform_strided ? 0 : batch;
             const int d_row_block_base = g.uniform_strided ? batch * g.d_row_block_stride : 0;
             const int rope_batch = g.uniform_strided ? 0 : batch;
