@@ -6,7 +6,7 @@ using namespace kittens;
 
 namespace mxfp4_silu_dgrad_quant_gemm {
 
-template <int _LOAD_PIPE_DEPTH, int _SUPERGROUP_SIZE, int _QUANT_MODE = 1>
+template <int _LOAD_PIPE_DEPTH, int _SUPERGROUP_SIZE, int _QUANT_MODE = 1, bool _USE_SAVED_SIGMOID = false>
 struct config {
     static constexpr int CLUSTER_SIZE = 2;
     static constexpr bool USE_PDL = true;
@@ -27,6 +27,7 @@ struct config {
     static constexpr int MMA_PER_TILE = 2;
     static constexpr int NUM_D_TILES = 2;
     static constexpr int QUANT_MODE = _QUANT_MODE;
+    static constexpr bool USE_SAVED_SIGMOID = _USE_SAVED_SIGMOID;
 };
 
 template <typename C>
@@ -50,6 +51,7 @@ struct globals {
 
     const bf16* h3;
     const bf16* h1_raw;
+    const bf16* sig_h1;
 
     row_fp4_gl row_fp4;
     uint8_t* row_sc;
@@ -286,6 +288,53 @@ __device__ __forceinline__ void silu_deriv_pair(
         __float2bfloat16_rn(dh_y * silu_y)};
 }
 
+__device__ __forceinline__ void silu_deriv_pair_from_sigmoid(
+    float dh_x,
+    float dh_y,
+    const bf16_2 h3_pair,
+    const bf16_2 h1_pair,
+    const bf16_2 sig_pair,
+    bf16_2& out0,
+    bf16_2& out1)
+{
+    const float h3_x = __bfloat162float(h3_pair.x);
+    const float h3_y = __bfloat162float(h3_pair.y);
+    const float h1_x = __bfloat162float(h1_pair.x);
+    const float h1_y = __bfloat162float(h1_pair.y);
+    const float sig_x = __bfloat162float(sig_pair.x);
+    const float sig_y = __bfloat162float(sig_pair.y);
+    const float silu_x = h1_x * sig_x;
+    const float silu_y = h1_y * sig_y;
+    const float silup_x = sig_x * (1.0f + h1_x * (1.0f - sig_x));
+    const float silup_y = sig_y * (1.0f + h1_y * (1.0f - sig_y));
+    out0 = bf16_2{
+        __float2bfloat16_rn(dh_x * h3_x * silup_x),
+        __float2bfloat16_rn(dh_y * h3_y * silup_y)};
+    out1 = bf16_2{
+        __float2bfloat16_rn(dh_x * silu_x),
+        __float2bfloat16_rn(dh_y * silu_y)};
+}
+
+template <typename C>
+__device__ __forceinline__ void silu_deriv_pair_dispatch(
+    const globals<C>& g,
+    float dh_x,
+    float dh_y,
+    const bf16_2 h3_pair,
+    const bf16_2 h1_pair,
+    int row,
+    int col,
+    bf16_2& out0,
+    bf16_2& out1)
+{
+    if constexpr (C::USE_SAVED_SIGMOID) {
+        const bf16_2 sig_pair = load_bf16_pair(g.sig_h1, row, g.H, col);
+        silu_deriv_pair_from_sigmoid(dh_x, dh_y, h3_pair, h1_pair, sig_pair, out0, out1);
+    } else {
+        silu_deriv_pair(dh_x, dh_y, h3_pair, h1_pair, out0, out1);
+    }
+}
+
 template <typename C, typename subtile_rt>
 __device__ __noinline__ void stage_silu_deriv_pairs(
     const globals<C>& g,
@@ -320,31 +369,35 @@ __device__ __noinline__ void stage_silu_deriv_pairs(
             bf16_2 h1_3 = load_bf16_pair(g.h1_raw, row_hi, g.H, pair_col1);
 
             bf16_2 out0, out1;
-            silu_deriv_pair(
+            silu_deriv_pair_dispatch<C>(
+                g,
                 D_fl.tiles[i][j].data[0].x * MXFP4_ALPHA,
                 D_fl.tiles[i][j].data[0].y * MXFP4_ALPHA,
-                h3_0, h1_0, out0, out1);
+                h3_0, h1_0, row_lo, pair_col0, out0, out1);
             pairs0[pair_base][i * 16 + row_pair_idx] = out0;
             pairs1[pair_base][i * 16 + row_pair_idx] = out1;
 
-            silu_deriv_pair(
+            silu_deriv_pair_dispatch<C>(
+                g,
                 D_fl.tiles[i][j].data[1].x * MXFP4_ALPHA,
                 D_fl.tiles[i][j].data[1].y * MXFP4_ALPHA,
-                h3_1, h1_1, out0, out1);
+                h3_1, h1_1, row_hi, pair_col0, out0, out1);
             pairs0[pair_base][i * 16 + row_pair_idx + 8] = out0;
             pairs1[pair_base][i * 16 + row_pair_idx + 8] = out1;
 
-            silu_deriv_pair(
+            silu_deriv_pair_dispatch<C>(
+                g,
                 D_fl.tiles[i][j].data[2].x * MXFP4_ALPHA,
                 D_fl.tiles[i][j].data[2].y * MXFP4_ALPHA,
-                h3_2, h1_2, out0, out1);
+                h3_2, h1_2, row_lo, pair_col1, out0, out1);
             pairs0[pair_base + 4][i * 16 + row_pair_idx] = out0;
             pairs1[pair_base + 4][i * 16 + row_pair_idx] = out1;
 
-            silu_deriv_pair(
+            silu_deriv_pair_dispatch<C>(
+                g,
                 D_fl.tiles[i][j].data[3].x * MXFP4_ALPHA,
                 D_fl.tiles[i][j].data[3].y * MXFP4_ALPHA,
-                h3_3, h1_3, out0, out1);
+                h3_3, h1_3, row_hi, pair_col1, out0, out1);
             pairs0[pair_base + 4][i * 16 + row_pair_idx + 8] = out0;
             pairs1[pair_base + 4][i * 16 + row_pair_idx + 8] = out1;
         }

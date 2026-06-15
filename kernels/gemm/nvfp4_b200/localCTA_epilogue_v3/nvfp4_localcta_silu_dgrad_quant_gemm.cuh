@@ -6,10 +6,10 @@ using namespace kittens;
 
 namespace nvfp4_localcta_silu_dgrad_quant_gemm {
 
-template <int _LOAD_PIPE_DEPTH, int _SUPERGROUP_SIZE>
+template <int _LOAD_PIPE_DEPTH, int _SUPERGROUP_SIZE, bool _USE_PDL = true>
 struct config {
     static constexpr int CLUSTER_SIZE = 2;
-    static constexpr bool USE_PDL = true;
+    static constexpr bool USE_PDL = _USE_PDL;
 
     static constexpr int CONSUMER_WARPGROUPS = 1;
     static constexpr int PRODUCER_WARPGROUPS = 1;
