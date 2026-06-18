@@ -6,10 +6,26 @@ using namespace kittens;
 
 namespace mxfp4_silu_dgrad_quant_gemm {
 
-template <int _LOAD_PIPE_DEPTH, int _SUPERGROUP_SIZE, int _QUANT_MODE = 1>
+template <
+    int _LOAD_PIPE_DEPTH,
+    int _SUPERGROUP_SIZE,
+    int _QUANT_MODE = 1,
+    bool _USE_PDL = true,
+    int _GRID_DIVISOR = 1,
+    bool _USE_SAVED_SIGMOID = false,
+    int _GRID_NUMERATOR = 1,
+    int _GRID_DENOMINATOR = 1,
+    bool _WRITE_COLS = true,
+    bool _WRITE_BF16 = false>
 struct config {
+    static_assert(_GRID_DIVISOR > 0, "GRID_DIVISOR must be positive");
+    static_assert(_GRID_NUMERATOR > 0, "GRID_NUMERATOR must be positive");
+    static_assert(_GRID_DENOMINATOR > 0, "GRID_DENOMINATOR must be positive");
     static constexpr int CLUSTER_SIZE = 2;
-    static constexpr bool USE_PDL = true;
+    static constexpr bool USE_PDL = _USE_PDL;
+    static constexpr int GRID_DIVISOR = _GRID_DIVISOR;
+    static constexpr int GRID_NUMERATOR = _GRID_NUMERATOR;
+    static constexpr int GRID_DENOMINATOR = _GRID_DENOMINATOR;
 
     static constexpr int CONSUMER_WARPGROUPS = 1;
     static constexpr int PRODUCER_WARPGROUPS = 1;
@@ -27,6 +43,9 @@ struct config {
     static constexpr int MMA_PER_TILE = 2;
     static constexpr int NUM_D_TILES = 2;
     static constexpr int QUANT_MODE = _QUANT_MODE;
+    static constexpr bool USE_SAVED_SIGMOID = _USE_SAVED_SIGMOID;
+    static constexpr bool WRITE_COLS = _WRITE_COLS;
+    static constexpr bool WRITE_BF16 = _WRITE_BF16;
 };
 
 template <typename C>
@@ -50,6 +69,9 @@ struct globals {
 
     const bf16* h3;
     const bf16* h1_raw;
+    const bf16* sig_h1;
+    bf16* dh0;
+    bf16* dh1;
 
     row_fp4_gl row_fp4;
     uint8_t* row_sc;
@@ -72,8 +94,10 @@ struct globals {
     __host__ inline dim3 grid() const {
         const int num_row_blocks = M / C::Mb;
         const int num_col_blocks = H / C::Nb;
-        int grid_size = min(num_row_blocks * num_col_blocks * C::CLUSTER_SIZE, num_sms());
-        grid_size = (grid_size / C::CLUSTER_SIZE) * C::CLUSTER_SIZE;
+        const int scaled_sms = (num_sms() * C::GRID_NUMERATOR) / C::GRID_DENOMINATOR;
+        const int sms_limit = max(C::CLUSTER_SIZE, scaled_sms / C::GRID_DIVISOR);
+        int grid_size = min(num_row_blocks * num_col_blocks * C::CLUSTER_SIZE, sms_limit);
+        grid_size = max(C::CLUSTER_SIZE, (grid_size / C::CLUSTER_SIZE) * C::CLUSTER_SIZE);
         return dim3(grid_size);
     }
     __host__ inline dim3 block() const { return dim3(C::NUM_THREADS); }
@@ -286,6 +310,74 @@ __device__ __forceinline__ void silu_deriv_pair(
         __float2bfloat16_rn(dh_y * silu_y)};
 }
 
+__device__ __forceinline__ void silu_deriv_pair_from_sigmoid(
+    float dh_x,
+    float dh_y,
+    const bf16_2 h3_pair,
+    const bf16_2 h1_pair,
+    const bf16_2 sig_pair,
+    bf16_2& out0,
+    bf16_2& out1)
+{
+    const float h3_x = __bfloat162float(h3_pair.x);
+    const float h3_y = __bfloat162float(h3_pair.y);
+    const float h1_x = __bfloat162float(h1_pair.x);
+    const float h1_y = __bfloat162float(h1_pair.y);
+    const float sig_x = __bfloat162float(sig_pair.x);
+    const float sig_y = __bfloat162float(sig_pair.y);
+    const float silu_x = h1_x * sig_x;
+    const float silu_y = h1_y * sig_y;
+    const float silup_x = sig_x * (1.0f + h1_x * (1.0f - sig_x));
+    const float silup_y = sig_y * (1.0f + h1_y * (1.0f - sig_y));
+    out0 = bf16_2{
+        __float2bfloat16_rn(dh_x * h3_x * silup_x),
+        __float2bfloat16_rn(dh_y * h3_y * silup_y)};
+    out1 = bf16_2{
+        __float2bfloat16_rn(dh_x * silu_x),
+        __float2bfloat16_rn(dh_y * silu_y)};
+}
+
+template <typename C>
+__device__ __forceinline__ void silu_deriv_pair_dispatch(
+    const globals<C>& g,
+    float dh_x,
+    float dh_y,
+    const bf16_2 h3_pair,
+    const bf16_2 h1_pair,
+    int row,
+    int col,
+    bf16_2& out0,
+    bf16_2& out1)
+{
+    if constexpr (C::USE_SAVED_SIGMOID) {
+        const bf16_2 sig_pair = load_bf16_pair(g.sig_h1, row, g.H, col);
+        silu_deriv_pair_from_sigmoid(dh_x, dh_y, h3_pair, h1_pair, sig_pair, out0, out1);
+    } else {
+        silu_deriv_pair(dh_x, dh_y, h3_pair, h1_pair, out0, out1);
+    }
+}
+
+template <typename C>
+__device__ __noinline__ void store_bf16_pairs_from_stage(
+    const globals<C>& g,
+    bf16_2 (*col_pairs)[33],
+    bf16* out,
+    int lane_id,
+    int warp_row_base,
+    int logical_col_start)
+{
+    if (out == nullptr) return;
+    const int local_row = lane_id;
+    const int global_row = warp_row_base + local_row;
+
+    #pragma unroll
+    for (int pair = 0; pair < 16; pair++) {
+        const bf16_2 v = col_pairs[pair][local_row];
+        const int64_t offset = static_cast<int64_t>(global_row) * g.H + logical_col_start + pair * 2;
+        *reinterpret_cast<bf16_2*>(&out[offset]) = v;
+    }
+}
+
 template <typename C, typename subtile_rt>
 __device__ __noinline__ void stage_silu_deriv_pairs(
     const globals<C>& g,
@@ -320,31 +412,35 @@ __device__ __noinline__ void stage_silu_deriv_pairs(
             bf16_2 h1_3 = load_bf16_pair(g.h1_raw, row_hi, g.H, pair_col1);
 
             bf16_2 out0, out1;
-            silu_deriv_pair(
+            silu_deriv_pair_dispatch<C>(
+                g,
                 D_fl.tiles[i][j].data[0].x * MXFP4_ALPHA,
                 D_fl.tiles[i][j].data[0].y * MXFP4_ALPHA,
-                h3_0, h1_0, out0, out1);
+                h3_0, h1_0, row_lo, pair_col0, out0, out1);
             pairs0[pair_base][i * 16 + row_pair_idx] = out0;
             pairs1[pair_base][i * 16 + row_pair_idx] = out1;
 
-            silu_deriv_pair(
+            silu_deriv_pair_dispatch<C>(
+                g,
                 D_fl.tiles[i][j].data[1].x * MXFP4_ALPHA,
                 D_fl.tiles[i][j].data[1].y * MXFP4_ALPHA,
-                h3_1, h1_1, out0, out1);
+                h3_1, h1_1, row_hi, pair_col0, out0, out1);
             pairs0[pair_base][i * 16 + row_pair_idx + 8] = out0;
             pairs1[pair_base][i * 16 + row_pair_idx + 8] = out1;
 
-            silu_deriv_pair(
+            silu_deriv_pair_dispatch<C>(
+                g,
                 D_fl.tiles[i][j].data[2].x * MXFP4_ALPHA,
                 D_fl.tiles[i][j].data[2].y * MXFP4_ALPHA,
-                h3_2, h1_2, out0, out1);
+                h3_2, h1_2, row_lo, pair_col1, out0, out1);
             pairs0[pair_base + 4][i * 16 + row_pair_idx] = out0;
             pairs1[pair_base + 4][i * 16 + row_pair_idx] = out1;
 
-            silu_deriv_pair(
+            silu_deriv_pair_dispatch<C>(
+                g,
                 D_fl.tiles[i][j].data[3].x * MXFP4_ALPHA,
                 D_fl.tiles[i][j].data[3].y * MXFP4_ALPHA,
-                h3_3, h1_3, out0, out1);
+                h3_3, h1_3, row_hi, pair_col1, out0, out1);
             pairs0[pair_base + 4][i * 16 + row_pair_idx + 8] = out0;
             pairs1[pair_base + 4][i * 16 + row_pair_idx + 8] = out1;
         }
@@ -403,7 +499,7 @@ __device__ inline void kernel(const globals<C>& g) {
     if (warpgroup_id >= C::CONSUMER_WARPGROUPS && warp::elect_leader()) {
         int warp_id = group<WARPGROUP_WARPS*C::PRODUCER_WARPGROUPS>::warpid();
         if (warp_id == 3) {
-            pdl::wait();
+            if constexpr (C::USE_PDL) pdl::wait();
             everyone::tma::cluster::wait();
             for (int block_idx = cluster_id; block_idx < num_blocks; block_idx += gridDim.x / C::CLUSTER_SIZE) {
                 int supergroup_idx = block_idx / num_blocks_per_supergroup;
@@ -421,7 +517,7 @@ __device__ inline void kernel(const globals<C>& g) {
                 }
             }
         } else if (warp_id == 2) {
-            pdl::wait();
+            if constexpr (C::USE_PDL) pdl::wait();
             everyone::tma::cluster::wait();
             for (int block_idx = cluster_id; block_idx < num_blocks; block_idx += gridDim.x / C::CLUSTER_SIZE) {
                 int supergroup_idx = block_idx / num_blocks_per_supergroup;
@@ -549,21 +645,29 @@ __device__ inline void kernel(const globals<C>& g) {
                 stage_silu_deriv_pairs<C>(
                     g, D_regs_fl[epi], pairs0, pairs1, lane_id, warp_row_base, col_start);
                 __syncwarp();
+                if constexpr (C::WRITE_BF16) {
+                    store_bf16_pairs_from_stage<C>(
+                        g, pairs0, g.dh0, lane_id, warp_row_base, col_start);
+                    store_bf16_pairs_from_stage<C>(
+                        g, pairs1, g.dh1, lane_id, warp_row_base, col_start);
+                }
                 quantize_rows_from_stage<C>(
                     g, pairs0, lane_id, warp_row_base, col_start, row_fp4_stride);
-                quantize_cols_from_stage<C>(
-                    g, pairs0, g.col0_fp4, g.col0_sc, lane_id, warp_row_base, col_start);
                 quantize_rows_from_stage<C>(
                     g, pairs1, lane_id, warp_row_base, g.H + col_start, row_fp4_stride);
-                quantize_cols_from_stage<C>(
-                    g, pairs1, g.col1_fp4, g.col1_sc, lane_id, warp_row_base, col_start);
+                if constexpr (C::WRITE_COLS) {
+                    quantize_cols_from_stage<C>(
+                        g, pairs0, g.col0_fp4, g.col0_sc, lane_id, warp_row_base, col_start);
+                    quantize_cols_from_stage<C>(
+                        g, pairs1, g.col1_fp4, g.col1_sc, lane_id, warp_row_base, col_start);
+                }
             }
             update_phasebit<0>(output_phasebits, 0);
         }
         warpgroup::sync(1);
-        warpgroup::pdl::arrive();
-        if (warpgroup::warpid() == 0) tm_allocator.deprovision();
+        if constexpr (C::USE_PDL) warpgroup::pdl::arrive();
     }
+    if (warpgroup_id < C::CONSUMER_WARPGROUPS && warpgroup::warpid() == 0) tm_allocator.deprovision();
 }
 
 } // namespace mxfp4_silu_dgrad_quant_gemm

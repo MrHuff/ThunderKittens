@@ -968,6 +968,7 @@ static void run_silu_dgrad_quant_gemm_with_config(
     const at::Tensor &B, const at::Tensor &B_sc,
     const at::Tensor &h3,
     const at::Tensor &h1_raw,
+    const at::Tensor *sig_h1,
     at::Tensor &row_fp4,
     at::Tensor &row_sc,
     at::Tensor &col0_fp4,
@@ -983,6 +984,9 @@ static void run_silu_dgrad_quant_gemm_with_config(
         .B_sc = kittens::py::tensor_to_gl<typename G::B_sc_gl>(B_sc),
         .h3 = reinterpret_cast<const kittens::bf16*>(h3.data_ptr<at::BFloat16>()),
         .h1_raw = reinterpret_cast<const kittens::bf16*>(h1_raw.data_ptr<at::BFloat16>()),
+        .sig_h1 = sig_h1 == nullptr ? nullptr : reinterpret_cast<const kittens::bf16*>(sig_h1->data_ptr<at::BFloat16>()),
+        .dh0 = nullptr,
+        .dh1 = nullptr,
         .row_fp4 = tensor_to_gl_tma_view<typename G::row_fp4_gl>(row_fp4, "row_fp4"),
         .row_sc = reinterpret_cast<uint8_t*>(row_sc.data_ptr()),
         .col0_fp4 = reinterpret_cast<uint8_t*>(col0_fp4.data_ptr()),
@@ -995,11 +999,47 @@ static void run_silu_dgrad_quant_gemm_with_config(
     kittens::py::launch_kernel<C, G, mxfp4_silu_dgrad_quant_gemm::kernel<C>>(g);
 }
 
-void mxfp4_gemm_silu_dgrad_quant_entrypoint(
+template <typename C>
+static void run_silu_dgrad_row_bf16_quant_gemm_with_config(
     const at::Tensor &A, const at::Tensor &A_sc,
     const at::Tensor &B, const at::Tensor &B_sc,
     const at::Tensor &h3,
     const at::Tensor &h1_raw,
+    const at::Tensor &sig_h1,
+    at::Tensor &dh0,
+    at::Tensor &dh1,
+    at::Tensor &row_fp4,
+    at::Tensor &row_sc
+) {
+    using G = mxfp4_silu_dgrad_quant_gemm::globals<C>;
+    G g {
+        .A = kittens::py::tensor_to_gl<typename G::A_fp4x2_gl>(A),
+        .A_sc = kittens::py::tensor_to_gl<typename G::A_sc_gl>(A_sc),
+        .B = kittens::py::tensor_to_gl<typename G::B_fp4x2_gl>(B),
+        .B_sc = kittens::py::tensor_to_gl<typename G::B_sc_gl>(B_sc),
+        .h3 = reinterpret_cast<const kittens::bf16*>(h3.data_ptr<at::BFloat16>()),
+        .h1_raw = reinterpret_cast<const kittens::bf16*>(h1_raw.data_ptr<at::BFloat16>()),
+        .sig_h1 = reinterpret_cast<const kittens::bf16*>(sig_h1.data_ptr<at::BFloat16>()),
+        .dh0 = reinterpret_cast<kittens::bf16*>(dh0.data_ptr<at::BFloat16>()),
+        .dh1 = reinterpret_cast<kittens::bf16*>(dh1.data_ptr<at::BFloat16>()),
+        .row_fp4 = tensor_to_gl_tma_view<typename G::row_fp4_gl>(row_fp4, "row_fp4"),
+        .row_sc = reinterpret_cast<uint8_t*>(row_sc.data_ptr()),
+        .col0_fp4 = nullptr,
+        .col0_sc = nullptr,
+        .col1_fp4 = nullptr,
+        .col1_sc = nullptr,
+        .M = static_cast<int>(h3.size(0)),
+        .H = static_cast<int>(h3.size(1)),
+    };
+    kittens::py::launch_kernel<C, G, mxfp4_silu_dgrad_quant_gemm::kernel<C>>(g);
+}
+
+static void mxfp4_gemm_silu_dgrad_quant_entrypoint_impl(
+    const at::Tensor &A, const at::Tensor &A_sc,
+    const at::Tensor &B, const at::Tensor &B_sc,
+    const at::Tensor &h3,
+    const at::Tensor &h1_raw,
+    const at::Tensor *sig_h1,
     at::Tensor &row_fp4,
     at::Tensor &row_sc,
     at::Tensor &col0_fp4,
@@ -1022,6 +1062,11 @@ void mxfp4_gemm_silu_dgrad_quant_entrypoint(
     TORCH_CHECK(h1_raw.is_cuda() && h1_raw.is_contiguous() && h1_raw.dim() == 2 && h1_raw.scalar_type() == at::kBFloat16,
                 "h1_raw must be contiguous CUDA bf16 matrix");
     TORCH_CHECK(h3.sizes() == h1_raw.sizes(), "h3 and h1_raw shape mismatch");
+    if (sig_h1 != nullptr) {
+        TORCH_CHECK(sig_h1->is_cuda() && sig_h1->is_contiguous() && sig_h1->dim() == 2 && sig_h1->scalar_type() == at::kBFloat16,
+                    "sig_h1 must be contiguous CUDA bf16 matrix");
+        TORCH_CHECK(sig_h1->sizes() == h1_raw.sizes(), "sig_h1 and h1_raw shape mismatch");
+    }
     const int64_t M = h3.size(0);
     const int64_t H = h3.size(1);
     const int64_t K = A.size(1) * 2;
@@ -1054,15 +1099,96 @@ void mxfp4_gemm_silu_dgrad_quant_entrypoint(
     auto launch_mode = [&]<int MODE>() {
         switch (config_id) {
         case 0:
-            run_silu_dgrad_quant_gemm_with_config<mxfp4_silu_dgrad_quant_gemm::config<5, 4, MODE>>(
-                A, A_sc, B, B_sc, h3, h1_raw, row_fp4, row_sc, col0_fp4, col0_sc, col1_fp4, col1_sc);
+            if (sig_h1 != nullptr) {
+                run_silu_dgrad_quant_gemm_with_config<mxfp4_silu_dgrad_quant_gemm::config<5, 4, MODE, true, 1, true>>(
+                    A, A_sc, B, B_sc, h3, h1_raw, sig_h1, row_fp4, row_sc, col0_fp4, col0_sc, col1_fp4, col1_sc);
+            } else {
+                run_silu_dgrad_quant_gemm_with_config<mxfp4_silu_dgrad_quant_gemm::config<5, 4, MODE>>(
+                    A, A_sc, B, B_sc, h3, h1_raw, nullptr, row_fp4, row_sc, col0_fp4, col0_sc, col1_fp4, col1_sc);
+            }
             break;
         case 4:
-            run_silu_dgrad_quant_gemm_with_config<mxfp4_silu_dgrad_quant_gemm::config<5, 12, MODE>>(
-                A, A_sc, B, B_sc, h3, h1_raw, row_fp4, row_sc, col0_fp4, col0_sc, col1_fp4, col1_sc);
+            if (sig_h1 != nullptr) {
+                run_silu_dgrad_quant_gemm_with_config<mxfp4_silu_dgrad_quant_gemm::config<5, 12, MODE, true, 1, true>>(
+                    A, A_sc, B, B_sc, h3, h1_raw, sig_h1, row_fp4, row_sc, col0_fp4, col0_sc, col1_fp4, col1_sc);
+            } else {
+                run_silu_dgrad_quant_gemm_with_config<mxfp4_silu_dgrad_quant_gemm::config<5, 12, MODE>>(
+                    A, A_sc, B, B_sc, h3, h1_raw, nullptr, row_fp4, row_sc, col0_fp4, col0_sc, col1_fp4, col1_sc);
+            }
+            break;
+        case 20:
+            if (sig_h1 != nullptr) {
+                run_silu_dgrad_quant_gemm_with_config<mxfp4_silu_dgrad_quant_gemm::config<5, 4, MODE, false, 1, true>>(
+                    A, A_sc, B, B_sc, h3, h1_raw, sig_h1, row_fp4, row_sc, col0_fp4, col0_sc, col1_fp4, col1_sc);
+            } else {
+                run_silu_dgrad_quant_gemm_with_config<mxfp4_silu_dgrad_quant_gemm::config<5, 4, MODE, false>>(
+                    A, A_sc, B, B_sc, h3, h1_raw, nullptr, row_fp4, row_sc, col0_fp4, col0_sc, col1_fp4, col1_sc);
+            }
+            break;
+        case 24:
+            if (sig_h1 != nullptr) {
+                run_silu_dgrad_quant_gemm_with_config<mxfp4_silu_dgrad_quant_gemm::config<5, 12, MODE, false, 1, true>>(
+                    A, A_sc, B, B_sc, h3, h1_raw, sig_h1, row_fp4, row_sc, col0_fp4, col0_sc, col1_fp4, col1_sc);
+            } else {
+                run_silu_dgrad_quant_gemm_with_config<mxfp4_silu_dgrad_quant_gemm::config<5, 12, MODE, false>>(
+                    A, A_sc, B, B_sc, h3, h1_raw, nullptr, row_fp4, row_sc, col0_fp4, col0_sc, col1_fp4, col1_sc);
+            }
+            break;
+        case 34:
+            TORCH_CHECK(sig_h1 != nullptr, "silu dgrad quant config_id 34 requires saved sigmoid input");
+            run_silu_dgrad_quant_gemm_with_config<mxfp4_silu_dgrad_quant_gemm::config<5, 12, MODE, false, 1, true, 3, 8>>(
+                A, A_sc, B, B_sc, h3, h1_raw, sig_h1, row_fp4, row_sc, col0_fp4, col0_sc, col1_fp4, col1_sc);
+            break;
+        case 44:
+            if (sig_h1 != nullptr) {
+                run_silu_dgrad_quant_gemm_with_config<mxfp4_silu_dgrad_quant_gemm::config<5, 12, MODE, false, 2, true>>(
+                    A, A_sc, B, B_sc, h3, h1_raw, sig_h1, row_fp4, row_sc, col0_fp4, col0_sc, col1_fp4, col1_sc);
+            } else {
+                run_silu_dgrad_quant_gemm_with_config<mxfp4_silu_dgrad_quant_gemm::config<5, 12, MODE, false, 2>>(
+                    A, A_sc, B, B_sc, h3, h1_raw, nullptr, row_fp4, row_sc, col0_fp4, col0_sc, col1_fp4, col1_sc);
+            }
+            break;
+        case 54:
+            TORCH_CHECK(sig_h1 != nullptr, "silu dgrad quant config_id 54 requires saved sigmoid input");
+            run_silu_dgrad_quant_gemm_with_config<mxfp4_silu_dgrad_quant_gemm::config<5, 12, MODE, true, 2, true>>(
+                A, A_sc, B, B_sc, h3, h1_raw, sig_h1, row_fp4, row_sc, col0_fp4, col0_sc, col1_fp4, col1_sc);
+            break;
+        case 58:
+            TORCH_CHECK(sig_h1 != nullptr, "silu dgrad quant config_id 58 requires saved sigmoid input");
+            run_silu_dgrad_quant_gemm_with_config<mxfp4_silu_dgrad_quant_gemm::config<5, 12, MODE, true, 1, true, 5, 8>>(
+                A, A_sc, B, B_sc, h3, h1_raw, sig_h1, row_fp4, row_sc, col0_fp4, col0_sc, col1_fp4, col1_sc);
+            break;
+        case 64:
+            TORCH_CHECK(sig_h1 != nullptr, "silu dgrad quant config_id 64 requires saved sigmoid input");
+            run_silu_dgrad_quant_gemm_with_config<mxfp4_silu_dgrad_quant_gemm::config<5, 12, MODE, false, 1, true, 5, 8>>(
+                A, A_sc, B, B_sc, h3, h1_raw, sig_h1, row_fp4, row_sc, col0_fp4, col0_sc, col1_fp4, col1_sc);
+            break;
+        case 74:
+            TORCH_CHECK(sig_h1 != nullptr, "silu dgrad quant config_id 74 requires saved sigmoid input");
+            run_silu_dgrad_quant_gemm_with_config<mxfp4_silu_dgrad_quant_gemm::config<5, 12, MODE, false, 1, true, 3, 4>>(
+                A, A_sc, B, B_sc, h3, h1_raw, sig_h1, row_fp4, row_sc, col0_fp4, col0_sc, col1_fp4, col1_sc);
+            break;
+        case 76:
+            TORCH_CHECK(sig_h1 != nullptr, "silu dgrad quant config_id 76 requires saved sigmoid input");
+            run_silu_dgrad_quant_gemm_with_config<mxfp4_silu_dgrad_quant_gemm::config<5, 12, MODE, false, 1, true, 13, 16>>(
+                A, A_sc, B, B_sc, h3, h1_raw, sig_h1, row_fp4, row_sc, col0_fp4, col0_sc, col1_fp4, col1_sc);
+            break;
+        case 78:
+            TORCH_CHECK(sig_h1 != nullptr, "silu dgrad quant config_id 78 requires saved sigmoid input");
+            run_silu_dgrad_quant_gemm_with_config<mxfp4_silu_dgrad_quant_gemm::config<5, 12, MODE, false, 1, true, 7, 8>>(
+                A, A_sc, B, B_sc, h3, h1_raw, sig_h1, row_fp4, row_sc, col0_fp4, col0_sc, col1_fp4, col1_sc);
+            break;
+        case 84:
+            if (sig_h1 != nullptr) {
+                run_silu_dgrad_quant_gemm_with_config<mxfp4_silu_dgrad_quant_gemm::config<5, 12, MODE, false, 4, true>>(
+                    A, A_sc, B, B_sc, h3, h1_raw, sig_h1, row_fp4, row_sc, col0_fp4, col0_sc, col1_fp4, col1_sc);
+            } else {
+                run_silu_dgrad_quant_gemm_with_config<mxfp4_silu_dgrad_quant_gemm::config<5, 12, MODE, false, 4>>(
+                    A, A_sc, B, B_sc, h3, h1_raw, nullptr, row_fp4, row_sc, col0_fp4, col0_sc, col1_fp4, col1_sc);
+            }
             break;
         default:
-            TORCH_CHECK(false, "Invalid silu dgrad quant config_id: ", config_id, " (valid: 0, 4)");
+            TORCH_CHECK(false, "Invalid silu dgrad quant config_id: ", config_id, " (valid: 0, 4, 20, 24, 34, 44, 54, 58, 64, 74, 76, 78, 84)");
         }
     };
     switch (mode) {
@@ -1072,6 +1198,141 @@ void mxfp4_gemm_silu_dgrad_quant_entrypoint(
     default:
         TORCH_CHECK(false, "Invalid silu dgrad quant mode: ", mode, " (valid: 0, 1, 2)");
     }
+}
+
+void mxfp4_gemm_silu_dgrad_from_sigmoid_row_bf16_quant_entrypoint(
+    const at::Tensor &A, const at::Tensor &A_sc,
+    const at::Tensor &B, const at::Tensor &B_sc,
+    const at::Tensor &h3,
+    const at::Tensor &h1_raw,
+    const at::Tensor &sig_h1,
+    at::Tensor &dh0,
+    at::Tensor &dh1,
+    at::Tensor &row_fp4,
+    at::Tensor &row_sc,
+    int config_id,
+    int mode
+) {
+    check_fp4_matrix(A, "A");
+    check_fp4_matrix(B, "B");
+    TORCH_CHECK(A_sc.is_cuda() && A_sc.is_contiguous(), "A_sc must be contiguous CUDA");
+    TORCH_CHECK(B_sc.is_cuda() && B_sc.is_contiguous(), "B_sc must be contiguous CUDA");
+    TORCH_CHECK(A_sc.scalar_type() == at::kFloat8_e8m0fnu || A_sc.scalar_type() == at::kByte,
+                "A_sc must be fp8e8m0/uint8");
+    TORCH_CHECK(B_sc.scalar_type() == at::kFloat8_e8m0fnu || B_sc.scalar_type() == at::kByte,
+                "B_sc must be fp8e8m0/uint8");
+    TORCH_CHECK(h3.is_cuda() && h3.is_contiguous() && h3.dim() == 2 && h3.scalar_type() == at::kBFloat16,
+                "h3 must be contiguous CUDA bf16 matrix");
+    TORCH_CHECK(h1_raw.is_cuda() && h1_raw.is_contiguous() && h1_raw.dim() == 2 && h1_raw.scalar_type() == at::kBFloat16,
+                "h1_raw must be contiguous CUDA bf16 matrix");
+    TORCH_CHECK(sig_h1.is_cuda() && sig_h1.is_contiguous() && sig_h1.dim() == 2 && sig_h1.scalar_type() == at::kBFloat16,
+                "sig_h1 must be contiguous CUDA bf16 matrix");
+    TORCH_CHECK(h3.sizes() == h1_raw.sizes() && sig_h1.sizes() == h1_raw.sizes(),
+                "h3, h1_raw, and sig_h1 shape mismatch");
+    const int64_t M = h3.size(0);
+    const int64_t H = h3.size(1);
+    const int64_t K = A.size(1) * 2;
+    TORCH_CHECK(A.size(0) == M && B.size(0) == H && B.size(1) * 2 == K,
+                "A/B shapes must produce an MxH W2 dgrad tile");
+    TORCH_CHECK(M % 256 == 0 && H % 256 == 0 && K % 256 == 0,
+                "mxfp4_gemm_silu_dgrad_from_sigmoid_row_bf16_quant requires M,H,K divisible by 256");
+    TORCH_CHECK(dh0.is_cuda() && dh0.is_contiguous() && dh0.scalar_type() == at::kBFloat16 &&
+                dh0.sizes() == h1_raw.sizes(), "dh0 must be contiguous CUDA bf16 with h1_raw shape");
+    TORCH_CHECK(dh1.is_cuda() && dh1.is_contiguous() && dh1.scalar_type() == at::kBFloat16 &&
+                dh1.sizes() == h1_raw.sizes(), "dh1 must be contiguous CUDA bf16 with h1_raw shape");
+    TORCH_CHECK(row_fp4.is_cuda() && row_fp4.is_contiguous() && row_fp4.dim() == 2 &&
+                row_fp4.scalar_type() == at::kFloat4_e2m1fn_x2 &&
+                row_fp4.size(0) == M && row_fp4.size(1) == H,
+                "row_fp4 must be contiguous fp4x2 with shape (M, H)");
+    TORCH_CHECK(row_sc.is_cuda() && row_sc.is_contiguous() && row_sc.scalar_type() == at::kByte &&
+                row_sc.sizes() == at::IntArrayRef({M / 128, (2 * H) / 128, 32, 16}),
+                "row_sc must have shape (M/128, 2H/128, 32, 16)");
+
+    auto launch_mode = [&]<int MODE>() {
+        switch (config_id) {
+        case 0:
+            run_silu_dgrad_row_bf16_quant_gemm_with_config<
+                mxfp4_silu_dgrad_quant_gemm::config<5, 4, MODE, true, 1, true, 1, 1, false, true>>(
+                A, A_sc, B, B_sc, h3, h1_raw, sig_h1, dh0, dh1, row_fp4, row_sc);
+            break;
+        case 4:
+            run_silu_dgrad_row_bf16_quant_gemm_with_config<
+                mxfp4_silu_dgrad_quant_gemm::config<5, 12, MODE, true, 1, true, 1, 1, false, true>>(
+                A, A_sc, B, B_sc, h3, h1_raw, sig_h1, dh0, dh1, row_fp4, row_sc);
+            break;
+        case 34:
+            run_silu_dgrad_row_bf16_quant_gemm_with_config<
+                mxfp4_silu_dgrad_quant_gemm::config<5, 12, MODE, false, 1, true, 3, 8, false, true>>(
+                A, A_sc, B, B_sc, h3, h1_raw, sig_h1, dh0, dh1, row_fp4, row_sc);
+            break;
+        case 44:
+            run_silu_dgrad_row_bf16_quant_gemm_with_config<
+                mxfp4_silu_dgrad_quant_gemm::config<5, 12, MODE, false, 2, true, 1, 1, false, true>>(
+                A, A_sc, B, B_sc, h3, h1_raw, sig_h1, dh0, dh1, row_fp4, row_sc);
+            break;
+        case 64:
+            run_silu_dgrad_row_bf16_quant_gemm_with_config<
+                mxfp4_silu_dgrad_quant_gemm::config<5, 12, MODE, false, 1, true, 5, 8, false, true>>(
+                A, A_sc, B, B_sc, h3, h1_raw, sig_h1, dh0, dh1, row_fp4, row_sc);
+            break;
+        case 74:
+            run_silu_dgrad_row_bf16_quant_gemm_with_config<
+                mxfp4_silu_dgrad_quant_gemm::config<5, 12, MODE, false, 1, true, 3, 4, false, true>>(
+                A, A_sc, B, B_sc, h3, h1_raw, sig_h1, dh0, dh1, row_fp4, row_sc);
+            break;
+        default:
+            TORCH_CHECK(false, "Invalid silu dgrad row-bf16 quant config_id: ", config_id,
+                        " (valid: 0, 4, 34, 44, 64, 74)");
+        }
+    };
+    switch (mode) {
+    case 0: launch_mode.template operator()<0>(); break;
+    case 1: launch_mode.template operator()<1>(); break;
+    case 2: launch_mode.template operator()<2>(); break;
+    default:
+        TORCH_CHECK(false, "Invalid silu dgrad row-bf16 quant mode: ", mode, " (valid: 0, 1, 2)");
+    }
+}
+
+void mxfp4_gemm_silu_dgrad_quant_entrypoint(
+    const at::Tensor &A, const at::Tensor &A_sc,
+    const at::Tensor &B, const at::Tensor &B_sc,
+    const at::Tensor &h3,
+    const at::Tensor &h1_raw,
+    at::Tensor &row_fp4,
+    at::Tensor &row_sc,
+    at::Tensor &col0_fp4,
+    at::Tensor &col0_sc,
+    at::Tensor &col1_fp4,
+    at::Tensor &col1_sc,
+    int config_id,
+    int mode
+) {
+    mxfp4_gemm_silu_dgrad_quant_entrypoint_impl(
+        A, A_sc, B, B_sc, h3, h1_raw, nullptr,
+        row_fp4, row_sc, col0_fp4, col0_sc, col1_fp4, col1_sc,
+        config_id, mode);
+}
+
+void mxfp4_gemm_silu_dgrad_from_sigmoid_quant_entrypoint(
+    const at::Tensor &A, const at::Tensor &A_sc,
+    const at::Tensor &B, const at::Tensor &B_sc,
+    const at::Tensor &h3,
+    const at::Tensor &h1_raw,
+    const at::Tensor &sig_h1,
+    at::Tensor &row_fp4,
+    at::Tensor &row_sc,
+    at::Tensor &col0_fp4,
+    at::Tensor &col0_sc,
+    at::Tensor &col1_fp4,
+    at::Tensor &col1_sc,
+    int config_id,
+    int mode
+) {
+    mxfp4_gemm_silu_dgrad_quant_entrypoint_impl(
+        A, A_sc, B, B_sc, h3, h1_raw, &sig_h1,
+        row_fp4, row_sc, col0_fp4, col0_sc, col1_fp4, col1_sc,
+        config_id, mode);
 }
 
 void mxfp4_gemm_rope_live64_entrypoint(
@@ -1567,6 +1828,24 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           pybind11::arg("row_fp4"), pybind11::arg("row_sc"),
           pybind11::arg("col0_fp4"), pybind11::arg("col0_sc"),
           pybind11::arg("col1_fp4"), pybind11::arg("col1_sc"),
+          pybind11::arg("config_id"), pybind11::arg("mode") = 1);
+    m.def("mxfp4_gemm_silu_dgrad_from_sigmoid_quant", &mxfp4_gemm_silu_dgrad_from_sigmoid_quant_entrypoint,
+          "W2 dgrad GEMM with fused saved-sigmoid SiLU derivative MXFP4 row/col quantization",
+          pybind11::arg("A"), pybind11::arg("A_sc"),
+          pybind11::arg("B"), pybind11::arg("B_sc"),
+          pybind11::arg("h3"), pybind11::arg("h1_raw"), pybind11::arg("sig_h1"),
+          pybind11::arg("row_fp4"), pybind11::arg("row_sc"),
+          pybind11::arg("col0_fp4"), pybind11::arg("col0_sc"),
+          pybind11::arg("col1_fp4"), pybind11::arg("col1_sc"),
+          pybind11::arg("config_id"), pybind11::arg("mode") = 1);
+    m.def("mxfp4_gemm_silu_dgrad_from_sigmoid_row_bf16_quant",
+          &mxfp4_gemm_silu_dgrad_from_sigmoid_row_bf16_quant_entrypoint,
+          "W2 dgrad GEMM with fused saved-sigmoid SiLU derivative, BF16 outputs, and MXFP4 row quantization",
+          pybind11::arg("A"), pybind11::arg("A_sc"),
+          pybind11::arg("B"), pybind11::arg("B_sc"),
+          pybind11::arg("h3"), pybind11::arg("h1_raw"), pybind11::arg("sig_h1"),
+          pybind11::arg("dh0"), pybind11::arg("dh1"),
+          pybind11::arg("row_fp4"), pybind11::arg("row_sc"),
           pybind11::arg("config_id"), pybind11::arg("mode") = 1);
     m.def("mxfp4_gemm_rope", &mxfp4_gemm_rope_entrypoint,
           "GEMM with a RoPE epilogue",
