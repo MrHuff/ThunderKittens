@@ -311,6 +311,14 @@ void nvfp4_rmsnorm_bwd_entrypoint(
 }
 
 template <typename C>
+static void run_gemm_row_scale_with_config(
+    const at::Tensor &A, const at::Tensor &A_sc, const at::Tensor &A_sc_global,
+    const at::Tensor &B, const at::Tensor &B_sc, const at::Tensor &B_sc_global,
+    const at::Tensor &row_scale_coeff,
+    at::Tensor &D
+);
+
+template <typename C>
 static void run_gemm_residual_rms_with_config(
     const at::Tensor &A, const at::Tensor &A_sc, const at::Tensor &A_sc_global,
     const at::Tensor &B, const at::Tensor &B_sc, const at::Tensor &B_sc_global,
@@ -426,6 +434,34 @@ void nvfp4_gemm_residual_rms_entrypoint(
         using C = nvfp4_gemm::config<256, 4, 8, 12, 2, false, 256, true, 2, 256, false, true, true>;
         run_gemm_residual_rms_with_config<C>(
             A, A_sc, A_sc_global, B, B_sc, B_sc_global, R, D, row_rms_partial, gamma_opt);
+    }
+}
+
+void nvfp4_gemm_row_scale_entrypoint(
+    const at::Tensor &A,
+    const at::Tensor &A_sc,
+    const at::Tensor &A_sc_global,
+    const at::Tensor &B,
+    const at::Tensor &B_sc,
+    const at::Tensor &B_sc_global,
+    const at::Tensor &row_scale_coeff,
+    at::Tensor &D
+) {
+    kittens::py::device_check(A, A_sc, A_sc_global, B, B_sc, B_sc_global, row_scale_coeff, D);
+    int K = B.size(1) * 2;
+    int N_out = D.size(1);
+    if (K <= 2048 && N_out <= 4096) {
+        using C = nvfp4_gemm::config<256, 5, 8, 4, 2, false, 256, true, 2, 256, false, false, false, true>;
+        run_gemm_row_scale_with_config<C>(
+            A, A_sc, A_sc_global, B, B_sc, B_sc_global, row_scale_coeff, D);
+    } else if (K <= 2048) {
+        using C = nvfp4_gemm::config<256, 5, 8, 4, 2, false, 256, true, 2, 256, false, false, false, true>;
+        run_gemm_row_scale_with_config<C>(
+            A, A_sc, A_sc_global, B, B_sc, B_sc_global, row_scale_coeff, D);
+    } else {
+        using C = nvfp4_gemm::config<256, 4, 8, 12, 2, false, 256, true, 2, 256, false, false, false, true>;
+        run_gemm_row_scale_with_config<C>(
+            A, A_sc, A_sc_global, B, B_sc, B_sc_global, row_scale_coeff, D);
     }
 }
 
@@ -1076,6 +1112,39 @@ static void run_gemm_with_config(
         .D_K = kittens::py::tensor_to_gl<typename G::D_gl>(D),
         .D_V = kittens::py::tensor_to_gl<typename G::D_gl>(D),
         .q_dim = 0, .k_dim = 0, .use_split_D = false, .b_sg_per_tile = nullptr, .silu_dim = 0
+    };
+    kittens::py::launch_kernel<C, G, nvfp4_gemm::kernel<C>>(g);
+}
+
+template <typename C>
+static void run_gemm_row_scale_with_config(
+    const at::Tensor &A, const at::Tensor &A_sc, const at::Tensor &A_sc_global,
+    const at::Tensor &B, const at::Tensor &B_sc, const at::Tensor &B_sc_global,
+    const at::Tensor &row_scale_coeff,
+    at::Tensor &D
+) {
+    TORCH_CHECK(row_scale_coeff.is_cuda() && row_scale_coeff.is_contiguous() &&
+                    row_scale_coeff.scalar_type() == at::kFloat &&
+                    row_scale_coeff.dim() == 1 && row_scale_coeff.numel() == D.size(0),
+                "row_scale_coeff must be contiguous CUDA fp32 [D.rows]");
+    using G = nvfp4_gemm::globals<C>;
+    G g {
+        .A = kittens::py::tensor_to_gl<typename G::A_fp4x2_gl>(A),
+        .A_sc = kittens::py::tensor_to_gl<typename G::A_sc_gl, false>(A_sc, 1, A_sc.dim() == 2 ? A_sc.size(0)/128 : A_sc.size(0), A_sc.dim() == 2 ? A_sc.size(1)/4 : A_sc.size(1), 256),
+        .A_sc_global = kittens::py::tensor_to_gl<typename G::A_sc_global_gl>(A_sc_global),
+        .B = kittens::py::tensor_to_gl<typename G::B_fp4x2_gl>(B),
+        .B_sc = kittens::py::tensor_to_gl<typename G::B_sc_gl, false>(B_sc, 1, B_sc.dim() == 2 ? B_sc.size(0)/128 : B_sc.size(0), B_sc.dim() == 2 ? B_sc.size(1)/4 : B_sc.size(1), 256),
+        .B_sc_global = kittens::py::tensor_to_gl<typename G::B_sc_global_gl>(B_sc_global),
+        .D = kittens::py::tensor_to_gl<typename G::D_gl>(D),
+        .D_K = kittens::py::tensor_to_gl<typename G::D_gl>(D),
+        .D_V = kittens::py::tensor_to_gl<typename G::D_gl>(D),
+        .q_dim = 0,
+        .k_dim = 0,
+        .v_dim = 0,
+        .use_split_D = false,
+        .b_sg_per_tile = nullptr,
+        .silu_dim = 0,
+        .row_scale_coeff = row_scale_coeff.data_ptr<float>()
     };
     kittens::py::launch_kernel<C, G, nvfp4_gemm::kernel<C>>(g);
 }
@@ -2186,6 +2255,11 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           pybind11::arg("B"), pybind11::arg("B_sc"), pybind11::arg("B_sc_global"),
           pybind11::arg("R"), pybind11::arg("D"),
           pybind11::arg("row_rms_partial"), pybind11::arg("gamma") = std::nullopt);
+    m.def("nvfp4_gemm_row_scale", &nvfp4_gemm_row_scale_entrypoint,
+          "NVFP4 GEMM with fused C3 row-scale output epilogue",
+          pybind11::arg("A"), pybind11::arg("A_sc"), pybind11::arg("A_sc_global"),
+          pybind11::arg("B"), pybind11::arg("B_sc"), pybind11::arg("B_sc_global"),
+          pybind11::arg("row_scale_coeff"), pybind11::arg("D"));
     m.def("c1_row_rms_reduce", &c1_rms_reduce::row_rms_reduce_entrypoint,
           "Reduce C1 partial row RMS stats into row RMS coefficients",
           pybind11::arg("row_rms_partial"), pybind11::arg("coeff"),

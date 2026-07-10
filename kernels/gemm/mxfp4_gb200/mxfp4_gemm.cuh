@@ -23,7 +23,8 @@ template <
     bool _ROPE_LIVE64_RHT32 = false,
     bool _FUSE_RESIDUAL = false,
     bool _OUTPUT_SCALE = false,
-    bool _FUSE_C1_RMS = false
+    bool _FUSE_C1_RMS = false,
+    bool _FUSE_C3_ROW_SCALE = false
 >
 struct config {
     static_assert(_Nb == 128 || _Nb == 256, "Nb must be 128 or 256");
@@ -55,6 +56,7 @@ struct config {
     static constexpr bool FUSE_RESIDUAL = _FUSE_RESIDUAL;
     static constexpr bool OUTPUT_SCALE = _OUTPUT_SCALE;
     static constexpr bool FUSE_C1_RMS = _FUSE_C1_RMS;
+    static constexpr bool FUSE_C3_ROW_SCALE = _FUSE_C3_ROW_SCALE;
     static constexpr int B_SC_SIZE = Nb/128;
     static constexpr int MMA_PER_TILE = Kb/128;
 
@@ -116,6 +118,7 @@ struct globals {
     float* row_rms_partial;        // optional [M, output_epilogue_tiles] partial sumsq
     int row_rms_partial_stride;
     const bf16* gamma;             // optional [N] gamma applied to stored output
+    const float* row_scale_coeff;  // optional C3 [M] row multiplier for stored GEMM output
     const uint8_t* tilemask_ptr;   // optional [mask_rows, mask_cols] activity mask
     int            tilemask_rows;
     int            tilemask_cols;
@@ -291,6 +294,33 @@ __device__ inline void apply_c1_rms_gamma_if_enabled(
             }
             warp::copy(D_reg, D_fl);
         }
+    }
+}
+
+template <typename C, typename RT>
+__device__ inline void apply_c3_row_scale_if_enabled(
+    const globals<C> &g,
+    RT &D_reg,
+    int row_tile
+) {
+    if constexpr (!C::FUSE_C3_ROW_SCALE) {
+        return;
+    } else {
+        if (g.row_scale_coeff == nullptr) {
+            return;
+        }
+
+        typename RT::col_vec row_coeff;
+        const int lane = warp::laneid();
+        const int warp_row_base = row_tile * (C::Mb / 2) + warpgroup::warpid() * RT::rows;
+        #pragma unroll
+        for (int i = 0; i < decltype(row_coeff)::outer_dim; ++i) {
+            const int row_x = warp_row_base + i * 16 + lane / 4;
+            const int row_y = row_x + 8;
+            row_coeff[i][0].x = g.row_scale_coeff[row_x];
+            row_coeff[i][0].y = g.row_scale_coeff[row_y];
+        }
+        warp::mul_row(D_reg, D_reg, row_coeff);
     }
 }
 
@@ -628,6 +658,9 @@ __device__ inline void kernel(const globals<C> &g) {
                             (col_block_idx * C::EPI_PIPE_DEPTH + i) * (C::Nb / C::EPI_PIPE_DEPTH)
                         );
                     }
+                    apply_c3_row_scale_if_enabled<C>(
+                        g, D_reg_fl,
+                        row_block_idx * 2 + cta_id);
                     rt_bf<C::Mb / 8, C::Nb / C::EPI_PIPE_DEPTH> D_reg;
                     warp::copy(D_reg, D_reg_fl);
                     warpgroup::tma::store_async_read_wait<C::NUM_D_TILES-1>();
@@ -676,6 +709,9 @@ __device__ inline void kernel(const globals<C> &g) {
                             (col_block_idx * C::EPI_PIPE_DEPTH + i) * (C::Nb / C::EPI_PIPE_DEPTH)
                         );
                     }
+                    apply_c3_row_scale_if_enabled<C>(
+                        g, D_reg_fl,
+                        row_block_idx * 2 + cta_id);
                     warp::copy(D_reg[i], D_reg_fl);
                 }
                 tensor_load_wait();

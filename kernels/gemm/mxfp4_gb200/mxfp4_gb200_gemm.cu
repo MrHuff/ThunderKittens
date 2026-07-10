@@ -840,6 +840,36 @@ static void launch_mxfp4_gemm_dense_residual_rms(
 }
 
 template <typename C>
+static void launch_mxfp4_gemm_dense_row_scale(
+    const at::Tensor &A,
+    const at::Tensor &A_sc,
+    const at::Tensor &B,
+    const at::Tensor &B_sc,
+    const at::Tensor &row_scale_coeff,
+    at::Tensor &D
+) {
+    TORCH_CHECK(row_scale_coeff.is_cuda() && row_scale_coeff.is_contiguous() &&
+                    row_scale_coeff.scalar_type() == at::kFloat &&
+                    row_scale_coeff.dim() == 1 && row_scale_coeff.numel() == D.size(0),
+                "row_scale_coeff must be contiguous CUDA fp32 [D.rows]");
+    using G = mxfp4_gemm::globals<C>;
+    G g {
+        .A = kittens::py::tensor_to_gl<typename G::A_fp4x2_gl>(A),
+        .A_sc = kittens::py::tensor_to_gl<typename G::A_sc_gl>(A_sc),
+        .B = kittens::py::tensor_to_gl<typename G::B_fp4x2_gl>(B),
+        .B_sc = kittens::py::tensor_to_gl<typename G::B_sc_gl>(B_sc),
+        .D = kittens::py::tensor_to_gl<typename G::D_gl>(D),
+        .output_scale = nullptr,
+        .row_scale_coeff = row_scale_coeff.data_ptr<float>(),
+        .tilemask_ptr = nullptr,
+        .tilemask_rows = 0,
+        .tilemask_cols = 0,
+        .tilemask_transposed = false
+    };
+    kittens::py::launch_kernel<C, G, mxfp4_gemm::kernel<C>>(g);
+}
+
+template <typename C>
 static void launch_mxfp4_gemm_masked(
     const at::Tensor &A,
     const at::Tensor &A_sc,
@@ -922,6 +952,19 @@ void mxfp4_gemm_residual_rms_entrypoint(
     }
     launch_mxfp4_gemm_dense_residual_rms<mxfp4_gemm::config<256, 5, 8, 4, 2, false, 256, false, true, false, true>>(
         A, A_sc, B, B_sc, R, D, row_rms_partial, gamma_opt);
+}
+
+void mxfp4_gemm_row_scale_entrypoint(
+    const at::Tensor &A,
+    const at::Tensor &A_sc,
+    const at::Tensor &B,
+    const at::Tensor &B_sc,
+    const at::Tensor &row_scale_coeff,
+    at::Tensor &D
+) {
+    kittens::py::device_check(A, A_sc, B, B_sc, row_scale_coeff, D);
+    launch_mxfp4_gemm_dense_row_scale<mxfp4_gemm::config<256, 5, 8, 4, 2, false, 256, false, false, false, false, true>>(
+        A, A_sc, B, B_sc, row_scale_coeff, D);
 }
 
 void mxfp4_gemm_residual_config_entrypoint(
@@ -2476,6 +2519,11 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           pybind11::arg("B"), pybind11::arg("B_sc"),
           pybind11::arg("R"), pybind11::arg("D"),
           pybind11::arg("row_rms_partial"), pybind11::arg("gamma") = std::nullopt);
+    m.def("mxfp4_gemm_row_scale", &mxfp4_gemm_row_scale_entrypoint,
+          "MXFP4 GEMM with fused C3 row-scale output epilogue",
+          pybind11::arg("A"), pybind11::arg("A_sc"),
+          pybind11::arg("B"), pybind11::arg("B_sc"),
+          pybind11::arg("row_scale_coeff"), pybind11::arg("D"));
     m.def("mxfp4_c1_row_rms_reduce", &c1_rms_reduce::row_rms_reduce_entrypoint,
           "Reduce C1 partial row RMS stats into row RMS coefficients",
           pybind11::arg("row_rms_partial"), pybind11::arg("coeff"),
