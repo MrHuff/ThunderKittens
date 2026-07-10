@@ -25,6 +25,7 @@
 #include "../nvfp4_split2_accum_gemm.cuh"
 #include "../nvfp4_split3_accum_gemm.cuh"
 #include "nvfp4_localcta_silu_dgrad_quant_gemm.cuh"  // fused W2-dgrad -> SiLU split2 quant producer
+#include "nvfp4_localcta_swiglu_quant_gemm.cuh"      // fused W1/W3 GEMM -> SwiGLU W2 payload producer
 
 namespace {
 
@@ -63,6 +64,10 @@ using localcta_onepass_sg_cfg5 = nvfp4_gemm::config<256, 5, 8, 12, 2, false, 256
 using localcta_onepass_sg_cfg6 = nvfp4_gemm::config<128, 5, 2, 12, 2, true, 256, false, 2, 128>;
 using localcta_onepass_sg_cfg7 = nvfp4_gemm::config<128, 5, 1, 12, 2, true, 256, false, 2, 128>;
 
+int64_t outer_sg_tiles_128(int64_t extent) {
+    return (extent / 128 + 1) / 2;
+}
+
 __global__ void sum3_tensors_kernel(
     const __nv_bfloat16* __restrict__ A,
     const __nv_bfloat16* __restrict__ B,
@@ -85,6 +90,25 @@ __global__ void sum4_tensors_kernel(
     const __nv_bfloat16* __restrict__ D,
     __nv_bfloat16* __restrict__ out,
     int64_t numel
+);
+
+__global__ void rmsnorm_bwd_dx_kernel(
+    const __nv_bfloat16* __restrict__ d_normed,
+    const __nv_bfloat16* __restrict__ input,
+    const __nv_bfloat16* __restrict__ norm_weight,
+    const float* __restrict__ inv_rms,
+    __nv_bfloat16* __restrict__ grad_input,
+    int64_t M,
+    int64_t K
+);
+
+__global__ void rmsnorm_bwd_dgamma_kernel(
+    const __nv_bfloat16* __restrict__ d_normed,
+    const __nv_bfloat16* __restrict__ input,
+    const float* __restrict__ inv_rms,
+    float* __restrict__ dgamma,
+    int64_t M,
+    int64_t K
 );
 
 enum class OuterScaleReduceKind : int {
@@ -167,6 +191,37 @@ bool use_v4_pack4_fold_outer_sg() {
         return true;
     }
     return std::strcmp(value, "0") != 0;
+}
+
+bool localcta_env_flag(const char* name, bool default_value) {
+    const char* value = std::getenv(name);
+    if (value == nullptr) {
+        return default_value;
+    }
+    return std::strcmp(value, "0") != 0;
+}
+
+int64_t localcta_env_int64(const char* name, int64_t default_value) {
+    const char* value = std::getenv(name);
+    if (value == nullptr) {
+        return default_value;
+    }
+    try {
+        return std::stoll(std::string(value));
+    } catch (...) {
+        return default_value;
+    }
+}
+
+bool use_v4_w13_virtual_raw_consumer(int64_t M) {
+    if (!localcta_env_flag("USE_TK_LOCALCTA_V4_SILU_ATOMIC_FINAL_SG_PRODUCER", true)) {
+        return false;
+    }
+    if (!localcta_env_flag("USE_TK_LOCALCTA_V4_GEMM_VIRTUAL_RESCALE", false)) {
+        return false;
+    }
+    const int64_t max_m = localcta_env_int64("USE_TK_LOCALCTA_V4_GEMM_VIRTUAL_RESCALE_MAX_M", 0);
+    return max_m <= 0 || M <= max_m;
 }
 
 int get_chunkgrid_gemm_config_idx() {
@@ -4001,6 +4056,93 @@ __global__ void sum4_tensors_kernel(
     }
 }
 
+__global__ void rmsnorm_bwd_dx_kernel(
+    const __nv_bfloat16* __restrict__ d_normed,
+    const __nv_bfloat16* __restrict__ input,
+    const __nv_bfloat16* __restrict__ norm_weight,
+    const float* __restrict__ inv_rms,
+    __nv_bfloat16* __restrict__ grad_input,
+    int64_t M,
+    int64_t K
+) {
+    __shared__ float scratch[256];
+    const int64_t row = static_cast<int64_t>(blockIdx.x);
+    if (row >= M) {
+        return;
+    }
+
+    const int tid = threadIdx.x;
+    const int64_t base = row * K;
+    float partial = 0.0f;
+    for (int64_t col = tid; col < K; col += blockDim.x) {
+        const int64_t idx = base + col;
+        const float dy = __bfloat162float(d_normed[idx]);
+        const float x = __bfloat162float(input[idx]);
+        const float gamma = __bfloat162float(norm_weight[col]);
+        partial += dy * gamma * x;
+    }
+    scratch[tid] = partial;
+    __syncthreads();
+
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            scratch[tid] += scratch[tid + stride];
+        }
+        __syncthreads();
+    }
+
+    const float inv = inv_rms[row];
+    const float dot_mean = scratch[0] / static_cast<float>(K);
+    const float inv3_dot = inv * inv * inv * dot_mean;
+    for (int64_t col = tid; col < K; col += blockDim.x) {
+        const int64_t idx = base + col;
+        const float dy = __bfloat162float(d_normed[idx]);
+        const float x = __bfloat162float(input[idx]);
+        const float gamma = __bfloat162float(norm_weight[col]);
+        const float dx = inv * (dy * gamma) - x * inv3_dot;
+        grad_input[idx] = __float2bfloat16(dx);
+    }
+}
+
+__global__ void rmsnorm_bwd_dgamma_kernel(
+    const __nv_bfloat16* __restrict__ d_normed,
+    const __nv_bfloat16* __restrict__ input,
+    const float* __restrict__ inv_rms,
+    float* __restrict__ dgamma,
+    int64_t M,
+    int64_t K
+) {
+    __shared__ float scratch[256];
+    const int64_t col = static_cast<int64_t>(blockIdx.x);
+    if (col >= K) {
+        return;
+    }
+
+    const int tid = threadIdx.x;
+    float partial = 0.0f;
+    for (int64_t row = tid; row < M; row += blockDim.x) {
+        const int64_t idx = row * K + col;
+        partial += (
+            __bfloat162float(d_normed[idx])
+            * __bfloat162float(input[idx])
+            * inv_rms[row]
+        );
+    }
+    scratch[tid] = partial;
+    __syncthreads();
+
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            scratch[tid] += scratch[tid + stride];
+        }
+        __syncthreads();
+    }
+
+    if (tid == 0) {
+        dgamma[col] = scratch[0];
+    }
+}
+
 }  // namespace
 
 void nvfp4_localcta_gemm_entrypoint(
@@ -5252,6 +5394,62 @@ void sum3_bf16_entrypoint(
     CUDACHECK(cudaGetLastError());
 }
 
+void nvfp4_localcta_rmsnorm_bwd_entrypoint(
+    const at::Tensor& d_normed,
+    const at::Tensor& input,
+    const at::Tensor& norm_weight,
+    const at::Tensor& inv_rms,
+    at::Tensor& grad_input,
+    at::Tensor& dgamma
+) {
+    TORCH_CHECK(d_normed.is_cuda() && d_normed.is_contiguous()
+                    && d_normed.scalar_type() == at::kBFloat16,
+                "d_normed must be contiguous CUDA bf16");
+    TORCH_CHECK(input.is_cuda() && input.is_contiguous()
+                    && input.scalar_type() == at::kBFloat16,
+                "input must be contiguous CUDA bf16");
+    TORCH_CHECK(norm_weight.is_cuda() && norm_weight.is_contiguous()
+                    && norm_weight.scalar_type() == at::kBFloat16,
+                "norm_weight must be contiguous CUDA bf16");
+    TORCH_CHECK(inv_rms.is_cuda() && inv_rms.is_contiguous()
+                    && inv_rms.scalar_type() == at::kFloat,
+                "inv_rms must be contiguous CUDA fp32");
+    TORCH_CHECK(d_normed.dim() == 2, "d_normed must be rank-2");
+    const int64_t M = d_normed.size(0);
+    const int64_t K = d_normed.size(1);
+    check_output_matrix(input, "input", M, K);
+    TORCH_CHECK(norm_weight.dim() == 1 && norm_weight.numel() == K,
+                "norm_weight must have shape [K]");
+    TORCH_CHECK(inv_rms.numel() == M,
+                "inv_rms must have M elements");
+    check_output_matrix(grad_input, "grad_input", M, K);
+    TORCH_CHECK(grad_input.scalar_type() == at::kBFloat16,
+                "grad_input must be bf16");
+    TORCH_CHECK(dgamma.is_cuda() && dgamma.is_contiguous()
+                    && dgamma.scalar_type() == at::kFloat
+                    && dgamma.dim() == 1 && dgamma.numel() == K,
+                "dgamma must be contiguous CUDA fp32 [K]");
+
+    auto stream = at::cuda::getCurrentCUDAStream();
+    constexpr int threads = 256;
+    rmsnorm_bwd_dx_kernel<<<static_cast<int>(M), threads, 0, stream>>>(
+        reinterpret_cast<const __nv_bfloat16*>(d_normed.data_ptr()),
+        reinterpret_cast<const __nv_bfloat16*>(input.data_ptr()),
+        reinterpret_cast<const __nv_bfloat16*>(norm_weight.data_ptr()),
+        reinterpret_cast<const float*>(inv_rms.data_ptr()),
+        reinterpret_cast<__nv_bfloat16*>(grad_input.data_ptr()),
+        M,
+        K);
+    rmsnorm_bwd_dgamma_kernel<<<static_cast<int>(K), threads, 0, stream>>>(
+        reinterpret_cast<const __nv_bfloat16*>(d_normed.data_ptr()),
+        reinterpret_cast<const __nv_bfloat16*>(input.data_ptr()),
+        reinterpret_cast<const float*>(inv_rms.data_ptr()),
+        reinterpret_cast<float*>(dgamma.data_ptr()),
+        M,
+        K);
+    CUDACHECK(cudaGetLastError());
+}
+
 at::Tensor nvfp4_localcta_prepare_outer_sg_entrypoint(
     const at::Tensor& sg,
     int64_t tiles,
@@ -5300,6 +5498,429 @@ at::Tensor nvfp4_localcta_fold_outer_sg_into_prepared_sc_entrypoint(
     int64_t cols
 ) {
     return fold_outer_sg_into_prepared_sc_tensor(sc_raw, sg, rows, cols);
+}
+
+template <int BLOCK_SIZE = 256>
+__global__ void b1_finalize_row_sc_kernel(
+    __nv_fp8_e4m3* __restrict__ row_sc,
+    const float* __restrict__ row_sg_chunk,
+    float* __restrict__ row_sg_tiles,
+    int row_chunks,
+    int sc_cols,
+    int sg_cols
+) {
+    const int tile = blockIdx.x;
+    const int sc_col = blockIdx.y;
+    const int row0 = tile * 2;
+    if (row0 >= row_chunks || sc_col >= sc_cols) return;
+    const int row1 = row0 + 1;
+
+    float thread_max = 0.0f;
+    for (int idx = threadIdx.x; idx < sg_cols * 2; idx += BLOCK_SIZE) {
+        const int r = idx / sg_cols;
+        const int c = idx % sg_cols;
+        const int row = (r == 0) ? row0 : row1;
+        if (row < row_chunks) {
+            thread_max = fmaxf(thread_max, row_sg_chunk[row * sg_cols + c]);
+        }
+    }
+
+    __shared__ float smem[BLOCK_SIZE];
+    smem[threadIdx.x] = thread_max;
+    __syncthreads();
+    for (int stride = BLOCK_SIZE / 2; stride > 0; stride >>= 1) {
+        if (threadIdx.x < stride) {
+            smem[threadIdx.x] = fmaxf(smem[threadIdx.x], smem[threadIdx.x + stride]);
+        }
+        __syncthreads();
+    }
+
+    const float denom = fmaxf(smem[0], 1e-12f);
+    if (threadIdx.x == 0 && sc_col == 0) {
+        row_sg_tiles[tile] = smem[0];
+    }
+
+    const int rows_in_tile = min(2, row_chunks - row0);
+    const int total = rows_in_tile * 512;
+    for (int idx = threadIdx.x; idx < total; idx += BLOCK_SIZE) {
+        const int local_row = idx / 512;
+        const int i = idx % 512;
+        const int row = row0 + local_row;
+        const float numer = row_sg_chunk[row * sg_cols + (sc_col / 2)];
+        const float ratio = numer / denom;
+        const int64_t base = ((int64_t)row * sc_cols + sc_col) * 512;
+        const float v = static_cast<float>(row_sc[base + i]);
+        row_sc[base + i] = static_cast<__nv_fp8_e4m3>(v * ratio);
+    }
+}
+
+template <int BLOCK_SIZE = 256>
+__global__ void b1_finalize_col_sc_kernel(
+    __nv_fp8_e4m3* __restrict__ col_sc,
+    const float* __restrict__ col_sg_chunk,
+    float* __restrict__ col_sg_tiles,
+    int k_chunks,
+    int sc_rows,
+    int sg_rows
+) {
+    const int tile = blockIdx.x;
+    const int sc_row = blockIdx.y;
+    const int k0 = tile * 2;
+    if (k0 >= k_chunks || sc_row >= sc_rows) return;
+    const int k1 = k0 + 1;
+
+    float thread_max = 0.0f;
+    for (int idx = threadIdx.x; idx < sg_rows * 2; idx += BLOCK_SIZE) {
+        const int k = idx / sg_rows;
+        const int r = idx % sg_rows;
+        const int kk = (k == 0) ? k0 : k1;
+        if (kk < k_chunks) {
+            thread_max = fmaxf(thread_max, col_sg_chunk[kk * sg_rows + r]);
+        }
+    }
+
+    __shared__ float smem[BLOCK_SIZE];
+    smem[threadIdx.x] = thread_max;
+    __syncthreads();
+    for (int stride = BLOCK_SIZE / 2; stride > 0; stride >>= 1) {
+        if (threadIdx.x < stride) {
+            smem[threadIdx.x] = fmaxf(smem[threadIdx.x], smem[threadIdx.x + stride]);
+        }
+        __syncthreads();
+    }
+
+    const float denom = fmaxf(smem[0], 1e-12f);
+    if (threadIdx.x == 0 && sc_row == 0) {
+        col_sg_tiles[tile] = smem[0];
+    }
+
+    const int ks_in_tile = min(2, k_chunks - k0);
+    const int total = ks_in_tile * 512;
+    for (int idx = threadIdx.x; idx < total; idx += BLOCK_SIZE) {
+        const int local_k = idx / 512;
+        const int i = idx % 512;
+        const int k = k0 + local_k;
+        const float numer = col_sg_chunk[k * sg_rows + (sc_row / 2)];
+        const float ratio = numer / denom;
+        const int64_t base = ((int64_t)k * sc_rows + sc_row) * 512;
+        const float v = static_cast<float>(col_sc[base + i]);
+        col_sc[base + i] = static_cast<__nv_fp8_e4m3>(v * ratio);
+    }
+}
+
+template <int BLOCK_SIZE = 256>
+__global__ void b1_reduce_row_sg_kernel(
+    const float* __restrict__ row_sg_chunk,
+    float* __restrict__ row_sg_tiles,
+    int row_chunks,
+    int sg_cols
+) {
+    const int tile = blockIdx.x;
+    const int row0 = tile * 2;
+    if (row0 >= row_chunks) return;
+
+    float thread_max = 0.0f;
+    for (int idx = threadIdx.x; idx < sg_cols * 2; idx += BLOCK_SIZE) {
+        const int r = idx / sg_cols;
+        const int c = idx % sg_cols;
+        const int row = row0 + r;
+        if (row < row_chunks) {
+            thread_max = fmaxf(thread_max, row_sg_chunk[row * sg_cols + c]);
+        }
+    }
+
+    __shared__ float smem[BLOCK_SIZE];
+    smem[threadIdx.x] = thread_max;
+    __syncthreads();
+    for (int stride = BLOCK_SIZE / 2; stride > 0; stride >>= 1) {
+        if (threadIdx.x < stride) {
+            smem[threadIdx.x] = fmaxf(smem[threadIdx.x], smem[threadIdx.x + stride]);
+        }
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) {
+        row_sg_tiles[tile] = smem[0];
+    }
+}
+
+template <int BLOCK_SIZE = 256>
+__global__ void b1_reduce_col_sg_kernel(
+    const float* __restrict__ col_sg_chunk,
+    float* __restrict__ col_sg_tiles,
+    int k_chunks,
+    int sg_rows
+) {
+    const int tile = blockIdx.x;
+    const int k0 = tile * 2;
+    if (k0 >= k_chunks) return;
+
+    float thread_max = 0.0f;
+    for (int idx = threadIdx.x; idx < sg_rows * 2; idx += BLOCK_SIZE) {
+        const int k = idx / sg_rows;
+        const int r = idx % sg_rows;
+        const int kk = k0 + k;
+        if (kk < k_chunks) {
+            thread_max = fmaxf(thread_max, col_sg_chunk[kk * sg_rows + r]);
+        }
+    }
+
+    __shared__ float smem[BLOCK_SIZE];
+    smem[threadIdx.x] = thread_max;
+    __syncthreads();
+    for (int stride = BLOCK_SIZE / 2; stride > 0; stride >>= 1) {
+        if (threadIdx.x < stride) {
+            smem[threadIdx.x] = fmaxf(smem[threadIdx.x], smem[threadIdx.x + stride]);
+        }
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) {
+        col_sg_tiles[tile] = smem[0];
+    }
+}
+
+void reduce_w13_swiglu_sg_only(
+    at::Tensor& row_sc,
+    at::Tensor& row_sg_chunk,
+    at::Tensor& row_sg,
+    at::Tensor& col_sg_chunk,
+    at::Tensor& col_sg
+) {
+    const int64_t M = row_sc.size(0) * 128;
+    const int64_t H = row_sc.size(1) * 64;
+    const int64_t row_chunks = M / 128;
+    const int64_t row_sg_cols = H / 128;
+    const int64_t col_chunks = H / 128;
+    const int64_t col_sg_rows = M / 128;
+    auto stream = at::cuda::getCurrentCUDAStream();
+
+    const auto row_tiles = static_cast<unsigned int>((row_chunks + 1) / 2);
+    b1_reduce_row_sg_kernel<256><<<row_tiles, 256, 0, stream>>>(
+        row_sg_chunk.data_ptr<float>(),
+        row_sg.data_ptr<float>(),
+        static_cast<int>(row_chunks),
+        static_cast<int>(row_sg_cols));
+    {
+        cudaError_t err = cudaGetLastError();
+        TORCH_CHECK(err == cudaSuccess, "b1_reduce_row_sg_kernel failed: ", cudaGetErrorString(err));
+    }
+
+    const auto col_tiles = static_cast<unsigned int>((col_chunks + 1) / 2);
+    b1_reduce_col_sg_kernel<256><<<col_tiles, 256, 0, stream>>>(
+        col_sg_chunk.data_ptr<float>(),
+        col_sg.data_ptr<float>(),
+        static_cast<int>(col_chunks),
+        static_cast<int>(col_sg_rows));
+    cudaError_t err = cudaGetLastError();
+    TORCH_CHECK(err == cudaSuccess, "b1_reduce_col_sg_kernel failed: ", cudaGetErrorString(err));
+}
+
+void finalize_w13_swiglu_quant_contract(
+    at::Tensor& row_sc,
+    at::Tensor& row_sg_chunk,
+    at::Tensor& row_sg,
+    at::Tensor& col_sc,
+    at::Tensor& col_sg_chunk,
+    at::Tensor& col_sg
+) {
+    const int64_t M = row_sc.size(0) * 128;
+    const int64_t H = row_sc.size(1) * 64;
+    const int64_t row_chunks = M / 128;
+    const int64_t row_sg_cols = H / 128;
+    const int64_t row_sc_cols = H / 64;
+    const int64_t col_chunks = H / 128;
+    const int64_t col_sg_rows = M / 128;
+    const int64_t col_sc_rows = M / 64;
+    auto stream = at::cuda::getCurrentCUDAStream();
+
+    dim3 row_grid(static_cast<unsigned int>((row_chunks + 1) / 2),
+                  static_cast<unsigned int>(row_sc_cols));
+    b1_finalize_row_sc_kernel<256><<<row_grid, 256, 0, stream>>>(
+        reinterpret_cast<__nv_fp8_e4m3*>(row_sc.data_ptr()),
+        row_sg_chunk.data_ptr<float>(),
+        row_sg.data_ptr<float>(),
+        static_cast<int>(row_chunks),
+        static_cast<int>(row_sc_cols),
+        static_cast<int>(row_sg_cols));
+    {
+        cudaError_t err = cudaGetLastError();
+        TORCH_CHECK(err == cudaSuccess, "b1_finalize_row_sc_kernel failed: ", cudaGetErrorString(err));
+    }
+
+    dim3 col_grid(static_cast<unsigned int>((col_chunks + 1) / 2),
+                  static_cast<unsigned int>(col_sc_rows));
+    b1_finalize_col_sc_kernel<256><<<col_grid, 256, 0, stream>>>(
+        reinterpret_cast<__nv_fp8_e4m3*>(col_sc.data_ptr()),
+        col_sg_chunk.data_ptr<float>(),
+        col_sg.data_ptr<float>(),
+        static_cast<int>(col_chunks),
+        static_cast<int>(col_sc_rows),
+        static_cast<int>(col_sg_rows));
+    cudaError_t err = cudaGetLastError();
+    TORCH_CHECK(err == cudaSuccess, "b1_finalize_col_sc_kernel failed: ", cudaGetErrorString(err));
+}
+
+template <typename C>
+void launch_localcta_swiglu_quant_gemm_with_config(
+    const at::Tensor& A,
+    const at::Tensor& A_sc,
+    const at::Tensor& A_sg,
+    const at::Tensor& A_sg_chunk,
+    const at::Tensor& B1,
+    const at::Tensor& B1_sc,
+    const at::Tensor& B1_sg,
+    const at::Tensor& B1_sg_chunk,
+    const at::Tensor& B3,
+    const at::Tensor& B3_sc,
+    const at::Tensor& B3_sg,
+    const at::Tensor& B3_sg_chunk,
+    at::Tensor& row_fp4,
+    at::Tensor& row_sc,
+    at::Tensor& row_sg_chunk,
+    at::Tensor& col_fp4,
+    at::Tensor& col_sc,
+    at::Tensor& col_sg_chunk
+) {
+    using G = nvfp4_localcta_swiglu_quant_gemm::globals<C>;
+    const int64_t M = A.size(0);
+    const int64_t H = B1.size(0);
+    auto A_sg_outer = normalize_outer_scale_tiles_tensor(A_sg, M / C::Mb, true).contiguous();
+    auto B1_sg_outer = normalize_outer_scale_tiles_tensor(B1_sg, H / 256, false).contiguous();
+    auto B3_sg_outer = normalize_outer_scale_tiles_tensor(B3_sg, H / 256, false).contiguous();
+
+    outer_scale_desc a_sg_desc = check_outer_scale_tiles(A_sg_outer, "A_sg_outer", M / C::Mb, true);
+    outer_scale_desc b1_sg_desc = check_outer_scale_tiles(B1_sg_outer, "B1_sg_outer", H / 256, false);
+    outer_scale_desc b3_sg_desc = check_outer_scale_tiles(B3_sg_outer, "B3_sg_outer", H / 256, false);
+    const bool has_a_chunks = has_virtual_rescale_chunk_grid(
+        A_sg_chunk, "A_sg_chunk", M, A.size(1) * 2);
+    const bool has_b1_chunks = has_virtual_rescale_chunk_grid(
+        B1_sg_chunk, "B1_sg_chunk", H, B1.size(1) * 2);
+    const bool has_b3_chunks = has_virtual_rescale_chunk_grid(
+        B3_sg_chunk, "B3_sg_chunk", H, B3.size(1) * 2);
+
+    G g {
+        .A = kittens::py::tensor_to_gl<typename G::A_fp4x2_gl>(A),
+        .A_sc = kittens::py::tensor_to_gl<typename G::A_sc_gl, false>(
+            A_sc, 1, A_sc.size(0), A_sc.size(1), 256),
+        .B1 = kittens::py::tensor_to_gl<typename G::B_fp4x2_gl>(B1),
+        .B1_sc = kittens::py::tensor_to_gl<typename G::B_sc_gl, false>(
+            B1_sc, 1, B1_sc.size(0), B1_sc.size(1), 256),
+        .B3 = kittens::py::tensor_to_gl<typename G::B_fp4x2_gl>(B3),
+        .B3_sc = kittens::py::tensor_to_gl<typename G::B_sc_gl, false>(
+            B3_sc, 1, B3_sc.size(0), B3_sc.size(1), 256),
+        .A_sg = a_sg_desc.ptr,
+        .A_sg_stride = a_sg_desc.stride,
+        .A_sg_chunk_grid = has_a_chunks ? A_sg_chunk.data_ptr<float>() : nullptr,
+        .A_sg_chunk_stride = has_a_chunks ? static_cast<int>(A_sg_chunk.size(1)) : 1,
+        .B1_sg = b1_sg_desc.ptr,
+        .B1_sg_stride = b1_sg_desc.stride,
+        .B1_sg_chunk_grid = has_b1_chunks ? B1_sg_chunk.data_ptr<float>() : nullptr,
+        .B1_sg_chunk_stride = has_b1_chunks ? static_cast<int>(B1_sg_chunk.size(1)) : 1,
+        .B3_sg = b3_sg_desc.ptr,
+        .B3_sg_stride = b3_sg_desc.stride,
+        .B3_sg_chunk_grid = has_b3_chunks ? B3_sg_chunk.data_ptr<float>() : nullptr,
+        .B3_sg_chunk_stride = has_b3_chunks ? static_cast<int>(B3_sg_chunk.size(1)) : 1,
+        .row_fp4 = reinterpret_cast<uint8_t*>(row_fp4.data_ptr()),
+        .row_sc = reinterpret_cast<uint8_t*>(row_sc.data_ptr()),
+        .row_sg = row_sg_chunk.data_ptr<float>(),
+        .col_fp4 = reinterpret_cast<uint8_t*>(col_fp4.data_ptr()),
+        .col_sc = reinterpret_cast<uint8_t*>(col_sc.data_ptr()),
+        .col_sg = col_sg_chunk.data_ptr<float>(),
+        .M = static_cast<int>(M),
+        .H = static_cast<int>(H),
+    };
+    kittens::py::launch_kernel<C, G, nvfp4_localcta_swiglu_quant_gemm::kernel<C>>(g);
+}
+
+void nvfp4_localcta_w13_swiglu_quant_gemm_entrypoint(
+    const at::Tensor& A,
+    const at::Tensor& A_sc,
+    const at::Tensor& A_sg,
+    const at::Tensor& A_sg_chunk,
+    const at::Tensor& B1,
+    const at::Tensor& B1_sc,
+    const at::Tensor& B1_sg,
+    const at::Tensor& B1_sg_chunk,
+    const at::Tensor& B3,
+    const at::Tensor& B3_sc,
+    const at::Tensor& B3_sg,
+    const at::Tensor& B3_sg_chunk,
+    at::Tensor& row_fp4,
+    at::Tensor& row_sc,
+    at::Tensor& row_sg,
+    at::Tensor& row_sg_chunk,
+    at::Tensor& col_fp4,
+    at::Tensor& col_sc,
+    at::Tensor& col_sg,
+    at::Tensor& col_sg_chunk,
+    int config_id = 1
+) {
+    check_fp4_matrix(A, "A");
+    check_fp4_matrix(B1, "B1");
+    check_fp4_matrix(B3, "B3");
+    TORCH_CHECK(A.size(1) == B1.size(1) && A.size(1) == B3.size(1),
+                "A, B1, and B3 must share packed K");
+    TORCH_CHECK(B1.sizes() == B3.sizes(), "B1 and B3 must have matching packed shapes");
+    const int64_t M = A.size(0);
+    const int64_t H = B1.size(0);
+    const int64_t K = A.size(1) * 2;
+    TORCH_CHECK(M % 256 == 0 && H % 256 == 0 && K % 256 == 0,
+                "localCTA W13 SwiGLU producer requires M,H,K divisible by 256");
+    check_scale_tensor(A_sc, "A_sc", M, K);
+    check_scale_tensor(B1_sc, "B1_sc", H, K);
+    check_scale_tensor(B3_sc, "B3_sc", H, K);
+
+    TORCH_CHECK(row_fp4.is_cuda() && row_fp4.is_contiguous() &&
+                row_fp4.scalar_type() == torch::kFloat4_e2m1fn_x2 &&
+                row_fp4.sizes() == torch::IntArrayRef({M, H / 2}),
+                "row_fp4 must be contiguous CUDA fp4 [M,H/2]");
+    TORCH_CHECK(row_sc.is_cuda() && row_sc.is_contiguous() &&
+                row_sc.scalar_type() == torch::kFloat8_e4m3fn &&
+                row_sc.sizes() == torch::IntArrayRef({M / 128, H / 64, 512}),
+                "row_sc must be contiguous CUDA fp8 [M/128,H/64,512]");
+    TORCH_CHECK(row_sg.is_cuda() && row_sg.is_contiguous() &&
+                row_sg.scalar_type() == torch::kFloat32 &&
+                row_sg.sizes() == torch::IntArrayRef({outer_sg_tiles_128(M), 1}),
+                "row_sg must be contiguous CUDA fp32 [ceil(M/256),1]");
+    TORCH_CHECK(row_sg_chunk.is_cuda() && row_sg_chunk.is_contiguous() &&
+                row_sg_chunk.scalar_type() == torch::kFloat32 &&
+                row_sg_chunk.sizes() == torch::IntArrayRef({M / 128, H / 128}),
+                "row_sg_chunk must be contiguous CUDA fp32 [M/128,H/128]");
+    TORCH_CHECK(col_fp4.is_cuda() && col_fp4.is_contiguous() &&
+                col_fp4.scalar_type() == torch::kFloat4_e2m1fn_x2 &&
+                col_fp4.sizes() == torch::IntArrayRef({H, M / 2}),
+                "col_fp4 must be contiguous CUDA fp4 [H,M/2]");
+    TORCH_CHECK(col_sc.is_cuda() && col_sc.is_contiguous() &&
+                col_sc.scalar_type() == torch::kFloat8_e4m3fn &&
+                col_sc.sizes() == torch::IntArrayRef({H / 128, M / 64, 512}),
+                "col_sc must be contiguous CUDA fp8 [H/128,M/64,512]");
+    TORCH_CHECK(col_sg.is_cuda() && col_sg.is_contiguous() &&
+                col_sg.scalar_type() == torch::kFloat32 &&
+                col_sg.sizes() == torch::IntArrayRef({1, outer_sg_tiles_128(H)}),
+                "col_sg must be contiguous CUDA fp32 [1,ceil(H/256)]");
+    TORCH_CHECK(col_sg_chunk.is_cuda() && col_sg_chunk.is_contiguous() &&
+                col_sg_chunk.scalar_type() == torch::kFloat32 &&
+                col_sg_chunk.sizes() == torch::IntArrayRef({H / 128, M / 128}),
+                "col_sg_chunk must be contiguous CUDA fp32 [H/128,M/128]");
+    kittens::py::device_check(A, A_sc, A_sg, B1, B1_sc, B1_sg, B3, B3_sc, B3_sg,
+                              row_fp4, row_sc, row_sg, row_sg_chunk,
+                              col_fp4, col_sc, col_sg, col_sg_chunk);
+
+    TORCH_CHECK(config_id == 1,
+                "localCTA W13 SwiGLU producer exposes only validated config_id=1");
+    launch_localcta_swiglu_quant_gemm_with_config<
+        nvfp4_localcta_swiglu_quant_gemm::config<2, 4, false, 128, 128>>(
+        A, A_sc, A_sg, A_sg_chunk,
+        B1, B1_sc, B1_sg, B1_sg_chunk,
+        B3, B3_sc, B3_sg, B3_sg_chunk,
+        row_fp4, row_sc, row_sg_chunk, col_fp4, col_sc, col_sg_chunk);
+
+    if (use_v4_w13_virtual_raw_consumer(M)) {
+        reduce_w13_swiglu_sg_only(row_sc, row_sg_chunk, row_sg,
+                                  col_sg_chunk, col_sg);
+    } else {
+        finalize_w13_swiglu_quant_contract(row_sc, row_sg_chunk, row_sg,
+                                            col_sc, col_sg_chunk, col_sg);
+    }
 }
 
 template <typename C>
@@ -5661,6 +6282,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("sum3_bf16", &sum3_bf16_entrypoint,
           pybind11::arg("A"), pybind11::arg("B"), pybind11::arg("C"),
           pybind11::arg("D_out"));
+    m.def("nvfp4_localcta_rmsnorm_bwd", &nvfp4_localcta_rmsnorm_bwd_entrypoint,
+          pybind11::arg("d_normed"), pybind11::arg("input"),
+          pybind11::arg("norm_weight"), pybind11::arg("inv_rms"),
+          pybind11::arg("grad_input"), pybind11::arg("dgamma"));
     m.def("nvfp4_localcta_prepare_outer_sg", &nvfp4_localcta_prepare_outer_sg_entrypoint,
           pybind11::arg("sg"), pybind11::arg("tiles"), pybind11::arg("row_axis") = true);
     m.def("nvfp4_localcta_prepare_split_wgrad_a_sg", &nvfp4_localcta_prepare_split_wgrad_a_sg_entrypoint,
@@ -5673,6 +6298,18 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           pybind11::arg("sc_raw"), pybind11::arg("sg"), pybind11::arg("rows"), pybind11::arg("cols"));
     m.def("nvfp4_localcta_fold_outer_sg_into_prepared_sc", &nvfp4_localcta_fold_outer_sg_into_prepared_sc_entrypoint,
           pybind11::arg("sc_raw"), pybind11::arg("sg"), pybind11::arg("rows"), pybind11::arg("cols"));
+    m.def("nvfp4_localcta_w13_swiglu_quant_gemm",
+          &nvfp4_localcta_w13_swiglu_quant_gemm_entrypoint,
+          pybind11::arg("A"), pybind11::arg("A_sc"), pybind11::arg("A_sg"),
+          pybind11::arg("A_sg_chunk"),
+          pybind11::arg("B1"), pybind11::arg("B1_sc"), pybind11::arg("B1_sg"),
+          pybind11::arg("B1_sg_chunk"),
+          pybind11::arg("B3"), pybind11::arg("B3_sc"), pybind11::arg("B3_sg"),
+          pybind11::arg("B3_sg_chunk"),
+          pybind11::arg("row_fp4"), pybind11::arg("row_sc"), pybind11::arg("row_sg"),
+          pybind11::arg("row_sg_chunk"), pybind11::arg("col_fp4"), pybind11::arg("col_sc"),
+          pybind11::arg("col_sg"), pybind11::arg("col_sg_chunk"),
+          pybind11::arg("config_id") = 1);
     m.def("nvfp4_localcta_w2_dgrad_silu_quant_gemm",
           &nvfp4_localcta_w2_dgrad_silu_quant_gemm_entrypoint,
           pybind11::arg("A"), pybind11::arg("A_sc"), pybind11::arg("A_sg"),
