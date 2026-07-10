@@ -452,15 +452,72 @@ static void launch_v5_w1_sqrelu_quant_pass(
         .B3_sc = kittens::py::tensor_to_gl<typename G::B_sc_gl, false>(
             B_sc, 1, B_sc.size(0), B_sc.size(1), 256),
         .A_sg = A_sg.data_ptr<float>(),
-        .A_sg_stride = 1,
+        .A_sg_stride = 0,
         .A_sg_chunk_grid = nullptr,
         .A_sg_chunk_stride = 1,
         .B1_sg = B_sg.data_ptr<float>(),
-        .B1_sg_stride = 1,
+        .B1_sg_stride = 0,
         .B1_sg_chunk_grid = nullptr,
         .B1_sg_chunk_stride = 1,
         .B3_sg = B_sg.data_ptr<float>(),
-        .B3_sg_stride = 1,
+        .B3_sg_stride = 0,
+        .B3_sg_chunk_grid = nullptr,
+        .B3_sg_chunk_stride = 1,
+        .row_fp4 = reinterpret_cast<uint8_t*>(row_fp4.data_ptr()),
+        .row_sc = reinterpret_cast<uint8_t*>(row_sc.data_ptr()),
+        .row_sg = row_sg.data_ptr<float>(),
+        .col_fp4 = reinterpret_cast<uint8_t*>(col_fp4.data_ptr()),
+        .col_sc = reinterpret_cast<uint8_t*>(col_sc.data_ptr()),
+        .col_sg = col_sg.data_ptr<float>(),
+        .global_amax = global_amax.data_ptr<float>(),
+        .M = static_cast<int>(M),
+        .H = static_cast<int>(H),
+    };
+    kittens::py::launch_kernel<C, G, nvfp4_localcta_swiglu_quant_gemm::kernel<C>>(g);
+}
+
+template <typename C>
+static void launch_v5_w13_swiglu_quant_pass(
+    const at::Tensor &A,
+    const at::Tensor &A_sc,
+    const at::Tensor &A_sg,
+    const at::Tensor &B1,
+    const at::Tensor &B1_sc,
+    const at::Tensor &B1_sg,
+    const at::Tensor &B3,
+    const at::Tensor &B3_sc,
+    const at::Tensor &B3_sg,
+    at::Tensor &row_fp4,
+    at::Tensor &row_sc,
+    at::Tensor &row_sg,
+    at::Tensor &col_fp4,
+    at::Tensor &col_sc,
+    at::Tensor &col_sg,
+    at::Tensor &global_amax
+) {
+    using G = nvfp4_localcta_swiglu_quant_gemm::globals<C>;
+    const int64_t M = A.size(0);
+    const int64_t H = B1.size(0);
+    G g {
+        .A = kittens::py::tensor_to_gl<typename G::A_fp4x2_gl>(A),
+        .A_sc = kittens::py::tensor_to_gl<typename G::A_sc_gl, false>(
+            A_sc, 1, A_sc.size(0), A_sc.size(1), 256),
+        .B1 = kittens::py::tensor_to_gl<typename G::B_fp4x2_gl>(B1),
+        .B1_sc = kittens::py::tensor_to_gl<typename G::B_sc_gl, false>(
+            B1_sc, 1, B1_sc.size(0), B1_sc.size(1), 256),
+        .B3 = kittens::py::tensor_to_gl<typename G::B_fp4x2_gl>(B3),
+        .B3_sc = kittens::py::tensor_to_gl<typename G::B_sc_gl, false>(
+            B3_sc, 1, B3_sc.size(0), B3_sc.size(1), 256),
+        .A_sg = A_sg.data_ptr<float>(),
+        .A_sg_stride = 0,
+        .A_sg_chunk_grid = nullptr,
+        .A_sg_chunk_stride = 1,
+        .B1_sg = B1_sg.data_ptr<float>(),
+        .B1_sg_stride = 0,
+        .B1_sg_chunk_grid = nullptr,
+        .B1_sg_chunk_stride = 1,
+        .B3_sg = B3_sg.data_ptr<float>(),
+        .B3_sg_stride = 0,
         .B3_sg_chunk_grid = nullptr,
         .B3_sg_chunk_stride = 1,
         .row_fp4 = reinterpret_cast<uint8_t*>(row_fp4.data_ptr()),
@@ -549,6 +606,95 @@ void nvfp4_w1_sqrelu_quant_gemm_entrypoint(
         row_fp4, row_sc, row_sg, col_fp4, col_sc, col_sg, global_amax);
     launch_v5_w1_sqrelu_quant_pass<QuantC>(
         A, A_sc, A_sg, B, B_sc, B_sg,
+        row_fp4, row_sc, row_sg, col_fp4, col_sc, col_sg, global_amax);
+}
+
+void nvfp4_w13_swiglu_quant_gemm_entrypoint(
+    const at::Tensor &A,
+    const at::Tensor &A_sc,
+    const at::Tensor &A_sg,
+    const at::Tensor &B1,
+    const at::Tensor &B1_sc,
+    const at::Tensor &B1_sg,
+    const at::Tensor &B3,
+    const at::Tensor &B3_sc,
+    const at::Tensor &B3_sg,
+    at::Tensor &row_fp4,
+    at::Tensor &row_sc,
+    at::Tensor &row_sg,
+    at::Tensor &col_fp4,
+    at::Tensor &col_sc,
+    at::Tensor &col_sg,
+    bool encode_centric = true
+) {
+    TORCH_CHECK(encode_centric, "v5 W13 SwiGLU producer supports encode-centric mode only");
+    TORCH_CHECK(A.is_cuda() && A.is_contiguous() && A.scalar_type() == at::kFloat4_e2m1fn_x2,
+                "A must be contiguous CUDA fp4x2");
+    TORCH_CHECK(B1.is_cuda() && B1.is_contiguous() && B1.scalar_type() == at::kFloat4_e2m1fn_x2,
+                "B1 must be contiguous CUDA fp4x2");
+    TORCH_CHECK(B3.is_cuda() && B3.is_contiguous() && B3.scalar_type() == at::kFloat4_e2m1fn_x2,
+                "B3 must be contiguous CUDA fp4x2");
+    TORCH_CHECK(A_sc.is_cuda() && A_sc.is_contiguous() && A_sc.scalar_type() == at::kFloat8_e4m3fn,
+                "A_sc must be contiguous CUDA fp8");
+    TORCH_CHECK(B1_sc.is_cuda() && B1_sc.is_contiguous() && B1_sc.scalar_type() == at::kFloat8_e4m3fn,
+                "B1_sc must be contiguous CUDA fp8");
+    TORCH_CHECK(B3_sc.is_cuda() && B3_sc.is_contiguous() && B3_sc.scalar_type() == at::kFloat8_e4m3fn,
+                "B3_sc must be contiguous CUDA fp8");
+    TORCH_CHECK(A_sg.is_cuda() && A_sg.is_contiguous() && A_sg.scalar_type() == at::kFloat &&
+                A_sg.numel() == 1, "A_sg must be contiguous CUDA float32 [1]");
+    TORCH_CHECK(B1_sg.is_cuda() && B1_sg.is_contiguous() && B1_sg.scalar_type() == at::kFloat &&
+                B1_sg.numel() == 1, "B1_sg must be contiguous CUDA float32 [1]");
+    TORCH_CHECK(B3_sg.is_cuda() && B3_sg.is_contiguous() && B3_sg.scalar_type() == at::kFloat &&
+                B3_sg.numel() == 1, "B3_sg must be contiguous CUDA float32 [1]");
+    TORCH_CHECK(A.size(1) == B1.size(1) && A.size(1) == B3.size(1),
+                "A, B1, and B3 must share packed K");
+    TORCH_CHECK(B1.size(0) == B3.size(0), "B1 and B3 must share H");
+    const int64_t M = A.size(0);
+    const int64_t H = B1.size(0);
+    const int64_t K = A.size(1) * 2;
+    TORCH_CHECK(M % 256 == 0 && H % 128 == 0 && K % 128 == 0,
+                "v5 W13 SwiGLU producer requires M divisible by 256 and H,K by 128");
+    TORCH_CHECK(A_sc.numel() == M * K / 16,
+                "A_sc must have M*K/16 fp8 elements");
+    TORCH_CHECK(B1_sc.numel() == H * K / 16,
+                "B1_sc must have H*K/16 fp8 elements");
+    TORCH_CHECK(B3_sc.numel() == H * K / 16,
+                "B3_sc must have H*K/16 fp8 elements");
+    TORCH_CHECK(row_fp4.is_cuda() && row_fp4.is_contiguous() &&
+                row_fp4.scalar_type() == at::kFloat4_e2m1fn_x2 &&
+                row_fp4.sizes() == at::IntArrayRef({M, H / 2}),
+                "row_fp4 must be contiguous CUDA fp4 [M,H/2]");
+    TORCH_CHECK(row_sc.is_cuda() && row_sc.is_contiguous() &&
+                row_sc.scalar_type() == at::kFloat8_e4m3fn &&
+                row_sc.numel() == M * H / 16,
+                "row_sc must be contiguous CUDA fp8 with M*H/16 elements");
+    TORCH_CHECK(row_sg.is_cuda() && row_sg.is_contiguous() &&
+                row_sg.scalar_type() == at::kFloat && row_sg.numel() == 1,
+                "row_sg must be contiguous CUDA float32 [1]");
+    TORCH_CHECK(col_fp4.is_cuda() && col_fp4.is_contiguous() &&
+                col_fp4.scalar_type() == at::kFloat4_e2m1fn_x2 &&
+                col_fp4.sizes() == at::IntArrayRef({H, M / 2}),
+                "col_fp4 must be contiguous CUDA fp4 [H,M/2]");
+    TORCH_CHECK(col_sc.is_cuda() && col_sc.is_contiguous() &&
+                col_sc.scalar_type() == at::kFloat8_e4m3fn &&
+                col_sc.numel() == H * M / 16,
+                "col_sc must be contiguous CUDA fp8 with H*M/16 elements");
+    TORCH_CHECK(col_sg.is_cuda() && col_sg.is_contiguous() &&
+                col_sg.scalar_type() == at::kFloat && col_sg.numel() == 1,
+                "col_sg must be contiguous CUDA float32 [1]");
+    kittens::py::device_check(A, A_sc, A_sg, B1, B1_sc, B1_sg, B3, B3_sc, B3_sg,
+                              row_fp4, row_sc, row_sg, col_fp4, col_sc, col_sg);
+
+    auto global_amax = at::empty({1}, A_sg.options());
+    auto stream = at::cuda::getCurrentCUDAStream();
+    CUDACHECK(cudaMemsetAsync(global_amax.data_ptr<float>(), 0, sizeof(float), stream));
+    using AmaxC = nvfp4_localcta_swiglu_quant_gemm::config<2, 4, false, 128, 128, false, true, true, true>;
+    using QuantC = nvfp4_localcta_swiglu_quant_gemm::config<2, 4, false, 128, 128, false, true, true, false>;
+    launch_v5_w13_swiglu_quant_pass<AmaxC>(
+        A, A_sc, A_sg, B1, B1_sc, B1_sg, B3, B3_sc, B3_sg,
+        row_fp4, row_sc, row_sg, col_fp4, col_sc, col_sg, global_amax);
+    launch_v5_w13_swiglu_quant_pass<QuantC>(
+        A, A_sc, A_sg, B1, B1_sc, B1_sg, B3, B3_sc, B3_sg,
         row_fp4, row_sc, row_sg, col_fp4, col_sc, col_sg, global_amax);
 }
 
@@ -1946,6 +2092,14 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           "v5 true W1 GEMM -> square-ReLU -> FP4 W2 payload producer",
           pybind11::arg("A"), pybind11::arg("A_sc"), pybind11::arg("A_sg"),
           pybind11::arg("B"), pybind11::arg("B_sc"), pybind11::arg("B_sg"),
+          pybind11::arg("row_fp4"), pybind11::arg("row_sc"), pybind11::arg("row_sg"),
+          pybind11::arg("col_fp4"), pybind11::arg("col_sc"), pybind11::arg("col_sg"),
+          pybind11::arg("encode_centric") = true);
+    m.def("nvfp4_w13_swiglu_quant_gemm", &nvfp4_w13_swiglu_quant_gemm_entrypoint,
+          "v5 true W1/W3 GEMM -> SwiGLU -> FP4 W2 payload producer",
+          pybind11::arg("A"), pybind11::arg("A_sc"), pybind11::arg("A_sg"),
+          pybind11::arg("B1"), pybind11::arg("B1_sc"), pybind11::arg("B1_sg"),
+          pybind11::arg("B3"), pybind11::arg("B3_sc"), pybind11::arg("B3_sg"),
           pybind11::arg("row_fp4"), pybind11::arg("row_sc"), pybind11::arg("row_sg"),
           pybind11::arg("col_fp4"), pybind11::arg("col_sc"), pybind11::arg("col_sg"),
           pybind11::arg("encode_centric") = true);
