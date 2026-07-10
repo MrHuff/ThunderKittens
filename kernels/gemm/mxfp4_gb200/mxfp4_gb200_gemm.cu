@@ -167,6 +167,7 @@ int main() {
 
 #include "pyutils/torchutils.cuh"
 #include "../common/c1_rms_reduce.cuh"
+#include "../common/c5_rms_bwd.cuh"
 
 namespace {
 
@@ -2528,6 +2529,20 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           "Reduce C1 partial row RMS stats into row RMS coefficients",
           pybind11::arg("row_rms_partial"), pybind11::arg("coeff"),
           pybind11::arg("hidden_size"), pybind11::arg("eps"));
+    m.def("mxfp4_c5_rms_bwd_partial_dot", &c5_rms_bwd::partial_dot_entrypoint,
+          "C5 RMSNorm backward partial dot over 32-column slices",
+          pybind11::arg("x"), pybind11::arg("dy"),
+          pybind11::arg("partial_dot"), pybind11::arg("gamma") = std::nullopt);
+    m.def("mxfp4_c5_rms_bwd_reduce_dot", &c5_rms_bwd::reduce_dot_entrypoint,
+          "C5 reduce partial RMSNorm backward dot to one scalar per row",
+          pybind11::arg("partial_dot"), pybind11::arg("dot"),
+          pybind11::arg("hidden_size"));
+    m.def("mxfp4_c5_rms_bwd_apply_dx", &c5_rms_bwd::apply_dx_entrypoint,
+          "C5 apply RMSNorm backward dx from coeff and row dot",
+          pybind11::arg("x"), pybind11::arg("dy"),
+          pybind11::arg("coeff"), pybind11::arg("dot"),
+          pybind11::arg("dx"), pybind11::arg("hidden_size"),
+          pybind11::arg("gamma") = std::nullopt);
     m.def("mxfp4_gemm_residual_config", &mxfp4_gemm_residual_config_entrypoint,
           "Dense GEMM with fused bf16 residual add and explicit kernel config",
           pybind11::arg("A"), pybind11::arg("A_sc"),

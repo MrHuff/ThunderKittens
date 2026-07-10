@@ -172,6 +172,7 @@ int main() {
 #include "pyutils/torchutils.cuh"
 #include "ATen/Functions.h"
 #include "../common/c1_rms_reduce.cuh"
+#include "../common/c5_rms_bwd.cuh"
 
 __global__ void v5_rmsnorm_bwd_dx_kernel(
     const __nv_bfloat16* __restrict__ d_normed,
@@ -2264,6 +2265,20 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           "Reduce C1 partial row RMS stats into row RMS coefficients",
           pybind11::arg("row_rms_partial"), pybind11::arg("coeff"),
           pybind11::arg("hidden_size"), pybind11::arg("eps"));
+    m.def("c5_rms_bwd_partial_dot", &c5_rms_bwd::partial_dot_entrypoint,
+          "C5 RMSNorm backward partial dot over 32-column slices",
+          pybind11::arg("x"), pybind11::arg("dy"),
+          pybind11::arg("partial_dot"), pybind11::arg("gamma") = std::nullopt);
+    m.def("c5_rms_bwd_reduce_dot", &c5_rms_bwd::reduce_dot_entrypoint,
+          "C5 reduce partial RMSNorm backward dot to one scalar per row",
+          pybind11::arg("partial_dot"), pybind11::arg("dot"),
+          pybind11::arg("hidden_size"));
+    m.def("c5_rms_bwd_apply_dx", &c5_rms_bwd::apply_dx_entrypoint,
+          "C5 apply RMSNorm backward dx from coeff and row dot",
+          pybind11::arg("x"), pybind11::arg("dy"),
+          pybind11::arg("coeff"), pybind11::arg("dot"),
+          pybind11::arg("dx"), pybind11::arg("hidden_size"),
+          pybind11::arg("gamma") = std::nullopt);
     m.def("nvfp4_gemm_nopdl", &nvfp4_gemm_nopdl_entrypoint,
           "Non-PDL GEMM for CUDA graph capture (CLUSTER_SIZE=1, USE_PDL=false)");
     m.def("nvfp4_gemm_config", &nvfp4_gemm_config_entrypoint,
