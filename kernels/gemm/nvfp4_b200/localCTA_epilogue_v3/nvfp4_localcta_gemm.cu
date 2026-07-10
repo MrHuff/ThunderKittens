@@ -5759,6 +5759,47 @@ void finalize_w13_swiglu_quant_contract(
     TORCH_CHECK(err == cudaSuccess, "b1_finalize_col_sc_kernel failed: ", cudaGetErrorString(err));
 }
 
+void finalize_w1_sqrelu_quant_contract(
+    at::Tensor& row_sc,
+    at::Tensor& row_sg_chunk,
+    at::Tensor& row_sg,
+    at::Tensor& col_sc,
+    at::Tensor& col_sg_chunk,
+    at::Tensor& col_sg
+) {
+    const int64_t M = row_sc.size(0) * 128;
+    const int64_t H = row_sc.size(1) * 64;
+    const int64_t row_chunks = M / 128;
+    const int64_t row_sg_cols = H / 128;
+    const int64_t col_chunks = H / 128;
+    const int64_t col_sg_rows = M / 128;
+    const int64_t col_sc_rows = M / 64;
+    auto stream = at::cuda::getCurrentCUDAStream();
+
+    const auto row_tiles = static_cast<unsigned int>((row_chunks + 1) / 2);
+    b1_reduce_row_sg_kernel<256><<<row_tiles, 256, 0, stream>>>(
+        row_sg_chunk.data_ptr<float>(),
+        row_sg.data_ptr<float>(),
+        static_cast<int>(row_chunks),
+        static_cast<int>(row_sg_cols));
+    {
+        cudaError_t err = cudaGetLastError();
+        TORCH_CHECK(err == cudaSuccess, "b1_reduce_row_sg_kernel failed: ", cudaGetErrorString(err));
+    }
+
+    dim3 col_grid(static_cast<unsigned int>((col_chunks + 1) / 2),
+                  static_cast<unsigned int>(col_sc_rows));
+    b1_finalize_col_sc_kernel<256><<<col_grid, 256, 0, stream>>>(
+        reinterpret_cast<__nv_fp8_e4m3*>(col_sc.data_ptr()),
+        col_sg_chunk.data_ptr<float>(),
+        col_sg.data_ptr<float>(),
+        static_cast<int>(col_chunks),
+        static_cast<int>(col_sc_rows),
+        static_cast<int>(col_sg_rows));
+    cudaError_t err = cudaGetLastError();
+    TORCH_CHECK(err == cudaSuccess, "b1_finalize_col_sc_kernel failed: ", cudaGetErrorString(err));
+}
+
 template <typename C>
 void launch_localcta_swiglu_quant_gemm_with_config(
     const at::Tensor& A,
@@ -5852,6 +5893,7 @@ void nvfp4_localcta_w13_swiglu_quant_gemm_entrypoint(
     at::Tensor& col_sc,
     at::Tensor& col_sg,
     at::Tensor& col_sg_chunk,
+    bool encode_centric = true,
     int config_id = 1
 ) {
     check_fp4_matrix(A, "A");
@@ -5907,12 +5949,21 @@ void nvfp4_localcta_w13_swiglu_quant_gemm_entrypoint(
 
     TORCH_CHECK(config_id == 1,
                 "localCTA W13 SwiGLU producer exposes only validated config_id=1");
-    launch_localcta_swiglu_quant_gemm_with_config<
-        nvfp4_localcta_swiglu_quant_gemm::config<2, 4, false, 128, 128>>(
-        A, A_sc, A_sg, A_sg_chunk,
-        B1, B1_sc, B1_sg, B1_sg_chunk,
-        B3, B3_sc, B3_sg, B3_sg_chunk,
-        row_fp4, row_sc, row_sg_chunk, col_fp4, col_sc, col_sg_chunk);
+    if (encode_centric) {
+        launch_localcta_swiglu_quant_gemm_with_config<
+            nvfp4_localcta_swiglu_quant_gemm::config<2, 4, false, 128, 128, false, true>>(
+            A, A_sc, A_sg, A_sg_chunk,
+            B1, B1_sc, B1_sg, B1_sg_chunk,
+            B3, B3_sc, B3_sg, B3_sg_chunk,
+            row_fp4, row_sc, row_sg_chunk, col_fp4, col_sc, col_sg_chunk);
+    } else {
+        launch_localcta_swiglu_quant_gemm_with_config<
+            nvfp4_localcta_swiglu_quant_gemm::config<2, 4, false, 128, 128, false, false>>(
+            A, A_sc, A_sg, A_sg_chunk,
+            B1, B1_sc, B1_sg, B1_sg_chunk,
+            B3, B3_sc, B3_sg, B3_sg_chunk,
+            row_fp4, row_sc, row_sg_chunk, col_fp4, col_sc, col_sg_chunk);
+    }
 
     if (use_v4_w13_virtual_raw_consumer(M)) {
         reduce_w13_swiglu_sg_only(row_sc, row_sg_chunk, row_sg,
@@ -5921,6 +5972,157 @@ void nvfp4_localcta_w13_swiglu_quant_gemm_entrypoint(
         finalize_w13_swiglu_quant_contract(row_sc, row_sg_chunk, row_sg,
                                             col_sc, col_sg_chunk, col_sg);
     }
+}
+
+template <typename C>
+void launch_localcta_sqrelu_quant_gemm_with_config(
+    const at::Tensor& A,
+    const at::Tensor& A_sc,
+    const at::Tensor& A_sg,
+    const at::Tensor& A_sg_chunk,
+    const at::Tensor& B,
+    const at::Tensor& B_sc,
+    const at::Tensor& B_sg,
+    const at::Tensor& B_sg_chunk,
+    at::Tensor& row_fp4,
+    at::Tensor& row_sc,
+    at::Tensor& row_sg_chunk,
+    at::Tensor& col_fp4,
+    at::Tensor& col_sc,
+    at::Tensor& col_sg_chunk
+) {
+    using G = nvfp4_localcta_swiglu_quant_gemm::globals<C>;
+    const int64_t M = A.size(0);
+    const int64_t H = B.size(0);
+    auto A_sg_outer = normalize_outer_scale_tiles_tensor(A_sg, M / C::Mb, true).contiguous();
+    auto B_sg_outer = normalize_outer_scale_tiles_tensor(B_sg, H / 256, false).contiguous();
+
+    outer_scale_desc a_sg_desc = check_outer_scale_tiles(A_sg_outer, "A_sg_outer", M / C::Mb, true);
+    outer_scale_desc b_sg_desc = check_outer_scale_tiles(B_sg_outer, "B_sg_outer", H / 256, false);
+    const bool has_a_chunks = has_virtual_rescale_chunk_grid(
+        A_sg_chunk, "A_sg_chunk", M, A.size(1) * 2);
+    const bool has_b_chunks = has_virtual_rescale_chunk_grid(
+        B_sg_chunk, "B_sg_chunk", H, B.size(1) * 2);
+
+    G g {
+        .A = kittens::py::tensor_to_gl<typename G::A_fp4x2_gl>(A),
+        .A_sc = kittens::py::tensor_to_gl<typename G::A_sc_gl, false>(
+            A_sc, 1, A_sc.size(0), A_sc.size(1), 256),
+        .B1 = kittens::py::tensor_to_gl<typename G::B_fp4x2_gl>(B),
+        .B1_sc = kittens::py::tensor_to_gl<typename G::B_sc_gl, false>(
+            B_sc, 1, B_sc.size(0), B_sc.size(1), 256),
+        .B3 = kittens::py::tensor_to_gl<typename G::B_fp4x2_gl>(B),
+        .B3_sc = kittens::py::tensor_to_gl<typename G::B_sc_gl, false>(
+            B_sc, 1, B_sc.size(0), B_sc.size(1), 256),
+        .A_sg = a_sg_desc.ptr,
+        .A_sg_stride = a_sg_desc.stride,
+        .A_sg_chunk_grid = has_a_chunks ? A_sg_chunk.data_ptr<float>() : nullptr,
+        .A_sg_chunk_stride = has_a_chunks ? static_cast<int>(A_sg_chunk.size(1)) : 1,
+        .B1_sg = b_sg_desc.ptr,
+        .B1_sg_stride = b_sg_desc.stride,
+        .B1_sg_chunk_grid = has_b_chunks ? B_sg_chunk.data_ptr<float>() : nullptr,
+        .B1_sg_chunk_stride = has_b_chunks ? static_cast<int>(B_sg_chunk.size(1)) : 1,
+        .B3_sg = b_sg_desc.ptr,
+        .B3_sg_stride = b_sg_desc.stride,
+        .B3_sg_chunk_grid = nullptr,
+        .B3_sg_chunk_stride = 1,
+        .row_fp4 = reinterpret_cast<uint8_t*>(row_fp4.data_ptr()),
+        .row_sc = reinterpret_cast<uint8_t*>(row_sc.data_ptr()),
+        .row_sg = row_sg_chunk.data_ptr<float>(),
+        .col_fp4 = reinterpret_cast<uint8_t*>(col_fp4.data_ptr()),
+        .col_sc = reinterpret_cast<uint8_t*>(col_sc.data_ptr()),
+        .col_sg = col_sg_chunk.data_ptr<float>(),
+        .M = static_cast<int>(M),
+        .H = static_cast<int>(H),
+    };
+    kittens::py::launch_kernel<C, G, nvfp4_localcta_swiglu_quant_gemm::kernel<C>>(g);
+}
+
+void nvfp4_localcta_w1_sqrelu_quant_gemm_entrypoint(
+    const at::Tensor& A,
+    const at::Tensor& A_sc,
+    const at::Tensor& A_sg,
+    const at::Tensor& A_sg_chunk,
+    const at::Tensor& B,
+    const at::Tensor& B_sc,
+    const at::Tensor& B_sg,
+    const at::Tensor& B_sg_chunk,
+    at::Tensor& row_fp4,
+    at::Tensor& row_sc,
+    at::Tensor& row_sg,
+    at::Tensor& row_sg_chunk,
+    at::Tensor& col_fp4,
+    at::Tensor& col_sc,
+    at::Tensor& col_sg,
+    at::Tensor& col_sg_chunk,
+    bool encode_centric = true,
+    int config_id = 1
+) {
+    check_fp4_matrix(A, "A");
+    check_fp4_matrix(B, "B");
+    TORCH_CHECK(A.size(1) == B.size(1), "A and B must share packed K");
+    const int64_t M = A.size(0);
+    const int64_t H = B.size(0);
+    const int64_t K = A.size(1) * 2;
+    TORCH_CHECK(M % 256 == 0 && H % 256 == 0 && K % 256 == 0,
+                "localCTA W1 square-ReLU producer requires M,H,K divisible by 256");
+    check_scale_tensor(A_sc, "A_sc", M, K);
+    check_scale_tensor(B_sc, "B_sc", H, K);
+
+    TORCH_CHECK(row_fp4.is_cuda() && row_fp4.is_contiguous() &&
+                row_fp4.scalar_type() == torch::kFloat4_e2m1fn_x2 &&
+                row_fp4.sizes() == torch::IntArrayRef({M, H / 2}),
+                "row_fp4 must be contiguous CUDA fp4 [M,H/2]");
+    TORCH_CHECK(row_sc.is_cuda() && row_sc.is_contiguous() &&
+                row_sc.scalar_type() == torch::kFloat8_e4m3fn &&
+                row_sc.sizes() == torch::IntArrayRef({M / 128, H / 64, 512}),
+                "row_sc must be contiguous CUDA fp8 [M/128,H/64,512]");
+    TORCH_CHECK(row_sg.is_cuda() && row_sg.is_contiguous() &&
+                row_sg.scalar_type() == torch::kFloat32 &&
+                row_sg.sizes() == torch::IntArrayRef({outer_sg_tiles_128(M), 1}),
+                "row_sg must be contiguous CUDA fp32 [ceil(M/256),1]");
+    TORCH_CHECK(row_sg_chunk.is_cuda() && row_sg_chunk.is_contiguous() &&
+                row_sg_chunk.scalar_type() == torch::kFloat32 &&
+                row_sg_chunk.sizes() == torch::IntArrayRef({M / 128, H / 128}),
+                "row_sg_chunk must be contiguous CUDA fp32 [M/128,H/128]");
+    TORCH_CHECK(col_fp4.is_cuda() && col_fp4.is_contiguous() &&
+                col_fp4.scalar_type() == torch::kFloat4_e2m1fn_x2 &&
+                col_fp4.sizes() == torch::IntArrayRef({H, M / 2}),
+                "col_fp4 must be contiguous CUDA fp4 [H,M/2]");
+    TORCH_CHECK(col_sc.is_cuda() && col_sc.is_contiguous() &&
+                col_sc.scalar_type() == torch::kFloat8_e4m3fn &&
+                col_sc.sizes() == torch::IntArrayRef({H / 128, M / 64, 512}),
+                "col_sc must be contiguous CUDA fp8 [H/128,M/64,512]");
+    TORCH_CHECK(col_sg.is_cuda() && col_sg.is_contiguous() &&
+                col_sg.scalar_type() == torch::kFloat32 &&
+                col_sg.sizes() == torch::IntArrayRef({1, outer_sg_tiles_128(H)}),
+                "col_sg must be contiguous CUDA fp32 [1,ceil(H/256)]");
+    TORCH_CHECK(col_sg_chunk.is_cuda() && col_sg_chunk.is_contiguous() &&
+                col_sg_chunk.scalar_type() == torch::kFloat32 &&
+                col_sg_chunk.sizes() == torch::IntArrayRef({H / 128, M / 128}),
+                "col_sg_chunk must be contiguous CUDA fp32 [H/128,M/128]");
+    kittens::py::device_check(A, A_sc, A_sg, B, B_sc, B_sg,
+                              row_fp4, row_sc, row_sg, row_sg_chunk,
+                              col_fp4, col_sc, col_sg, col_sg_chunk);
+
+    TORCH_CHECK(config_id == 1,
+                "localCTA W1 square-ReLU producer exposes only validated config_id=1");
+    if (encode_centric) {
+        launch_localcta_sqrelu_quant_gemm_with_config<
+            nvfp4_localcta_swiglu_quant_gemm::config<2, 4, false, 128, 128, true, true>>(
+            A, A_sc, A_sg, A_sg_chunk,
+            B, B_sc, B_sg, B_sg_chunk,
+            row_fp4, row_sc, row_sg_chunk, col_fp4, col_sc, col_sg_chunk);
+    } else {
+        launch_localcta_sqrelu_quant_gemm_with_config<
+            nvfp4_localcta_swiglu_quant_gemm::config<2, 4, false, 128, 128, true, false>>(
+            A, A_sc, A_sg, A_sg_chunk,
+            B, B_sc, B_sg, B_sg_chunk,
+            row_fp4, row_sc, row_sg_chunk, col_fp4, col_sc, col_sg_chunk);
+    }
+
+    finalize_w1_sqrelu_quant_contract(row_sc, row_sg_chunk, row_sg,
+                                      col_sc, col_sg_chunk, col_sg);
 }
 
 template <typename C>
@@ -6309,6 +6511,18 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           pybind11::arg("row_fp4"), pybind11::arg("row_sc"), pybind11::arg("row_sg"),
           pybind11::arg("row_sg_chunk"), pybind11::arg("col_fp4"), pybind11::arg("col_sc"),
           pybind11::arg("col_sg"), pybind11::arg("col_sg_chunk"),
+          pybind11::arg("encode_centric") = true,
+          pybind11::arg("config_id") = 1);
+    m.def("nvfp4_localcta_w1_sqrelu_quant_gemm",
+          &nvfp4_localcta_w1_sqrelu_quant_gemm_entrypoint,
+          pybind11::arg("A"), pybind11::arg("A_sc"), pybind11::arg("A_sg"),
+          pybind11::arg("A_sg_chunk"),
+          pybind11::arg("B"), pybind11::arg("B_sc"), pybind11::arg("B_sg"),
+          pybind11::arg("B_sg_chunk"),
+          pybind11::arg("row_fp4"), pybind11::arg("row_sc"), pybind11::arg("row_sg"),
+          pybind11::arg("row_sg_chunk"), pybind11::arg("col_fp4"), pybind11::arg("col_sc"),
+          pybind11::arg("col_sg"), pybind11::arg("col_sg_chunk"),
+          pybind11::arg("encode_centric") = true,
           pybind11::arg("config_id") = 1);
     m.def("nvfp4_localcta_w2_dgrad_silu_quant_gemm",
           &nvfp4_localcta_w2_dgrad_silu_quant_gemm_entrypoint,

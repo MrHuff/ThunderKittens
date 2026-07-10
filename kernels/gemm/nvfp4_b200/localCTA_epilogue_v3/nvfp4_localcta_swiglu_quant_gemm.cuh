@@ -6,12 +6,23 @@ using namespace kittens;
 
 namespace nvfp4_localcta_swiglu_quant_gemm {
 
-template <int _LOAD_PIPE_DEPTH, int _SUPERGROUP_SIZE, bool _USE_PDL = true, int _Nb = 128, int _Kb = 128>
+static constexpr float LOCALCTA_PREPARED_MIN_NONZERO_SCALE = 0.001953125f;
+
+template <
+    int _LOAD_PIPE_DEPTH,
+    int _SUPERGROUP_SIZE,
+    bool _USE_PDL = true,
+    int _Nb = 128,
+    int _Kb = 128,
+    bool _USE_SQRELU = false,
+    bool _ENCODE_CENTRIC = true>
 struct config {
     static_assert(_Nb == 128 || _Nb == 256, "W13 SwiGLU producer supports 128- or 256-column tiles");
     static_assert(_Kb == 128 || _Kb == 256, "W13 SwiGLU producer supports 128- or 256-wide reduction tiles");
     static constexpr int CLUSTER_SIZE = 2;
     static constexpr bool USE_PDL = _USE_PDL;
+    static constexpr bool USE_SQRELU = _USE_SQRELU;
+    static constexpr bool ENCODE_CENTRIC = _ENCODE_CENTRIC;
 
     static constexpr int CONSUMER_WARPGROUPS = 1;
     static constexpr int PRODUCER_WARPGROUPS = 1;
@@ -151,6 +162,9 @@ __device__ inline void apply_w13_chunk_scales_to_stage(
     int col_block_idx,
     int chunk_base)
 {
+    constexpr int B_BLOCKS_PER_OUTER_SG = 256 / C::Nb;
+    const int b_outer_idx = col_block_idx / B_BLOCKS_PER_OUTER_SG;
+
     #pragma unroll
     for (int ii = 0; ii < C::MMA_PER_TILE; ++ii) {
         const int chunk_k = chunk_base + ii / 2;
@@ -167,7 +181,7 @@ __device__ inline void apply_w13_chunk_scales_to_stage(
 
         if (B1_sg_chunks != nullptr) {
             const float b1_final_sg = (B1_sg_final != nullptr)
-                ? fmaxf(B1_sg_final[col_block_idx * B1_sg_final_stride], 1.0e-12f)
+                ? fmaxf(B1_sg_final[b_outer_idx * B1_sg_final_stride], 1.0e-12f)
                 : 1.0f;
             const float b1_chunk_sg_0 = B1_sg_chunks[b_chunk_row_0 * B1_sg_stride + chunk_k];
             const float b1_scale_0 = b1_chunk_sg_0 / b1_final_sg;
@@ -185,7 +199,7 @@ __device__ inline void apply_w13_chunk_scales_to_stage(
 
         if (B3_sg_chunks != nullptr) {
             const float b3_final_sg = (B3_sg_final != nullptr)
-                ? fmaxf(B3_sg_final[col_block_idx * B3_sg_final_stride], 1.0e-12f)
+                ? fmaxf(B3_sg_final[b_outer_idx * B3_sg_final_stride], 1.0e-12f)
                 : 1.0f;
             const float b3_chunk_sg_0 = B3_sg_chunks[b_chunk_row_0 * B3_sg_stride + chunk_k];
             const float b3_scale_0 = b3_chunk_sg_0 / b3_final_sg;
@@ -222,9 +236,22 @@ __device__ __forceinline__ uint8_t float_to_fp4(float val) {
 }
 
 __device__ __forceinline__ uint8_t quantize_fp4_pair(float v0, float v1, float coeff) {
-    uint8_t q0 = float_to_fp4(v0 * coeff);
-    uint8_t q1 = float_to_fp4(v1 * coeff);
-    return q0 | (q1 << 4);
+    uint32_t out;
+    asm volatile(
+        "{\n"
+        ".reg.b8 f0, f1, f2, f3; \n\t"
+        ".reg.f32 x, y; \n\t"
+        "mul.rn.f32 x, %1, %3; \n\t"
+        "mul.rn.f32 y, %2, %3; \n\t"
+        "cvt.rn.satfinite.e2m1x2.f32 f0, x, y; \n\t"
+        "cvt.rn.satfinite.e2m1x2.f32 f1, x, y; \n\t"
+        "cvt.rn.satfinite.e2m1x2.f32 f2, x, y; \n\t"
+        "cvt.rn.satfinite.e2m1x2.f32 f3, x, y; \n\t"
+        "mov.b32 %0, {f0, f1, f2, f3}; \n"
+        "}"
+        : "=r"(out)
+        : "f"(v0), "f"(v1), "f"(coeff));
+    return static_cast<uint8_t>(out & 0xffu);
 }
 
 __device__ __forceinline__ uint8_t fp8e4m3_byte(float value) {
@@ -238,10 +265,14 @@ __device__ __forceinline__ float fp8e4m3_round_to_float(float value) {
 }
 
 __device__ __forceinline__ float localcta_encode_scale(float amax) {
-    if (amax <= 1.0e-9f) {
+    if (amax == 0.0f) {
         return 1.0f;
     }
-    return fminf(LOCALCTA_GLOBAL_SCALE_NUM / amax, 3.4028235e+38f);
+    const float scale = LOCALCTA_GLOBAL_SCALE_NUM / amax;
+    if (scale == 0.0f) {
+        return 1.0f;
+    }
+    return fminf(scale, 3.4028235e+38f);
 }
 
 __device__ __forceinline__ uint32_t mul_cvt_bf16_to_fp4_8x_rn(
@@ -323,6 +354,7 @@ __device__ __forceinline__ uint32_t cluster_load_shared_u32(const uint32_t* ptr,
     return value;
 }
 
+template <typename C>
 __device__ __forceinline__ void localcta_block_quant_params(
     float block_amax,
     float chunk_s_enc,
@@ -331,15 +363,29 @@ __device__ __forceinline__ void localcta_block_quant_params(
     uint8_t& stored_scale_byte)
 {
     (void)chunk_sg;
-    __nv_fp8_e4m3 mult_fp8 = static_cast<__nv_fp8_e4m3>(FP8_E4M3_MAX);
-    if (block_amax > 1.0e-9f && chunk_s_enc > 0.0f) {
-        const float mult = fminf(6.0f / (block_amax * chunk_s_enc), 3.4028235e+38f);
-        mult_fp8 = static_cast<__nv_fp8_e4m3>(mult);
+    if constexpr (C::ENCODE_CENTRIC) {
+        __nv_fp8_e4m3 mult_fp8 = static_cast<__nv_fp8_e4m3>(FP8_E4M3_MAX);
+        float mult = FP8_E4M3_MAX;
+        if (block_amax > 0.0f && chunk_s_enc > 0.0f) {
+            mult = fminf(6.0f / (block_amax * chunk_s_enc), 3.4028235e+38f);
+            mult_fp8 = static_cast<__nv_fp8_e4m3>(mult);
+        }
+        const float mult_val = static_cast<float>(mult_fp8);
+        coeff = mult_val * chunk_s_enc;
+        const __nv_fp8_e4m3 stored = static_cast<__nv_fp8_e4m3>(1.0f / mult_val);
+        stored_scale_byte = *reinterpret_cast<const uint8_t*>(&stored);
+    } else {
+        __nv_fp8_e4m3 stored = static_cast<__nv_fp8_e4m3>(0.0f);
+        if (chunk_s_enc > 0.0f) {
+            stored = static_cast<__nv_fp8_e4m3>(
+                fminf((block_amax / 6.0f) * chunk_s_enc, 3.4028235e+38f));
+        }
+        const float stored_val = static_cast<float>(stored);
+        coeff = (stored_val > 0.0f && chunk_s_enc > 0.0f)
+            ? fminf(chunk_s_enc / stored_val, 3.4028235e+38f)
+            : 0.0f;
+        stored_scale_byte = *reinterpret_cast<const uint8_t*>(&stored);
     }
-    const float mult_val = static_cast<float>(mult_fp8);
-    coeff = mult_val * chunk_s_enc;
-    const __nv_fp8_e4m3 stored = static_cast<__nv_fp8_e4m3>(1.0f / mult_val);
-    stored_scale_byte = *reinterpret_cast<const uint8_t*>(&stored);
 }
 
 template <typename C, typename subtile_rt>
@@ -351,11 +397,9 @@ __device__ __noinline__ float stage_swiglu_pairs(
     int lane_id,
     int warp_row_base,
     int logical_col_start,
+    int M,
     int H)
 {
-    (void)H;
-    (void)warp_row_base;
-    (void)logical_col_start;
     const int lane_byte = lane_id % 4;
     const int row_pair_idx = lane_id / 4;
     float local_amax = 0.0f;
@@ -381,6 +425,49 @@ __device__ __noinline__ float stage_swiglu_pairs(
                 const float sig_y = 1.0f / (1.0f + __expf(-h1_y));
                 const float out_x = h1_x * sig_x * h3_x;
                 const float out_y = h1_y * sig_y * h3_y;
+
+                const int col_slot = pair_base + ((d >= 2) ? 4 : 0);
+                const int row_slot = i * 16 + row_pair_idx + ((d & 1) ? 8 : 0);
+                const bf16_2 out_pair = bf16_2{
+                    __float2bfloat16_rn(out_x),
+                    __float2bfloat16_rn(out_y)};
+                pairs[epi_slot][col_slot][row_slot] = out_pair;
+                local_amax = fmaxf(local_amax, fabsf(__bfloat162float(out_pair.x)));
+                local_amax = fmaxf(local_amax, fabsf(__bfloat162float(out_pair.y)));
+            }
+        }
+    }
+    return local_amax;
+}
+
+template <typename C, typename subtile_rt>
+__device__ __noinline__ float stage_sqrelu_pairs(
+    subtile_rt& D1_fl,
+    bf16_2 (*pairs)[16][33],
+    int epi_slot,
+    int lane_id)
+{
+    const int lane_byte = lane_id % 4;
+    const int row_pair_idx = lane_id / 4;
+    float local_amax = 0.0f;
+
+    #pragma unroll
+    for (int i = 0; i < subtile_rt::height; i++) {
+        (void)row_pair_idx;
+        #pragma unroll
+        for (int j = 0; j < subtile_rt::width; j++) {
+            const int pair_base = j * 8 + lane_byte;
+
+            #pragma unroll
+            for (int d = 0; d < 4; ++d) {
+                const float h1_x = __bfloat162float(
+                    __float2bfloat16_rn(D1_fl.tiles[i][j].data[d].x));
+                const float h1_y = __bfloat162float(
+                    __float2bfloat16_rn(D1_fl.tiles[i][j].data[d].y));
+                const float relu_x = fmaxf(h1_x, 0.0f);
+                const float relu_y = fmaxf(h1_y, 0.0f);
+                const float out_x = relu_x * relu_x;
+                const float out_y = relu_y * relu_y;
 
                 const int col_slot = pair_base + ((d >= 2) ? 4 : 0);
                 const int row_slot = i * 16 + row_pair_idx + ((d & 1) ? 8 : 0);
@@ -447,7 +534,22 @@ __device__ __noinline__ void quantize_rows_from_stage(
 
         float coeff;
         uint8_t stored_scale;
-        localcta_block_quant_params(block_amax, chunk_s_enc, chunk_sg, coeff, stored_scale);
+        localcta_block_quant_params<C>(block_amax, chunk_s_enc, chunk_sg, coeff, stored_scale);
+        if constexpr (C::USE_SQRELU) {
+            __nv_fp8_e4m3 raw_scale;
+            *reinterpret_cast<uint8_t*>(&raw_scale) = stored_scale;
+            __nv_fp8_e4m3 prepared_scale =
+                static_cast<__nv_fp8_e4m3>(static_cast<float>(raw_scale) * chunk_sg);
+            if (
+                static_cast<float>(raw_scale) > 0.0f
+                && chunk_sg > 0.0f
+                && static_cast<float>(prepared_scale) == 0.0f
+            ) {
+                prepared_scale = static_cast<__nv_fp8_e4m3>(
+                    LOCALCTA_PREPARED_MIN_NONZERO_SCALE);
+            }
+            stored_scale = *reinterpret_cast<const uint8_t*>(&prepared_scale);
+        }
 
         const uint32_t packed_lo = mul_cvt_bf16_to_fp4_8x_rn(
             *reinterpret_cast<const uint64_t*>(&cached[0]),
@@ -509,7 +611,7 @@ __device__ __noinline__ void quantize_cols_from_stage(
 
         float coeff;
         uint8_t stored_scale;
-        localcta_block_quant_params(block_amax, chunk_s_enc, chunk_sg, coeff, stored_scale);
+        localcta_block_quant_params<C>(block_amax, chunk_s_enc, chunk_sg, coeff, stored_scale);
 
         const uint32_t packed_lo = mul_cvt_bf16_to_fp4_8x_rn(
             *reinterpret_cast<const uint64_t*>(&cached[0]),
@@ -678,9 +780,9 @@ __device__ inline void kernel(const globals<C>& g) {
                         g.B1_sg_chunk_stride < 0 ? -g.B1_sg_chunk_stride : g.B1_sg_chunk_stride,
                         g.B1_sg,
                         g.B1_sg_stride,
-                        g.B3_sg_chunk_grid,
+                        C::USE_SQRELU ? nullptr : g.B3_sg_chunk_grid,
                         g.B3_sg_chunk_stride < 0 ? -g.B3_sg_chunk_stride : g.B3_sg_chunk_stride,
-                        g.B3_sg,
+                        C::USE_SQRELU ? nullptr : g.B3_sg,
                         g.B3_sg_stride,
                         row_block_idx * 2 + cta_id,
                         col_block_idx * C::B_SC_SIZE,
@@ -740,16 +842,20 @@ __device__ inline void kernel(const globals<C>& g) {
                         auto B1_sc_tm_subtile_0 = B1_sc_tm.template subtile<full_tt_fp8e4m3<16>>(stage*C::MMA_PER_TILE*C::B_SC_SIZE*16+ii*C::B_SC_SIZE*16);
                         auto &B1_sc_sm_subtile_0 = *reinterpret_cast<st_fp8e4m3<32, 16, false> *>(reinterpret_cast<uint64_t>(&input_scales[stage].B1[0].data[0])+16*32*ii);
                         load_mxnv_scale_async2(B1_sc_tm_subtile_0, B1_sc_sm_subtile_0);
-                        auto B3_sc_tm_subtile_0 = B3_sc_tm.template subtile<full_tt_fp8e4m3<16>>(stage*C::MMA_PER_TILE*C::B_SC_SIZE*16+ii*C::B_SC_SIZE*16);
-                        auto &B3_sc_sm_subtile_0 = *reinterpret_cast<st_fp8e4m3<32, 16, false> *>(reinterpret_cast<uint64_t>(&input_scales[stage].B3[0].data[0])+16*32*ii);
-                        load_mxnv_scale_async2(B3_sc_tm_subtile_0, B3_sc_sm_subtile_0);
+                        if constexpr (!C::USE_SQRELU) {
+                            auto B3_sc_tm_subtile_0 = B3_sc_tm.template subtile<full_tt_fp8e4m3<16>>(stage*C::MMA_PER_TILE*C::B_SC_SIZE*16+ii*C::B_SC_SIZE*16);
+                            auto &B3_sc_sm_subtile_0 = *reinterpret_cast<st_fp8e4m3<32, 16, false> *>(reinterpret_cast<uint64_t>(&input_scales[stage].B3[0].data[0])+16*32*ii);
+                            load_mxnv_scale_async2(B3_sc_tm_subtile_0, B3_sc_sm_subtile_0);
+                        }
                         if constexpr (C::B_SC_SIZE == 2) {
                             auto B1_sc_tm_subtile_1 = B1_sc_tm.template subtile<full_tt_fp8e4m3<16>>(stage*C::MMA_PER_TILE*C::B_SC_SIZE*16+ii*C::B_SC_SIZE*16+16);
                             auto &B1_sc_sm_subtile_1 = *reinterpret_cast<st_fp8e4m3<32, 16, false> *>(reinterpret_cast<uint64_t>(&input_scales[stage].B1[1].data[0])+16*32*ii);
                             load_mxnv_scale_async2(B1_sc_tm_subtile_1, B1_sc_sm_subtile_1);
-                            auto B3_sc_tm_subtile_1 = B3_sc_tm.template subtile<full_tt_fp8e4m3<16>>(stage*C::MMA_PER_TILE*C::B_SC_SIZE*16+ii*C::B_SC_SIZE*16+16);
-                            auto &B3_sc_sm_subtile_1 = *reinterpret_cast<st_fp8e4m3<32, 16, false> *>(reinterpret_cast<uint64_t>(&input_scales[stage].B3[1].data[0])+16*32*ii);
-                            load_mxnv_scale_async2(B3_sc_tm_subtile_1, B3_sc_sm_subtile_1);
+                            if constexpr (!C::USE_SQRELU) {
+                                auto B3_sc_tm_subtile_1 = B3_sc_tm.template subtile<full_tt_fp8e4m3<16>>(stage*C::MMA_PER_TILE*C::B_SC_SIZE*16+ii*C::B_SC_SIZE*16+16);
+                                auto &B3_sc_sm_subtile_1 = *reinterpret_cast<st_fp8e4m3<32, 16, false> *>(reinterpret_cast<uint64_t>(&input_scales[stage].B3[1].data[0])+16*32*ii);
+                                load_mxnv_scale_async2(B3_sc_tm_subtile_1, B3_sc_sm_subtile_1);
+                            }
                         }
                     }
                     if (has_any_chunk_grid) {
@@ -761,17 +867,28 @@ __device__ inline void kernel(const globals<C>& g) {
                     asm volatile("fence.proxy.async.shared::cluster;\n" ::: "memory");
                     auto A_sc_stage = A_sc_tm.template subtile<full_tt_fp8e4m3<C::MMA_PER_TILE*16>>(stage*C::MMA_PER_TILE*16);
                     auto B1_sc_stage = B1_sc_tm.template subtile<full_tt_fp8e4m3<C::MMA_PER_TILE*C::B_SC_SIZE*16>>(stage*C::MMA_PER_TILE*C::B_SC_SIZE*16);
-                    auto B3_sc_stage = B3_sc_tm.template subtile<full_tt_fp8e4m3<C::MMA_PER_TILE*C::B_SC_SIZE*16>>(stage*C::MMA_PER_TILE*C::B_SC_SIZE*16);
                     if (i == 0) {
-                        mm2_ABt(out1_tm, input_tiles[stage].A, input_tiles[stage].B1,
-                                A_sc_stage, B1_sc_stage);
-                        mm2_ABt(out3_tm, input_tiles[stage].A, input_tiles[stage].B3,
-                                A_sc_stage, B3_sc_stage, inputs_finished[stage]);
+                        if constexpr (C::USE_SQRELU) {
+                            mm2_ABt(out1_tm, input_tiles[stage].A, input_tiles[stage].B1,
+                                    A_sc_stage, B1_sc_stage, inputs_finished[stage]);
+                        } else {
+                            auto B3_sc_stage = B3_sc_tm.template subtile<full_tt_fp8e4m3<C::MMA_PER_TILE*C::B_SC_SIZE*16>>(stage*C::MMA_PER_TILE*C::B_SC_SIZE*16);
+                            mm2_ABt(out1_tm, input_tiles[stage].A, input_tiles[stage].B1,
+                                    A_sc_stage, B1_sc_stage);
+                            mm2_ABt(out3_tm, input_tiles[stage].A, input_tiles[stage].B3,
+                                    A_sc_stage, B3_sc_stage, inputs_finished[stage]);
+                        }
                     } else {
-                        mma2_ABt(out1_tm, input_tiles[stage].A, input_tiles[stage].B1,
-                                 A_sc_stage, B1_sc_stage);
-                        mma2_ABt(out3_tm, input_tiles[stage].A, input_tiles[stage].B3,
-                                 A_sc_stage, B3_sc_stage, inputs_finished[stage]);
+                        if constexpr (C::USE_SQRELU) {
+                            mma2_ABt(out1_tm, input_tiles[stage].A, input_tiles[stage].B1,
+                                     A_sc_stage, B1_sc_stage, inputs_finished[stage]);
+                        } else {
+                            auto B3_sc_stage = B3_sc_tm.template subtile<full_tt_fp8e4m3<C::MMA_PER_TILE*C::B_SC_SIZE*16>>(stage*C::MMA_PER_TILE*C::B_SC_SIZE*16);
+                            mma2_ABt(out1_tm, input_tiles[stage].A, input_tiles[stage].B1,
+                                     A_sc_stage, B1_sc_stage);
+                            mma2_ABt(out3_tm, input_tiles[stage].A, input_tiles[stage].B3,
+                                     A_sc_stage, B3_sc_stage, inputs_finished[stage]);
+                        }
                     }
                     update_phasebit<0>(phasebits, stage);
                     stage = (stage + 1) % C::LOAD_PIPE_DEPTH;
@@ -817,7 +934,10 @@ __device__ inline void kernel(const globals<C>& g) {
             const int b_outer_idx = col_block_idx / B_BLOCKS_PER_OUTER_SG;
             const float a_sg = g.A_sg[row_block_idx * g.A_sg_stride];
             const float gs1 = a_sg * g.B1_sg[b_outer_idx * g.B1_sg_stride];
-            const float gs3 = a_sg * g.B3_sg[b_outer_idx * g.B3_sg_stride];
+            float gs3 = 1.0f;
+            if constexpr (!C::USE_SQRELU) {
+                gs3 = a_sg * g.B3_sg[b_outer_idx * g.B3_sg_stride];
+            }
 
             #pragma unroll
             for (int half = 0; half < C::NUM_HALVES; ++half) {
@@ -827,26 +947,37 @@ __device__ inline void kernel(const globals<C>& g) {
                 for (int e = 0; e < C::EPI_PER_HALF; ++e) {
                     const int epi = half * C::EPI_PER_HALF + e;
                     subtile_rt D1_acc;
-                    subtile_rt D3_acc;
                     warpgroup::load_async(
                         D1_acc,
                         out1_tm.template subtile<full_tt_fl<SUBTILE_COLS>>(0, SUBTILE_COLS * epi));
-                    warpgroup::load_async(
-                        D3_acc,
-                        out3_tm.template subtile<full_tt_fl<SUBTILE_COLS>>(0, SUBTILE_COLS * epi));
+                    subtile_rt D3_acc;
+                    if constexpr (!C::USE_SQRELU) {
+                        warpgroup::load_async(
+                            D3_acc,
+                            out3_tm.template subtile<full_tt_fl<SUBTILE_COLS>>(0, SUBTILE_COLS * epi));
+                    }
                     tensor_load_wait();
                     tensor_before_thread_sync();
                     warpgroup::sync(1);
 
                     warp::mul(D1_acc, D1_acc, gs1);
-                    warp::mul(D3_acc, D3_acc, gs3);
+                    if constexpr (!C::USE_SQRELU) {
+                        warp::mul(D3_acc, D3_acc, gs3);
+                    }
                     warpgroup::sync(1);
                     const int col_start = col_block_idx * C::Nb + epi * SUBTILE_COLS;
-                    local_amax = fmaxf(
+                    if constexpr (C::USE_SQRELU) {
+                        local_amax = fmaxf(
                         local_amax,
-                        stage_swiglu_pairs<C>(
-                            D1_acc, D3_acc, pairs, e, lane_id,
-                            warp_row_base, col_start, g.H));
+                        stage_sqrelu_pairs<C>(
+                            D1_acc, pairs, e, lane_id));
+                    } else {
+                        local_amax = fmaxf(
+                            local_amax,
+                            stage_swiglu_pairs<C>(
+                                D1_acc, D3_acc, pairs, e, lane_id,
+                                warp_row_base, col_start, g.M, g.H));
+                    }
                     warpgroup::sync(1);
                 }
                 local_amax = warp_reduce_max(local_amax);
