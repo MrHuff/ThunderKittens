@@ -270,6 +270,8 @@ __device__ __forceinline__ void silu_deriv_pair(
     bf16_2& out0,
     bf16_2& out1)
 {
+    dh_x = __bfloat162float(__float2bfloat16_rn(dh_x));
+    dh_y = __bfloat162float(__float2bfloat16_rn(dh_y));
     const float h3_x = __bfloat162float(h3_pair.x);
     const float h3_y = __bfloat162float(h3_pair.y);
     const float h1_x = __bfloat162float(h1_pair.x);
@@ -297,6 +299,8 @@ __device__ __forceinline__ void silu_deriv_pair_from_sigmoid(
     bf16_2& out0,
     bf16_2& out1)
 {
+    dh_x = __bfloat162float(__float2bfloat16_rn(dh_x));
+    dh_y = __bfloat162float(__float2bfloat16_rn(dh_y));
     const float h3_x = __bfloat162float(h3_pair.x);
     const float h3_y = __bfloat162float(h3_pair.y);
     const float h1_x = __bfloat162float(h1_pair.x);
