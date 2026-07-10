@@ -431,8 +431,15 @@ __device__ __noinline__ float stage_swiglu_pairs(
                     __float2bfloat16_rn(D3_fl.tiles[i][j].data[d].x));
                 const float h3_y = __bfloat162float(
                     __float2bfloat16_rn(D3_fl.tiles[i][j].data[d].y));
-                const float sig_x = 1.0f / (1.0f + __expf(-h1_x));
-                const float sig_y = 1.0f / (1.0f + __expf(-h1_y));
+                float sig_x;
+                float sig_y;
+                if constexpr (C::V5_SCALAR_SG) {
+                    sig_x = 1.0f / (1.0f + expf(-h1_x));
+                    sig_y = 1.0f / (1.0f + expf(-h1_y));
+                } else {
+                    sig_x = 1.0f / (1.0f + __expf(-h1_x));
+                    sig_y = 1.0f / (1.0f + __expf(-h1_y));
+                }
                 const float out_x = h1_x * sig_x * h3_x;
                 const float out_y = h1_y * sig_y * h3_y;
 
@@ -442,8 +449,13 @@ __device__ __noinline__ float stage_swiglu_pairs(
                     __float2bfloat16_rn(out_x),
                     __float2bfloat16_rn(out_y)};
                 pairs[epi_slot][col_slot][row_slot] = out_pair;
-                local_amax = fmaxf(local_amax, fabsf(__bfloat162float(out_pair.x)));
-                local_amax = fmaxf(local_amax, fabsf(__bfloat162float(out_pair.y)));
+                if constexpr (C::V5_SCALAR_SG) {
+                    local_amax = fmaxf(local_amax, fabsf(out_x));
+                    local_amax = fmaxf(local_amax, fabsf(out_y));
+                } else {
+                    local_amax = fmaxf(local_amax, fabsf(__bfloat162float(out_pair.x)));
+                    local_amax = fmaxf(local_amax, fabsf(__bfloat162float(out_pair.y)));
+                }
             }
         }
     }
