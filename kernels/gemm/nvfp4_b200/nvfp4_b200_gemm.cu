@@ -171,6 +171,7 @@ int main() {
 
 #include "pyutils/torchutils.cuh"
 #include "ATen/Functions.h"
+#include "../common/c1_rms_reduce.cuh"
 
 __global__ void v5_rmsnorm_bwd_dx_kernel(
     const __nv_bfloat16* __restrict__ d_normed,
@@ -2185,6 +2186,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           pybind11::arg("B"), pybind11::arg("B_sc"), pybind11::arg("B_sc_global"),
           pybind11::arg("R"), pybind11::arg("D"),
           pybind11::arg("row_rms_partial"), pybind11::arg("gamma") = std::nullopt);
+    m.def("c1_row_rms_reduce", &c1_rms_reduce::row_rms_reduce_entrypoint,
+          "Reduce C1 partial row RMS stats into row RMS coefficients",
+          pybind11::arg("row_rms_partial"), pybind11::arg("coeff"),
+          pybind11::arg("hidden_size"), pybind11::arg("eps"));
     m.def("nvfp4_gemm_nopdl", &nvfp4_gemm_nopdl_entrypoint,
           "Non-PDL GEMM for CUDA graph capture (CLUSTER_SIZE=1, USE_PDL=false)");
     m.def("nvfp4_gemm_config", &nvfp4_gemm_config_entrypoint,

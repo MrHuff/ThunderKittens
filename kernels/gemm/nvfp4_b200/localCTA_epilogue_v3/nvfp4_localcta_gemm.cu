@@ -24,6 +24,7 @@
 #include "../nvfp4_batched_gemm.cuh"
 #include "../nvfp4_split2_accum_gemm.cuh"
 #include "../nvfp4_split3_accum_gemm.cuh"
+#include "../../common/c1_rms_reduce.cuh"
 #include "nvfp4_localcta_silu_dgrad_quant_gemm.cuh"  // fused W2-dgrad -> SiLU split2 quant producer
 #include "nvfp4_localcta_swiglu_quant_gemm.cuh"      // fused W1/W3 GEMM -> SwiGLU W2 payload producer
 
@@ -6417,6 +6418,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           pybind11::arg("B"), pybind11::arg("B_sc"), pybind11::arg("B_sg_chunks"),
           pybind11::arg("R"), pybind11::arg("D"),
           pybind11::arg("row_rms_partial"), pybind11::arg("gamma") = std::nullopt);
+    m.def("nvfp4_localcta_c1_row_rms_reduce", &c1_rms_reduce::row_rms_reduce_entrypoint,
+          "Reduce C1 partial row RMS stats into row RMS coefficients",
+          pybind11::arg("row_rms_partial"), pybind11::arg("coeff"),
+          pybind11::arg("hidden_size"), pybind11::arg("eps"));
     m.def("nvfp4_localcta_fast_gemm", &nvfp4_localcta_fast_gemm_entrypoint,
           pybind11::arg("A"), pybind11::arg("A_sc_prepared"),
           pybind11::arg("B"), pybind11::arg("B_sc_prepared"),

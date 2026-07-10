@@ -166,6 +166,7 @@ int main() {
 #else
 
 #include "pyutils/torchutils.cuh"
+#include "../common/c1_rms_reduce.cuh"
 
 namespace {
 
@@ -2475,6 +2476,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           pybind11::arg("B"), pybind11::arg("B_sc"),
           pybind11::arg("R"), pybind11::arg("D"),
           pybind11::arg("row_rms_partial"), pybind11::arg("gamma") = std::nullopt);
+    m.def("mxfp4_c1_row_rms_reduce", &c1_rms_reduce::row_rms_reduce_entrypoint,
+          "Reduce C1 partial row RMS stats into row RMS coefficients",
+          pybind11::arg("row_rms_partial"), pybind11::arg("coeff"),
+          pybind11::arg("hidden_size"), pybind11::arg("eps"));
     m.def("mxfp4_gemm_residual_config", &mxfp4_gemm_residual_config_entrypoint,
           "Dense GEMM with fused bf16 residual add and explicit kernel config",
           pybind11::arg("A"), pybind11::arg("A_sc"),
