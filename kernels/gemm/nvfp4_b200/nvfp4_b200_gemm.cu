@@ -2279,6 +2279,14 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           pybind11::arg("coeff"), pybind11::arg("dot"),
           pybind11::arg("dx"), pybind11::arg("hidden_size"),
           pybind11::arg("gamma") = std::nullopt);
+    m.def("g5_rms_bwd_partial_dgamma", &c5_rms_bwd::partial_dgamma_entrypoint,
+          "G5 RMSNorm backward partial dgamma over 256-row tiles",
+          pybind11::arg("x"), pybind11::arg("dy"),
+          pybind11::arg("coeff"), pybind11::arg("partial_dgamma"));
+    m.def("g5_rms_bwd_reduce_dgamma", &c5_rms_bwd::reduce_dgamma_entrypoint,
+          "G5 reduce tiled RMSNorm backward dgamma to one scalar per feature",
+          pybind11::arg("partial_dgamma"), pybind11::arg("dgamma"),
+          pybind11::arg("hidden_size"));
     m.def("nvfp4_gemm_nopdl", &nvfp4_gemm_nopdl_entrypoint,
           "Non-PDL GEMM for CUDA graph capture (CLUSTER_SIZE=1, USE_PDL=false)");
     m.def("nvfp4_gemm_config", &nvfp4_gemm_config_entrypoint,

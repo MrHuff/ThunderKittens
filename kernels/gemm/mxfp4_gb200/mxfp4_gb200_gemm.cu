@@ -2543,6 +2543,14 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           pybind11::arg("coeff"), pybind11::arg("dot"),
           pybind11::arg("dx"), pybind11::arg("hidden_size"),
           pybind11::arg("gamma") = std::nullopt);
+    m.def("mxfp4_g5_rms_bwd_partial_dgamma", &c5_rms_bwd::partial_dgamma_entrypoint,
+          "G5 RMSNorm backward partial dgamma over 256-row tiles",
+          pybind11::arg("x"), pybind11::arg("dy"),
+          pybind11::arg("coeff"), pybind11::arg("partial_dgamma"));
+    m.def("mxfp4_g5_rms_bwd_reduce_dgamma", &c5_rms_bwd::reduce_dgamma_entrypoint,
+          "G5 reduce tiled RMSNorm backward dgamma to one scalar per feature",
+          pybind11::arg("partial_dgamma"), pybind11::arg("dgamma"),
+          pybind11::arg("hidden_size"));
     m.def("mxfp4_gemm_residual_config", &mxfp4_gemm_residual_config_entrypoint,
           "Dense GEMM with fused bf16 residual add and explicit kernel config",
           pybind11::arg("A"), pybind11::arg("A_sc"),

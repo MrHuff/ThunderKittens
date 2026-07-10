@@ -93,6 +93,74 @@ __global__ void rmsnorm_dx_apply_kernel(
     dx[idx] = __float2bfloat16(dx_val);
 }
 
+__global__ void row_tile_partial_dgamma_kernel(
+    const __nv_bfloat16* __restrict__ x,
+    const __nv_bfloat16* __restrict__ dy,
+    const float* __restrict__ coeff,
+    float* __restrict__ partial_dgamma,
+    int64_t rows,
+    int64_t hidden_size
+) {
+    __shared__ float scratch[256];
+    const int64_t col = static_cast<int64_t>(blockIdx.x);
+    const int64_t row_tile = static_cast<int64_t>(blockIdx.y);
+    if (col >= hidden_size) {
+        return;
+    }
+    const int tid = threadIdx.x;
+    const int64_t row_start = row_tile * 256;
+    const int64_t row_end = min(row_start + 256, rows);
+    float partial = 0.0f;
+    for (int64_t row = row_start + tid; row < row_end; row += blockDim.x) {
+        const int64_t idx = row * hidden_size + col;
+        partial += (
+            __bfloat162float(x[idx])
+            * __bfloat162float(dy[idx])
+            * coeff[row]
+        );
+    }
+    scratch[tid] = partial;
+    __syncthreads();
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            scratch[tid] += scratch[tid + stride];
+        }
+        __syncthreads();
+    }
+    if (tid == 0) {
+        partial_dgamma[row_tile * hidden_size + col] = scratch[0];
+    }
+}
+
+__global__ void partial_dgamma_reduce_kernel(
+    const float* __restrict__ partial_dgamma,
+    float* __restrict__ dgamma,
+    int64_t row_tiles,
+    int64_t hidden_size
+) {
+    __shared__ float scratch[256];
+    const int64_t col = static_cast<int64_t>(blockIdx.x);
+    if (col >= hidden_size) {
+        return;
+    }
+    const int tid = threadIdx.x;
+    float sum = 0.0f;
+    for (int64_t tile = tid; tile < row_tiles; tile += blockDim.x) {
+        sum += partial_dgamma[tile * hidden_size + col];
+    }
+    scratch[tid] = sum;
+    __syncthreads();
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            scratch[tid] += scratch[tid + stride];
+        }
+        __syncthreads();
+    }
+    if (tid == 0) {
+        dgamma[col] = scratch[0];
+    }
+}
+
 inline void check_matrix_bf16(const at::Tensor& t, const char* name) {
     TORCH_CHECK(t.is_cuda(), name, " must be CUDA");
     TORCH_CHECK(t.is_contiguous(), name, " must be contiguous");
@@ -127,6 +195,25 @@ inline void check_vector_fp32(const at::Tensor& t, const char* name, int64_t row
     TORCH_CHECK(t.is_contiguous(), name, " must be contiguous");
     TORCH_CHECK(t.scalar_type() == at::kFloat, name, " must be float32");
     TORCH_CHECK(t.dim() == 1 && t.numel() == rows, name, " must have shape [M]");
+}
+
+inline void check_partial_dgamma(const at::Tensor& partial_dgamma, int64_t rows, int64_t hidden_size) {
+    const int64_t row_tiles = (rows + 255) / 256;
+    TORCH_CHECK(partial_dgamma.is_cuda(), "partial_dgamma must be CUDA");
+    TORCH_CHECK(partial_dgamma.is_contiguous(), "partial_dgamma must be contiguous");
+    TORCH_CHECK(partial_dgamma.scalar_type() == at::kFloat, "partial_dgamma must be float32");
+    TORCH_CHECK(partial_dgamma.dim() == 2 &&
+                    partial_dgamma.size(0) == row_tiles &&
+                    partial_dgamma.size(1) == hidden_size,
+                "partial_dgamma must have shape [ceil(M / 256), hidden_size]");
+}
+
+inline void check_dgamma(const at::Tensor& dgamma, int64_t hidden_size) {
+    TORCH_CHECK(dgamma.is_cuda(), "dgamma must be CUDA");
+    TORCH_CHECK(dgamma.is_contiguous(), "dgamma must be contiguous");
+    TORCH_CHECK(dgamma.scalar_type() == at::kFloat, "dgamma must be float32");
+    TORCH_CHECK(dgamma.dim() == 1 && dgamma.numel() == hidden_size,
+                "dgamma must have shape [hidden_size]");
 }
 
 inline void partial_dot_entrypoint(
@@ -228,6 +315,64 @@ inline void apply_dx_entrypoint(
         dot.data_ptr<float>(),
         reinterpret_cast<__nv_bfloat16*>(dx.data_ptr()),
         numel,
+        hidden_size
+    );
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+inline void partial_dgamma_entrypoint(
+    const at::Tensor& x,
+    const at::Tensor& dy,
+    const at::Tensor& coeff,
+    at::Tensor& partial_dgamma
+) {
+    check_matrix_bf16(x, "x");
+    check_matrix_bf16(dy, "dy");
+    TORCH_CHECK(dy.sizes() == x.sizes(), "dy shape must match x");
+    const int64_t rows = x.size(0);
+    const int64_t hidden_size = x.size(1);
+    TORCH_CHECK(hidden_size > 0, "hidden_size must be positive");
+    check_vector_fp32(coeff, "coeff", rows);
+    check_partial_dgamma(partial_dgamma, rows, hidden_size);
+    if (rows == 0) {
+        return;
+    }
+    constexpr int threads = 256;
+    dim3 grid(static_cast<unsigned int>(hidden_size), static_cast<unsigned int>((rows + 255) / 256));
+    row_tile_partial_dgamma_kernel<<<grid, threads, 0, at::cuda::getCurrentCUDAStream()>>>(
+        reinterpret_cast<const __nv_bfloat16*>(x.data_ptr()),
+        reinterpret_cast<const __nv_bfloat16*>(dy.data_ptr()),
+        coeff.data_ptr<float>(),
+        partial_dgamma.data_ptr<float>(),
+        rows,
+        hidden_size
+    );
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+inline void reduce_dgamma_entrypoint(
+    const at::Tensor& partial_dgamma,
+    at::Tensor& dgamma,
+    int64_t hidden_size
+) {
+    TORCH_CHECK(hidden_size > 0, "hidden_size must be positive");
+    TORCH_CHECK(partial_dgamma.is_cuda(), "partial_dgamma must be CUDA");
+    TORCH_CHECK(partial_dgamma.is_contiguous(), "partial_dgamma must be contiguous");
+    TORCH_CHECK(partial_dgamma.scalar_type() == at::kFloat, "partial_dgamma must be float32");
+    TORCH_CHECK(partial_dgamma.dim() == 2, "partial_dgamma must be rank-2 [ceil(M / 256), hidden_size]");
+    TORCH_CHECK(partial_dgamma.size(1) == hidden_size,
+                "partial_dgamma second dimension must equal hidden_size");
+    check_dgamma(dgamma, hidden_size);
+    const int64_t row_tiles = partial_dgamma.size(0);
+    if (row_tiles == 0) {
+        dgamma.zero_();
+        return;
+    }
+    constexpr int threads = 256;
+    partial_dgamma_reduce_kernel<<<static_cast<int>(hidden_size), threads, 0, at::cuda::getCurrentCUDAStream()>>>(
+        partial_dgamma.data_ptr<float>(),
+        dgamma.data_ptr<float>(),
+        row_tiles,
         hidden_size
     );
     C10_CUDA_KERNEL_LAUNCH_CHECK();
