@@ -9,6 +9,8 @@
 #include "mxfp4_split2_accum_gemm.cuh"
 #include "mxfp4_split3_accum_gemm.cuh"
 #include "mxfp4_silu_dgrad_quant_gemm.cuh"
+#include "mxfp4_sqrelu_quant_gemm.cuh"
+#include "mxfp4_swiglu_quant_gemm.cuh"
 #include <cstdlib>
 #include <cstdint>
 #include <cstring>
@@ -1185,6 +1187,200 @@ void mxfp4_gemm_config_entrypoint(
 }
 
 template <typename C>
+static void run_sqrelu_quant_gemm_with_config(
+    const at::Tensor &A, const at::Tensor &A_sc,
+    const at::Tensor &B, const at::Tensor &B_sc,
+    at::Tensor &row_fp4,
+    at::Tensor &row_sc,
+    at::Tensor &col_fp4,
+    at::Tensor &col_sc
+) {
+    using G = mxfp4_sqrelu_quant_gemm::globals<C>;
+    G g {
+        .A = kittens::py::tensor_to_gl<typename G::A_fp4x2_gl>(A),
+        .A_sc = kittens::py::tensor_to_gl<typename G::A_sc_gl>(A_sc),
+        .B = kittens::py::tensor_to_gl<typename G::B_fp4x2_gl>(B),
+        .B_sc = kittens::py::tensor_to_gl<typename G::B_sc_gl>(B_sc),
+        .row_fp4 = tensor_to_gl_tma_view<typename G::row_fp4_gl>(row_fp4, "row_fp4"),
+        .row_sc = reinterpret_cast<uint8_t*>(row_sc.data_ptr()),
+        .col_fp4 = reinterpret_cast<uint8_t*>(col_fp4.data_ptr()),
+        .col_sc = reinterpret_cast<uint8_t*>(col_sc.data_ptr()),
+        .M = static_cast<int>(row_fp4.size(0)),
+        .H = static_cast<int>(col_fp4.size(0)),
+    };
+    kittens::py::launch_kernel<C, G, mxfp4_sqrelu_quant_gemm::kernel<C>>(g);
+}
+
+void mxfp4_w1_sqrelu_quant_gemm_entrypoint(
+    const at::Tensor &A, const at::Tensor &A_sc,
+    const at::Tensor &B, const at::Tensor &B_sc,
+    at::Tensor &row_fp4,
+    at::Tensor &row_sc,
+    at::Tensor &col_fp4,
+    at::Tensor &col_sc,
+    int config_id,
+    int mode
+) {
+    check_fp4_matrix(A, "A");
+    check_fp4_matrix(B, "B");
+    TORCH_CHECK(A_sc.is_cuda() && A_sc.is_contiguous(), "A_sc must be contiguous CUDA");
+    TORCH_CHECK(B_sc.is_cuda() && B_sc.is_contiguous(), "B_sc must be contiguous CUDA");
+    TORCH_CHECK(A_sc.scalar_type() == at::kFloat8_e8m0fnu || A_sc.scalar_type() == at::kByte,
+                "A_sc must be fp8e8m0/uint8");
+    TORCH_CHECK(B_sc.scalar_type() == at::kFloat8_e8m0fnu || B_sc.scalar_type() == at::kByte,
+                "B_sc must be fp8e8m0/uint8");
+
+    TORCH_CHECK(row_fp4.is_cuda() && row_fp4.is_contiguous() && row_fp4.dim() == 2 &&
+                row_fp4.scalar_type() == at::kFloat4_e2m1fn_x2,
+                "row_fp4 must be contiguous CUDA fp4x2 matrix");
+    TORCH_CHECK(col_fp4.is_cuda() && col_fp4.is_contiguous() && col_fp4.dim() == 2 &&
+                col_fp4.scalar_type() == at::kFloat4_e2m1fn_x2,
+                "col_fp4 must be contiguous CUDA fp4x2 matrix");
+    TORCH_CHECK(row_sc.is_cuda() && row_sc.is_contiguous() && row_sc.scalar_type() == at::kByte,
+                "row_sc must be contiguous CUDA uint8");
+    TORCH_CHECK(col_sc.is_cuda() && col_sc.is_contiguous() && col_sc.scalar_type() == at::kByte,
+                "col_sc must be contiguous CUDA uint8");
+
+    const int64_t M = row_fp4.size(0);
+    const int64_t H = col_fp4.size(0);
+    const int64_t K = A.size(1) * 2;
+    TORCH_CHECK(row_fp4.size(1) * 2 == H, "row_fp4 must have shape (M, H/2)");
+    TORCH_CHECK(col_fp4.size(1) * 2 == M, "col_fp4 must have shape (H, M/2)");
+    TORCH_CHECK(A.size(0) == M && B.size(0) == H && B.size(1) * 2 == K,
+                "A/B shapes must produce an MxH square-ReLU tile");
+    TORCH_CHECK(M % 256 == 0 && H % 256 == 0 && K % 256 == 0,
+                "mxfp4_w1_sqrelu_quant_gemm requires M,H,K divisible by 256");
+    TORCH_CHECK(row_sc.sizes() == at::IntArrayRef({M / 128, H / 128, 32, 16}),
+                "row_sc must have shape (M/128, H/128, 32, 16)");
+    TORCH_CHECK(col_sc.sizes() == at::IntArrayRef({H / 128, M / 128, 32, 16}),
+                "col_sc must have shape (H/128, M/128, 32, 16)");
+
+    auto launch_mode = [&]<int MODE>() {
+        switch (config_id) {
+        case 0:
+            run_sqrelu_quant_gemm_with_config<mxfp4_sqrelu_quant_gemm::config<5, 4, MODE>>(
+                A, A_sc, B, B_sc, row_fp4, row_sc, col_fp4, col_sc);
+            break;
+        case 4:
+            run_sqrelu_quant_gemm_with_config<mxfp4_sqrelu_quant_gemm::config<5, 12, MODE>>(
+                A, A_sc, B, B_sc, row_fp4, row_sc, col_fp4, col_sc);
+            break;
+        default:
+            TORCH_CHECK(false, "Invalid square-ReLU quant GEMM config_id: ", config_id, " (valid: 0, 4)");
+        }
+    };
+    switch (mode) {
+    case 0: launch_mode.template operator()<0>(); break;
+    case 1: launch_mode.template operator()<1>(); break;
+    case 2: launch_mode.template operator()<2>(); break;
+    default:
+        TORCH_CHECK(false, "Invalid square-ReLU quant GEMM mode: ", mode, " (valid: 0, 1, 2)");
+    }
+}
+
+template <typename C>
+static void run_swiglu_quant_gemm_with_config(
+    const at::Tensor &A, const at::Tensor &A_sc,
+    const at::Tensor &B1, const at::Tensor &B1_sc,
+    const at::Tensor &B3, const at::Tensor &B3_sc,
+    at::Tensor &row_fp4,
+    at::Tensor &row_sc,
+    at::Tensor &col_fp4,
+    at::Tensor &col_sc
+) {
+    using G = mxfp4_swiglu_quant_gemm::globals<C>;
+    G g {
+        .A = kittens::py::tensor_to_gl<typename G::A_fp4x2_gl>(A),
+        .A_sc = kittens::py::tensor_to_gl<typename G::A_sc_gl>(A_sc),
+        .B1 = kittens::py::tensor_to_gl<typename G::B_fp4x2_gl>(B1),
+        .B1_sc = kittens::py::tensor_to_gl<typename G::B_sc_gl>(B1_sc),
+        .B3 = kittens::py::tensor_to_gl<typename G::B_fp4x2_gl>(B3),
+        .B3_sc = kittens::py::tensor_to_gl<typename G::B_sc_gl>(B3_sc),
+        .row_fp4 = tensor_to_gl_tma_view<typename G::row_fp4_gl>(row_fp4, "row_fp4"),
+        .row_sc = reinterpret_cast<uint8_t*>(row_sc.data_ptr()),
+        .col_fp4 = reinterpret_cast<uint8_t*>(col_fp4.data_ptr()),
+        .col_sc = reinterpret_cast<uint8_t*>(col_sc.data_ptr()),
+        .M = static_cast<int>(row_fp4.size(0)),
+        .H = static_cast<int>(col_fp4.size(0)),
+    };
+    kittens::py::launch_kernel<C, G, mxfp4_swiglu_quant_gemm::kernel<C>>(g);
+}
+
+void mxfp4_w13_swiglu_quant_gemm_entrypoint(
+    const at::Tensor &A, const at::Tensor &A_sc,
+    const at::Tensor &B1, const at::Tensor &B1_sc,
+    const at::Tensor &B3, const at::Tensor &B3_sc,
+    at::Tensor &row_fp4,
+    at::Tensor &row_sc,
+    at::Tensor &col_fp4,
+    at::Tensor &col_sc,
+    int config_id,
+    int mode
+) {
+    check_fp4_matrix(A, "A");
+    check_fp4_matrix(B1, "B1");
+    check_fp4_matrix(B3, "B3");
+    TORCH_CHECK(A_sc.is_cuda() && A_sc.is_contiguous(), "A_sc must be contiguous CUDA");
+    TORCH_CHECK(B1_sc.is_cuda() && B1_sc.is_contiguous(), "B1_sc must be contiguous CUDA");
+    TORCH_CHECK(B3_sc.is_cuda() && B3_sc.is_contiguous(), "B3_sc must be contiguous CUDA");
+    TORCH_CHECK(A_sc.scalar_type() == at::kFloat8_e8m0fnu || A_sc.scalar_type() == at::kByte,
+                "A_sc must be fp8e8m0/uint8");
+    TORCH_CHECK(B1_sc.scalar_type() == at::kFloat8_e8m0fnu || B1_sc.scalar_type() == at::kByte,
+                "B1_sc must be fp8e8m0/uint8");
+    TORCH_CHECK(B3_sc.scalar_type() == at::kFloat8_e8m0fnu || B3_sc.scalar_type() == at::kByte,
+                "B3_sc must be fp8e8m0/uint8");
+
+    TORCH_CHECK(row_fp4.is_cuda() && row_fp4.is_contiguous() && row_fp4.dim() == 2 &&
+                row_fp4.scalar_type() == at::kFloat4_e2m1fn_x2,
+                "row_fp4 must be contiguous CUDA fp4x2 matrix");
+    TORCH_CHECK(col_fp4.is_cuda() && col_fp4.is_contiguous() && col_fp4.dim() == 2 &&
+                col_fp4.scalar_type() == at::kFloat4_e2m1fn_x2,
+                "col_fp4 must be contiguous CUDA fp4x2 matrix");
+    TORCH_CHECK(row_sc.is_cuda() && row_sc.is_contiguous() && row_sc.scalar_type() == at::kByte,
+                "row_sc must be contiguous CUDA uint8");
+    TORCH_CHECK(col_sc.is_cuda() && col_sc.is_contiguous() && col_sc.scalar_type() == at::kByte,
+                "col_sc must be contiguous CUDA uint8");
+
+    const int64_t M = row_fp4.size(0);
+    const int64_t H = col_fp4.size(0);
+    const int64_t K = A.size(1) * 2;
+    TORCH_CHECK(row_fp4.size(1) * 2 == H, "row_fp4 must have shape (M, H/2)");
+    TORCH_CHECK(col_fp4.size(1) * 2 == M, "col_fp4 must have shape (H, M/2)");
+    TORCH_CHECK(A.size(0) == M && B1.size(0) == H && B1.size(1) * 2 == K &&
+                B3.size(0) == H && B3.size(1) * 2 == K,
+                "A/B1/B3 shapes must produce an MxH SwiGLU tile");
+    TORCH_CHECK(B1.sizes() == B3.sizes(), "B1 and B3 must have the same shape");
+    TORCH_CHECK(M % 256 == 0 && H % 256 == 0 && K % 256 == 0,
+                "mxfp4_w13_swiglu_quant_gemm requires M,H,K divisible by 256");
+    TORCH_CHECK(row_sc.sizes() == at::IntArrayRef({M / 128, H / 128, 32, 16}),
+                "row_sc must have shape (M/128, H/128, 32, 16)");
+    TORCH_CHECK(col_sc.sizes() == at::IntArrayRef({H / 128, M / 128, 32, 16}),
+                "col_sc must have shape (H/128, M/128, 32, 16)");
+
+    auto launch_mode = [&]<int MODE>() {
+        switch (config_id) {
+        case 0:
+            run_swiglu_quant_gemm_with_config<mxfp4_swiglu_quant_gemm::config<128, 3, 4, 4, MODE>>(
+                A, A_sc, B1, B1_sc, B3, B3_sc, row_fp4, row_sc, col_fp4, col_sc);
+            break;
+        case 4:
+            run_swiglu_quant_gemm_with_config<mxfp4_swiglu_quant_gemm::config<128, 3, 4, 12, MODE>>(
+                A, A_sc, B1, B1_sc, B3, B3_sc, row_fp4, row_sc, col_fp4, col_sc);
+            break;
+        default:
+            TORCH_CHECK(false, "Invalid SwiGLU quant GEMM config_id: ", config_id, " (valid: 0, 4)");
+        }
+    };
+    switch (mode) {
+    case 0: launch_mode.template operator()<0>(); break;
+    case 1: launch_mode.template operator()<1>(); break;
+    case 2: launch_mode.template operator()<2>(); break;
+    default:
+        TORCH_CHECK(false, "Invalid SwiGLU quant GEMM mode: ", mode, " (valid: 0, 1, 2)");
+    }
+}
+
+template <typename C>
 static void run_silu_dgrad_quant_gemm_with_config(
     const at::Tensor &A, const at::Tensor &A_sc,
     const at::Tensor &B, const at::Tensor &B_sc,
@@ -2245,6 +2441,21 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           pybind11::arg("A"), pybind11::arg("A_sc"),
           pybind11::arg("B"), pybind11::arg("B_sc"),
           pybind11::arg("D"), pybind11::arg("config_id"));
+    m.def("mxfp4_w1_sqrelu_quant_gemm", &mxfp4_w1_sqrelu_quant_gemm_entrypoint,
+          "W1 GEMM with fused square-ReLU MXFP4 row/col quantization",
+          pybind11::arg("A"), pybind11::arg("A_sc"),
+          pybind11::arg("B"), pybind11::arg("B_sc"),
+          pybind11::arg("row_fp4"), pybind11::arg("row_sc"),
+          pybind11::arg("col_fp4"), pybind11::arg("col_sc"),
+          pybind11::arg("config_id"), pybind11::arg("mode") = 1);
+    m.def("mxfp4_w13_swiglu_quant_gemm", &mxfp4_w13_swiglu_quant_gemm_entrypoint,
+          "W1/W3 GEMMs with fused SwiGLU MXFP4 row/col quantization",
+          pybind11::arg("A"), pybind11::arg("A_sc"),
+          pybind11::arg("B1"), pybind11::arg("B1_sc"),
+          pybind11::arg("B3"), pybind11::arg("B3_sc"),
+          pybind11::arg("row_fp4"), pybind11::arg("row_sc"),
+          pybind11::arg("col_fp4"), pybind11::arg("col_sc"),
+          pybind11::arg("config_id"), pybind11::arg("mode") = 1);
     m.def("mxfp4_gemm_silu_dgrad_quant", &mxfp4_gemm_silu_dgrad_quant_entrypoint,
           "W2 dgrad GEMM with fused SiLU derivative MXFP4 row/col quantization",
           pybind11::arg("A"), pybind11::arg("A_sc"),

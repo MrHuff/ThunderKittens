@@ -1,0 +1,563 @@
+#pragma once
+
+#include "kittens.cuh"
+
+using namespace kittens;
+
+namespace mxfp4_swiglu_quant_gemm {
+
+template <int _Nb, int _LOAD_PIPE_DEPTH, int _EPI_PIPE_DEPTH, int _SUPERGROUP_SIZE, int _QUANT_MODE = 1>
+struct config {
+    static constexpr int CLUSTER_SIZE = 2;
+    static constexpr bool USE_PDL = true;
+
+    static constexpr int CONSUMER_WARPGROUPS = 1;
+    static constexpr int PRODUCER_WARPGROUPS = 1;
+    static constexpr int NUM_WARPGROUPS = CONSUMER_WARPGROUPS + PRODUCER_WARPGROUPS;
+    static constexpr int NUM_WARPS = NUM_WARPGROUPS * WARPGROUP_WARPS;
+    static constexpr int NUM_THREADS = NUM_WARPS * WARP_THREADS;
+
+    static constexpr int LOAD_PIPE_DEPTH = _LOAD_PIPE_DEPTH;
+    static constexpr int EPI_PIPE_DEPTH = _EPI_PIPE_DEPTH;
+    static constexpr int SUPERGROUP_SIZE = _SUPERGROUP_SIZE;
+    static constexpr int Mb = 256;
+    static constexpr int Nb = _Nb;
+    static constexpr int Kb = 256;
+    static constexpr int B_SC_SIZE = Nb / 128;
+    static constexpr int MMA_PER_TILE = 2;
+    static constexpr int NUM_D_TILES = 2;
+    static constexpr int QUANT_MODE = _QUANT_MODE;
+    static constexpr int OUT1_TMEM_OFFSET = 0;
+    static constexpr int OUT3_TMEM_OFFSET = Nb;
+    static constexpr int A_SC_TMEM_OFFSET = 256;
+    static constexpr int B1_SC_TMEM_OFFSET = A_SC_TMEM_OFFSET + 4 * MMA_PER_TILE * LOAD_PIPE_DEPTH;
+    static constexpr int B3_SC_TMEM_OFFSET = B1_SC_TMEM_OFFSET + 8 * MMA_PER_TILE * LOAD_PIPE_DEPTH;
+    static_assert(Nb == 128 || Nb == 256, "MXFP4 W13 producer supports Nb=128 or Nb=256");
+    static_assert(Nb / EPI_PIPE_DEPTH == 32, "MXFP4 W13 producer assumes 32-column epilogue slices");
+};
+
+template <typename C>
+struct globals {
+    using A_fp4x2_tile = st_fp4e2m1_2<C::Mb/2, C::Kb/2>;
+    using A_sc_tile    = st_fp8e8m0<32, 16, false>;
+    using B_fp4x2_tile = st_fp4e2m1_2<C::Nb/2, C::Kb/2>;
+    using B_sc_tile    = st_fp8e8m0<32, 16, false>;
+    using row_fp4_tile = st_fp4e2m1_2<C::Mb/2, C::Nb/2>;
+
+    using A_fp4x2_gl = gl<fp4e2m1_2, 1,  1, -1, -1, A_fp4x2_tile>;
+    using A_sc_gl    = gl<fp8e8m0,  -1, -1, 32, 16, A_sc_tile>;
+    using B_fp4x2_gl = gl<fp4e2m1_2, 1,  1, -1, -1, B_fp4x2_tile>;
+    using B_sc_gl    = gl<fp8e8m0,  -1, -1, 32, 16, B_sc_tile>;
+    using row_fp4_gl = gl<fp4e2m1_2, 1,  1, -1, -1, row_fp4_tile>;
+
+    A_fp4x2_gl A;
+    A_sc_gl    A_sc;
+    B_fp4x2_gl B1;
+    B_sc_gl    B1_sc;
+    B_fp4x2_gl B3;
+    B_sc_gl    B3_sc;
+
+    row_fp4_gl row_fp4;
+    uint8_t* row_sc;
+    uint8_t* col_fp4;
+    uint8_t* col_sc;
+    int M;
+    int H;
+
+    struct input_tiles_t {
+        A_fp4x2_tile A;
+        B_fp4x2_tile B1;
+        B_fp4x2_tile B3;
+    };
+    struct input_scales_t {
+        A_sc_tile A[C::MMA_PER_TILE];
+        B_sc_tile B1[C::B_SC_SIZE * C::MMA_PER_TILE];
+        B_sc_tile B3[C::B_SC_SIZE * C::MMA_PER_TILE];
+    };
+
+    __host__ inline dim3 grid() const {
+        const int num_row_blocks = M / C::Mb;
+        const int num_col_blocks = H / C::Nb;
+        int grid_size = min(num_row_blocks * num_col_blocks * C::CLUSTER_SIZE, num_sms());
+        grid_size = (grid_size / C::CLUSTER_SIZE) * C::CLUSTER_SIZE;
+        return dim3(grid_size);
+    }
+    __host__ inline dim3 block() const { return dim3(C::NUM_THREADS); }
+    __host__ inline int dynamic_shared_memory() const {
+        constexpr int _dynamic_shared_memory = sizeof(input_tiles_t)  * C::LOAD_PIPE_DEPTH + 1024 +
+                                               sizeof(input_scales_t) * C::LOAD_PIPE_DEPTH + 1024;
+        static_assert(_dynamic_shared_memory <= MAX_SHARED_MEMORY - 1024);
+        return _dynamic_shared_memory;
+    }
+};
+
+__device__ __forceinline__ uint8_t float_to_fp4(float val) {
+    float aval = fabsf(val);
+    uint8_t sign = ((__float_as_uint(val) >> 31) << 3);
+    uint8_t enc =
+        static_cast<uint8_t>(aval >= 0.25f) +
+        static_cast<uint8_t>(aval >= 0.75f) +
+        static_cast<uint8_t>(aval >= 1.25f) +
+        static_cast<uint8_t>(aval >= 1.75f) +
+        static_cast<uint8_t>(aval >= 2.5f) +
+        static_cast<uint8_t>(aval >= 3.5f) +
+        static_cast<uint8_t>(aval >= 5.0f);
+    return sign | enc;
+}
+
+__device__ __forceinline__ uint8_t quantize_fp4_pair(float v0, float v1, float rcp_scale) {
+    uint8_t q0 = float_to_fp4(v0 * rcp_scale);
+    uint8_t q1 = float_to_fp4(v1 * rcp_scale);
+    return q0 | (q1 << 4);
+}
+
+__device__ __forceinline__ uint8_t float_to_e8m0_rn(float val) {
+    if (val == 0.0f) return 0x00;
+    uint32_t val_u32 = __float_as_uint(val);
+    uint8_t exponent = (val_u32 >> 23) & 0xFF;
+    uint32_t mantissa = val_u32 & 0x7FFFFF;
+    constexpr uint32_t half = 1u << 22;
+    bool round_up = (mantissa > half) || (mantissa == half && (exponent & 1));
+    if (round_up && exponent < 0xFE) ++exponent;
+    return exponent;
+}
+
+__device__ __forceinline__ uint8_t float_to_e8m0_ceil(float val) {
+    if (val == 0.0f) return 0x00;
+    uint32_t u = __float_as_uint(val);
+    uint8_t exp = (u >> 23) & 0xFF;
+    uint32_t mant = u & 0x7FFFFF;
+    if (mant > 0 && exp < 0xFE) ++exp;
+    return exp;
+}
+
+__device__ __forceinline__ uint8_t float_to_e8m0_floor(float val) {
+    if (val == 0.0f) return 0x00;
+    uint32_t u = __float_as_uint(val);
+    return (u >> 23) & 0xFF;
+}
+
+template <int MODE>
+__device__ __forceinline__ uint8_t float_to_e8m0_dispatch(float val) {
+    if constexpr (MODE == 1) {
+        return float_to_e8m0_ceil(val);
+    } else if constexpr (MODE == 2) {
+        return float_to_e8m0_floor(val);
+    } else {
+        return float_to_e8m0_rn(val);
+    }
+}
+
+__device__ __forceinline__ float exp2f_rcp_e8m0(uint8_t e8m0) {
+    if (e8m0 == 0) return 0.0f;
+    uint32_t bits = (uint32_t)(254 - e8m0) << 23;
+    return __uint_as_float(bits);
+}
+
+template <typename C>
+__device__ __noinline__ void quantize_rows_from_stage(
+    const globals<C>& g,
+    bf16_2 (*col_pairs)[33],
+    int lane_id,
+    int warp_row_base,
+    int logical_col_start,
+    int row_fp4_stride)
+{
+    const int local_row = lane_id;
+    const int global_row = warp_row_base + local_row;
+    bf16_2 cached_pairs[16];
+    float row_amax = 0.0f;
+
+    #pragma unroll
+    for (int pair = 0; pair < 16; pair++) {
+        const bf16_2 v = col_pairs[pair][local_row];
+        cached_pairs[pair] = v;
+        row_amax = fmaxf(row_amax, fabsf(__bfloat162float(v.x)));
+        row_amax = fmaxf(row_amax, fabsf(__bfloat162float(v.y)));
+    }
+
+    const uint8_t row_e8m0 = (row_amax <= 1e-9f) ? 0 : float_to_e8m0_dispatch<C::QUANT_MODE>(row_amax);
+    const float row_coeff = 6.0f * exp2f_rcp_e8m0(row_e8m0);
+    uint64_t packed_lo = 0;
+    uint64_t packed_hi = 0;
+    #pragma unroll
+    for (int pair = 0; pair < 8; pair++) {
+        const bf16_2 v = cached_pairs[pair];
+        packed_lo |= static_cast<uint64_t>(
+            quantize_fp4_pair(__bfloat162float(v.x), __bfloat162float(v.y), row_coeff)) << (pair * 8);
+    }
+    #pragma unroll
+    for (int pair = 0; pair < 8; pair++) {
+        const bf16_2 v = cached_pairs[pair + 8];
+        packed_hi |= static_cast<uint64_t>(
+            quantize_fp4_pair(__bfloat162float(v.x), __bfloat162float(v.y), row_coeff)) << (pair * 8);
+    }
+
+    uint8_t* row_fp4_ptr = reinterpret_cast<uint8_t*>(g.row_fp4.raw_ptr);
+    const int row_fp4_base = global_row * row_fp4_stride + logical_col_start / 2;
+    *reinterpret_cast<uint64_t*>(&row_fp4_ptr[row_fp4_base + 0]) = packed_lo;
+    *reinterpret_cast<uint64_t*>(&row_fp4_ptr[row_fp4_base + 8]) = packed_hi;
+
+    const int row_ntk_total = g.H / 128;
+    const int sc_row_blk = global_row / 128;
+    const int j_in_tile = global_row % 32;
+    const int grp = (global_row % 128) / 32;
+    const int sc_col_blk = logical_col_start / 128;
+    const int base = (sc_row_blk * row_ntk_total + sc_col_blk) * 512 + j_in_tile * 16 + grp * 4;
+    g.row_sc[base + (logical_col_start % 128) / 32] = row_e8m0;
+}
+
+template <typename C>
+__device__ __noinline__ void quantize_cols_from_stage(
+    const globals<C>& g,
+    bf16_2 (*col_pairs)[33],
+    int lane_id,
+    int warp_row_base,
+    int col_start)
+{
+    const int local_col = lane_id;
+    const int local_col_pair = local_col >> 1;
+    const bool use_y = (local_col & 1) != 0;
+    const int global_col = col_start + local_col;
+    bf16_2 cached_pairs[16];
+    float col_amax = 0.0f;
+
+    #pragma unroll
+    for (int pair = 0; pair < 16; pair++) {
+        const int row0 = pair * 2;
+        const bf16_2 v0 = col_pairs[local_col_pair][row0 + 0];
+        const bf16_2 v1 = col_pairs[local_col_pair][row0 + 1];
+        cached_pairs[pair] = use_y ? bf16_2{v0.y, v1.y} : bf16_2{v0.x, v1.x};
+        col_amax = fmaxf(col_amax, fabsf(__bfloat162float(cached_pairs[pair].x)));
+        col_amax = fmaxf(col_amax, fabsf(__bfloat162float(cached_pairs[pair].y)));
+    }
+
+    const uint8_t col_e8m0 = (col_amax <= 1e-9f) ? 0 : float_to_e8m0_dispatch<C::QUANT_MODE>(col_amax);
+    const float col_coeff = 6.0f * exp2f_rcp_e8m0(col_e8m0);
+    const int global_row_pair_base = warp_row_base / 2;
+    const int col_fp4_stride = g.M / 2;
+    uint64_t packed_col_lo = 0;
+    uint64_t packed_col_hi = 0;
+    #pragma unroll
+    for (int pair = 0; pair < 16; pair++) {
+        const uint64_t packed_pair = static_cast<uint64_t>(quantize_fp4_pair(
+            __bfloat162float(cached_pairs[pair].x),
+            __bfloat162float(cached_pairs[pair].y),
+            col_coeff));
+        if (pair < 8) packed_col_lo |= packed_pair << (pair * 8);
+        else          packed_col_hi |= packed_pair << ((pair - 8) * 8);
+    }
+    *reinterpret_cast<uint64_t*>(&g.col_fp4[global_col * col_fp4_stride + global_row_pair_base + 0]) = packed_col_lo;
+    *reinterpret_cast<uint64_t*>(&g.col_fp4[global_col * col_fp4_stride + global_row_pair_base + 8]) = packed_col_hi;
+
+    const int m_kgroup = warp_row_base / 128;
+    const int m_32_in_128 = (warp_row_base / 32) % 4;
+    const int depth = global_col / 128;
+    const int sr = global_col % 32;
+    const int rr = (global_col / 32) % 4;
+    const int chunk = depth * (g.M / 128) + m_kgroup;
+    const int byte_idx = sr * 16 + rr * 4 + m_32_in_128;
+    g.col_sc[chunk * 512 + byte_idx] = col_e8m0;
+}
+
+template <typename C, typename subtile_rt>
+__device__ __noinline__ void stage_swiglu_pairs(
+    subtile_rt& D1_fl,
+    subtile_rt& D3_fl,
+    bf16_2 (*pairs)[33],
+    int lane_id)
+{
+    constexpr float MXFP4_ALPHA = 1.0f / 36.0f;
+    const int lane_byte = lane_id % 4;
+    const int row_pair_idx = lane_id / 4;
+
+    #pragma unroll
+    for (int i = 0; i < subtile_rt::height; i++) {
+        #pragma unroll
+        for (int j = 0; j < subtile_rt::width; j++) {
+            const int pair_base = j * 8 + lane_byte;
+
+            const float h1_0_x = __bfloat162float(__float2bfloat16_rn(D1_fl.tiles[i][j].data[0].x * MXFP4_ALPHA));
+            const float h1_0_y = __bfloat162float(__float2bfloat16_rn(D1_fl.tiles[i][j].data[0].y * MXFP4_ALPHA));
+            const float h1_1_x = __bfloat162float(__float2bfloat16_rn(D1_fl.tiles[i][j].data[1].x * MXFP4_ALPHA));
+            const float h1_1_y = __bfloat162float(__float2bfloat16_rn(D1_fl.tiles[i][j].data[1].y * MXFP4_ALPHA));
+            const float h1_2_x = __bfloat162float(__float2bfloat16_rn(D1_fl.tiles[i][j].data[2].x * MXFP4_ALPHA));
+            const float h1_2_y = __bfloat162float(__float2bfloat16_rn(D1_fl.tiles[i][j].data[2].y * MXFP4_ALPHA));
+            const float h1_3_x = __bfloat162float(__float2bfloat16_rn(D1_fl.tiles[i][j].data[3].x * MXFP4_ALPHA));
+            const float h1_3_y = __bfloat162float(__float2bfloat16_rn(D1_fl.tiles[i][j].data[3].y * MXFP4_ALPHA));
+            const float h3_0_x = __bfloat162float(__float2bfloat16_rn(D3_fl.tiles[i][j].data[0].x * MXFP4_ALPHA));
+            const float h3_0_y = __bfloat162float(__float2bfloat16_rn(D3_fl.tiles[i][j].data[0].y * MXFP4_ALPHA));
+            const float h3_1_x = __bfloat162float(__float2bfloat16_rn(D3_fl.tiles[i][j].data[1].x * MXFP4_ALPHA));
+            const float h3_1_y = __bfloat162float(__float2bfloat16_rn(D3_fl.tiles[i][j].data[1].y * MXFP4_ALPHA));
+            const float h3_2_x = __bfloat162float(__float2bfloat16_rn(D3_fl.tiles[i][j].data[2].x * MXFP4_ALPHA));
+            const float h3_2_y = __bfloat162float(__float2bfloat16_rn(D3_fl.tiles[i][j].data[2].y * MXFP4_ALPHA));
+            const float h3_3_x = __bfloat162float(__float2bfloat16_rn(D3_fl.tiles[i][j].data[3].x * MXFP4_ALPHA));
+            const float h3_3_y = __bfloat162float(__float2bfloat16_rn(D3_fl.tiles[i][j].data[3].y * MXFP4_ALPHA));
+
+            pairs[pair_base][i * 16 + row_pair_idx] = bf16_2{
+                __float2bfloat16_rn((h1_0_x / (1.0f + __expf(-h1_0_x))) * h3_0_x),
+                __float2bfloat16_rn((h1_0_y / (1.0f + __expf(-h1_0_y))) * h3_0_y)};
+            pairs[pair_base][i * 16 + row_pair_idx + 8] = bf16_2{
+                __float2bfloat16_rn((h1_1_x / (1.0f + __expf(-h1_1_x))) * h3_1_x),
+                __float2bfloat16_rn((h1_1_y / (1.0f + __expf(-h1_1_y))) * h3_1_y)};
+            pairs[pair_base + 4][i * 16 + row_pair_idx] = bf16_2{
+                __float2bfloat16_rn((h1_2_x / (1.0f + __expf(-h1_2_x))) * h3_2_x),
+                __float2bfloat16_rn((h1_2_y / (1.0f + __expf(-h1_2_y))) * h3_2_y)};
+            pairs[pair_base + 4][i * 16 + row_pair_idx + 8] = bf16_2{
+                __float2bfloat16_rn((h1_3_x / (1.0f + __expf(-h1_3_x))) * h3_3_x),
+                __float2bfloat16_rn((h1_3_y / (1.0f + __expf(-h1_3_y))) * h3_3_y)};
+        }
+    }
+}
+
+template <typename C>
+__device__ inline void kernel(const globals<C>& g) {
+    using G = globals<C>;
+
+    if (threadIdx.x == 0) {
+        g.A.template prefetch_tma<typename G::A_fp4x2_tile>();
+        g.A_sc.template prefetch_tma<typename G::A_sc_tile>();
+        g.B1.template prefetch_tma<typename G::B_fp4x2_tile>();
+        g.B1_sc.template prefetch_tma<typename G::B_sc_tile>();
+        g.B3.template prefetch_tma<typename G::B_fp4x2_tile>();
+        g.B3_sc.template prefetch_tma<typename G::B_sc_tile>();
+    }
+
+    const int warpgroup_id = warpgroup::groupid();
+    const int cta_id = cluster_ctarank();
+    const int cluster_id = clusterIdx().x;
+    const int num_row_blocks = g.M / C::Mb;
+    const int num_col_blocks = g.H / C::Nb;
+    const int num_blocks = num_row_blocks * num_col_blocks;
+    const int num_iters_per_block = 2 * g.A.cols() / C::Kb;
+    const int num_blocks_per_supergroup = C::SUPERGROUP_SIZE * num_col_blocks;
+    uint32_t stage = 0;
+    uint32_t phasebits = 0xFFFF0000;
+
+    extern __shared__ int __shm[];
+    tma_swizzle_allocator sm_allocator((int*)&__shm[0]);
+    typename G::input_tiles_t  (&input_tiles) [C::LOAD_PIPE_DEPTH] = sm_allocator.allocate<G::input_tiles_t, C::LOAD_PIPE_DEPTH>();
+    typename G::input_scales_t (&input_scales)[C::LOAD_PIPE_DEPTH] = sm_allocator.allocate<G::input_scales_t, C::LOAD_PIPE_DEPTH>();
+
+    tensor_allocator<1, C::CLUSTER_SIZE, false> tm_allocator;
+
+    __shared__ uint32_t tmem_addr;
+    __shared__ semaphore tmem_provisioned;
+    __shared__ semaphore tiles_arrived[C::LOAD_PIPE_DEPTH];
+    __shared__ semaphore scales_arrived[C::LOAD_PIPE_DEPTH];
+    __shared__ semaphore inputs_finished[C::LOAD_PIPE_DEPTH];
+    __shared__ semaphore outputs_arrived;
+    __shared__ semaphore outputs_finished;
+    if (threadIdx.x == 32) {
+        init_semaphore(tmem_provisioned, 0, 1);
+        #pragma unroll
+        for (int i = 0; i < C::LOAD_PIPE_DEPTH; ++i) {
+            init_semaphore(tiles_arrived[i], 0, 1);
+            init_semaphore(scales_arrived[i], 0, 1);
+            init_semaphore(inputs_finished[i], 0, 1);
+        }
+        init_semaphore(outputs_arrived, 0, 1);
+        init_semaphore(outputs_finished, 0, C::CLUSTER_SIZE);
+    }
+    everyone::tma::cluster::arrive_aligned();
+
+    if (warpgroup_id >= C::CONSUMER_WARPGROUPS && warp::elect_leader()) {
+        int warp_id = group<WARPGROUP_WARPS*C::PRODUCER_WARPGROUPS>::warpid();
+        if (warp_id == 3) {
+            pdl::wait();
+            everyone::tma::cluster::wait();
+            for (int block_idx = cluster_id; block_idx < num_blocks; block_idx += gridDim.x / C::CLUSTER_SIZE) {
+                int supergroup_idx = block_idx / num_blocks_per_supergroup;
+                int idx_within_supergroup = block_idx % num_blocks_per_supergroup;
+                int rows_in_supergroup = min(C::SUPERGROUP_SIZE, num_row_blocks - supergroup_idx * C::SUPERGROUP_SIZE);
+                int row_within_supergroup = idx_within_supergroup % rows_in_supergroup;
+                int row_block_idx = supergroup_idx * C::SUPERGROUP_SIZE + row_within_supergroup;
+                int col_block_idx = idx_within_supergroup / rows_in_supergroup;
+                for (int i = 0; i < num_iters_per_block; ++i) {
+                    wait(inputs_finished[stage], get_phasebit<1>(phasebits, stage));
+                    tma::cluster::load_async(input_tiles[stage].A, g.A, {row_block_idx*2 + cta_id, i}, tiles_arrived[stage], (uint16_t)(1<<cta_id), 0);
+                    tma::cluster::load_async(input_tiles[stage].B1, g.B1, {col_block_idx*2 + cta_id, i}, tiles_arrived[stage], (uint16_t)(1<<cta_id), 0);
+                    tma::cluster::load_async(input_tiles[stage].B3, g.B3, {col_block_idx*2 + cta_id, i}, tiles_arrived[stage], (uint16_t)(1<<cta_id), 0);
+                    update_phasebit<1>(phasebits, stage);
+                    stage = (stage + 1) % C::LOAD_PIPE_DEPTH;
+                }
+            }
+        } else if (warp_id == 2) {
+            pdl::wait();
+            everyone::tma::cluster::wait();
+            for (int block_idx = cluster_id; block_idx < num_blocks; block_idx += gridDim.x / C::CLUSTER_SIZE) {
+                int supergroup_idx = block_idx / num_blocks_per_supergroup;
+                int idx_within_supergroup = block_idx % num_blocks_per_supergroup;
+                int rows_in_supergroup = min(C::SUPERGROUP_SIZE, num_row_blocks - supergroup_idx * C::SUPERGROUP_SIZE);
+                int row_within_supergroup = idx_within_supergroup % rows_in_supergroup;
+                int row_block_idx = supergroup_idx * C::SUPERGROUP_SIZE + row_within_supergroup;
+                int col_block_idx = idx_within_supergroup / rows_in_supergroup;
+                for (int i = 0; i < num_iters_per_block; ++i) {
+                    wait(inputs_finished[stage], get_phasebit<1>(phasebits, stage));
+                    #pragma unroll
+                    for (int k = 0; k < C::MMA_PER_TILE; k++) {
+                        tma::cluster::load_async(input_scales[stage].A[k], g.A_sc,
+                            {row_block_idx*2 + cta_id, i*C::MMA_PER_TILE + k, 0, 0},
+                            scales_arrived[stage], (uint16_t)(1<<cta_id), 0);
+                    }
+                    if constexpr (C::B_SC_SIZE == 2) {
+                        #pragma unroll
+                        for (int k = 0; k < C::MMA_PER_TILE; k++) {
+                            tma::cluster::load_async(
+                                input_scales[stage].B1[cta_id * C::MMA_PER_TILE + k], g.B1_sc,
+                                {col_block_idx*2 + cta_id, i*C::MMA_PER_TILE + k, 0, 0},
+                                scales_arrived[stage], (uint16_t)(0b11), 0);
+                            tma::cluster::load_async(
+                                input_scales[stage].B3[cta_id * C::MMA_PER_TILE + k], g.B3_sc,
+                                {col_block_idx*2 + cta_id, i*C::MMA_PER_TILE + k, 0, 0},
+                                scales_arrived[stage], (uint16_t)(0b11), 0);
+                        }
+                    } else if (cta_id == 0) {
+                        #pragma unroll
+                        for (int k = 0; k < C::MMA_PER_TILE; k++) {
+                            tma::cluster::load_async(
+                                input_scales[stage].B1[k], g.B1_sc,
+                                {col_block_idx, i*C::MMA_PER_TILE + k, 0, 0},
+                                scales_arrived[stage], (uint16_t)(0b11), 0);
+                            tma::cluster::load_async(
+                                input_scales[stage].B3[k], g.B3_sc,
+                                {col_block_idx, i*C::MMA_PER_TILE + k, 0, 0},
+                                scales_arrived[stage], (uint16_t)(0b11), 0);
+                        }
+                    }
+                    update_phasebit<1>(phasebits, stage);
+                    stage = (stage + 1) % C::LOAD_PIPE_DEPTH;
+                }
+            }
+        } else if (cta_id == 0 && warp_id == 0) {
+            everyone::tma::cluster::wait();
+            wait(tmem_provisioned, 0);
+            tm_allocator.set_addr(tmem_addr);
+            auto out1_tm = tm_allocator.template allocate<full_tt_fl<C::Nb>>(C::OUT1_TMEM_OFFSET);
+            auto out3_tm = tm_allocator.template allocate<full_tt_fl<C::Nb>>(C::OUT3_TMEM_OFFSET);
+            auto A_sc_tm = tm_allocator.template allocate<full_tt_fp8e8m0<16*C::MMA_PER_TILE*C::LOAD_PIPE_DEPTH>>(C::A_SC_TMEM_OFFSET);
+            auto B1_sc_tm = tm_allocator.template allocate<full_tt_fp8e8m0<32*C::MMA_PER_TILE*C::LOAD_PIPE_DEPTH>>(C::B1_SC_TMEM_OFFSET);
+            auto B3_sc_tm = tm_allocator.template allocate<full_tt_fp8e8m0<32*C::MMA_PER_TILE*C::LOAD_PIPE_DEPTH>>(C::B3_SC_TMEM_OFFSET);
+            uint32_t output_phasebits = 0xFFFF0000;
+            for (int block_idx = cluster_id; block_idx < num_blocks; block_idx += gridDim.x / C::CLUSTER_SIZE) {
+                int supergroup_idx = block_idx / num_blocks_per_supergroup;
+                int idx_within_supergroup = block_idx % num_blocks_per_supergroup;
+                int rows_in_supergroup = min(C::SUPERGROUP_SIZE, num_row_blocks - supergroup_idx * C::SUPERGROUP_SIZE);
+                int row_within_supergroup = idx_within_supergroup % rows_in_supergroup;
+                int row_block_idx = supergroup_idx * C::SUPERGROUP_SIZE + row_within_supergroup;
+                wait(outputs_finished, get_phasebit<1>(output_phasebits, 0));
+                tensor_after_thread_sync();
+                bool issued_mma = false;
+                for (int i = 0; i < num_iters_per_block; i++) {
+                    tma::expect_bytes(scales_arrived[stage], 2*sizeof(G::input_scales_t));
+                    wait(scales_arrived[stage], get_phasebit<0>(phasebits, stage));
+                    #pragma unroll
+                    for (int k = 0; k < C::MMA_PER_TILE; k++) {
+                        auto A_sc_tm_subtile = A_sc_tm.template subtile<full_tt_fp8e8m0<16>>(stage*C::MMA_PER_TILE*16 + k*16);
+                        load_mxnv_scale_async2(A_sc_tm_subtile, input_scales[stage].A[k]);
+                        auto B1_sc_tm_subtile_0 = B1_sc_tm.template subtile<full_tt_fp8e8m0<16>>(stage*C::MMA_PER_TILE*32 + k*C::B_SC_SIZE*16);
+                        load_mxnv_scale_async2(B1_sc_tm_subtile_0, input_scales[stage].B1[k]);
+                        auto B3_sc_tm_subtile_0 = B3_sc_tm.template subtile<full_tt_fp8e8m0<16>>(stage*C::MMA_PER_TILE*32 + k*C::B_SC_SIZE*16);
+                        load_mxnv_scale_async2(B3_sc_tm_subtile_0, input_scales[stage].B3[k]);
+                        if constexpr (C::B_SC_SIZE == 2) {
+                            auto B1_sc_tm_subtile_1 = B1_sc_tm.template subtile<full_tt_fp8e8m0<16>>(stage*C::MMA_PER_TILE*32 + k*C::B_SC_SIZE*16 + 16);
+                            load_mxnv_scale_async2(B1_sc_tm_subtile_1, input_scales[stage].B1[C::MMA_PER_TILE + k]);
+                            auto B3_sc_tm_subtile_1 = B3_sc_tm.template subtile<full_tt_fp8e8m0<16>>(stage*C::MMA_PER_TILE*32 + k*C::B_SC_SIZE*16 + 16);
+                            load_mxnv_scale_async2(B3_sc_tm_subtile_1, input_scales[stage].B3[C::MMA_PER_TILE + k]);
+                        }
+                    }
+                    tma::expect_bytes(tiles_arrived[stage], 2*sizeof(G::input_tiles_t));
+                    wait(tiles_arrived[stage], get_phasebit<0>(phasebits, stage));
+                    asm volatile("fence.proxy.async.shared::cta;\n" ::: "memory");
+                    asm volatile("fence.proxy.async.shared::cluster;\n" ::: "memory");
+                    if (!issued_mma) {
+                        mm2_ABt(out1_tm, input_tiles[stage].A, input_tiles[stage].B1,
+                            A_sc_tm.template subtile<full_tt_fp8e8m0<C::MMA_PER_TILE*16>>(stage * C::MMA_PER_TILE * 16),
+                            B1_sc_tm.template subtile<full_tt_fp8e8m0<C::MMA_PER_TILE*32>>(stage * C::MMA_PER_TILE * 32));
+                        mm2_ABt(out3_tm, input_tiles[stage].A, input_tiles[stage].B3,
+                            A_sc_tm.template subtile<full_tt_fp8e8m0<C::MMA_PER_TILE*16>>(stage * C::MMA_PER_TILE * 16),
+                            B3_sc_tm.template subtile<full_tt_fp8e8m0<C::MMA_PER_TILE*32>>(stage * C::MMA_PER_TILE * 32),
+                            inputs_finished[stage]);
+                        issued_mma = true;
+                    } else {
+                        mma2_ABt(out1_tm, input_tiles[stage].A, input_tiles[stage].B1,
+                            A_sc_tm.template subtile<full_tt_fp8e8m0<C::MMA_PER_TILE*16>>(stage * C::MMA_PER_TILE * 16),
+                            B1_sc_tm.template subtile<full_tt_fp8e8m0<C::MMA_PER_TILE*32>>(stage * C::MMA_PER_TILE * 32));
+                        mma2_ABt(out3_tm, input_tiles[stage].A, input_tiles[stage].B3,
+                            A_sc_tm.template subtile<full_tt_fp8e8m0<C::MMA_PER_TILE*16>>(stage * C::MMA_PER_TILE * 16),
+                            B3_sc_tm.template subtile<full_tt_fp8e8m0<C::MMA_PER_TILE*32>>(stage * C::MMA_PER_TILE * 32),
+                            inputs_finished[stage]);
+                    }
+                    update_phasebit<0>(phasebits, stage);
+                    stage = (stage + 1) % C::LOAD_PIPE_DEPTH;
+                }
+                tensor_commit<2>(outputs_arrived);
+                update_phasebit<1>(output_phasebits, 0);
+            }
+        }
+    } else if (warpgroup_id < C::CONSUMER_WARPGROUPS) {
+        everyone::tma::cluster::wait_aligned();
+        if (warpgroup::warpid() == 0) {
+            tm_allocator.provision(tmem_addr);
+            warp::arrive(tmem_provisioned);
+        }
+        wait(tmem_provisioned, 0);
+        tm_allocator.set_addr(tmem_addr);
+        auto out1_tm = tm_allocator.template allocate<full_tt_fl<C::Nb>>(C::OUT1_TMEM_OFFSET);
+        auto out3_tm = tm_allocator.template allocate<full_tt_fl<C::Nb>>(C::OUT3_TMEM_OFFSET);
+
+        constexpr int SUBTILE_COLS = C::Nb / C::EPI_PIPE_DEPTH;
+        using subtile_rt = rt_fl<C::Mb / 8, SUBTILE_COLS>;
+        static_assert(SUBTILE_COLS == 32, "MXFP4 square-ReLU producer assumes 32-column epilogue slices");
+        __shared__ bf16_2 col_stage_smem[WARPGROUP_WARPS][16][33];
+        uint32_t output_phasebits = 0xFFFF0000;
+
+        for (int block_idx = cluster_id; block_idx < num_blocks; block_idx += gridDim.x / C::CLUSTER_SIZE) {
+            int supergroup_idx = block_idx / num_blocks_per_supergroup;
+            int idx_within_supergroup = block_idx % num_blocks_per_supergroup;
+            int rows_in_supergroup = min(C::SUPERGROUP_SIZE, num_row_blocks - supergroup_idx * C::SUPERGROUP_SIZE);
+            int row_within_supergroup = idx_within_supergroup % rows_in_supergroup;
+            int row_block_idx = supergroup_idx * C::SUPERGROUP_SIZE + row_within_supergroup;
+            int col_block_idx = idx_within_supergroup / rows_in_supergroup;
+            const int warp_row_base = (row_block_idx * 2 + cta_id) * (C::Mb / 2) + warpgroup::warpid() * 32;
+
+            wait(outputs_arrived, get_phasebit<0>(output_phasebits, 0));
+
+            subtile_rt D1_regs_fl[C::EPI_PIPE_DEPTH];
+            subtile_rt D3_regs_fl[C::EPI_PIPE_DEPTH];
+            #pragma unroll
+            for (int epi = 0; epi < C::EPI_PIPE_DEPTH; epi++) {
+                warpgroup::load_async(
+                    D1_regs_fl[epi],
+                    out1_tm.template subtile<full_tt_fl<SUBTILE_COLS>>(0, SUBTILE_COLS * epi));
+                warpgroup::load_async(
+                    D3_regs_fl[epi],
+                    out3_tm.template subtile<full_tt_fl<SUBTILE_COLS>>(0, SUBTILE_COLS * epi));
+            }
+            tensor_load_wait();
+            tensor_before_thread_sync();
+            warpgroup::sync(1);
+            warpgroup::tma::cluster::arrive(outputs_finished, 0, 1);
+
+            const int row_fp4_stride = g.row_fp4.cols();
+            const int lane_id = warp::laneid();
+            bf16_2 (*pairs)[33] = col_stage_smem[warpgroup::warpid()];
+            #pragma unroll
+            for (int epi = 0; epi < C::EPI_PIPE_DEPTH; epi++) {
+                const int col_start = col_block_idx * C::Nb + epi * SUBTILE_COLS;
+                stage_swiglu_pairs<C>(D1_regs_fl[epi], D3_regs_fl[epi], pairs, lane_id);
+                __syncwarp();
+                quantize_rows_from_stage<C>(
+                    g, pairs, lane_id, warp_row_base, col_start, row_fp4_stride);
+                quantize_cols_from_stage<C>(
+                    g, pairs, lane_id, warp_row_base, col_start);
+            }
+            update_phasebit<0>(output_phasebits, 0);
+        }
+        warpgroup::sync(1);
+        warpgroup::pdl::arrive();
+        if (warpgroup::warpid() == 0) tm_allocator.deprovision();
+    }
+}
+
+} // namespace mxfp4_swiglu_quant_gemm
