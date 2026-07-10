@@ -3,6 +3,7 @@
 // Includes kernel headers and provides entrypoints + pybind11.
 // ================================================================
 #include "nvfp4_gemm.cuh"
+#include "localCTA_epilogue_v3/nvfp4_localcta_swiglu_quant_gemm.cuh"
 #include "nvfp4_quantize.cuh"
 #include "nvfp4_batched_accum_gemm.cuh"
 #include "nvfp4_accum_gemm.cuh"
@@ -171,6 +172,143 @@ int main() {
 #include "pyutils/torchutils.cuh"
 #include "ATen/Functions.h"
 
+__global__ void v5_rmsnorm_bwd_dx_kernel(
+    const __nv_bfloat16* __restrict__ d_normed,
+    const __nv_bfloat16* __restrict__ input,
+    const __nv_bfloat16* __restrict__ norm_weight,
+    const float* __restrict__ inv_rms,
+    __nv_bfloat16* __restrict__ grad_input,
+    int64_t M,
+    int64_t K
+) {
+    __shared__ float scratch[256];
+    const int64_t row = static_cast<int64_t>(blockIdx.x);
+    if (row >= M) {
+        return;
+    }
+    const int tid = threadIdx.x;
+    const int64_t base = row * K;
+    float partial = 0.0f;
+    for (int64_t col = tid; col < K; col += blockDim.x) {
+        const int64_t idx = base + col;
+        const float dy = __bfloat162float(d_normed[idx]);
+        const float x = __bfloat162float(input[idx]);
+        const float gamma = __bfloat162float(norm_weight[col]);
+        partial += dy * gamma * x;
+    }
+    scratch[tid] = partial;
+    __syncthreads();
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            scratch[tid] += scratch[tid + stride];
+        }
+        __syncthreads();
+    }
+    const float inv = inv_rms[row];
+    const float dot_mean = scratch[0] / static_cast<float>(K);
+    const float inv3_dot = inv * inv * inv * dot_mean;
+    for (int64_t col = tid; col < K; col += blockDim.x) {
+        const int64_t idx = base + col;
+        const float dy = __bfloat162float(d_normed[idx]);
+        const float x = __bfloat162float(input[idx]);
+        const float gamma = __bfloat162float(norm_weight[col]);
+        const float dx = inv * (dy * gamma) - x * inv3_dot;
+        grad_input[idx] = __float2bfloat16(dx);
+    }
+}
+
+__global__ void v5_rmsnorm_bwd_dgamma_kernel(
+    const __nv_bfloat16* __restrict__ d_normed,
+    const __nv_bfloat16* __restrict__ input,
+    const float* __restrict__ inv_rms,
+    float* __restrict__ dgamma,
+    int64_t M,
+    int64_t K
+) {
+    __shared__ float scratch[256];
+    const int64_t col = static_cast<int64_t>(blockIdx.x);
+    if (col >= K) {
+        return;
+    }
+    const int tid = threadIdx.x;
+    float partial = 0.0f;
+    for (int64_t row = tid; row < M; row += blockDim.x) {
+        const int64_t idx = row * K + col;
+        partial += (
+            __bfloat162float(d_normed[idx])
+            * __bfloat162float(input[idx])
+            * inv_rms[row]
+        );
+    }
+    scratch[tid] = partial;
+    __syncthreads();
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            scratch[tid] += scratch[tid + stride];
+        }
+        __syncthreads();
+    }
+    if (tid == 0) {
+        dgamma[col] = scratch[0];
+    }
+}
+
+void nvfp4_rmsnorm_bwd_entrypoint(
+    const at::Tensor& d_normed,
+    const at::Tensor& input,
+    const at::Tensor& norm_weight,
+    const at::Tensor& inv_rms,
+    at::Tensor& grad_input,
+    at::Tensor& dgamma
+) {
+    TORCH_CHECK(d_normed.is_cuda() && d_normed.is_contiguous()
+                    && d_normed.scalar_type() == at::kBFloat16,
+                "d_normed must be contiguous CUDA bf16");
+    TORCH_CHECK(input.is_cuda() && input.is_contiguous()
+                    && input.scalar_type() == at::kBFloat16,
+                "input must be contiguous CUDA bf16");
+    TORCH_CHECK(norm_weight.is_cuda() && norm_weight.is_contiguous()
+                    && norm_weight.scalar_type() == at::kBFloat16,
+                "norm_weight must be contiguous CUDA bf16");
+    TORCH_CHECK(inv_rms.is_cuda() && inv_rms.is_contiguous()
+                    && inv_rms.scalar_type() == at::kFloat,
+                "inv_rms must be contiguous CUDA fp32");
+    TORCH_CHECK(d_normed.dim() == 2, "d_normed must be rank-2");
+    const int64_t M = d_normed.size(0);
+    const int64_t K = d_normed.size(1);
+    TORCH_CHECK(input.sizes() == at::IntArrayRef({M, K}), "input shape mismatch");
+    TORCH_CHECK(norm_weight.dim() == 1 && norm_weight.numel() == K,
+                "norm_weight must have shape [K]");
+    TORCH_CHECK(inv_rms.numel() == M, "inv_rms must have M elements");
+    TORCH_CHECK(grad_input.is_cuda() && grad_input.is_contiguous()
+                    && grad_input.scalar_type() == at::kBFloat16
+                    && grad_input.sizes() == at::IntArrayRef({M, K}),
+                "grad_input must be contiguous CUDA bf16 [M,K]");
+    TORCH_CHECK(dgamma.is_cuda() && dgamma.is_contiguous()
+                    && dgamma.scalar_type() == at::kFloat
+                    && dgamma.dim() == 1 && dgamma.numel() == K,
+                "dgamma must be contiguous CUDA fp32 [K]");
+
+    auto stream = at::cuda::getCurrentCUDAStream();
+    constexpr int threads = 256;
+    v5_rmsnorm_bwd_dx_kernel<<<static_cast<int>(M), threads, 0, stream>>>(
+        reinterpret_cast<const __nv_bfloat16*>(d_normed.data_ptr()),
+        reinterpret_cast<const __nv_bfloat16*>(input.data_ptr()),
+        reinterpret_cast<const __nv_bfloat16*>(norm_weight.data_ptr()),
+        reinterpret_cast<const float*>(inv_rms.data_ptr()),
+        reinterpret_cast<__nv_bfloat16*>(grad_input.data_ptr()),
+        M,
+        K);
+    v5_rmsnorm_bwd_dgamma_kernel<<<static_cast<int>(K), threads, 0, stream>>>(
+        reinterpret_cast<const __nv_bfloat16*>(d_normed.data_ptr()),
+        reinterpret_cast<const __nv_bfloat16*>(input.data_ptr()),
+        reinterpret_cast<const float*>(inv_rms.data_ptr()),
+        reinterpret_cast<float*>(dgamma.data_ptr()),
+        M,
+        K);
+    CUDACHECK(cudaGetLastError());
+}
+
 void nvfp4_gemm_entrypoint(
     const at::Tensor &A,
     const at::Tensor &A_sc,
@@ -282,6 +420,136 @@ void nvfp4_gemm_nopdl_entrypoint(
         .silu_dim = 0
     };
     kittens::py::launch_kernel<C, G, nvfp4_gemm::kernel<C>>(g);
+}
+
+template <typename C>
+static void launch_v5_w1_sqrelu_quant_pass(
+    const at::Tensor &A,
+    const at::Tensor &A_sc,
+    const at::Tensor &A_sg,
+    const at::Tensor &B,
+    const at::Tensor &B_sc,
+    const at::Tensor &B_sg,
+    at::Tensor &row_fp4,
+    at::Tensor &row_sc,
+    at::Tensor &row_sg,
+    at::Tensor &col_fp4,
+    at::Tensor &col_sc,
+    at::Tensor &col_sg,
+    at::Tensor &global_amax
+) {
+    using G = nvfp4_localcta_swiglu_quant_gemm::globals<C>;
+    const int64_t M = A.size(0);
+    const int64_t H = B.size(0);
+    G g {
+        .A = kittens::py::tensor_to_gl<typename G::A_fp4x2_gl>(A),
+        .A_sc = kittens::py::tensor_to_gl<typename G::A_sc_gl, false>(
+            A_sc, 1, A_sc.size(0), A_sc.size(1), 256),
+        .B1 = kittens::py::tensor_to_gl<typename G::B_fp4x2_gl>(B),
+        .B1_sc = kittens::py::tensor_to_gl<typename G::B_sc_gl, false>(
+            B_sc, 1, B_sc.size(0), B_sc.size(1), 256),
+        .B3 = kittens::py::tensor_to_gl<typename G::B_fp4x2_gl>(B),
+        .B3_sc = kittens::py::tensor_to_gl<typename G::B_sc_gl, false>(
+            B_sc, 1, B_sc.size(0), B_sc.size(1), 256),
+        .A_sg = A_sg.data_ptr<float>(),
+        .A_sg_stride = 1,
+        .A_sg_chunk_grid = nullptr,
+        .A_sg_chunk_stride = 1,
+        .B1_sg = B_sg.data_ptr<float>(),
+        .B1_sg_stride = 1,
+        .B1_sg_chunk_grid = nullptr,
+        .B1_sg_chunk_stride = 1,
+        .B3_sg = B_sg.data_ptr<float>(),
+        .B3_sg_stride = 1,
+        .B3_sg_chunk_grid = nullptr,
+        .B3_sg_chunk_stride = 1,
+        .row_fp4 = reinterpret_cast<uint8_t*>(row_fp4.data_ptr()),
+        .row_sc = reinterpret_cast<uint8_t*>(row_sc.data_ptr()),
+        .row_sg = row_sg.data_ptr<float>(),
+        .col_fp4 = reinterpret_cast<uint8_t*>(col_fp4.data_ptr()),
+        .col_sc = reinterpret_cast<uint8_t*>(col_sc.data_ptr()),
+        .col_sg = col_sg.data_ptr<float>(),
+        .global_amax = global_amax.data_ptr<float>(),
+        .M = static_cast<int>(M),
+        .H = static_cast<int>(H),
+    };
+    kittens::py::launch_kernel<C, G, nvfp4_localcta_swiglu_quant_gemm::kernel<C>>(g);
+}
+
+void nvfp4_w1_sqrelu_quant_gemm_entrypoint(
+    const at::Tensor &A,
+    const at::Tensor &A_sc,
+    const at::Tensor &A_sg,
+    const at::Tensor &B,
+    const at::Tensor &B_sc,
+    const at::Tensor &B_sg,
+    at::Tensor &row_fp4,
+    at::Tensor &row_sc,
+    at::Tensor &row_sg,
+    at::Tensor &col_fp4,
+    at::Tensor &col_sc,
+    at::Tensor &col_sg,
+    bool encode_centric = true
+) {
+    TORCH_CHECK(encode_centric, "v5 W1 square-ReLU producer supports encode-centric mode only");
+    TORCH_CHECK(A.is_cuda() && A.is_contiguous() && A.scalar_type() == at::kFloat4_e2m1fn_x2,
+                "A must be contiguous CUDA fp4x2");
+    TORCH_CHECK(B.is_cuda() && B.is_contiguous() && B.scalar_type() == at::kFloat4_e2m1fn_x2,
+                "B must be contiguous CUDA fp4x2");
+    TORCH_CHECK(A_sc.is_cuda() && A_sc.is_contiguous() && A_sc.scalar_type() == at::kFloat8_e4m3fn,
+                "A_sc must be contiguous CUDA fp8");
+    TORCH_CHECK(B_sc.is_cuda() && B_sc.is_contiguous() && B_sc.scalar_type() == at::kFloat8_e4m3fn,
+                "B_sc must be contiguous CUDA fp8");
+    TORCH_CHECK(A_sg.is_cuda() && A_sg.is_contiguous() && A_sg.scalar_type() == at::kFloat &&
+                A_sg.numel() == 1, "A_sg must be contiguous CUDA float32 [1]");
+    TORCH_CHECK(B_sg.is_cuda() && B_sg.is_contiguous() && B_sg.scalar_type() == at::kFloat &&
+                B_sg.numel() == 1, "B_sg must be contiguous CUDA float32 [1]");
+    TORCH_CHECK(A.size(1) == B.size(1), "A and B must share packed K");
+    const int64_t M = A.size(0);
+    const int64_t H = B.size(0);
+    const int64_t K = A.size(1) * 2;
+    TORCH_CHECK(M % 256 == 0 && H % 128 == 0 && K % 128 == 0,
+                "v5 W1 square-ReLU producer requires M divisible by 256 and H,K by 128");
+    TORCH_CHECK(A_sc.numel() == M * K / 16,
+                "A_sc must have M*K/16 fp8 elements");
+    TORCH_CHECK(B_sc.numel() == H * K / 16,
+                "B_sc must have H*K/16 fp8 elements");
+    TORCH_CHECK(row_fp4.is_cuda() && row_fp4.is_contiguous() &&
+                row_fp4.scalar_type() == at::kFloat4_e2m1fn_x2 &&
+                row_fp4.sizes() == at::IntArrayRef({M, H / 2}),
+                "row_fp4 must be contiguous CUDA fp4 [M,H/2]");
+    TORCH_CHECK(row_sc.is_cuda() && row_sc.is_contiguous() &&
+                row_sc.scalar_type() == at::kFloat8_e4m3fn &&
+                row_sc.numel() == M * H / 16,
+                "row_sc must be contiguous CUDA fp8 with M*H/16 elements");
+    TORCH_CHECK(row_sg.is_cuda() && row_sg.is_contiguous() &&
+                row_sg.scalar_type() == at::kFloat && row_sg.numel() == 1,
+                "row_sg must be contiguous CUDA float32 [1]");
+    TORCH_CHECK(col_fp4.is_cuda() && col_fp4.is_contiguous() &&
+                col_fp4.scalar_type() == at::kFloat4_e2m1fn_x2 &&
+                col_fp4.sizes() == at::IntArrayRef({H, M / 2}),
+                "col_fp4 must be contiguous CUDA fp4 [H,M/2]");
+    TORCH_CHECK(col_sc.is_cuda() && col_sc.is_contiguous() &&
+                col_sc.scalar_type() == at::kFloat8_e4m3fn &&
+                col_sc.numel() == H * M / 16,
+                "col_sc must be contiguous CUDA fp8 with H*M/16 elements");
+    TORCH_CHECK(col_sg.is_cuda() && col_sg.is_contiguous() &&
+                col_sg.scalar_type() == at::kFloat && col_sg.numel() == 1,
+                "col_sg must be contiguous CUDA float32 [1]");
+    kittens::py::device_check(A, A_sc, A_sg, B, B_sc, B_sg,
+                              row_fp4, row_sc, row_sg, col_fp4, col_sc, col_sg);
+
+    auto global_amax = at::empty({1}, A_sg.options());
+    auto stream = at::cuda::getCurrentCUDAStream();
+    CUDACHECK(cudaMemsetAsync(global_amax.data_ptr<float>(), 0, sizeof(float), stream));
+    using AmaxC = nvfp4_localcta_swiglu_quant_gemm::config<2, 4, false, 128, 128, true, true, true, true>;
+    using QuantC = nvfp4_localcta_swiglu_quant_gemm::config<2, 4, false, 128, 128, true, true, true, false>;
+    launch_v5_w1_sqrelu_quant_pass<AmaxC>(
+        A, A_sc, A_sg, B, B_sc, B_sg,
+        row_fp4, row_sc, row_sg, col_fp4, col_sc, col_sg, global_amax);
+    launch_v5_w1_sqrelu_quant_pass<QuantC>(
+        A, A_sc, A_sg, B, B_sc, B_sg,
+        row_fp4, row_sc, row_sg, col_fp4, col_sc, col_sg, global_amax);
 }
 
 // Grouped GEMM: concatenated weights with per-tile B_sc_global
@@ -1674,6 +1942,18 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           pybind11::arg("A"), pybind11::arg("A_sc"), pybind11::arg("A_sc_global"),
           pybind11::arg("B"), pybind11::arg("B_sc"), pybind11::arg("B_sc_global"),
           pybind11::arg("D"), pybind11::arg("config_id"));
+    m.def("nvfp4_w1_sqrelu_quant_gemm", &nvfp4_w1_sqrelu_quant_gemm_entrypoint,
+          "v5 true W1 GEMM -> square-ReLU -> FP4 W2 payload producer",
+          pybind11::arg("A"), pybind11::arg("A_sc"), pybind11::arg("A_sg"),
+          pybind11::arg("B"), pybind11::arg("B_sc"), pybind11::arg("B_sg"),
+          pybind11::arg("row_fp4"), pybind11::arg("row_sc"), pybind11::arg("row_sg"),
+          pybind11::arg("col_fp4"), pybind11::arg("col_sc"), pybind11::arg("col_sg"),
+          pybind11::arg("encode_centric") = true);
+    m.def("rmsnorm_bwd_out", &nvfp4_rmsnorm_bwd_entrypoint,
+          "native BF16 RMSNorm backward for plain v5 paths",
+          pybind11::arg("d_normed"), pybind11::arg("input"),
+          pybind11::arg("norm_weight"), pybind11::arg("inv_rms"),
+          pybind11::arg("grad_input"), pybind11::arg("dgamma"));
     m.def("nvfp4_grouped_gemm", &nvfp4_grouped_gemm_entrypoint,
           pybind11::arg("A"), pybind11::arg("A_sc"), pybind11::arg("A_sc_global"),
           pybind11::arg("B"), pybind11::arg("B_sc"), pybind11::arg("B_sg_per_tile"),

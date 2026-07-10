@@ -6,12 +6,27 @@ using namespace kittens;
 
 namespace nvfp4_localcta_swiglu_quant_gemm {
 
-template <int _LOAD_PIPE_DEPTH, int _SUPERGROUP_SIZE, bool _USE_PDL = true, int _Nb = 128, int _Kb = 128>
+static constexpr float LOCALCTA_PREPARED_MIN_NONZERO_SCALE = 0.001953125f;
+
+template <
+    int _LOAD_PIPE_DEPTH,
+    int _SUPERGROUP_SIZE,
+    bool _USE_PDL = true,
+    int _Nb = 128,
+    int _Kb = 128,
+    bool _USE_SQRELU = false,
+    bool _ENCODE_CENTRIC = true,
+    bool _V5_SCALAR_SG = false,
+    bool _AMAX_ONLY = false>
 struct config {
     static_assert(_Nb == 128 || _Nb == 256, "W13 SwiGLU producer supports 128- or 256-column tiles");
     static_assert(_Kb == 128 || _Kb == 256, "W13 SwiGLU producer supports 128- or 256-wide reduction tiles");
     static constexpr int CLUSTER_SIZE = 2;
     static constexpr bool USE_PDL = _USE_PDL;
+    static constexpr bool USE_SQRELU = _USE_SQRELU;
+    static constexpr bool ENCODE_CENTRIC = _ENCODE_CENTRIC;
+    static constexpr bool V5_SCALAR_SG = _V5_SCALAR_SG;
+    static constexpr bool AMAX_ONLY = _AMAX_ONLY;
 
     static constexpr int CONSUMER_WARPGROUPS = 1;
     static constexpr int PRODUCER_WARPGROUPS = 1;
@@ -100,6 +115,7 @@ struct globals {
     uint8_t* col_fp4;
     uint8_t* col_sc;
     float* col_sg;
+    float* global_amax;
     int M;
     int H;
 
@@ -204,8 +220,21 @@ __device__ inline void apply_w13_chunk_scales_to_stage(
 }
 
 static constexpr float LOCALCTA_GLOBAL_SCALE_NUM = 1493.0f;
+static constexpr float V5_GLOBAL_SCALE_NUM = 2688.0f;
 static constexpr float LOCALCTA_MIN_NONZERO_SCALE = 0.001953125f;
 static constexpr float FP8_E4M3_MAX = 448.0f;
+
+__device__ __forceinline__ void atomic_max_float_bits(float* addr, float val) {
+    if (val <= 0.0f) {
+        return;
+    }
+    unsigned int* p = reinterpret_cast<unsigned int*>(addr);
+    unsigned int old = *p;
+    const unsigned int want = __float_as_uint(val);
+    while (want > old) {
+        old = atomicCAS(p, old, want);
+    }
+}
 
 __device__ __forceinline__ uint8_t float_to_fp4(float val) {
     float aval = fabsf(val);
@@ -242,6 +271,17 @@ __device__ __forceinline__ float localcta_encode_scale(float amax) {
         return 1.0f;
     }
     return fminf(LOCALCTA_GLOBAL_SCALE_NUM / amax, 3.4028235e+38f);
+}
+
+__device__ __forceinline__ float v5_encode_scale(float amax) {
+    if (amax == 0.0f) {
+        return 1.0f;
+    }
+    const float scale = V5_GLOBAL_SCALE_NUM / amax;
+    if (scale == 0.0f) {
+        return 1.0f;
+    }
+    return fminf(scale, 3.4028235e+38f);
 }
 
 __device__ __forceinline__ uint32_t mul_cvt_bf16_to_fp4_8x_rn(
@@ -447,7 +487,22 @@ __device__ __noinline__ void quantize_rows_from_stage(
 
         float coeff;
         uint8_t stored_scale;
-        localcta_block_quant_params(block_amax, chunk_s_enc, chunk_sg, coeff, stored_scale);
+        localcta_block_quant_params<C>(block_amax, chunk_s_enc, chunk_sg, coeff, stored_scale);
+        if constexpr (C::USE_SQRELU && !C::V5_SCALAR_SG) {
+            __nv_fp8_e4m3 raw_scale;
+            *reinterpret_cast<uint8_t*>(&raw_scale) = stored_scale;
+            __nv_fp8_e4m3 prepared_scale =
+                static_cast<__nv_fp8_e4m3>(static_cast<float>(raw_scale) * chunk_sg);
+            if (
+                static_cast<float>(raw_scale) > 0.0f
+                && chunk_sg > 0.0f
+                && static_cast<float>(prepared_scale) == 0.0f
+            ) {
+                prepared_scale = static_cast<__nv_fp8_e4m3>(
+                    LOCALCTA_PREPARED_MIN_NONZERO_SCALE);
+            }
+            stored_scale = *reinterpret_cast<const uint8_t*>(&prepared_scale);
+        }
 
         const uint32_t packed_lo = mul_cvt_bf16_to_fp4_8x_rn(
             *reinterpret_cast<const uint64_t*>(&cached[0]),
@@ -867,17 +922,33 @@ __device__ inline void kernel(const globals<C>& g) {
                     for (int w = 0; w < WARPGROUP_WARPS; ++w) {
                         amax = fmaxf(amax, warp_amax[half][w]);
                     }
-                    chunk_s_enc[half] = localcta_encode_scale(amax);
-                    chunk_sg[half] = amax / LOCALCTA_GLOBAL_SCALE_NUM;
+                    if constexpr (C::AMAX_ONLY) {
+                        atomic_max_float_bits(g.global_amax, amax);
+                    } else if constexpr (C::V5_SCALAR_SG) {
+                        const float global_amax = fmaxf(*g.global_amax, 0.0f);
+                        chunk_s_enc[half] = v5_encode_scale(global_amax);
+                        chunk_sg[half] = global_amax / V5_GLOBAL_SCALE_NUM;
+                        if (row_block_idx == 0 && col_block_idx == 0 && cta_id == 0 && half == 0) {
+                            g.row_sg[0] = chunk_sg[half];
+                            g.col_sg[0] = chunk_sg[half];
+                        }
+                    } else {
+                        chunk_s_enc[half] = localcta_encode_scale(amax);
+                        chunk_sg[half] = amax / LOCALCTA_GLOBAL_SCALE_NUM;
 
-                    const int row_chunk = row_block_idx * 2 + cta_id;
-                    const int col_chunk = col_block_idx * C::NUM_HALVES + half;
-                    const int row_sg_cols = g.H / 128;
-                    const int col_sg_cols = g.M / 128;
-                    g.row_sg[row_chunk * row_sg_cols + col_chunk] = chunk_sg[half];
-                    g.col_sg[col_chunk * col_sg_cols + row_chunk] = chunk_sg[half];
+                        const int row_chunk = row_block_idx * 2 + cta_id;
+                        const int col_chunk = col_block_idx * C::NUM_HALVES + half;
+                        const int row_sg_cols = g.H / 128;
+                        const int col_sg_cols = g.M / 128;
+                        g.row_sg[row_chunk * row_sg_cols + col_chunk] = chunk_sg[half];
+                        g.col_sg[col_chunk * col_sg_cols + row_chunk] = chunk_sg[half];
+                    }
                 }
                 warpgroup::sync(1);
+            }
+
+            if constexpr (C::AMAX_ONLY) {
+                continue;
             }
 
             #pragma unroll
