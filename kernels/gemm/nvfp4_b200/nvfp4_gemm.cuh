@@ -23,7 +23,8 @@ template <
     int _CLUSTER_SIZE = 2,
     int _Kb = 256,
     bool _ROPE_LIVE64 = false,
-    bool _FUSE_RESIDUAL = false
+    bool _FUSE_RESIDUAL = false,
+    bool _FUSE_C1_RMS = false
 >
 struct config {
     static_assert(_Nb == 128 || _Nb == 256, "Nb must be 128 or 256");
@@ -58,6 +59,7 @@ struct config {
     static constexpr int NUM_D_TILES = _NUM_D_TILES;
     static constexpr bool ROPE_LIVE64 = _ROPE_LIVE64;
     static constexpr bool FUSE_RESIDUAL = _FUSE_RESIDUAL;
+    static constexpr bool FUSE_C1_RMS = _FUSE_C1_RMS;
 
     // Output cache policy for TMA stores
     static constexpr auto D_CACHE_POLICY = cache_policy::EVICT_FIRST;
@@ -140,6 +142,9 @@ struct globals {
     nvfp4_rope_epilogue::rope_desc rope;
     nvfp4_rope_epilogue::rope_live64_desc rope_live64;
     CUtensorMap R_tma;   // optional residual descriptor, M x N
+    float* row_rms_partial;  // optional [M, output_epilogue_tiles] partial sumsq
+    int row_rms_partial_stride;
+    const bf16* gamma;       // optional [N] gamma applied to stored output
 
     struct input_tiles_t {
         A_fp4x2_tile A;
@@ -340,6 +345,71 @@ __device__ inline void maybe_add_residual_tile(
         warpgroup::load(R_reg, smem_tile);
         warpgroup::sync(1);
         warp::add(D_reg, D_reg, R_reg);
+    }
+}
+
+template <typename C, typename RT>
+__device__ inline void apply_c1_rms_gamma_if_enabled(
+    const globals<C> &g,
+    RT &D_reg,
+    int row_tile,
+    int col_tile
+) {
+    if constexpr (!C::FUSE_C1_RMS) {
+        return;
+    } else {
+        if (g.row_rms_partial == nullptr && g.gamma == nullptr) {
+            return;
+        }
+
+        rt_fl<RT::rows, RT::cols> D_fl;
+        warp::copy(D_fl, D_reg);
+
+        if (g.row_rms_partial != nullptr) {
+            rt_fl<RT::rows, RT::cols> D_sq;
+            warp::mul(D_sq, D_fl, D_fl);
+            typename decltype(D_sq)::col_vec row_sums;
+            warp::row_sum(row_sums, D_sq);
+
+            const int lane = warp::laneid();
+            const int warp_row_base = row_tile * (C::Mb / 2) + warpgroup::warpid() * RT::rows;
+            if ((lane & 3) == 0) {
+                #pragma unroll
+                for (int i = 0; i < decltype(row_sums)::outer_dim; ++i) {
+                    const int row_x = warp_row_base + i * 16 + lane / 4;
+                    const int row_y = row_x + 8;
+                    g.row_rms_partial[row_x * g.row_rms_partial_stride + col_tile] = row_sums[i][0].x;
+                    g.row_rms_partial[row_y * g.row_rms_partial_stride + col_tile] = row_sums[i][0].y;
+                }
+            }
+        }
+
+        if (g.gamma != nullptr) {
+            const int lane_col_pair = warp::laneid() & 3;
+            const int col_base = col_tile * RT::cols;
+            #pragma unroll
+            for (int i = 0; i < RT::height; ++i) {
+                #pragma unroll
+                for (int j = 0; j < RT::width; ++j) {
+                    const int col_l = col_base + j * 16 + lane_col_pair * 2;
+                    const int col_r = col_l + 8;
+                    const float gl0 = __bfloat162float(g.gamma[col_l]);
+                    const float gl1 = __bfloat162float(g.gamma[col_l + 1]);
+                    const float gr0 = __bfloat162float(g.gamma[col_r]);
+                    const float gr1 = __bfloat162float(g.gamma[col_r + 1]);
+
+                    D_fl.tiles[i][j].data[0].x *= gl0;
+                    D_fl.tiles[i][j].data[0].y *= gl1;
+                    D_fl.tiles[i][j].data[1].x *= gl0;
+                    D_fl.tiles[i][j].data[1].y *= gl1;
+                    D_fl.tiles[i][j].data[2].x *= gr0;
+                    D_fl.tiles[i][j].data[2].y *= gr1;
+                    D_fl.tiles[i][j].data[3].x *= gr0;
+                    D_fl.tiles[i][j].data[3].y *= gr1;
+                }
+            }
+            warp::copy(D_reg, D_fl);
+        }
     }
 }
 
@@ -641,6 +711,10 @@ __device__ inline void kernel_impl(const globals<C> &g) {
                             residual_load_arrived, residual_load_phase,
                             row_block_idx * 2 + cta_id,
                             C::EPI_PIPE_DEPTH * col_block_idx + i);
+                        apply_c1_rms_gamma_if_enabled<C>(
+                            g, D_reg_bf,
+                            row_block_idx * 2 + cta_id,
+                            C::EPI_PIPE_DEPTH * col_block_idx + i);
                         warpgroup::store(output_tiles.D[i%C::NUM_D_TILES], D_reg_bf);
                     } else {
                         warpgroup::store(output_tiles.D[i%C::NUM_D_TILES], D_reg);
@@ -691,6 +765,10 @@ __device__ inline void kernel_impl(const globals<C> &g) {
                     maybe_add_residual_tile<C>(
                         g, output_tiles.D[i%C::NUM_D_TILES], D_reg[i],
                         residual_load_arrived, residual_load_phase,
+                        row_block_idx * 2 + cta_id,
+                        C::EPI_PIPE_DEPTH * col_block_idx + i);
+                    apply_c1_rms_gamma_if_enabled<C>(
+                        g, D_reg[i],
                         row_block_idx * 2 + cta_id,
                         C::EPI_PIPE_DEPTH * col_block_idx + i);
                     warpgroup::store(output_tiles.D[i%C::NUM_D_TILES], D_reg[i]);

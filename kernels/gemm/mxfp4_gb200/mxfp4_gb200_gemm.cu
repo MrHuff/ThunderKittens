@@ -790,6 +790,55 @@ static void launch_mxfp4_gemm_dense_residual(
 }
 
 template <typename C>
+static void launch_mxfp4_gemm_dense_residual_rms(
+    const at::Tensor &A,
+    const at::Tensor &A_sc,
+    const at::Tensor &B,
+    const at::Tensor &B_sc,
+    const at::Tensor &R,
+    at::Tensor &D,
+    at::Tensor &row_rms_partial,
+    std::optional<at::Tensor> gamma_opt
+) {
+    using G = mxfp4_gemm::globals<C>;
+    constexpr int epi_cols = C::Nb / C::EPI_PIPE_DEPTH;
+    TORCH_CHECK(row_rms_partial.is_cuda() && row_rms_partial.is_contiguous() &&
+                    row_rms_partial.scalar_type() == at::kFloat,
+                "row_rms_partial must be contiguous CUDA fp32");
+    TORCH_CHECK(row_rms_partial.dim() == 2 &&
+                    row_rms_partial.size(0) == D.size(0) &&
+                    row_rms_partial.size(1) == D.size(1) / epi_cols,
+                "row_rms_partial must have shape [D.rows, D.cols / epi_cols]");
+    if (gamma_opt.has_value()) {
+        const auto& gamma = gamma_opt.value();
+        TORCH_CHECK(gamma.is_cuda() && gamma.is_contiguous() &&
+                        gamma.scalar_type() == at::kBFloat16 &&
+                        gamma.dim() == 1 && gamma.numel() == D.size(1),
+                    "gamma must be contiguous CUDA bf16 [D.cols]");
+    }
+    G g {
+        .A = kittens::py::tensor_to_gl<typename G::A_fp4x2_gl>(A),
+        .A_sc = kittens::py::tensor_to_gl<typename G::A_sc_gl>(A_sc),
+        .B = kittens::py::tensor_to_gl<typename G::B_fp4x2_gl>(B),
+        .B_sc = kittens::py::tensor_to_gl<typename G::B_sc_gl>(B_sc),
+        .D = kittens::py::tensor_to_gl<typename G::D_gl>(D),
+        .output_scale = nullptr,
+        .row_rms_partial = row_rms_partial.data_ptr<float>(),
+        .row_rms_partial_stride = static_cast<int>(row_rms_partial.size(1)),
+        .gamma = gamma_opt.has_value()
+            ? reinterpret_cast<const bf16*>(gamma_opt.value().data_ptr())
+            : nullptr,
+        .tilemask_ptr = nullptr,
+        .tilemask_rows = 0,
+        .tilemask_cols = 0,
+        .tilemask_transposed = false
+    };
+    auto r_gl = kittens::py::tensor_to_gl<typename G::D_gl>(R);
+    memcpy(&g.R_tma, &r_gl.tma_descs.tma_desc, sizeof(CUtensorMap));
+    kittens::py::launch_kernel<C, G, mxfp4_gemm::kernel<C>>(g);
+}
+
+template <typename C>
 static void launch_mxfp4_gemm_masked(
     const at::Tensor &A,
     const at::Tensor &A_sc,
@@ -853,6 +902,25 @@ void mxfp4_gemm_residual_entrypoint(
     kittens::py::device_check(A, A_sc, B, B_sc, R, D);
     launch_mxfp4_gemm_dense_residual<mxfp4_gemm::config<256, 5, 8, 4, 2, false, 256, false, true>>(
         A, A_sc, B, B_sc, R, D);
+}
+
+void mxfp4_gemm_residual_rms_entrypoint(
+    const at::Tensor &A,
+    const at::Tensor &A_sc,
+    const at::Tensor &B,
+    const at::Tensor &B_sc,
+    const at::Tensor &R,
+    at::Tensor &D,
+    at::Tensor &row_rms_partial,
+    std::optional<at::Tensor> gamma_opt = std::nullopt
+) {
+    check_output_matrix(R, "R", D.size(0), D.size(1));
+    kittens::py::device_check(A, A_sc, B, B_sc, R, D, row_rms_partial);
+    if (gamma_opt.has_value()) {
+        kittens::py::device_check(gamma_opt.value());
+    }
+    launch_mxfp4_gemm_dense_residual_rms<mxfp4_gemm::config<256, 5, 8, 4, 2, false, 256, false, true, false, true>>(
+        A, A_sc, B, B_sc, R, D, row_rms_partial, gamma_opt);
 }
 
 void mxfp4_gemm_residual_config_entrypoint(
@@ -2401,6 +2469,12 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           pybind11::arg("A"), pybind11::arg("A_sc"),
           pybind11::arg("B"), pybind11::arg("B_sc"),
           pybind11::arg("R"), pybind11::arg("D"));
+    m.def("mxfp4_gemm_residual_rms", &mxfp4_gemm_residual_rms_entrypoint,
+          "Dense GEMM with fused residual add, partial row RMS stats, and optional gamma output",
+          pybind11::arg("A"), pybind11::arg("A_sc"),
+          pybind11::arg("B"), pybind11::arg("B_sc"),
+          pybind11::arg("R"), pybind11::arg("D"),
+          pybind11::arg("row_rms_partial"), pybind11::arg("gamma") = std::nullopt);
     m.def("mxfp4_gemm_residual_config", &mxfp4_gemm_residual_config_entrypoint,
           "Dense GEMM with fused bf16 residual add and explicit kernel config",
           pybind11::arg("A"), pybind11::arg("A_sc"),

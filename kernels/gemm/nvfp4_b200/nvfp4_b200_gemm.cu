@@ -309,6 +309,16 @@ void nvfp4_rmsnorm_bwd_entrypoint(
     CUDACHECK(cudaGetLastError());
 }
 
+template <typename C>
+static void run_gemm_residual_rms_with_config(
+    const at::Tensor &A, const at::Tensor &A_sc, const at::Tensor &A_sc_global,
+    const at::Tensor &B, const at::Tensor &B_sc, const at::Tensor &B_sc_global,
+    const at::Tensor &R,
+    at::Tensor &D,
+    at::Tensor &row_rms_partial,
+    std::optional<at::Tensor> gamma_opt = std::nullopt
+);
+
 void nvfp4_gemm_entrypoint(
     const at::Tensor &A,
     const at::Tensor &A_sc,
@@ -382,6 +392,39 @@ void nvfp4_gemm_entrypoint(
             .b_sg_per_tile = nullptr
         };
         kittens::py::launch_kernel<C, G, nvfp4_gemm::kernel<C>>(g);
+    }
+}
+
+void nvfp4_gemm_residual_rms_entrypoint(
+    const at::Tensor &A,
+    const at::Tensor &A_sc,
+    const at::Tensor &A_sc_global,
+    const at::Tensor &B,
+    const at::Tensor &B_sc,
+    const at::Tensor &B_sc_global,
+    const at::Tensor &R,
+    at::Tensor &D,
+    at::Tensor &row_rms_partial,
+    std::optional<at::Tensor> gamma_opt
+) {
+    kittens::py::device_check(A, A_sc, A_sc_global, B, B_sc, B_sc_global, R, D, row_rms_partial);
+    if (gamma_opt.has_value()) {
+        kittens::py::device_check(gamma_opt.value());
+    }
+    int K = B.size(1) * 2;
+    int N_out = D.size(1);
+    if (K <= 2048 && N_out <= 4096) {
+        using C = nvfp4_gemm::config<256, 5, 8, 4, 2, false, 256, true, 2, 256, false, true, true>;
+        run_gemm_residual_rms_with_config<C>(
+            A, A_sc, A_sc_global, B, B_sc, B_sc_global, R, D, row_rms_partial, gamma_opt);
+    } else if (K <= 2048) {
+        using C = nvfp4_gemm::config<256, 5, 8, 4, 2, false, 256, true, 2, 256, false, true, true>;
+        run_gemm_residual_rms_with_config<C>(
+            A, A_sc, A_sc_global, B, B_sc, B_sc_global, R, D, row_rms_partial, gamma_opt);
+    } else {
+        using C = nvfp4_gemm::config<256, 4, 8, 12, 2, false, 256, true, 2, 256, false, true, true>;
+        run_gemm_residual_rms_with_config<C>(
+            A, A_sc, A_sc_global, B, B_sc, B_sc_global, R, D, row_rms_partial, gamma_opt);
     }
 }
 
@@ -1033,6 +1076,66 @@ static void run_gemm_with_config(
         .D_V = kittens::py::tensor_to_gl<typename G::D_gl>(D),
         .q_dim = 0, .k_dim = 0, .use_split_D = false, .b_sg_per_tile = nullptr, .silu_dim = 0
     };
+    kittens::py::launch_kernel<C, G, nvfp4_gemm::kernel<C>>(g);
+}
+
+template <typename C>
+static void run_gemm_residual_rms_with_config(
+    const at::Tensor &A, const at::Tensor &A_sc, const at::Tensor &A_sc_global,
+    const at::Tensor &B, const at::Tensor &B_sc, const at::Tensor &B_sc_global,
+    const at::Tensor &R,
+    at::Tensor &D,
+    at::Tensor &row_rms_partial,
+    std::optional<at::Tensor> gamma_opt
+) {
+    TORCH_CHECK(R.is_cuda() && R.is_contiguous() && R.scalar_type() == at::kBFloat16,
+                "R must be contiguous CUDA bf16");
+    TORCH_CHECK(R.sizes() == D.sizes(), "R shape must match D");
+    constexpr int epi_cols = C::Nb / C::EPI_PIPE_DEPTH;
+    TORCH_CHECK(D.size(1) % epi_cols == 0, "D columns must be divisible by C1 epilogue columns");
+    TORCH_CHECK(row_rms_partial.is_cuda() && row_rms_partial.is_contiguous() &&
+                    row_rms_partial.scalar_type() == at::kFloat,
+                "row_rms_partial must be contiguous CUDA fp32");
+    TORCH_CHECK(row_rms_partial.dim() == 2 &&
+                    row_rms_partial.size(0) == D.size(0) &&
+                    row_rms_partial.size(1) == D.size(1) / epi_cols,
+                "row_rms_partial must have shape [D.rows, D.cols / epi_cols]");
+    if (gamma_opt.has_value()) {
+        const at::Tensor &gamma = gamma_opt.value();
+        TORCH_CHECK(gamma.is_cuda() && gamma.is_contiguous() &&
+                        gamma.scalar_type() == at::kBFloat16 &&
+                        gamma.dim() == 1 && gamma.numel() == D.size(1),
+                    "gamma must be contiguous CUDA bf16 [D.cols]");
+    }
+
+    using G = nvfp4_gemm::globals<C>;
+    G g {
+        .A = kittens::py::tensor_to_gl<typename G::A_fp4x2_gl>(A),
+        .A_sc = kittens::py::tensor_to_gl<typename G::A_sc_gl, false>(A_sc, 1, A_sc.dim() == 2 ? A_sc.size(0)/128 : A_sc.size(0), A_sc.dim() == 2 ? A_sc.size(1)/4 : A_sc.size(1), 256),
+        .A_sc_global = kittens::py::tensor_to_gl<typename G::A_sc_global_gl>(A_sc_global),
+        .B = kittens::py::tensor_to_gl<typename G::B_fp4x2_gl>(B),
+        .B_sc = kittens::py::tensor_to_gl<typename G::B_sc_gl, false>(B_sc, 1, B_sc.dim() == 2 ? B_sc.size(0)/128 : B_sc.size(0), B_sc.dim() == 2 ? B_sc.size(1)/4 : B_sc.size(1), 256),
+        .B_sc_global = kittens::py::tensor_to_gl<typename G::B_sc_global_gl>(B_sc_global),
+        .D = kittens::py::tensor_to_gl<typename G::D_gl>(D),
+        .D_K = kittens::py::tensor_to_gl<typename G::D_gl>(D),
+        .D_V = kittens::py::tensor_to_gl<typename G::D_gl>(D),
+        .q_dim = 0,
+        .k_dim = 0,
+        .v_dim = 0,
+        .use_split_D = false,
+        .a_sg_per_tile = nullptr,
+        .a_sg_stride = 1,
+        .b_sg_per_tile = nullptr,
+        .b_sg_stride = 1,
+        .silu_dim = 0,
+        .row_rms_partial = row_rms_partial.data_ptr<float>(),
+        .row_rms_partial_stride = static_cast<int>(row_rms_partial.size(1)),
+        .gamma = gamma_opt.has_value()
+            ? reinterpret_cast<const bf16*>(gamma_opt.value().data_ptr())
+            : nullptr
+    };
+    auto r_gl = kittens::py::tensor_to_gl<typename G::D_gl>(R);
+    memcpy(&g.R_tma, &r_gl.tma_descs.tma_desc, sizeof(CUtensorMap));
     kittens::py::launch_kernel<C, G, nvfp4_gemm::kernel<C>>(g);
 }
 
@@ -2076,6 +2179,12 @@ void nvfp4_persistent_gemm_entrypoint(
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("nvfp4_gemm", &nvfp4_gemm_entrypoint);
+    m.def("nvfp4_gemm_residual_rms", &nvfp4_gemm_residual_rms_entrypoint,
+          "NVFP4 residual GEMM with fused partial row RMS stats and optional gamma output",
+          pybind11::arg("A"), pybind11::arg("A_sc"), pybind11::arg("A_sc_global"),
+          pybind11::arg("B"), pybind11::arg("B_sc"), pybind11::arg("B_sc_global"),
+          pybind11::arg("R"), pybind11::arg("D"),
+          pybind11::arg("row_rms_partial"), pybind11::arg("gamma") = std::nullopt);
     m.def("nvfp4_gemm_nopdl", &nvfp4_gemm_nopdl_entrypoint,
           "Non-PDL GEMM for CUDA graph capture (CLUSTER_SIZE=1, USE_PDL=false)");
     m.def("nvfp4_gemm_config", &nvfp4_gemm_config_entrypoint,
