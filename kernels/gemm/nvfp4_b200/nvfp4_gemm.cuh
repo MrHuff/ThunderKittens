@@ -6,6 +6,10 @@
 
 #include "kittens.cuh"
 #include "nvfp4_rope_epilogue.cuh"
+#include "localCTA_epilogue_v3/nvfp4_localcta_silu_dgrad_quant_gemm.cuh"
+
+#include <type_traits>
+
 
 using namespace kittens;
 
@@ -25,7 +29,9 @@ template <
     bool _ROPE_LIVE64 = false,
     bool _FUSE_RESIDUAL = false,
     bool _FUSE_C1_RMS = false,
-    bool _FUSE_C3_ROW_SCALE = false
+    bool _FUSE_C3_ROW_SCALE = false,
+    bool _FUSE_G1_SILU_DGRAD_QUANT = false,
+    int _G1_MODE = 0
 >
 struct config {
     static_assert(_Nb == 128 || _Nb == 256, "Nb must be 128 or 256");
@@ -62,6 +68,9 @@ struct config {
     static constexpr bool FUSE_RESIDUAL = _FUSE_RESIDUAL;
     static constexpr bool FUSE_C1_RMS = _FUSE_C1_RMS;
     static constexpr bool FUSE_C3_ROW_SCALE = _FUSE_C3_ROW_SCALE;
+    static constexpr bool FUSE_G1_SILU_DGRAD_QUANT = _FUSE_G1_SILU_DGRAD_QUANT;
+    static constexpr int G1_MODE = _G1_MODE;
+    static_assert(G1_MODE >= 0 && G1_MODE <= 4, "unsupported G1 epilogue mode");
 
     // Output cache policy for TMA stores
     static constexpr auto D_CACHE_POLICY = cache_policy::EVICT_FIRST;
@@ -148,6 +157,26 @@ struct globals {
     int row_rms_partial_stride;
     const bf16* gamma;       // optional [N] gamma applied to stored output
     const float* row_scale_coeff; // optional C3 [M] row multiplier for stored GEMM output
+    const bf16* h3;               // optional G1 [M,N] saved W3 activation
+    const bf16* h1_raw;           // optional G1 [M,N] saved W1 preactivation
+    uint8_t* row_fp4;             // optional G1 [M,2*N/2]
+    uint8_t* row_sc;              // optional G1 prepared row scales
+    float* row_sg;                // optional G1 row chunk scales
+    uint8_t* col_fp4;             // optional G1 [2*N,M/2]
+    uint8_t* col_sc;              // optional G1 prepared col scales
+    float* col_sg;                // optional G1 col chunk scales
+    uint8_t* row_fp4_split1;      // optional v5 G1 second contiguous row payload
+    uint8_t* row_sc_split1;       // optional v5 G1 second contiguous row scales
+    uint8_t* col_fp4_split1;      // optional v5 G1 second contiguous col payload
+    uint8_t* col_sc_split1;       // optional v5 G1 second contiguous col scales
+    const float* g1_row_outer_sg0; // optional localCTA final-direct row SG, split 0
+    const float* g1_row_outer_sg1; // optional localCTA final-direct row SG, split 1
+    const float* g1_col_outer_sg0; // optional localCTA final-direct col SG, split 0
+    const float* g1_col_outer_sg1; // optional localCTA final-direct col SG, split 1
+    float* g1_global_amax;        // optional G1 v5 [2] amax workspace
+    int g1_mode;                  // 0=localCTA, 1=v5 amax, 2=v5 quant
+    int M;                        // G1 row count
+    int H;                        // G1 output width N
 
     struct input_tiles_t {
         A_fp4x2_tile A;
@@ -169,7 +198,7 @@ struct globals {
     __host__ inline int dynamic_shared_memory() const {
         constexpr int _dynamic_shared_memory = sizeof(input_tiles_t)  * C::LOAD_PIPE_DEPTH + 1024 +
                                                sizeof(input_scales_t) * C::LOAD_PIPE_DEPTH + 1024 +
-                                               sizeof(outputs_t);
+                                               (C::FUSE_G1_SILU_DGRAD_QUANT ? 1 : sizeof(outputs_t));
         static_assert(_dynamic_shared_memory <= MAX_SHARED_MEMORY - 1024);
         return _dynamic_shared_memory;
     }
@@ -481,7 +510,12 @@ __device__ inline void kernel_impl(const globals<C> &g) {
     tma_swizzle_allocator sm_allocator((int*)&__shm[0]);
     typename G::input_tiles_t  (&input_tiles) [C::LOAD_PIPE_DEPTH] = sm_allocator.allocate<G::input_tiles_t, C::LOAD_PIPE_DEPTH>();
     typename G::input_scales_t (&input_scales)[C::LOAD_PIPE_DEPTH] = sm_allocator.allocate<G::input_scales_t, C::LOAD_PIPE_DEPTH>();
-    typename G::outputs_t       &output_tiles                      = sm_allocator.allocate<G::outputs_t>();
+    struct empty_outputs_t { uint8_t unused; };
+    using output_storage_t = std::conditional_t<
+        C::FUSE_G1_SILU_DGRAD_QUANT, empty_outputs_t, typename G::outputs_t>;
+    output_storage_t &output_storage = sm_allocator.allocate<output_storage_t>();
+    typename G::outputs_t &output_tiles =
+        reinterpret_cast<typename G::outputs_t&>(output_storage);
 
     // Allocate tensor memory
     tensor_allocator<1, C::CLUSTER_SIZE, false> tm_allocator;
@@ -702,16 +736,224 @@ __device__ inline void kernel_impl(const globals<C> &g) {
             const float a_sg = (use_outer_tile_scales && g.a_sg_per_tile != nullptr)
                 ? g.a_sg_per_tile[row_block_idx * g.a_sg_stride]
                 : default_a_sg;
+            constexpr int B_BLOCKS_PER_OUTER_G1_SG = 256 / C::Nb;
+            const int b_sg_idx = C::FUSE_G1_SILU_DGRAD_QUANT
+                ? col_block_idx / B_BLOCKS_PER_OUTER_G1_SG
+                : col_block_idx;
             const float b_sg = (use_outer_tile_scales && g.b_sg_per_tile != nullptr)
-                ? g.b_sg_per_tile[col_block_idx * g.b_sg_stride]
+                ? g.b_sg_per_tile[b_sg_idx * g.b_sg_stride]
                 : default_b_sg;
             const float gs = a_sg * b_sg;
 
             // Wait for the last matmul to complete
             wait(outputs_arrived, get_phasebit<0>(phasebits, 0));
 
-            // Load the output from tensor memory into registers and store to HBM
-            if constexpr (C::OVERLAP_EPI) {
+            // Load the output from tensor memory into registers and store to HBM.
+            if constexpr (C::FUSE_G1_SILU_DGRAD_QUANT) {
+                static_assert(C::Mb == 256 && (C::Nb == 128 || C::Nb == 256) &&
+                                  C::EPI_PIPE_DEPTH == C::Nb / 32,
+                              "G1 epilogue requires 128- or 256-column tiles in 32-column slices");
+                constexpr int SUBTILE_COLS = C::Nb / C::EPI_PIPE_DEPTH;
+                constexpr int NUM_HALVES = C::Nb / 128;
+                constexpr int EPI_PER_HALF = 4;
+                using subtile_rt = rt_fl<C::Mb / 8, SUBTILE_COLS>;
+                constexpr int WARPGROUP_WARPS = 4;
+                __shared__ bf16_2 staged0[WARPGROUP_WARPS][4][16][33];
+                __shared__ bf16_2 staged1[WARPGROUP_WARPS][4][16][33];
+                __shared__ float warp_amax0[NUM_HALVES][WARPGROUP_WARPS];
+                __shared__ float warp_amax1[NUM_HALVES][WARPGROUP_WARPS];
+                __shared__ float chunk_s_enc0[NUM_HALVES];
+                __shared__ float chunk_s_enc1[NUM_HALVES];
+                __shared__ float chunk_sg0[NUM_HALVES];
+                __shared__ float chunk_sg1[NUM_HALVES];
+                const int wg_warp = warpgroup::warpid();
+                const int lane_id = warp::laneid();
+                const int warp_row_base =
+                    (row_block_idx * 2 + cta_id) * (C::Mb / 2) + wg_warp * 32;
+
+                #pragma unroll
+                for (int half = 0; half < NUM_HALVES; ++half) {
+                    subtile_rt D_acc[EPI_PER_HALF];
+                    #pragma unroll
+                    for (int e = 0; e < EPI_PER_HALF; ++e) {
+                        const int epi = half * EPI_PER_HALF + e;
+                        warpgroup::load_async(
+                            D_acc[e],
+                            out_tm.template subtile<full_tt_fl<SUBTILE_COLS>>(
+                                0, SUBTILE_COLS * epi));
+                    }
+                    tensor_load_wait();
+                    #pragma unroll
+                    for (int e = 0; e < EPI_PER_HALF; ++e) {
+                        warp::mul(D_acc[e], D_acc[e], gs);
+                    }
+                    float local_amax0 = 0.0f;
+                    float local_amax1 = 0.0f;
+                    bf16_2 (*pairs0)[16][33] = staged0[wg_warp];
+                    bf16_2 (*pairs1)[16][33] = staged1[wg_warp];
+                    #pragma unroll
+                    for (int e = 0; e < EPI_PER_HALF; ++e) {
+                        const int epi = half * EPI_PER_HALF + e;
+                        const int col_start = col_block_idx * C::Nb + epi * SUBTILE_COLS;
+                        if constexpr (C::G1_MODE == 0) {
+                            nvfp4_localcta_silu_dgrad_quant_gemm::stage_silu_deriv_pairs<C>(
+                                g, D_acc[e], pairs0, pairs1, e, lane_id, warp_row_base,
+                                col_start, local_amax0, local_amax1);
+                        } else if constexpr (C::G1_MODE == 1) {
+                            nvfp4_localcta_silu_dgrad_quant_gemm::stage_silu_deriv_pairs<
+                                C, true, false, true>(
+                                g, D_acc[e], pairs0, pairs1, e, lane_id, warp_row_base,
+                                col_start, local_amax0, local_amax1);
+                        } else if constexpr (C::G1_MODE == 2) {
+                            nvfp4_localcta_silu_dgrad_quant_gemm::stage_silu_deriv_pairs<
+                                C, true, true, false>(
+                                g, D_acc[e], pairs0, pairs1, e, lane_id, warp_row_base,
+                                col_start, local_amax0, local_amax1);
+                        } else if constexpr (C::G1_MODE == 3) {
+                            nvfp4_localcta_silu_dgrad_quant_gemm::stage_silu_deriv_pairs<
+                                C, false, false, true>(
+                                g, D_acc[e], pairs0, pairs1, e, lane_id, warp_row_base,
+                                col_start, local_amax0, local_amax1);
+                        } else {
+                            nvfp4_localcta_silu_dgrad_quant_gemm::stage_silu_deriv_pairs<
+                                C, false, true, false>(
+                                g, D_acc[e], pairs0, pairs1, e, lane_id, warp_row_base,
+                                col_start, local_amax0, local_amax1);
+                        }
+                    }
+                    if constexpr (C::G1_MODE != 2 && C::G1_MODE != 4) {
+                        local_amax0 = nvfp4_localcta_silu_dgrad_quant_gemm::warp_reduce_max(local_amax0);
+                        local_amax1 = nvfp4_localcta_silu_dgrad_quant_gemm::warp_reduce_max(local_amax1);
+                        if (lane_id == 0) {
+                            warp_amax0[half][wg_warp] = local_amax0;
+                            warp_amax1[half][wg_warp] = local_amax1;
+                        }
+                    }
+                    tensor_before_thread_sync();
+                    warpgroup::sync(1);
+                    if (half == NUM_HALVES - 1) {
+                        warpgroup::tma::cluster::arrive(outputs_finished, 0, 1);
+                    }
+                    if (wg_warp == 0 && lane_id == 0) {
+                        if constexpr (C::G1_MODE == 1) {
+                            float amax0 = 0.0f;
+                            float amax1 = 0.0f;
+                            #pragma unroll
+                            for (int w = 0; w < WARPGROUP_WARPS; ++w) {
+                                amax0 = fmaxf(amax0, warp_amax0[half][w]);
+                                amax1 = fmaxf(amax1, warp_amax1[half][w]);
+                            }
+                            nvfp4_localcta_silu_dgrad_quant_gemm::atomic_max_float(
+                                g.g1_global_amax + 0, amax0);
+                            nvfp4_localcta_silu_dgrad_quant_gemm::atomic_max_float(
+                                g.g1_global_amax + 1, amax1);
+                        } else if constexpr (C::G1_MODE == 2) {
+                            const float global_amax0 = g.g1_global_amax[0];
+                            const float global_amax1 = g.g1_global_amax[1];
+                            chunk_s_enc0[half] =
+                                nvfp4_localcta_silu_dgrad_quant_gemm::v5_encode_scale(global_amax0);
+                            chunk_s_enc1[half] =
+                                nvfp4_localcta_silu_dgrad_quant_gemm::v5_encode_scale(global_amax1);
+                            chunk_sg0[half] = global_amax0 /
+                                nvfp4_localcta_silu_dgrad_quant_gemm::V5_GLOBAL_SCALE_NUM;
+                            chunk_sg1[half] = global_amax1 /
+                                nvfp4_localcta_silu_dgrad_quant_gemm::V5_GLOBAL_SCALE_NUM;
+                            g.row_sg[0] = chunk_sg0[half];
+                            g.row_sg[1] = chunk_sg1[half];
+                            g.col_sg[0] = chunk_sg0[half];
+                            g.col_sg[1] = chunk_sg1[half];
+                        } else if constexpr (C::G1_MODE == 0 || C::G1_MODE == 3) {
+                            float amax0 = 0.0f;
+                            float amax1 = 0.0f;
+                            #pragma unroll
+                            for (int w = 0; w < WARPGROUP_WARPS; ++w) {
+                                amax0 = fmaxf(amax0, warp_amax0[half][w]);
+                                amax1 = fmaxf(amax1, warp_amax1[half][w]);
+                            }
+                            chunk_s_enc0[half] =
+                                nvfp4_localcta_silu_dgrad_quant_gemm::localcta_encode_scale(amax0);
+                            chunk_s_enc1[half] =
+                                nvfp4_localcta_silu_dgrad_quant_gemm::localcta_encode_scale(amax1);
+                            chunk_sg0[half] = amax0 /
+                                nvfp4_localcta_silu_dgrad_quant_gemm::LOCALCTA_GLOBAL_SCALE_NUM;
+                            chunk_sg1[half] = amax1 /
+                                nvfp4_localcta_silu_dgrad_quant_gemm::LOCALCTA_GLOBAL_SCALE_NUM;
+
+                            const int row_chunk = row_block_idx * 2 + cta_id;
+                            const int col_chunk = col_block_idx * NUM_HALVES + half;
+                            const int row_sg_cols = (2 * g.H) / 128;
+                            const int split_chunk_offset = g.H / 128;
+                            const int col_sg_cols = g.D.rows() / 128;
+                            g.row_sg[row_chunk * row_sg_cols + col_chunk] = chunk_sg0[half];
+                            g.row_sg[row_chunk * row_sg_cols + split_chunk_offset + col_chunk] =
+                                chunk_sg1[half];
+                            g.col_sg[col_chunk * col_sg_cols + row_chunk] = chunk_sg0[half];
+                            g.col_sg[(split_chunk_offset + col_chunk) * col_sg_cols + row_chunk] =
+                                chunk_sg1[half];
+                        }
+                    }
+                    warpgroup::sync(1);
+                    if constexpr (C::G1_MODE != 1 && C::G1_MODE != 3) {
+                        #pragma unroll
+                        for (int e = 0; e < EPI_PER_HALF; ++e) {
+                            const int epi = half * EPI_PER_HALF + e;
+                            const int col_start = col_block_idx * C::Nb + epi * SUBTILE_COLS;
+                            if constexpr (C::G1_MODE == 2) {
+                                nvfp4_localcta_silu_dgrad_quant_gemm::quantize_rows_from_stage<C, G, true>(
+                                    g, pairs0, e, lane_id, warp_row_base, col_start,
+                                    chunk_s_enc0[half], chunk_sg0[half]);
+                                nvfp4_localcta_silu_dgrad_quant_gemm::quantize_cols_from_stage<C, G, true>(
+                                    g, pairs0, e, lane_id, warp_row_base, col_start,
+                                    chunk_s_enc0[half], chunk_sg0[half]);
+                                nvfp4_localcta_silu_dgrad_quant_gemm::quantize_rows_from_stage<C, G, true>(
+                                    g, pairs1, e, lane_id, warp_row_base, g.H + col_start,
+                                    chunk_s_enc1[half], chunk_sg1[half]);
+                                nvfp4_localcta_silu_dgrad_quant_gemm::quantize_cols_from_stage<C, G, true>(
+                                    g, pairs1, e, lane_id, warp_row_base, g.H + col_start,
+                                    chunk_s_enc1[half], chunk_sg1[half]);
+                            } else if constexpr (C::G1_MODE == 0) {
+                                nvfp4_localcta_silu_dgrad_quant_gemm::quantize_rows_from_stage<C>(
+                                    g, pairs0, e, lane_id, warp_row_base, col_start,
+                                    chunk_s_enc0[half], chunk_sg0[half]);
+                                nvfp4_localcta_silu_dgrad_quant_gemm::quantize_cols_from_stage<C>(
+                                    g, pairs0, e, lane_id, warp_row_base, col_start,
+                                    chunk_s_enc0[half], chunk_sg0[half]);
+                                nvfp4_localcta_silu_dgrad_quant_gemm::quantize_rows_from_stage<C>(
+                                    g, pairs1, e, lane_id, warp_row_base, g.H + col_start,
+                                    chunk_s_enc1[half], chunk_sg1[half]);
+                                nvfp4_localcta_silu_dgrad_quant_gemm::quantize_cols_from_stage<C>(
+                                    g, pairs1, e, lane_id, warp_row_base, g.H + col_start,
+                                    chunk_s_enc1[half], chunk_sg1[half]);
+                            } else {
+                                const int row_outer = warp_row_base / 256;
+                                const int col_outer = col_start / 256;
+                                const float row_sg0 = g.g1_row_outer_sg0[row_outer];
+                                const float row_sg1 = g.g1_row_outer_sg1[row_outer];
+                                const float col_sg0 = g.g1_col_outer_sg0[col_outer];
+                                const float col_sg1 = g.g1_col_outer_sg1[col_outer];
+                                const float row_s_enc0 = row_sg0 > 0.0f ? 1.0f / row_sg0 : 1.0f;
+                                const float row_s_enc1 = row_sg1 > 0.0f ? 1.0f / row_sg1 : 1.0f;
+                                const float col_s_enc0 = col_sg0 > 0.0f ? 1.0f / col_sg0 : 1.0f;
+                                const float col_s_enc1 = col_sg1 > 0.0f ? 1.0f / col_sg1 : 1.0f;
+                                nvfp4_localcta_silu_dgrad_quant_gemm::quantize_rows_from_stage<C>(
+                                    g, pairs0, e, lane_id, warp_row_base, col_start,
+                                    row_s_enc0, row_sg0);
+                                nvfp4_localcta_silu_dgrad_quant_gemm::quantize_cols_from_stage<C>(
+                                    g, pairs0, e, lane_id, warp_row_base, col_start,
+                                    col_s_enc0, col_sg0);
+                                nvfp4_localcta_silu_dgrad_quant_gemm::quantize_rows_from_stage<C>(
+                                    g, pairs1, e, lane_id, warp_row_base, g.H + col_start,
+                                    row_s_enc1, row_sg1);
+                                nvfp4_localcta_silu_dgrad_quant_gemm::quantize_cols_from_stage<C>(
+                                    g, pairs1, e, lane_id, warp_row_base, g.H + col_start,
+                                    col_s_enc1, col_sg1);
+                            }
+                        }
+                    }
+                    warpgroup::sync(1);
+                    tensor_after_thread_sync();
+                }
+            } else if constexpr (C::OVERLAP_EPI) {
                 #pragma unroll
                 for (int i = 0; i < C::EPI_PIPE_DEPTH; i++) {
                     rt_fl<C::Mb / 8, C::Nb/C::EPI_PIPE_DEPTH> D_reg;

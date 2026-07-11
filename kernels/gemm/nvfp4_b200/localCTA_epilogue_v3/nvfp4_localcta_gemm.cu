@@ -46,6 +46,12 @@ using localcta_fast_largek_residual_rms_config = nvfp4_gemm::config<256, 5, 8, 1
 using localcta_fast_smallk_row_scale_config = nvfp4_gemm::config<256, 5, 8, 4, 2, false, 256, true, 2, 256, false, false, false, true>;
 using localcta_fast_largek_row_scale_config = nvfp4_gemm::config<256, 5, 8, 12, 2, false, 256, true, 2, 256, false, false, false, true>;
 using localcta_fast_grouped_config = nvfp4_gemm::config<256, 5, 8, 4, 2, false>;
+using localcta_fast_g1_amax_config = nvfp4_gemm::config<
+    128, 2, 4, 12, 2, true, 256, true, 2, 256,
+    false, false, false, false, true, 3>;
+using localcta_fast_g1_quant_config = nvfp4_gemm::config<
+    128, 2, 4, 12, 2, true, 256, true, 2, 256,
+    false, false, false, false, true, 4>;
 using localcta_fast_largek_rope_config = nvfp4_gemm::config<256, 5, 8, 12, 2, false, 256, true, 2, 256, true>;
 using localcta_fast_grouped_rope_config = nvfp4_gemm::config<256, 5, 8, 4, 2, false, 256, true, 2, 256, true>;
 using localcta_fast_chunkgrid_smallk_config = nvfp4_gemm::config<256, 5, 8, 4, 2, false, 256, true, 2, 128>;
@@ -1295,6 +1301,132 @@ void launch_fast_gemm_with_config(
         .silu_dim = 0
     };
     kittens::py::launch_kernel<C, G, nvfp4_gemm::kernel<C>>(g);
+}
+
+__global__ void g1_reduce_outer_sg_kernel(
+    const float* row_sg_chunk,
+    const float* col_sg_chunk,
+    float* row_outer0,
+    float* row_outer1,
+    float* col_outer0,
+    float* col_outer1,
+    int M,
+    int H)
+{
+    const int row_outer_count = M / 256;
+    const int col_outer_count = H / 256;
+    const int total = 2 * row_outer_count + 2 * col_outer_count;
+    for (int idx = blockIdx.x * blockDim.x + threadIdx.x; idx < total;
+         idx += blockDim.x * gridDim.x) {
+        if (idx < 2 * row_outer_count) {
+            const int split = idx / row_outer_count;
+            const int outer = idx - split * row_outer_count;
+            const int row_stride = 2 * (H / 128);
+            const int split_col = split * (H / 128);
+            float value = 0.0f;
+            #pragma unroll
+            for (int r = 0; r < 2; ++r) {
+                const float* row = row_sg_chunk + (outer * 2 + r) * row_stride + split_col;
+                for (int c = 0; c < H / 128; ++c) {
+                    value = fmaxf(value, row[c]);
+                }
+            }
+            (split == 0 ? row_outer0 : row_outer1)[outer] = value;
+        } else {
+            const int col_idx = idx - 2 * row_outer_count;
+            const int split = col_idx / col_outer_count;
+            const int outer = col_idx - split * col_outer_count;
+            const int col_stride = M / 128;
+            const int split_row = split * (H / 128) + outer * 2;
+            float value = 0.0f;
+            #pragma unroll
+            for (int c = 0; c < 2; ++c) {
+                const float* col = col_sg_chunk + (split_row + c) * col_stride;
+                for (int r = 0; r < M / 128; ++r) {
+                    value = fmaxf(value, col[r]);
+                }
+            }
+            (split == 0 ? col_outer0 : col_outer1)[outer] = value;
+        }
+    }
+}
+
+template <typename AmaxC, typename QuantC>
+void launch_fast_g1_silu_dgrad_quant_with_config(
+    const at::Tensor& A,
+    const at::Tensor& A_sc_prepared,
+    const at::Tensor& A_sg_tiles,
+    const at::Tensor& B,
+    const at::Tensor& B_sc_prepared,
+    const at::Tensor& B_sg_tiles,
+    const at::Tensor& h3,
+    const at::Tensor& h1_raw,
+    at::Tensor& row_fp4,
+    at::Tensor& row_sc,
+    at::Tensor& row_sg,
+    at::Tensor& col_fp4,
+    at::Tensor& col_sc,
+    at::Tensor& col_sg,
+    at::Tensor& row_outer0,
+    at::Tensor& row_outer1,
+    at::Tensor& col_outer0,
+    at::Tensor& col_outer1
+) {
+    auto one = get_unit_scale_tensor(A);
+    auto a_sg_desc = check_outer_scale_tiles(
+        A_sg_tiles, "A_sg_tiles", A.size(0) / AmaxC::Mb, true);
+    auto b_sg_desc = check_outer_scale_tiles(
+        B_sg_tiles, "B_sg_tiles", B.size(0) / 256, false);
+    auto launch = [&]<typename C>() {
+        using G = nvfp4_gemm::globals<C>;
+        G g {
+            .A = kittens::py::tensor_to_gl<typename G::A_fp4x2_gl>(A),
+            .A_sc = kittens::py::tensor_to_gl<typename G::A_sc_gl, false>(
+                A_sc_prepared, 1, A_sc_prepared.size(0), A_sc_prepared.size(1), 256),
+            .A_sc_global = kittens::py::tensor_to_gl<typename G::A_sc_global_gl>(one),
+            .B = kittens::py::tensor_to_gl<typename G::B_fp4x2_gl>(B),
+            .B_sc = kittens::py::tensor_to_gl<typename G::B_sc_gl, false>(
+                B_sc_prepared, 1, B_sc_prepared.size(0), B_sc_prepared.size(1), 256),
+            .B_sc_global = kittens::py::tensor_to_gl<typename G::B_sc_global_gl>(one),
+            .D = kittens::py::tensor_to_gl<typename G::D_gl>(h3),
+            .D_K = kittens::py::tensor_to_gl<typename G::D_gl>(h1_raw),
+            .D_V = kittens::py::tensor_to_gl<typename G::D_gl>(h3),
+            .q_dim = 0,
+            .k_dim = 0,
+            .v_dim = 0,
+            .use_split_D = false,
+            .a_sg_per_tile = a_sg_desc.ptr,
+            .a_sg_stride = a_sg_desc.stride,
+            .b_sg_per_tile = b_sg_desc.ptr,
+            .b_sg_stride = b_sg_desc.stride,
+            .silu_dim = 0,
+            .h3 = reinterpret_cast<const bf16*>(h3.data_ptr<at::BFloat16>()),
+            .h1_raw = reinterpret_cast<const bf16*>(h1_raw.data_ptr<at::BFloat16>()),
+            .row_fp4 = reinterpret_cast<uint8_t*>(row_fp4.data_ptr()),
+            .row_sc = reinterpret_cast<uint8_t*>(row_sc.data_ptr()),
+            .row_sg = row_sg.data_ptr<float>(),
+            .col_fp4 = reinterpret_cast<uint8_t*>(col_fp4.data_ptr()),
+            .col_sc = reinterpret_cast<uint8_t*>(col_sc.data_ptr()),
+            .col_sg = col_sg.data_ptr<float>(),
+            .g1_row_outer_sg0 = row_outer0.data_ptr<float>(),
+            .g1_row_outer_sg1 = row_outer1.data_ptr<float>(),
+            .g1_col_outer_sg0 = col_outer0.data_ptr<float>(),
+            .g1_col_outer_sg1 = col_outer1.data_ptr<float>(),
+            .g1_mode = C::G1_MODE,
+            .M = static_cast<int>(A.size(0)),
+            .H = static_cast<int>(B.size(0)),
+        };
+        kittens::py::launch_kernel<C, G, nvfp4_gemm::kernel<C>>(g);
+    };
+    launch.template operator()<AmaxC>();
+    const int outputs = 2 * (A.size(0) / 256) + 2 * (B.size(0) / 256);
+    const int blocks = static_cast<int>((outputs + 255) / 256);
+    g1_reduce_outer_sg_kernel<<<blocks, 256, 0, at::cuda::getCurrentCUDAStream()>>>(
+        row_sg.data_ptr<float>(), col_sg.data_ptr<float>(),
+        row_outer0.data_ptr<float>(), row_outer1.data_ptr<float>(),
+        col_outer0.data_ptr<float>(), col_outer1.data_ptr<float>(),
+        static_cast<int>(A.size(0)), static_cast<int>(B.size(0)));
+    launch.template operator()<QuantC>();
 }
 
 template <typename C>
@@ -6427,7 +6559,11 @@ void nvfp4_localcta_w2_dgrad_silu_quant_gemm_entrypoint(
     at::Tensor& col_fp4_cat,
     at::Tensor& col_sc_prepared_cat,
     at::Tensor& col_sg_cat,
-    int config_id = 4
+    int config_id = 4,
+    std::optional<at::Tensor> row_outer0_opt = std::nullopt,
+    std::optional<at::Tensor> row_outer1_opt = std::nullopt,
+    std::optional<at::Tensor> col_outer0_opt = std::nullopt,
+    std::optional<at::Tensor> col_outer1_opt = std::nullopt
 ) {
     check_fp4_matrix(A, "A");
     check_fp4_matrix(B, "B");
@@ -6476,7 +6612,33 @@ void nvfp4_localcta_w2_dgrad_silu_quant_gemm_entrypoint(
                               row_fp4_cat, row_sc_prepared_cat, row_sg_cat,
                               col_fp4_cat, col_sc_prepared_cat, col_sg_cat);
 
-    if (config_id == 0) {
+    if (config_id == 6) {
+        TORCH_CHECK(row_outer0_opt.has_value() && row_outer1_opt.has_value() &&
+                    col_outer0_opt.has_value() && col_outer1_opt.has_value(),
+                    "localCTA G1 config 6 requires final row/col SG outputs");
+        auto row_outer0 = row_outer0_opt.value();
+        auto row_outer1 = row_outer1_opt.value();
+        auto col_outer0 = col_outer0_opt.value();
+        auto col_outer1 = col_outer1_opt.value();
+        for (const auto* tensor : {&row_outer0, &row_outer1}) {
+            TORCH_CHECK(tensor->is_cuda() && tensor->is_contiguous() &&
+                        tensor->scalar_type() == torch::kFloat32 &&
+                        tensor->sizes() == torch::IntArrayRef({M / 256, 1}),
+                        "localCTA G1 row outer SG must be float32 [M/256,1]");
+        }
+        for (const auto* tensor : {&col_outer0, &col_outer1}) {
+            TORCH_CHECK(tensor->is_cuda() && tensor->is_contiguous() &&
+                        tensor->scalar_type() == torch::kFloat32 &&
+                        tensor->sizes() == torch::IntArrayRef({1, H / 256}),
+                        "localCTA G1 col outer SG must be float32 [1,H/256]");
+        }
+        launch_fast_g1_silu_dgrad_quant_with_config<
+            localcta_fast_g1_amax_config, localcta_fast_g1_quant_config>(
+            A, A_sc, A_sg, B, B_sc, B_sg, h3, h1_raw,
+            row_fp4_cat, row_sc_prepared_cat, row_sg_cat,
+            col_fp4_cat, col_sc_prepared_cat, col_sg_cat,
+            row_outer0, row_outer1, col_outer0, col_outer1);
+    } else if (config_id == 0) {
         launch_localcta_silu_dgrad_quant_gemm_with_config<
             nvfp4_localcta_silu_dgrad_quant_gemm::config<3, 4>>(
             A, A_sc, A_sg, B, B_sc, B_sg, h3, h1_raw,
@@ -6805,5 +6967,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           pybind11::arg("row_fp4_cat"), pybind11::arg("row_sc_prepared_cat"),
           pybind11::arg("row_sg_cat"), pybind11::arg("col_fp4_cat"),
           pybind11::arg("col_sc_prepared_cat"), pybind11::arg("col_sg_cat"),
-          pybind11::arg("config_id") = 4);
+          pybind11::arg("config_id") = 4,
+          pybind11::arg("row_outer0") = std::nullopt,
+          pybind11::arg("row_outer1") = std::nullopt,
+          pybind11::arg("col_outer0") = std::nullopt,
+          pybind11::arg("col_outer1") = std::nullopt);
 }

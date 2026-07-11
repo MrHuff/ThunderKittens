@@ -113,6 +113,7 @@ struct globals {
 };
 
 static constexpr float LOCALCTA_GLOBAL_SCALE_NUM = 1493.0f;
+static constexpr float V5_GLOBAL_SCALE_NUM = 2688.0f;
 static constexpr float LOCALCTA_MIN_NONZERO_SCALE = 0.001953125f;
 static constexpr float FP8_E4M3_MAX = 448.0f;
 
@@ -136,6 +137,26 @@ __device__ __forceinline__ uint8_t quantize_fp4_pair(float v0, float v1, float c
     return q0 | (q1 << 4);
 }
 
+__device__ __forceinline__ uint8_t float_to_fp4_rn_even(float val) {
+    const float aval = fabsf(val);
+    const uint8_t sign = ((__float_as_uint(val) >> 31) << 3);
+    const uint8_t enc =
+        static_cast<uint8_t>(aval > 0.25f) +
+        static_cast<uint8_t>(aval >= 0.75f) +
+        static_cast<uint8_t>(aval > 1.25f) +
+        static_cast<uint8_t>(aval >= 1.75f) +
+        static_cast<uint8_t>(aval > 2.5f) +
+        static_cast<uint8_t>(aval >= 3.5f) +
+        static_cast<uint8_t>(aval > 5.0f);
+    return sign | enc;
+}
+
+__device__ __forceinline__ uint8_t quantize_fp4_pair_v5(float v0, float v1, float coeff) {
+    const uint8_t q0 = float_to_fp4_rn_even(v0 * coeff);
+    const uint8_t q1 = float_to_fp4_rn_even(v1 * coeff);
+    return q0 | (q1 << 4);
+}
+
 __device__ __forceinline__ uint8_t fp8e4m3_byte(float value) {
     fp8e4m3 out = static_cast<fp8e4m3>(value);
     return reinterpret_cast<const uint8_t&>(out);
@@ -151,6 +172,19 @@ __device__ __forceinline__ float localcta_encode_scale(float amax) {
         return 1.0f;
     }
     return fminf(LOCALCTA_GLOBAL_SCALE_NUM / amax, 3.4028235e+38f);
+}
+
+__device__ __forceinline__ float v5_encode_scale(float amax) {
+    if (amax <= 0.0f) {
+        return 1.0f;
+    }
+    return fminf(V5_GLOBAL_SCALE_NUM / amax, 3.4028235e+38f);
+}
+
+__device__ __forceinline__ void atomic_max_float(float* addr, float value) {
+    if (value > 0.0f) {
+        atomicMax(reinterpret_cast<unsigned int*>(addr), __float_as_uint(value));
+    }
 }
 
 __device__ __forceinline__ float warp_reduce_max(float value) {
@@ -174,18 +208,30 @@ __device__ __forceinline__ void localcta_block_quant_params(
     }
     const float mult_fp8 = fmaxf(fp8e4m3_round_to_float(mult), 1.0e-12f);
     coeff = mult_fp8 * chunk_s_enc;
-    float stored = fp8e4m3_round_to_float(1.0f / mult_fp8) * chunk_sg;
-    uint8_t byte = fp8e4m3_byte(stored);
-    if (stored > 0.0f && byte == 0) {
-        byte = fp8e4m3_byte(LOCALCTA_MIN_NONZERO_SCALE);
+    stored_scale_byte = fp8e4m3_byte(1.0f / mult_fp8);
+    (void)chunk_sg;
+}
+
+__device__ __forceinline__ void v5_block_quant_params(
+    float block_amax,
+    float global_s_enc,
+    float& coeff,
+    uint8_t& stored_scale_byte)
+{
+    float mult = FP8_E4M3_MAX;
+    if (block_amax > 1.0e-9f && global_s_enc > 0.0f) {
+        mult = fminf(6.0f / (block_amax * global_s_enc), 3.4028235e+38f);
     }
-    stored_scale_byte = byte;
+    const float mult_fp8 = fmaxf(fp8e4m3_round_to_float(mult), 1.0e-12f);
+    coeff = mult_fp8 * global_s_enc;
+    stored_scale_byte = fp8e4m3_byte(1.0f / mult_fp8);
 }
 
 __device__ __forceinline__ bf16_2 load_bf16_pair(const bf16* ptr, int row, int cols, int col) {
     return *reinterpret_cast<const bf16_2*>(&ptr[static_cast<int64_t>(row) * cols + col]);
 }
 
+template <bool V5_MATH = false>
 __device__ __forceinline__ void silu_deriv_pair(
     float dh_x,
     float dh_y,
@@ -200,8 +246,17 @@ __device__ __forceinline__ void silu_deriv_pair(
     const float h3_y = __bfloat162float(h3_pair.y);
     const float h1_x = __bfloat162float(h1_pair.x);
     const float h1_y = __bfloat162float(h1_pair.y);
-    const float sig_x = 1.0f / (1.0f + __expf(-h1_x));
-    const float sig_y = 1.0f / (1.0f + __expf(-h1_y));
+    float exp_x;
+    float exp_y;
+    if constexpr (V5_MATH) {
+        exp_x = expf(-h1_x);
+        exp_y = expf(-h1_y);
+    } else {
+        exp_x = __expf(-h1_x);
+        exp_y = __expf(-h1_y);
+    }
+    const float sig_x = 1.0f / (1.0f + exp_x);
+    const float sig_y = 1.0f / (1.0f + exp_y);
     const float silu_x = h1_x * sig_x;
     const float silu_y = h1_y * sig_y;
     const float silup_x = sig_x * (1.0f + h1_x - silu_x);
@@ -214,9 +269,15 @@ __device__ __forceinline__ void silu_deriv_pair(
         __float2bfloat16_rn(dh_y * silu_y)};
 }
 
-template <typename C, typename subtile_rt>
+template <
+    typename C,
+    bool V5_MATH = false,
+    bool STORE_OUTPUT = true,
+    bool COLLECT_AMAX = true,
+    typename G,
+    typename subtile_rt>
 __device__ __noinline__ void stage_silu_deriv_pairs(
-    const globals<C>& g,
+    const G& g,
     subtile_rt& D_fl,
     bf16_2 (*pairs0)[16][33],
     bf16_2 (*pairs1)[16][33],
@@ -250,56 +311,72 @@ __device__ __noinline__ void stage_silu_deriv_pairs(
             bf16_2 h1_3 = load_bf16_pair(g.h1_raw, row_hi, g.H, pair_col1);
 
             bf16_2 out0, out1;
-            silu_deriv_pair(
+            silu_deriv_pair<V5_MATH>(
                 D_fl.tiles[i][j].data[0].x,
                 D_fl.tiles[i][j].data[0].y,
                 h3_0, h1_0, out0, out1);
-            pairs0[epi_slot][pair_base][i * 16 + row_pair_idx] = out0;
-            pairs1[epi_slot][pair_base][i * 16 + row_pair_idx] = out1;
-            local_amax0 = fmaxf(local_amax0, fabsf(__bfloat162float(out0.x)));
-            local_amax0 = fmaxf(local_amax0, fabsf(__bfloat162float(out0.y)));
-            local_amax1 = fmaxf(local_amax1, fabsf(__bfloat162float(out1.x)));
-            local_amax1 = fmaxf(local_amax1, fabsf(__bfloat162float(out1.y)));
+            if constexpr (STORE_OUTPUT) {
+                pairs0[epi_slot][pair_base][i * 16 + row_pair_idx] = out0;
+                pairs1[epi_slot][pair_base][i * 16 + row_pair_idx] = out1;
+            }
+            if constexpr (COLLECT_AMAX) {
+                local_amax0 = fmaxf(local_amax0, fabsf(__bfloat162float(out0.x)));
+                local_amax0 = fmaxf(local_amax0, fabsf(__bfloat162float(out0.y)));
+                local_amax1 = fmaxf(local_amax1, fabsf(__bfloat162float(out1.x)));
+                local_amax1 = fmaxf(local_amax1, fabsf(__bfloat162float(out1.y)));
+            }
 
-            silu_deriv_pair(
+            silu_deriv_pair<V5_MATH>(
                 D_fl.tiles[i][j].data[1].x,
                 D_fl.tiles[i][j].data[1].y,
                 h3_1, h1_1, out0, out1);
-            pairs0[epi_slot][pair_base][i * 16 + row_pair_idx + 8] = out0;
-            pairs1[epi_slot][pair_base][i * 16 + row_pair_idx + 8] = out1;
-            local_amax0 = fmaxf(local_amax0, fabsf(__bfloat162float(out0.x)));
-            local_amax0 = fmaxf(local_amax0, fabsf(__bfloat162float(out0.y)));
-            local_amax1 = fmaxf(local_amax1, fabsf(__bfloat162float(out1.x)));
-            local_amax1 = fmaxf(local_amax1, fabsf(__bfloat162float(out1.y)));
+            if constexpr (STORE_OUTPUT) {
+                pairs0[epi_slot][pair_base][i * 16 + row_pair_idx + 8] = out0;
+                pairs1[epi_slot][pair_base][i * 16 + row_pair_idx + 8] = out1;
+            }
+            if constexpr (COLLECT_AMAX) {
+                local_amax0 = fmaxf(local_amax0, fabsf(__bfloat162float(out0.x)));
+                local_amax0 = fmaxf(local_amax0, fabsf(__bfloat162float(out0.y)));
+                local_amax1 = fmaxf(local_amax1, fabsf(__bfloat162float(out1.x)));
+                local_amax1 = fmaxf(local_amax1, fabsf(__bfloat162float(out1.y)));
+            }
 
-            silu_deriv_pair(
+            silu_deriv_pair<V5_MATH>(
                 D_fl.tiles[i][j].data[2].x,
                 D_fl.tiles[i][j].data[2].y,
                 h3_2, h1_2, out0, out1);
-            pairs0[epi_slot][pair_base + 4][i * 16 + row_pair_idx] = out0;
-            pairs1[epi_slot][pair_base + 4][i * 16 + row_pair_idx] = out1;
-            local_amax0 = fmaxf(local_amax0, fabsf(__bfloat162float(out0.x)));
-            local_amax0 = fmaxf(local_amax0, fabsf(__bfloat162float(out0.y)));
-            local_amax1 = fmaxf(local_amax1, fabsf(__bfloat162float(out1.x)));
-            local_amax1 = fmaxf(local_amax1, fabsf(__bfloat162float(out1.y)));
+            if constexpr (STORE_OUTPUT) {
+                pairs0[epi_slot][pair_base + 4][i * 16 + row_pair_idx] = out0;
+                pairs1[epi_slot][pair_base + 4][i * 16 + row_pair_idx] = out1;
+            }
+            if constexpr (COLLECT_AMAX) {
+                local_amax0 = fmaxf(local_amax0, fabsf(__bfloat162float(out0.x)));
+                local_amax0 = fmaxf(local_amax0, fabsf(__bfloat162float(out0.y)));
+                local_amax1 = fmaxf(local_amax1, fabsf(__bfloat162float(out1.x)));
+                local_amax1 = fmaxf(local_amax1, fabsf(__bfloat162float(out1.y)));
+            }
 
-            silu_deriv_pair(
+            silu_deriv_pair<V5_MATH>(
                 D_fl.tiles[i][j].data[3].x,
                 D_fl.tiles[i][j].data[3].y,
                 h3_3, h1_3, out0, out1);
-            pairs0[epi_slot][pair_base + 4][i * 16 + row_pair_idx + 8] = out0;
-            pairs1[epi_slot][pair_base + 4][i * 16 + row_pair_idx + 8] = out1;
-            local_amax0 = fmaxf(local_amax0, fabsf(__bfloat162float(out0.x)));
-            local_amax0 = fmaxf(local_amax0, fabsf(__bfloat162float(out0.y)));
-            local_amax1 = fmaxf(local_amax1, fabsf(__bfloat162float(out1.x)));
-            local_amax1 = fmaxf(local_amax1, fabsf(__bfloat162float(out1.y)));
+            if constexpr (STORE_OUTPUT) {
+                pairs0[epi_slot][pair_base + 4][i * 16 + row_pair_idx + 8] = out0;
+                pairs1[epi_slot][pair_base + 4][i * 16 + row_pair_idx + 8] = out1;
+            }
+            if constexpr (COLLECT_AMAX) {
+                local_amax0 = fmaxf(local_amax0, fabsf(__bfloat162float(out0.x)));
+                local_amax0 = fmaxf(local_amax0, fabsf(__bfloat162float(out0.y)));
+                local_amax1 = fmaxf(local_amax1, fabsf(__bfloat162float(out1.x)));
+                local_amax1 = fmaxf(local_amax1, fabsf(__bfloat162float(out1.y)));
+            }
         }
     }
 }
 
-template <typename C>
+template <typename C, typename G, bool V5_SCALAR_SG = false>
 __device__ __noinline__ void quantize_rows_from_stage(
-    const globals<C>& g,
+    const G& g,
     bf16_2 (*pairs)[16][33],
     int epi_slot,
     int lane_id,
@@ -310,8 +387,20 @@ __device__ __noinline__ void quantize_rows_from_stage(
 {
     const int local_row = lane_id;
     const int global_row = warp_row_base + local_row;
-    const int row_fp4_stride = g.H;
-    const int row_ntk_total = (2 * g.H) / 64;
+    bool separate_split = false;
+    bool second_split = false;
+    int split_col_start = logical_col_start;
+    uint8_t* row_fp4 = g.row_fp4;
+    uint8_t* row_sc = g.row_sc;
+    if constexpr (V5_SCALAR_SG) {
+        separate_split = g.row_fp4_split1 != nullptr;
+        second_split = separate_split && logical_col_start >= g.H;
+        split_col_start = second_split ? logical_col_start - g.H : logical_col_start;
+        row_fp4 = second_split ? g.row_fp4_split1 : g.row_fp4;
+        row_sc = second_split ? g.row_sc_split1 : g.row_sc;
+    }
+    const int row_fp4_stride = separate_split ? g.H / 2 : g.H;
+    const int row_ntk_total = separate_split ? g.H / 64 : (2 * g.H) / 64;
     const int sc_row_blk = global_row / 128;
     const int j_in_tile = global_row % 32;
     const int grp = (global_row % 128) / 32;
@@ -330,31 +419,37 @@ __device__ __noinline__ void quantize_rows_from_stage(
 
         float coeff;
         uint8_t stored_scale;
-        localcta_block_quant_params(block_amax, chunk_s_enc, chunk_sg, coeff, stored_scale);
+        if constexpr (V5_SCALAR_SG) {
+            v5_block_quant_params(block_amax, chunk_s_enc, coeff, stored_scale);
+        } else {
+            localcta_block_quant_params(block_amax, chunk_s_enc, chunk_sg, coeff, stored_scale);
+        }
 
         uint64_t packed = 0;
         #pragma unroll
         for (int pair = 0; pair < 8; ++pair) {
             const bf16_2 v = cached[pair];
-            packed |= static_cast<uint64_t>(quantize_fp4_pair(
-                __bfloat162float(v.x), __bfloat162float(v.y), coeff)) << (pair * 8);
+            const uint8_t q = V5_SCALAR_SG
+                ? quantize_fp4_pair_v5(__bfloat162float(v.x), __bfloat162float(v.y), coeff)
+                : quantize_fp4_pair(__bfloat162float(v.x), __bfloat162float(v.y), coeff);
+            packed |= static_cast<uint64_t>(q) << (pair * 8);
         }
 
-        const int logical_col = logical_col_start + group * 16;
+        const int logical_col = split_col_start + group * 16;
         *reinterpret_cast<uint64_t*>(
-            &g.row_fp4[global_row * row_fp4_stride + logical_col / 2]) = packed;
+            &row_fp4[global_row * row_fp4_stride + logical_col / 2]) = packed;
 
         const int col64 = logical_col / 64;
         const int scale_in64 = (logical_col % 64) / 16;
         const int scale_base = (sc_row_blk * row_ntk_total + col64) * 512 +
                                j_in_tile * 16 + grp * 4 + scale_in64;
-        g.row_sc[scale_base] = stored_scale;
+        row_sc[scale_base] = stored_scale;
     }
 }
 
-template <typename C>
+template <typename C, typename G, bool V5_SCALAR_SG = false>
 __device__ __noinline__ void quantize_cols_from_stage(
-    const globals<C>& g,
+    const G& g,
     bf16_2 (*pairs)[16][33],
     int epi_slot,
     int lane_id,
@@ -363,10 +458,22 @@ __device__ __noinline__ void quantize_cols_from_stage(
     float chunk_s_enc,
     float chunk_sg)
 {
+    bool separate_split = false;
+    bool second_split = false;
+    int split_col_start = logical_col_start;
+    uint8_t* col_fp4 = g.col_fp4;
+    uint8_t* col_sc = g.col_sc;
+    if constexpr (V5_SCALAR_SG) {
+        separate_split = g.col_fp4_split1 != nullptr;
+        second_split = separate_split && logical_col_start >= g.H;
+        split_col_start = second_split ? logical_col_start - g.H : logical_col_start;
+        col_fp4 = second_split ? g.col_fp4_split1 : g.col_fp4;
+        col_sc = second_split ? g.col_sc_split1 : g.col_sc;
+    }
     const int local_col = lane_id;
     const int local_col_pair = local_col >> 1;
     const bool use_y = (local_col & 1) != 0;
-    const int logical_col = logical_col_start + local_col;
+    const int logical_col = split_col_start + local_col;
     const int col_fp4_stride = g.M / 2;
     const int col_ntk_total = g.M / 64;
     const int col_chunk = logical_col / 128;
@@ -389,26 +496,32 @@ __device__ __noinline__ void quantize_cols_from_stage(
 
         float coeff;
         uint8_t stored_scale;
-        localcta_block_quant_params(block_amax, chunk_s_enc, chunk_sg, coeff, stored_scale);
+        if constexpr (V5_SCALAR_SG) {
+            v5_block_quant_params(block_amax, chunk_s_enc, coeff, stored_scale);
+        } else {
+            localcta_block_quant_params(block_amax, chunk_s_enc, chunk_sg, coeff, stored_scale);
+        }
 
         uint64_t packed = 0;
         #pragma unroll
         for (int pair = 0; pair < 8; ++pair) {
             const bf16_2 v = cached[pair];
-            packed |= static_cast<uint64_t>(quantize_fp4_pair(
-                __bfloat162float(v.x), __bfloat162float(v.y), coeff)) << (pair * 8);
+            const uint8_t q = V5_SCALAR_SG
+                ? quantize_fp4_pair_v5(__bfloat162float(v.x), __bfloat162float(v.y), coeff)
+                : quantize_fp4_pair(__bfloat162float(v.x), __bfloat162float(v.y), coeff);
+            packed |= static_cast<uint64_t>(q) << (pair * 8);
         }
 
         const int global_row_pair = warp_row_base / 2 + row_group * 8;
         *reinterpret_cast<uint64_t*>(
-            &g.col_fp4[logical_col * col_fp4_stride + global_row_pair]) = packed;
+            &col_fp4[logical_col * col_fp4_stride + global_row_pair]) = packed;
 
         const int global_row = warp_row_base + row_group * 16;
         const int row64 = global_row / 64;
         const int scale_in64 = (global_row % 64) / 16;
         const int scale_base = (col_chunk * col_ntk_total + row64) * 512 +
                                j_in_tile * 16 + grp * 4 + scale_in64;
-        g.col_sc[scale_base] = stored_scale;
+        col_sc[scale_base] = stored_scale;
     }
 }
 
@@ -589,31 +702,26 @@ __device__ inline void kernel(const globals<C>& g) {
             const int lane_id = warp::laneid();
             const int warp_row_base = (row_block_idx * 2 + cta_id) * (C::Mb / 2) + wg_warp * 32;
 
-            subtile_rt D_acc[C::EPI_PIPE_DEPTH];
             wait(outputs_arrived, get_phasebit<0>(output_phasebits, 0));
-            #pragma unroll
-            for (int epi = 0; epi < C::EPI_PIPE_DEPTH; epi++) {
-                warpgroup::load_async(
-                    D_acc[epi],
-                    out_tm.template subtile<full_tt_fl<SUBTILE_COLS>>(0, SUBTILE_COLS * epi));
-            }
-            tensor_load_wait();
-            tensor_before_thread_sync();
-            warpgroup::sync(1);
-            warpgroup::tma::cluster::arrive(outputs_finished, 0, 1);
-
             const float gs = g.A_sg[row_block_idx * g.A_sg_stride] *
                              g.B_sg[col_block_idx * g.B_sg_stride];
             #pragma unroll
-            for (int epi = 0; epi < C::EPI_PIPE_DEPTH; ++epi) {
-                warp::mul(D_acc[epi], D_acc[epi], gs);
-            }
-            warpgroup::sync(1);
-            tensor_after_thread_sync();
-            update_phasebit<0>(output_phasebits, 0);
-
-            #pragma unroll
             for (int half = 0; half < 2; ++half) {
+                subtile_rt D_acc[4];
+                #pragma unroll
+                for (int e = 0; e < 4; ++e) {
+                    const int epi = half * 4 + e;
+                    warpgroup::load_async(
+                        D_acc[e],
+                        out_tm.template subtile<full_tt_fl<SUBTILE_COLS>>(
+                            0, SUBTILE_COLS * epi));
+                }
+                tensor_load_wait();
+                #pragma unroll
+                for (int e = 0; e < 4; ++e) {
+                    warp::mul(D_acc[e], D_acc[e], gs);
+                }
+
                 float local_amax0 = 0.0f;
                 float local_amax1 = 0.0f;
                 bf16_2 (*pairs0)[16][33] = staged0[wg_warp];
@@ -623,7 +731,7 @@ __device__ inline void kernel(const globals<C>& g) {
                     const int epi = half * 4 + e;
                     const int col_start = col_block_idx * C::Nb + epi * SUBTILE_COLS;
                     stage_silu_deriv_pairs<C>(
-                        g, D_acc[epi], pairs0, pairs1, e, lane_id, warp_row_base,
+                        g, D_acc[e], pairs0, pairs1, e, lane_id, warp_row_base,
                         col_start, local_amax0, local_amax1);
                 }
                 local_amax0 = warp_reduce_max(local_amax0);
@@ -632,7 +740,11 @@ __device__ inline void kernel(const globals<C>& g) {
                     warp_amax0[half][wg_warp] = local_amax0;
                     warp_amax1[half][wg_warp] = local_amax1;
                 }
+                tensor_before_thread_sync();
                 warpgroup::sync(1);
+                if (half == 1) {
+                    warpgroup::tma::cluster::arrive(outputs_finished, 0, 1);
+                }
                 if (wg_warp == 0 && lane_id == 0) {
                     float amax0 = 0.0f;
                     float amax1 = 0.0f;
@@ -675,7 +787,9 @@ __device__ inline void kernel(const globals<C>& g) {
                         chunk_s_enc1[half], chunk_sg1[half]);
                 }
                 warpgroup::sync(1);
+                tensor_after_thread_sync();
             }
+            update_phasebit<0>(output_phasebits, 0);
         }
         warpgroup::sync(1);
         if constexpr (C::USE_PDL) warpgroup::pdl::arrive();
