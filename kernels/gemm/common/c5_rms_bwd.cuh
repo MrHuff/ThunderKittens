@@ -141,14 +141,20 @@ __global__ void dgamma_native_order_kernel(
     }
     scratch[tid] = partial;
     __syncthreads();
-    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+    for (int stride = 128; stride >= 32; stride >>= 1) {
         if (tid < stride) {
             scratch[tid] += scratch[tid + stride];
         }
         __syncthreads();
     }
-    if (tid == 0) {
-        dgamma[col] = scratch[0];
+    if (tid < 32) {
+        float total = scratch[tid];
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            total += __shfl_down_sync(0xffffffffu, total, offset);
+        }
+        if (tid == 0) {
+            dgamma[col] = total;
+        }
     }
 }
 
