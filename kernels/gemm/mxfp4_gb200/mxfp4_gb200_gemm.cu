@@ -841,6 +841,55 @@ static void launch_mxfp4_gemm_dense_residual_rms(
 }
 
 template <typename C>
+static void launch_mxfp4_gemm_dense_rms_bwd_partial_dot(
+    const at::Tensor &A,
+    const at::Tensor &A_sc,
+    const at::Tensor &B,
+    const at::Tensor &B_sc,
+    const at::Tensor &x,
+    at::Tensor &D,
+    at::Tensor &partial_dot,
+    std::optional<at::Tensor> gamma_opt
+) {
+    using G = mxfp4_gemm::globals<C>;
+    TORCH_CHECK(D.is_cuda() && D.is_contiguous() && D.scalar_type() == at::kBFloat16 && D.dim() == 2,
+                "D must be contiguous CUDA bf16 [M,N]");
+    TORCH_CHECK(x.is_cuda() && x.is_contiguous() && x.scalar_type() == at::kBFloat16 &&
+                    x.dim() == 2 && x.sizes() == D.sizes(),
+                "x must be contiguous CUDA bf16 with the same [M,N] shape as D");
+    constexpr int epi_cols = C::Nb / C::EPI_PIPE_DEPTH;
+    static_assert(epi_cols == 32, "G4 partial-dot epilogue requires 32-column slices");
+    TORCH_CHECK(partial_dot.is_cuda() && partial_dot.is_contiguous() &&
+                    partial_dot.scalar_type() == at::kFloat && partial_dot.dim() == 2 &&
+                    partial_dot.size(0) == D.size(0) && partial_dot.size(1) == D.size(1) / 32,
+                "partial_dot must be contiguous CUDA fp32 [M,N/32]");
+    if (gamma_opt.has_value()) {
+        const auto& gamma = gamma_opt.value();
+        TORCH_CHECK(gamma.is_cuda() && gamma.is_contiguous() && gamma.scalar_type() == at::kBFloat16 &&
+                        gamma.dim() == 1 && gamma.numel() == D.size(1),
+                    "gamma must be contiguous CUDA bf16 [N]");
+    }
+    G g {
+        .A = kittens::py::tensor_to_gl<typename G::A_fp4x2_gl>(A),
+        .A_sc = kittens::py::tensor_to_gl<typename G::A_sc_gl>(A_sc),
+        .B = kittens::py::tensor_to_gl<typename G::B_fp4x2_gl>(B),
+        .B_sc = kittens::py::tensor_to_gl<typename G::B_sc_gl>(B_sc),
+        .D = kittens::py::tensor_to_gl<typename G::D_gl>(D),
+        .g4_x = reinterpret_cast<const bf16*>(x.data_ptr()),
+        .g4_partial_dot = partial_dot.data_ptr<float>(),
+        .g4_partial_dot_stride = static_cast<int>(partial_dot.size(1)),
+        .g4_gamma = gamma_opt.has_value()
+            ? reinterpret_cast<const bf16*>(gamma_opt.value().data_ptr())
+            : nullptr,
+        .tilemask_ptr = nullptr,
+        .tilemask_rows = 0,
+        .tilemask_cols = 0,
+        .tilemask_transposed = false
+    };
+    kittens::py::launch_kernel<C, G, mxfp4_gemm::kernel<C>>(g);
+}
+
+template <typename C>
 static void launch_mxfp4_gemm_dense_row_scale(
     const at::Tensor &A,
     const at::Tensor &A_sc,
@@ -953,6 +1002,26 @@ void mxfp4_gemm_residual_rms_entrypoint(
     }
     launch_mxfp4_gemm_dense_residual_rms<mxfp4_gemm::config<256, 5, 8, 4, 2, false, 256, false, true, false, true>>(
         A, A_sc, B, B_sc, R, D, row_rms_partial, gamma_opt);
+}
+
+void mxfp4_gemm_rms_bwd_partial_dot_entrypoint(
+    const at::Tensor &A,
+    const at::Tensor &A_sc,
+    const at::Tensor &B,
+    const at::Tensor &B_sc,
+    const at::Tensor &x,
+    at::Tensor &D,
+    at::Tensor &partial_dot,
+    std::optional<at::Tensor> gamma_opt = std::nullopt
+) {
+    kittens::py::device_check(A, A_sc, B, B_sc, x, D, partial_dot);
+    if (gamma_opt.has_value()) {
+        kittens::py::device_check(gamma_opt.value());
+    }
+    launch_mxfp4_gemm_dense_rms_bwd_partial_dot<mxfp4_gemm::config<
+        256, 5, 8, 4, 2, true, 256,
+        false, false, false, false, false, true>>(
+        A, A_sc, B, B_sc, x, D, partial_dot, gamma_opt);
 }
 
 void mxfp4_gemm_row_scale_entrypoint(
@@ -2525,6 +2594,12 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           pybind11::arg("A"), pybind11::arg("A_sc"),
           pybind11::arg("B"), pybind11::arg("B_sc"),
           pybind11::arg("row_scale_coeff"), pybind11::arg("D"));
+    m.def("mxfp4_gemm_rms_bwd_partial_dot", &mxfp4_gemm_rms_bwd_partial_dot_entrypoint,
+          "MXFP4 GEMM with adjacent G4 RMSNorm-backward partial-dot epilogue",
+          pybind11::arg("A"), pybind11::arg("A_sc"),
+          pybind11::arg("B"), pybind11::arg("B_sc"),
+          pybind11::arg("x"), pybind11::arg("D"), pybind11::arg("partial_dot"),
+          pybind11::arg("gamma") = std::nullopt);
     m.def("mxfp4_c1_row_rms_reduce", &c1_rms_reduce::row_rms_reduce_entrypoint,
           "Reduce C1 partial row RMS stats into row RMS coefficients",
           pybind11::arg("row_rms_partial"), pybind11::arg("coeff"),
@@ -2543,6 +2618,18 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           pybind11::arg("coeff"), pybind11::arg("dot"),
           pybind11::arg("dx"), pybind11::arg("hidden_size"),
           pybind11::arg("gamma") = std::nullopt);
+    m.def("mxfp4_g4_rms_bwd_apply_dx_native_order",
+          &c5_rms_bwd::apply_dx_native_order_entrypoint,
+          "MXFP4 G4 apply dx in the production native operation order",
+          pybind11::arg("x"), pybind11::arg("dy"),
+          pybind11::arg("coeff"), pybind11::arg("dot"),
+          pybind11::arg("dx"), pybind11::arg("hidden_size"),
+          pybind11::arg("gamma") = std::nullopt);
+    m.def("mxfp4_g4_rms_bwd_dgamma_native_order",
+          &c5_rms_bwd::dgamma_native_order_entrypoint,
+          "MXFP4 G4 dgamma in the production native reduction order",
+          pybind11::arg("x"), pybind11::arg("dy"),
+          pybind11::arg("coeff"), pybind11::arg("dgamma"));
     m.def("mxfp4_g5_rms_bwd_partial_dgamma", &c5_rms_bwd::partial_dgamma_entrypoint,
           "G5 RMSNorm backward partial dgamma over 256-row tiles",
           pybind11::arg("x"), pybind11::arg("dy"),

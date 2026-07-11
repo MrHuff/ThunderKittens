@@ -329,6 +329,16 @@ static void run_gemm_residual_rms_with_config(
     std::optional<at::Tensor> gamma_opt = std::nullopt
 );
 
+template <typename C>
+static void run_gemm_rms_bwd_partial_dot_with_config(
+    const at::Tensor &A, const at::Tensor &A_sc, const at::Tensor &A_sc_global,
+    const at::Tensor &B, const at::Tensor &B_sc, const at::Tensor &B_sc_global,
+    const at::Tensor &x,
+    at::Tensor &D,
+    at::Tensor &partial_dot,
+    std::optional<at::Tensor> gamma_opt = std::nullopt
+);
+
 void nvfp4_gemm_entrypoint(
     const at::Tensor &A,
     const at::Tensor &A_sc,
@@ -435,6 +445,38 @@ void nvfp4_gemm_residual_rms_entrypoint(
         using C = nvfp4_gemm::config<256, 4, 8, 12, 2, false, 256, true, 2, 256, false, true, true>;
         run_gemm_residual_rms_with_config<C>(
             A, A_sc, A_sc_global, B, B_sc, B_sc_global, R, D, row_rms_partial, gamma_opt);
+    }
+}
+
+void nvfp4_gemm_rms_bwd_partial_dot_entrypoint(
+    const at::Tensor &A,
+    const at::Tensor &A_sc,
+    const at::Tensor &A_sc_global,
+    const at::Tensor &B,
+    const at::Tensor &B_sc,
+    const at::Tensor &B_sc_global,
+    const at::Tensor &x,
+    at::Tensor &D,
+    at::Tensor &partial_dot,
+    std::optional<at::Tensor> gamma_opt
+) {
+    kittens::py::device_check(A, A_sc, A_sc_global, B, B_sc, B_sc_global, x, D, partial_dot);
+    if (gamma_opt.has_value()) {
+        kittens::py::device_check(gamma_opt.value());
+    }
+    const int K = B.size(1) * 2;
+    if (K <= 2048) {
+        using C = nvfp4_gemm::config<
+            256, 5, 8, 4, 2, true, 256, true, 2, 256,
+            false, false, false, false, false, 0, true>;
+        run_gemm_rms_bwd_partial_dot_with_config<C>(
+            A, A_sc, A_sc_global, B, B_sc, B_sc_global, x, D, partial_dot, gamma_opt);
+    } else {
+        using C = nvfp4_gemm::config<
+            256, 4, 8, 12, 2, true, 256, true, 2, 256,
+            false, false, false, false, false, 0, true>;
+        run_gemm_rms_bwd_partial_dot_with_config<C>(
+            A, A_sc, A_sc_global, B, B_sc, B_sc_global, x, D, partial_dot, gamma_opt);
     }
 }
 
@@ -1207,6 +1249,69 @@ static void run_gemm_residual_rms_with_config(
     };
     auto r_gl = kittens::py::tensor_to_gl<typename G::D_gl>(R);
     memcpy(&g.R_tma, &r_gl.tma_descs.tma_desc, sizeof(CUtensorMap));
+    kittens::py::launch_kernel<C, G, nvfp4_gemm::kernel<C>>(g);
+}
+
+template <typename C>
+static void run_gemm_rms_bwd_partial_dot_with_config(
+    const at::Tensor &A, const at::Tensor &A_sc, const at::Tensor &A_sc_global,
+    const at::Tensor &B, const at::Tensor &B_sc, const at::Tensor &B_sc_global,
+    const at::Tensor &x,
+    at::Tensor &D,
+    at::Tensor &partial_dot,
+    std::optional<at::Tensor> gamma_opt
+) {
+    TORCH_CHECK(D.is_cuda() && D.is_contiguous() && D.scalar_type() == at::kBFloat16 && D.dim() == 2,
+                "D must be contiguous CUDA bf16 [M,N]");
+    TORCH_CHECK(x.is_cuda() && x.is_contiguous() && x.scalar_type() == at::kBFloat16 &&
+                    x.dim() == 2 && x.sizes() == D.sizes(),
+                "x must be contiguous CUDA bf16 with the same [M,N] shape as D");
+    constexpr int epi_cols = C::Nb / C::EPI_PIPE_DEPTH;
+    static_assert(epi_cols == 32, "G4 partial-dot epilogue requires 32-column slices");
+    TORCH_CHECK(D.size(1) > 0 && D.size(1) % 32 == 0,
+                "D columns must be positive and divisible by 32");
+    TORCH_CHECK(partial_dot.is_cuda() && partial_dot.is_contiguous() &&
+                    partial_dot.scalar_type() == at::kFloat && partial_dot.dim() == 2 &&
+                    partial_dot.size(0) == D.size(0) && partial_dot.size(1) == D.size(1) / 32,
+                "partial_dot must be contiguous CUDA fp32 [M,N/32]");
+    if (gamma_opt.has_value()) {
+        const auto &gamma = gamma_opt.value();
+        TORCH_CHECK(gamma.is_cuda() && gamma.is_contiguous() && gamma.scalar_type() == at::kBFloat16 &&
+                        gamma.dim() == 1 && gamma.numel() == D.size(1),
+                    "gamma must be contiguous CUDA bf16 [N]");
+    }
+
+    using G = nvfp4_gemm::globals<C>;
+    G g {
+        .A = kittens::py::tensor_to_gl<typename G::A_fp4x2_gl>(A),
+        .A_sc = kittens::py::tensor_to_gl<typename G::A_sc_gl, false>(
+            A_sc, 1, A_sc.dim() == 2 ? A_sc.size(0) / 128 : A_sc.size(0),
+            A_sc.dim() == 2 ? A_sc.size(1) / 4 : A_sc.size(1), 256),
+        .A_sc_global = kittens::py::tensor_to_gl<typename G::A_sc_global_gl>(A_sc_global),
+        .B = kittens::py::tensor_to_gl<typename G::B_fp4x2_gl>(B),
+        .B_sc = kittens::py::tensor_to_gl<typename G::B_sc_gl, false>(
+            B_sc, 1, B_sc.dim() == 2 ? B_sc.size(0) / 128 : B_sc.size(0),
+            B_sc.dim() == 2 ? B_sc.size(1) / 4 : B_sc.size(1), 256),
+        .B_sc_global = kittens::py::tensor_to_gl<typename G::B_sc_global_gl>(B_sc_global),
+        .D = kittens::py::tensor_to_gl<typename G::D_gl>(D),
+        .D_K = kittens::py::tensor_to_gl<typename G::D_gl>(D),
+        .D_V = kittens::py::tensor_to_gl<typename G::D_gl>(D),
+        .q_dim = 0,
+        .k_dim = 0,
+        .v_dim = 0,
+        .use_split_D = false,
+        .a_sg_per_tile = nullptr,
+        .a_sg_stride = 1,
+        .b_sg_per_tile = nullptr,
+        .b_sg_stride = 1,
+        .silu_dim = 0,
+        .g4_x = reinterpret_cast<const bf16*>(x.data_ptr()),
+        .g4_partial_dot = partial_dot.data_ptr<float>(),
+        .g4_partial_dot_stride = static_cast<int>(partial_dot.size(1)),
+        .g4_gamma = gamma_opt.has_value()
+            ? reinterpret_cast<const bf16*>(gamma_opt.value().data_ptr())
+            : nullptr
+    };
     kittens::py::launch_kernel<C, G, nvfp4_gemm::kernel<C>>(g);
 }
 
@@ -2386,6 +2491,12 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           pybind11::arg("A"), pybind11::arg("A_sc"), pybind11::arg("A_sc_global"),
           pybind11::arg("B"), pybind11::arg("B_sc"), pybind11::arg("B_sc_global"),
           pybind11::arg("row_scale_coeff"), pybind11::arg("D"));
+    m.def("nvfp4_gemm_rms_bwd_partial_dot", &nvfp4_gemm_rms_bwd_partial_dot_entrypoint,
+          "NVFP4 GEMM with adjacent G4 RMSNorm-backward partial-dot epilogue",
+          pybind11::arg("A"), pybind11::arg("A_sc"), pybind11::arg("A_sc_global"),
+          pybind11::arg("B"), pybind11::arg("B_sc"), pybind11::arg("B_sc_global"),
+          pybind11::arg("x"), pybind11::arg("D"), pybind11::arg("partial_dot"),
+          pybind11::arg("gamma") = std::nullopt);
     m.def("c1_row_rms_reduce", &c1_rms_reduce::row_rms_reduce_entrypoint,
           "Reduce C1 partial row RMS stats into row RMS coefficients",
           pybind11::arg("row_rms_partial"), pybind11::arg("coeff"),
@@ -2404,6 +2515,16 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           pybind11::arg("coeff"), pybind11::arg("dot"),
           pybind11::arg("dx"), pybind11::arg("hidden_size"),
           pybind11::arg("gamma") = std::nullopt);
+    m.def("g4_rms_bwd_apply_dx_native_order", &c5_rms_bwd::apply_dx_native_order_entrypoint,
+          "G4 apply RMSNorm backward dx in the production native operation order",
+          pybind11::arg("x"), pybind11::arg("dy"),
+          pybind11::arg("coeff"), pybind11::arg("dot"),
+          pybind11::arg("dx"), pybind11::arg("hidden_size"),
+          pybind11::arg("gamma") = std::nullopt);
+    m.def("g4_rms_bwd_dgamma_native_order", &c5_rms_bwd::dgamma_native_order_entrypoint,
+          "G4 RMSNorm backward dgamma in the production native reduction order",
+          pybind11::arg("x"), pybind11::arg("dy"),
+          pybind11::arg("coeff"), pybind11::arg("dgamma"));
     m.def("g5_rms_bwd_partial_dgamma", &c5_rms_bwd::partial_dgamma_entrypoint,
           "G5 RMSNorm backward partial dgamma over 256-row tiles",
           pybind11::arg("x"), pybind11::arg("dy"),

@@ -31,7 +31,8 @@ template <
     bool _FUSE_C1_RMS = false,
     bool _FUSE_C3_ROW_SCALE = false,
     bool _FUSE_G1_SILU_DGRAD_QUANT = false,
-    int _G1_MODE = 0
+    int _G1_MODE = 0,
+    bool _FUSE_G4_RMS_BWD = false
 >
 struct config {
     static_assert(_Nb == 128 || _Nb == 256, "Nb must be 128 or 256");
@@ -70,6 +71,7 @@ struct config {
     static constexpr bool FUSE_C3_ROW_SCALE = _FUSE_C3_ROW_SCALE;
     static constexpr bool FUSE_G1_SILU_DGRAD_QUANT = _FUSE_G1_SILU_DGRAD_QUANT;
     static constexpr int G1_MODE = _G1_MODE;
+    static constexpr bool FUSE_G4_RMS_BWD = _FUSE_G4_RMS_BWD;
     static_assert(G1_MODE >= 0 && G1_MODE <= 4, "unsupported G1 epilogue mode");
 
     // Output cache policy for TMA stores
@@ -157,6 +159,10 @@ struct globals {
     int row_rms_partial_stride;
     const bf16* gamma;       // optional [N] gamma applied to stored output
     const float* row_scale_coeff; // optional C3 [M] row multiplier for stored GEMM output
+    const bf16* g4_x;              // optional G4 [M,N] pre-gamma RMSNorm input
+    float* g4_partial_dot;         // optional G4 [M,N/32] partial sum(x * dy * gamma)
+    int g4_partial_dot_stride;
+    const bf16* g4_gamma;          // optional G4 [N]
     const bf16* h3;               // optional G1 [M,N] saved W3 activation
     const bf16* h1_raw;           // optional G1 [M,N] saved W1 preactivation
     uint8_t* row_fp4;             // optional G1 [M,2*N/2]
@@ -217,6 +223,77 @@ __device__ inline void apply_silu_inplace(RT &D_reg) {
                 auto &v = D_reg.tiles[i][j].data[k];
                 v.x = v.x / (1.0f + __expf(-v.x));
                 v.y = v.y / (1.0f + __expf(-v.y));
+            }
+        }
+    }
+}
+
+template <typename C, typename RT>
+__device__ inline void apply_g4_partial_dot_if_enabled(
+    const globals<C> &g,
+    const RT &D_reg,
+    int row_tile,
+    int col_tile
+) {
+    if constexpr (!C::FUSE_G4_RMS_BWD) {
+        return;
+    } else {
+        static_assert(RT::cols == 32, "G4 partial-dot tiles must cover 32 columns");
+        const int lane = warp::laneid();
+        const int lane_col_pair = lane & 3;
+        const int warp_row_base = row_tile * (C::Mb / 2) + warpgroup::warpid() * RT::rows;
+        const int col_base = col_tile * RT::cols;
+        #pragma unroll
+        for (int i = 0; i < RT::height; ++i) {
+            const int row_x = warp_row_base + i * 16 + lane / 4;
+            const int row_y = row_x + 8;
+            const int col_0 = col_base + lane_col_pair * 2;
+            const int col_8 = col_0 + 8;
+            const int col_16 = col_0 + 16;
+            const int col_24 = col_0 + 24;
+            const bf16 *x_row = g.g4_x + static_cast<int64_t>(row_x) * g.D.cols();
+            const bf16 *y_row = g.g4_x + static_cast<int64_t>(row_y) * g.D.cols();
+
+            #define G4_PRODUCT(XROW, COL, DY) \
+                ((__bfloat162float((XROW)[COL]) * __bfloat162float(DY)) * \
+                 (g.g4_gamma == nullptr ? 1.0f : __bfloat162float(g.g4_gamma[COL])))
+            float2 top;
+            top.x = G4_PRODUCT(x_row, col_0, D_reg.tiles[i][0].data[0].x)
+                  + G4_PRODUCT(x_row, col_16, D_reg.tiles[i][1].data[0].x);
+            top.x += G4_PRODUCT(x_row, col_8, D_reg.tiles[i][0].data[2].x)
+                   + G4_PRODUCT(x_row, col_24, D_reg.tiles[i][1].data[2].x);
+            top.y = G4_PRODUCT(x_row, col_0 + 1, D_reg.tiles[i][0].data[0].y)
+                  + G4_PRODUCT(x_row, col_16 + 1, D_reg.tiles[i][1].data[0].y);
+            top.y += G4_PRODUCT(x_row, col_8 + 1, D_reg.tiles[i][0].data[2].y)
+                   + G4_PRODUCT(x_row, col_24 + 1, D_reg.tiles[i][1].data[2].y);
+
+            float2 bottom;
+            bottom.x = G4_PRODUCT(y_row, col_0, D_reg.tiles[i][0].data[1].x)
+                     + G4_PRODUCT(y_row, col_16, D_reg.tiles[i][1].data[1].x);
+            bottom.x += G4_PRODUCT(y_row, col_8, D_reg.tiles[i][0].data[3].x)
+                      + G4_PRODUCT(y_row, col_24, D_reg.tiles[i][1].data[3].x);
+            bottom.y = G4_PRODUCT(y_row, col_0 + 1, D_reg.tiles[i][0].data[1].y)
+                     + G4_PRODUCT(y_row, col_16 + 1, D_reg.tiles[i][1].data[1].y);
+            bottom.y += G4_PRODUCT(y_row, col_8 + 1, D_reg.tiles[i][0].data[3].y)
+                      + G4_PRODUCT(y_row, col_24 + 1, D_reg.tiles[i][1].data[3].y);
+            #undef G4_PRODUCT
+
+            float2 other = packed_shfl_down_sync(MASK_ALL, top, 2);
+            top.x += other.x;
+            top.y += other.y;
+            other = packed_shfl_down_sync(MASK_ALL, bottom, 2);
+            bottom.x += other.x;
+            bottom.y += other.y;
+            other = packed_shfl_down_sync(MASK_ALL, top, 1);
+            top.x += other.x;
+            top.y += other.y;
+            other = packed_shfl_down_sync(MASK_ALL, bottom, 1);
+            bottom.x += other.x;
+            bottom.y += other.y;
+
+            if ((lane & 3) == 0) {
+                g.g4_partial_dot[row_x * g.g4_partial_dot_stride + col_tile] = top.x + top.y;
+                g.g4_partial_dot[row_y * g.g4_partial_dot_stride + col_tile] = bottom.x + bottom.y;
             }
         }
     }
@@ -978,7 +1055,7 @@ __device__ inline void kernel_impl(const globals<C> &g) {
                         row_block_idx * 2 + cta_id);
                     warpgroup::tma::store_async_read_wait<C::NUM_D_TILES-1>();
                     warpgroup::sync(1);
-                    if constexpr (C::FUSE_RESIDUAL) {
+                    if constexpr (C::FUSE_RESIDUAL || C::FUSE_G4_RMS_BWD) {
                         rt_bf<C::Mb / 8, C::Nb/C::EPI_PIPE_DEPTH> D_reg_bf;
                         warp::copy(D_reg_bf, D_reg);
                         maybe_add_residual_tile<C>(
@@ -987,6 +1064,10 @@ __device__ inline void kernel_impl(const globals<C> &g) {
                             row_block_idx * 2 + cta_id,
                             C::EPI_PIPE_DEPTH * col_block_idx + i);
                         apply_c1_rms_gamma_if_enabled<C>(
+                            g, D_reg_bf,
+                            row_block_idx * 2 + cta_id,
+                            C::EPI_PIPE_DEPTH * col_block_idx + i);
+                        apply_g4_partial_dot_if_enabled<C>(
                             g, D_reg_bf,
                             row_block_idx * 2 + cta_id,
                             C::EPI_PIPE_DEPTH * col_block_idx + i);
@@ -1046,6 +1127,10 @@ __device__ inline void kernel_impl(const globals<C> &g) {
                         row_block_idx * 2 + cta_id,
                         C::EPI_PIPE_DEPTH * col_block_idx + i);
                     apply_c1_rms_gamma_if_enabled<C>(
+                        g, D_reg[i],
+                        row_block_idx * 2 + cta_id,
+                        C::EPI_PIPE_DEPTH * col_block_idx + i);
+                    apply_g4_partial_dot_if_enabled<C>(
                         g, D_reg[i],
                         row_block_idx * 2 + cta_id,
                         C::EPI_PIPE_DEPTH * col_block_idx + i);

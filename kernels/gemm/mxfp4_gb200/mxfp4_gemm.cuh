@@ -24,7 +24,8 @@ template <
     bool _FUSE_RESIDUAL = false,
     bool _OUTPUT_SCALE = false,
     bool _FUSE_C1_RMS = false,
-    bool _FUSE_C3_ROW_SCALE = false
+    bool _FUSE_C3_ROW_SCALE = false,
+    bool _FUSE_G4_RMS_BWD = false
 >
 struct config {
     static_assert(_Nb == 128 || _Nb == 256, "Nb must be 128 or 256");
@@ -57,6 +58,7 @@ struct config {
     static constexpr bool OUTPUT_SCALE = _OUTPUT_SCALE;
     static constexpr bool FUSE_C1_RMS = _FUSE_C1_RMS;
     static constexpr bool FUSE_C3_ROW_SCALE = _FUSE_C3_ROW_SCALE;
+    static constexpr bool FUSE_G4_RMS_BWD = _FUSE_G4_RMS_BWD;
     static constexpr int B_SC_SIZE = Nb/128;
     static constexpr int MMA_PER_TILE = Kb/128;
 
@@ -119,6 +121,10 @@ struct globals {
     int row_rms_partial_stride;
     const bf16* gamma;             // optional [N] gamma applied to stored output
     const float* row_scale_coeff;  // optional C3 [M] row multiplier for stored GEMM output
+    const bf16* g4_x;              // optional G4 [M,N] pre-gamma RMSNorm input
+    float* g4_partial_dot;         // optional G4 [M,N/32] partial sum(x * dy * gamma)
+    int g4_partial_dot_stride;
+    const bf16* g4_gamma;          // optional G4 [N]
     const uint8_t* tilemask_ptr;   // optional [mask_rows, mask_cols] activity mask
     int            tilemask_rows;
     int            tilemask_cols;
@@ -321,6 +327,77 @@ __device__ inline void apply_c3_row_scale_if_enabled(
             row_coeff[i][0].y = g.row_scale_coeff[row_y];
         }
         warp::mul_row(D_reg, D_reg, row_coeff);
+    }
+}
+
+template <typename C, typename RT>
+__device__ inline void apply_g4_partial_dot_if_enabled(
+    const globals<C> &g,
+    const RT &D_reg,
+    int row_tile,
+    int col_tile
+) {
+    if constexpr (!C::FUSE_G4_RMS_BWD) {
+        return;
+    } else {
+        static_assert(RT::cols == 32, "G4 partial-dot tiles must cover 32 columns");
+        const int lane = warp::laneid();
+        const int lane_col_pair = lane & 3;
+        const int warp_row_base = row_tile * (C::Mb / 2) + warpgroup::warpid() * RT::rows;
+        const int col_base = col_tile * RT::cols;
+        #pragma unroll
+        for (int i = 0; i < RT::height; ++i) {
+            const int row_x = warp_row_base + i * 16 + lane / 4;
+            const int row_y = row_x + 8;
+            const int col_0 = col_base + lane_col_pair * 2;
+            const int col_8 = col_0 + 8;
+            const int col_16 = col_0 + 16;
+            const int col_24 = col_0 + 24;
+            const bf16 *x_row = g.g4_x + static_cast<int64_t>(row_x) * g.D.cols();
+            const bf16 *y_row = g.g4_x + static_cast<int64_t>(row_y) * g.D.cols();
+
+            #define G4_PRODUCT(XROW, COL, DY) \
+                ((__bfloat162float((XROW)[COL]) * __bfloat162float(DY)) * \
+                 (g.g4_gamma == nullptr ? 1.0f : __bfloat162float(g.g4_gamma[COL])))
+            float2 top;
+            top.x = G4_PRODUCT(x_row, col_0, D_reg.tiles[i][0].data[0].x)
+                  + G4_PRODUCT(x_row, col_16, D_reg.tiles[i][1].data[0].x);
+            top.x += G4_PRODUCT(x_row, col_8, D_reg.tiles[i][0].data[2].x)
+                   + G4_PRODUCT(x_row, col_24, D_reg.tiles[i][1].data[2].x);
+            top.y = G4_PRODUCT(x_row, col_0 + 1, D_reg.tiles[i][0].data[0].y)
+                  + G4_PRODUCT(x_row, col_16 + 1, D_reg.tiles[i][1].data[0].y);
+            top.y += G4_PRODUCT(x_row, col_8 + 1, D_reg.tiles[i][0].data[2].y)
+                   + G4_PRODUCT(x_row, col_24 + 1, D_reg.tiles[i][1].data[2].y);
+
+            float2 bottom;
+            bottom.x = G4_PRODUCT(y_row, col_0, D_reg.tiles[i][0].data[1].x)
+                     + G4_PRODUCT(y_row, col_16, D_reg.tiles[i][1].data[1].x);
+            bottom.x += G4_PRODUCT(y_row, col_8, D_reg.tiles[i][0].data[3].x)
+                      + G4_PRODUCT(y_row, col_24, D_reg.tiles[i][1].data[3].x);
+            bottom.y = G4_PRODUCT(y_row, col_0 + 1, D_reg.tiles[i][0].data[1].y)
+                     + G4_PRODUCT(y_row, col_16 + 1, D_reg.tiles[i][1].data[1].y);
+            bottom.y += G4_PRODUCT(y_row, col_8 + 1, D_reg.tiles[i][0].data[3].y)
+                      + G4_PRODUCT(y_row, col_24 + 1, D_reg.tiles[i][1].data[3].y);
+            #undef G4_PRODUCT
+
+            float2 other = packed_shfl_down_sync(MASK_ALL, top, 2);
+            top.x += other.x;
+            top.y += other.y;
+            other = packed_shfl_down_sync(MASK_ALL, bottom, 2);
+            bottom.x += other.x;
+            bottom.y += other.y;
+            other = packed_shfl_down_sync(MASK_ALL, top, 1);
+            top.x += other.x;
+            top.y += other.y;
+            other = packed_shfl_down_sync(MASK_ALL, bottom, 1);
+            bottom.x += other.x;
+            bottom.y += other.y;
+
+            if ((lane & 3) == 0) {
+                g.g4_partial_dot[row_x * g.g4_partial_dot_stride + col_tile] = top.x + top.y;
+                g.g4_partial_dot[row_y * g.g4_partial_dot_stride + col_tile] = bottom.x + bottom.y;
+            }
+        }
     }
 }
 
@@ -594,6 +671,10 @@ __device__ inline void kernel(const globals<C> &g) {
                             g, D_reg,
                             row_block_idx * 2 + cta_id,
                             col_block_idx * C::EPI_PIPE_DEPTH + i);
+                        apply_g4_partial_dot_if_enabled<C>(
+                            g, D_reg,
+                            row_block_idx * 2 + cta_id,
+                            col_block_idx * C::EPI_PIPE_DEPTH + i);
                         warpgroup::store(output_tiles.D[smem_slot], D_reg);
                         warpgroup::sync(1);
                         warpgroup::tma::store_async<dim::ROW, cache_policy::EVICT_FIRST>(g.D, output_tiles.D[smem_slot], {row_block_idx * 2 + cta_id, col_block_idx * C::EPI_PIPE_DEPTH + i});
@@ -613,6 +694,10 @@ __device__ inline void kernel(const globals<C> &g) {
                             row_block_idx * 2 + cta_id,
                             col_block_idx * C::EPI_PIPE_DEPTH + i);
                         apply_c1_rms_gamma_if_enabled<C>(
+                            g, D_reg[i],
+                            row_block_idx * 2 + cta_id,
+                            col_block_idx * C::EPI_PIPE_DEPTH + i);
+                        apply_g4_partial_dot_if_enabled<C>(
                             g, D_reg[i],
                             row_block_idx * 2 + cta_id,
                             col_block_idx * C::EPI_PIPE_DEPTH + i);
@@ -674,6 +759,10 @@ __device__ inline void kernel(const globals<C> &g) {
                         g, D_reg,
                         row_block_idx * 2 + cta_id,
                         col_block_idx * C::EPI_PIPE_DEPTH + i);
+                    apply_g4_partial_dot_if_enabled<C>(
+                        g, D_reg,
+                        row_block_idx * 2 + cta_id,
+                        col_block_idx * C::EPI_PIPE_DEPTH + i);
                     warpgroup::store(output_tiles.D[smem_slot], D_reg);
                     warpgroup::sync(1);
                     warpgroup::tma::store_async<dim::ROW, cache_policy::EVICT_FIRST>(g.D, output_tiles.D[smem_slot], {row_block_idx * 2 + cta_id, col_block_idx * C::EPI_PIPE_DEPTH + i});
@@ -729,6 +818,10 @@ __device__ inline void kernel(const globals<C> &g) {
                         row_block_idx * 2 + cta_id,
                         col_block_idx * C::EPI_PIPE_DEPTH + i);
                     apply_c1_rms_gamma_if_enabled<C>(
+                        g, D_reg[i],
+                        row_block_idx * 2 + cta_id,
+                        col_block_idx * C::EPI_PIPE_DEPTH + i);
+                    apply_g4_partial_dot_if_enabled<C>(
                         g, D_reg[i],
                         row_block_idx * 2 + cta_id,
                         col_block_idx * C::EPI_PIPE_DEPTH + i);

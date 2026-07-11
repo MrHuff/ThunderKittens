@@ -90,6 +90,68 @@ __global__ void rmsnorm_dx_apply_kernel(
     dx[idx] = __float2bfloat16(dx_val);
 }
 
+__global__ void rmsnorm_dx_apply_native_order_kernel(
+    const __nv_bfloat16* __restrict__ x,
+    const __nv_bfloat16* __restrict__ dy,
+    const __nv_bfloat16* __restrict__ gamma,
+    const float* __restrict__ coeff,
+    const float* __restrict__ dot,
+    __nv_bfloat16* __restrict__ dx,
+    int64_t numel,
+    int64_t hidden_size
+) {
+    const int64_t idx = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (idx >= numel) {
+        return;
+    }
+    const int64_t row = idx / hidden_size;
+    const int64_t col = idx - row * hidden_size;
+    const float inv = coeff[row];
+    const float g = gamma == nullptr ? 1.0f : __bfloat162float(gamma[col]);
+    const float x_val = __bfloat162float(x[idx]);
+    const float dy_val = __bfloat162float(dy[idx]);
+    const float dot_mean = dot[row] / static_cast<float>(hidden_size);
+    const float inv3_dot = inv * inv * inv * dot_mean;
+    const float dx_val = inv * (dy_val * g) - x_val * inv3_dot;
+    dx[idx] = __float2bfloat16(dx_val);
+}
+
+__global__ void dgamma_native_order_kernel(
+    const __nv_bfloat16* __restrict__ x,
+    const __nv_bfloat16* __restrict__ dy,
+    const float* __restrict__ coeff,
+    float* __restrict__ dgamma,
+    int64_t rows,
+    int64_t hidden_size
+) {
+    __shared__ float scratch[256];
+    const int64_t col = static_cast<int64_t>(blockIdx.x);
+    if (col >= hidden_size) {
+        return;
+    }
+    const int tid = threadIdx.x;
+    float partial = 0.0f;
+    for (int64_t row = tid; row < rows; row += blockDim.x) {
+        const int64_t idx = row * hidden_size + col;
+        partial += (
+            __bfloat162float(dy[idx])
+            * __bfloat162float(x[idx])
+            * coeff[row]
+        );
+    }
+    scratch[tid] = partial;
+    __syncthreads();
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            scratch[tid] += scratch[tid + stride];
+        }
+        __syncthreads();
+    }
+    if (tid == 0) {
+        dgamma[col] = scratch[0];
+    }
+}
+
 __global__ void row_tile_partial_dgamma_kernel(
     const __nv_bfloat16* __restrict__ x,
     const __nv_bfloat16* __restrict__ dy,
@@ -313,6 +375,79 @@ inline void apply_dx_entrypoint(
         dot.data_ptr<float>(),
         reinterpret_cast<__nv_bfloat16*>(dx.data_ptr()),
         numel,
+        hidden_size
+    );
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+inline void apply_dx_native_order_entrypoint(
+    const at::Tensor& x,
+    const at::Tensor& dy,
+    const at::Tensor& coeff,
+    const at::Tensor& dot,
+    at::Tensor& dx,
+    int64_t hidden_size,
+    std::optional<at::Tensor> gamma_opt = std::nullopt
+) {
+    check_matrix_bf16(x, "x");
+    check_matrix_bf16(dy, "dy");
+    check_matrix_bf16(dx, "dx");
+    TORCH_CHECK(dy.sizes() == x.sizes(), "dy shape must match x");
+    TORCH_CHECK(dx.sizes() == x.sizes(), "dx shape must match x");
+    TORCH_CHECK(hidden_size == x.size(1), "hidden_size must equal x.shape[1]");
+    TORCH_CHECK(hidden_size > 0 && hidden_size % 32 == 0,
+                "hidden_size must be positive and divisible by 32");
+    const int64_t rows = x.size(0);
+    check_gamma(gamma_opt, hidden_size);
+    check_vector_fp32(coeff, "coeff", rows);
+    check_vector_fp32(dot, "dot", rows);
+    const int64_t numel = x.numel();
+    if (numel == 0) {
+        return;
+    }
+    const __nv_bfloat16* gamma_ptr = gamma_opt.has_value()
+        ? reinterpret_cast<const __nv_bfloat16*>(gamma_opt.value().data_ptr())
+        : nullptr;
+    constexpr int threads = 256;
+    const int blocks = static_cast<int>((numel + threads - 1) / threads);
+    rmsnorm_dx_apply_native_order_kernel<<<blocks, threads, 0, at::cuda::getCurrentCUDAStream()>>>(
+        reinterpret_cast<const __nv_bfloat16*>(x.data_ptr()),
+        reinterpret_cast<const __nv_bfloat16*>(dy.data_ptr()),
+        gamma_ptr,
+        coeff.data_ptr<float>(),
+        dot.data_ptr<float>(),
+        reinterpret_cast<__nv_bfloat16*>(dx.data_ptr()),
+        numel,
+        hidden_size
+    );
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+inline void dgamma_native_order_entrypoint(
+    const at::Tensor& x,
+    const at::Tensor& dy,
+    const at::Tensor& coeff,
+    at::Tensor& dgamma
+) {
+    check_matrix_bf16(x, "x");
+    check_matrix_bf16(dy, "dy");
+    TORCH_CHECK(dy.sizes() == x.sizes(), "dy shape must match x");
+    const int64_t rows = x.size(0);
+    const int64_t hidden_size = x.size(1);
+    TORCH_CHECK(hidden_size > 0, "hidden_size must be positive");
+    check_vector_fp32(coeff, "coeff", rows);
+    check_dgamma(dgamma, hidden_size);
+    if (rows == 0) {
+        dgamma.zero_();
+        return;
+    }
+    dgamma_native_order_kernel<<<static_cast<int>(hidden_size), 256, 0,
+        at::cuda::getCurrentCUDAStream()>>>(
+        reinterpret_cast<const __nv_bfloat16*>(x.data_ptr()),
+        reinterpret_cast<const __nv_bfloat16*>(dy.data_ptr()),
+        coeff.data_ptr<float>(),
+        dgamma.data_ptr<float>(),
+        rows,
         hidden_size
     );
     C10_CUDA_KERNEL_LAUNCH_CHECK();

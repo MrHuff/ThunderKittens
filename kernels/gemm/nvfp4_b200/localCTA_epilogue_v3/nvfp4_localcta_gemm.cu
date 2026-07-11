@@ -43,6 +43,12 @@ using localcta_fast_smallk_residual_config = nvfp4_gemm::config<256, 5, 8, 4, 2,
 using localcta_fast_largek_residual_config = nvfp4_gemm::config<256, 5, 8, 12, 2, false, 256, true, 2, 256, false, true>;
 using localcta_fast_smallk_residual_rms_config = nvfp4_gemm::config<256, 5, 8, 4, 2, false, 256, true, 2, 256, false, true, true>;
 using localcta_fast_largek_residual_rms_config = nvfp4_gemm::config<256, 5, 8, 12, 2, false, 256, true, 2, 256, false, true, true>;
+using localcta_fast_smallk_g4_config = nvfp4_gemm::config<
+    256, 5, 8, 4, 2, true, 256, true, 2, 256,
+    false, false, false, false, false, 0, true>;
+using localcta_fast_largek_g4_config = nvfp4_gemm::config<
+    256, 5, 8, 12, 2, true, 256, true, 2, 256,
+    false, false, false, false, false, 0, true>;
 using localcta_fast_smallk_row_scale_config = nvfp4_gemm::config<256, 5, 8, 4, 2, false, 256, true, 2, 256, false, false, false, true>;
 using localcta_fast_largek_row_scale_config = nvfp4_gemm::config<256, 5, 8, 12, 2, false, 256, true, 2, 256, false, false, false, true>;
 using localcta_fast_grouped_config = nvfp4_gemm::config<256, 5, 8, 4, 2, false>;
@@ -1548,6 +1554,72 @@ void launch_fast_gemm_with_config_residual_rms(
 }
 
 template <typename C>
+void launch_fast_gemm_with_config_rms_bwd_partial_dot(
+    const at::Tensor& A,
+    const at::Tensor& A_sc_prepared,
+    const at::Tensor& A_sg_tiles,
+    const at::Tensor& B,
+    const at::Tensor& B_sc_prepared,
+    const at::Tensor& B_sg_tiles,
+    const at::Tensor& x,
+    at::Tensor& D,
+    at::Tensor& partial_dot,
+    std::optional<at::Tensor> gamma_opt
+) {
+    using G = nvfp4_gemm::globals<C>;
+    auto one = get_unit_scale_tensor(A);
+    const bool has_tile_scales = A_sg_tiles.defined() && B_sg_tiles.defined();
+    outer_scale_desc a_sg_desc{nullptr, 1};
+    outer_scale_desc b_sg_desc{nullptr, 1};
+    if (has_tile_scales) {
+        a_sg_desc = check_outer_scale_tiles(A_sg_tiles, "A_sg_tiles", A.size(0) / C::Mb, true);
+        b_sg_desc = check_outer_scale_tiles(B_sg_tiles, "B_sg_tiles", B.size(0) / C::Nb, false);
+    }
+    check_output_matrix(x, "x", D.size(0), D.size(1));
+    constexpr int epi_cols = C::Nb / C::EPI_PIPE_DEPTH;
+    static_assert(epi_cols == 32, "G4 partial-dot epilogue requires 32-column slices");
+    TORCH_CHECK(partial_dot.is_cuda() && partial_dot.is_contiguous() &&
+                    partial_dot.scalar_type() == at::kFloat && partial_dot.dim() == 2 &&
+                    partial_dot.size(0) == D.size(0) && partial_dot.size(1) == D.size(1) / 32,
+                "partial_dot must be contiguous CUDA fp32 [M,N/32]");
+    if (gamma_opt.has_value()) {
+        const auto& gamma = gamma_opt.value();
+        TORCH_CHECK(gamma.is_cuda() && gamma.is_contiguous() && gamma.scalar_type() == at::kBFloat16 &&
+                        gamma.dim() == 1 && gamma.numel() == D.size(1),
+                    "gamma must be contiguous CUDA bf16 [N]");
+    }
+    G g {
+        .A = kittens::py::tensor_to_gl<typename G::A_fp4x2_gl>(A),
+        .A_sc = kittens::py::tensor_to_gl<typename G::A_sc_gl, false>(
+            A_sc_prepared, 1, A_sc_prepared.size(0), A_sc_prepared.size(1), 256),
+        .A_sc_global = kittens::py::tensor_to_gl<typename G::A_sc_global_gl>(one),
+        .B = kittens::py::tensor_to_gl<typename G::B_fp4x2_gl>(B),
+        .B_sc = kittens::py::tensor_to_gl<typename G::B_sc_gl, false>(
+            B_sc_prepared, 1, B_sc_prepared.size(0), B_sc_prepared.size(1), 256),
+        .B_sc_global = kittens::py::tensor_to_gl<typename G::B_sc_global_gl>(one),
+        .D = kittens::py::tensor_to_gl<typename G::D_gl>(D),
+        .D_K = kittens::py::tensor_to_gl<typename G::D_gl>(D),
+        .D_V = kittens::py::tensor_to_gl<typename G::D_gl>(D),
+        .q_dim = 0,
+        .k_dim = 0,
+        .v_dim = 0,
+        .use_split_D = false,
+        .a_sg_per_tile = has_tile_scales ? a_sg_desc.ptr : nullptr,
+        .a_sg_stride = has_tile_scales ? a_sg_desc.stride : 1,
+        .b_sg_per_tile = has_tile_scales ? b_sg_desc.ptr : nullptr,
+        .b_sg_stride = has_tile_scales ? b_sg_desc.stride : 1,
+        .silu_dim = 0,
+        .g4_x = reinterpret_cast<const bf16*>(x.data_ptr()),
+        .g4_partial_dot = partial_dot.data_ptr<float>(),
+        .g4_partial_dot_stride = static_cast<int>(partial_dot.size(1)),
+        .g4_gamma = gamma_opt.has_value()
+            ? reinterpret_cast<const bf16*>(gamma_opt.value().data_ptr())
+            : nullptr
+    };
+    kittens::py::launch_kernel<C, G, nvfp4_gemm::kernel<C>>(g);
+}
+
+template <typename C>
 void launch_fast_gemm_with_config_row_scale(
     const at::Tensor& A,
     const at::Tensor& A_sc_prepared,
@@ -1889,6 +1961,30 @@ void launch_fast_regular_gemm_residual_rms(
         launch_fast_gemm_with_config_residual_rms<localcta_fast_largek_residual_rms_config>(
             A, A_sc_prepared, A_sg_tiles, B, B_sc_prepared, B_sg_tiles,
             R, D, row_rms_partial, gamma_opt);
+    }
+}
+
+void launch_fast_regular_gemm_rms_bwd_partial_dot(
+    const at::Tensor& A,
+    const at::Tensor& A_sc_prepared,
+    const at::Tensor& A_sg_tiles,
+    const at::Tensor& B,
+    const at::Tensor& B_sc_prepared,
+    const at::Tensor& B_sg_tiles,
+    const at::Tensor& x,
+    at::Tensor& D,
+    at::Tensor& partial_dot,
+    std::optional<at::Tensor> gamma_opt
+) {
+    const int64_t K = A.size(1) * 2;
+    if (K <= 2048) {
+        launch_fast_gemm_with_config_rms_bwd_partial_dot<localcta_fast_smallk_g4_config>(
+            A, A_sc_prepared, A_sg_tiles, B, B_sc_prepared, B_sg_tiles,
+            x, D, partial_dot, gamma_opt);
+    } else {
+        launch_fast_gemm_with_config_rms_bwd_partial_dot<localcta_fast_largek_g4_config>(
+            A, A_sc_prepared, A_sg_tiles, B, B_sc_prepared, B_sg_tiles,
+            x, D, partial_dot, gamma_opt);
     }
 }
 
@@ -4540,6 +4636,39 @@ void nvfp4_localcta_gemm_residual_rms_entrypoint(
         R, D, row_rms_partial, gamma_opt);
 }
 
+void nvfp4_localcta_gemm_rms_bwd_partial_dot_entrypoint(
+    const at::Tensor& A,
+    const at::Tensor& A_sc,
+    const at::Tensor& A_sg_chunks,
+    const at::Tensor& B,
+    const at::Tensor& B_sc,
+    const at::Tensor& B_sg_chunks,
+    const at::Tensor& x,
+    at::Tensor& D,
+    at::Tensor& partial_dot,
+    std::optional<at::Tensor> gamma_opt = std::nullopt
+) {
+    const auto sg_contract = infer_regular_sg_contract(A, A_sg_chunks, B, B_sg_chunks);
+    TORCH_CHECK(
+        sg_contract != SGContractMode::ChunkGrid128,
+        "nvfp4_localcta_gemm_rms_bwd_partial_dot only supports prepared TileGrid256 or outer-SG contracts");
+    if (sg_contract == SGContractMode::TileGrid256) {
+        check_v3_tilegrid256_gemm_inputs(A, A_sc, A_sg_chunks, B, B_sc, B_sg_chunks);
+        check_output_matrix(D, "D", A.size(0), B.size(0));
+        launch_fast_regular_gemm_rms_bwd_partial_dot(
+            A, A_sc, torch::Tensor(), B, B_sc, torch::Tensor(),
+            x, D, partial_dot, gamma_opt);
+        return;
+    }
+    auto A_sg_outer = normalize_outer_scale_tiles_tensor(A_sg_chunks, A.size(0) / 256, true);
+    auto B_sg_outer = normalize_outer_scale_tiles_tensor(B_sg_chunks, B.size(0) / 256, false);
+    check_v3_fast_gemm_inputs(A, A_sc, A_sg_outer, B, B_sc, B_sg_outer);
+    check_output_matrix(D, "D", A.size(0), B.size(0));
+    launch_fast_regular_gemm_rms_bwd_partial_dot(
+        A, A_sc, A_sg_outer, B, B_sc, B_sg_outer,
+        x, D, partial_dot, gamma_opt);
+}
+
 void nvfp4_localcta_gemm_row_scale_entrypoint(
     const at::Tensor& A,
     const at::Tensor& A_sc,
@@ -6691,6 +6820,13 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           pybind11::arg("A"), pybind11::arg("A_sc"), pybind11::arg("A_sg_chunks"),
           pybind11::arg("B"), pybind11::arg("B_sc"), pybind11::arg("B_sg_chunks"),
           pybind11::arg("row_scale_coeff"), pybind11::arg("D"));
+    m.def("nvfp4_localcta_gemm_rms_bwd_partial_dot",
+          &nvfp4_localcta_gemm_rms_bwd_partial_dot_entrypoint,
+          "localCTA v4 GEMM with adjacent G4 RMSNorm-backward partial-dot epilogue",
+          pybind11::arg("A"), pybind11::arg("A_sc"), pybind11::arg("A_sg_chunks"),
+          pybind11::arg("B"), pybind11::arg("B_sc"), pybind11::arg("B_sg_chunks"),
+          pybind11::arg("x"), pybind11::arg("D"), pybind11::arg("partial_dot"),
+          pybind11::arg("gamma") = std::nullopt);
     m.def("nvfp4_localcta_c1_row_rms_reduce", &c1_rms_reduce::row_rms_reduce_entrypoint,
           "Reduce C1 partial row RMS stats into row RMS coefficients",
           pybind11::arg("row_rms_partial"), pybind11::arg("coeff"),
@@ -6709,6 +6845,18 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           pybind11::arg("coeff"), pybind11::arg("dot"),
           pybind11::arg("dx"), pybind11::arg("hidden_size"),
           pybind11::arg("gamma") = std::nullopt);
+    m.def("nvfp4_localcta_g4_rms_bwd_apply_dx_native_order",
+          &c5_rms_bwd::apply_dx_native_order_entrypoint,
+          "localCTA G4 apply dx in the production native operation order",
+          pybind11::arg("x"), pybind11::arg("dy"),
+          pybind11::arg("coeff"), pybind11::arg("dot"),
+          pybind11::arg("dx"), pybind11::arg("hidden_size"),
+          pybind11::arg("gamma") = std::nullopt);
+    m.def("nvfp4_localcta_g4_rms_bwd_dgamma_native_order",
+          &c5_rms_bwd::dgamma_native_order_entrypoint,
+          "localCTA G4 dgamma in the production native reduction order",
+          pybind11::arg("x"), pybind11::arg("dy"),
+          pybind11::arg("coeff"), pybind11::arg("dgamma"));
     m.def("nvfp4_localcta_g5_rms_bwd_partial_dgamma", &c5_rms_bwd::partial_dgamma_entrypoint,
           "G5 RMSNorm backward partial dgamma over 256-row tiles",
           pybind11::arg("x"), pybind11::arg("dy"),
