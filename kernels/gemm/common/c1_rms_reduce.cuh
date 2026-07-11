@@ -2,6 +2,7 @@
 
 #include <ATen/ATen.h>
 #include <ATen/cuda/CUDAContext.h>
+#include <c10/cuda/CUDAGuard.h>
 #include <c10/cuda/CUDAException.h>
 
 namespace c1_rms_reduce {
@@ -78,6 +79,8 @@ inline void check_row_rms_reduce_args(
 ) {
     TORCH_CHECK(row_rms_partial.is_cuda(), "row_rms_partial must be CUDA");
     TORCH_CHECK(coeff.is_cuda(), "coeff must be CUDA");
+    TORCH_CHECK(row_rms_partial.get_device() == coeff.get_device(),
+                "row_rms_partial and coeff must be on the same CUDA device");
     TORCH_CHECK(row_rms_partial.scalar_type() == at::kFloat, "row_rms_partial must be float32");
     TORCH_CHECK(coeff.scalar_type() == at::kFloat, "coeff must be float32");
     TORCH_CHECK(row_rms_partial.is_contiguous(), "row_rms_partial must be contiguous");
@@ -104,11 +107,42 @@ inline void row_rms_reduce_entrypoint(
     if (rows == 0) {
         return;
     }
+    auto stream = at::cuda::getCurrentCUDAStream();
+    const auto tensor_device = row_rms_partial.get_device();
+    if (C10_UNLIKELY(stream.device_index() != tensor_device)) {
+        const c10::cuda::CUDAGuard device_guard(tensor_device);
+        if (partial_cols <= 128) {
+            constexpr int WARPS_PER_BLOCK = 4;
+            dim3 grid((rows + WARPS_PER_BLOCK - 1) / WARPS_PER_BLOCK);
+            dim3 block(32 * WARPS_PER_BLOCK);
+            row_rms_coeff_warp_kernel<<<grid, block, 0, at::cuda::getCurrentCUDAStream()>>>(
+                row_rms_partial.data_ptr<float>(),
+                coeff.data_ptr<float>(),
+                rows,
+                partial_cols,
+                hidden_size,
+                static_cast<float>(eps)
+            );
+        } else {
+            dim3 grid(rows);
+            dim3 block(256);
+            row_rms_coeff_kernel<<<grid, block, 0, at::cuda::getCurrentCUDAStream()>>>(
+                row_rms_partial.data_ptr<float>(),
+                coeff.data_ptr<float>(),
+                rows,
+                partial_cols,
+                hidden_size,
+                static_cast<float>(eps)
+            );
+        }
+        C10_CUDA_KERNEL_LAUNCH_CHECK();
+        return;
+    }
     if (partial_cols <= 128) {
         constexpr int WARPS_PER_BLOCK = 4;
         dim3 grid((rows + WARPS_PER_BLOCK - 1) / WARPS_PER_BLOCK);
         dim3 block(32 * WARPS_PER_BLOCK);
-        row_rms_coeff_warp_kernel<<<grid, block, 0, at::cuda::getCurrentCUDAStream()>>>(
+        row_rms_coeff_warp_kernel<<<grid, block, 0, stream>>>(
             row_rms_partial.data_ptr<float>(),
             coeff.data_ptr<float>(),
             rows,
@@ -119,7 +153,7 @@ inline void row_rms_reduce_entrypoint(
     } else {
         dim3 grid(rows);
         dim3 block(256);
-        row_rms_coeff_kernel<<<grid, block, 0, at::cuda::getCurrentCUDAStream()>>>(
+        row_rms_coeff_kernel<<<grid, block, 0, stream>>>(
             row_rms_partial.data_ptr<float>(),
             coeff.data_ptr<float>(),
             rows,
