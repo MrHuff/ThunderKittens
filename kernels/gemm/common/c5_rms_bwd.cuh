@@ -152,6 +152,13 @@ __global__ void dgamma_native_order_kernel(
     }
 }
 
+__device__ __forceinline__ float warp_sum(float value) {
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        value += __shfl_down_sync(0xffffffffu, value, offset);
+    }
+    return value;
+}
+
 __global__ void row_tile_partial_dgamma_kernel(
     const __nv_bfloat16* __restrict__ x,
     const __nv_bfloat16* __restrict__ dy,
@@ -160,13 +167,15 @@ __global__ void row_tile_partial_dgamma_kernel(
     int64_t rows,
     int64_t hidden_size
 ) {
-    __shared__ float scratch[256];
+    __shared__ float warp_sums[8];
     const int64_t col = static_cast<int64_t>(blockIdx.x);
     const int64_t row_tile = static_cast<int64_t>(blockIdx.y);
     if (col >= hidden_size) {
         return;
     }
     const int tid = threadIdx.x;
+    const int lane = tid & 31;
+    const int warp = tid >> 5;
     const int64_t row_start = row_tile * 256;
     const int64_t row_end = min(row_start + 256, rows);
     float partial = 0.0f;
@@ -178,16 +187,17 @@ __global__ void row_tile_partial_dgamma_kernel(
             * coeff[row]
         );
     }
-    scratch[tid] = partial;
-    __syncthreads();
-    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
-        if (tid < stride) {
-            scratch[tid] += scratch[tid + stride];
-        }
-        __syncthreads();
+    partial = warp_sum(partial);
+    if (lane == 0) {
+        warp_sums[warp] = partial;
     }
-    if (tid == 0) {
-        partial_dgamma[row_tile * hidden_size + col] = scratch[0];
+    __syncthreads();
+    if (warp == 0) {
+        float block_sum = lane < 8 ? warp_sums[lane] : 0.0f;
+        block_sum = warp_sum(block_sum);
+        if (lane == 0) {
+            partial_dgamma[row_tile * hidden_size + col] = block_sum;
+        }
     }
 }
 
@@ -197,26 +207,18 @@ __global__ void partial_dgamma_reduce_kernel(
     int64_t row_tiles,
     int64_t hidden_size
 ) {
-    __shared__ float scratch[256];
     const int64_t col = static_cast<int64_t>(blockIdx.x);
     if (col >= hidden_size) {
         return;
     }
-    const int tid = threadIdx.x;
+    const int lane = threadIdx.x;
     float sum = 0.0f;
-    for (int64_t tile = tid; tile < row_tiles; tile += blockDim.x) {
+    for (int64_t tile = lane; tile < row_tiles; tile += 32) {
         sum += partial_dgamma[tile * hidden_size + col];
     }
-    scratch[tid] = sum;
-    __syncthreads();
-    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
-        if (tid < stride) {
-            scratch[tid] += scratch[tid + stride];
-        }
-        __syncthreads();
-    }
-    if (tid == 0) {
-        dgamma[col] = scratch[0];
+    sum = warp_sum(sum);
+    if (lane == 0) {
+        dgamma[col] = sum;
     }
 }
 
@@ -501,7 +503,7 @@ inline void reduce_dgamma_entrypoint(
         dgamma.zero_();
         return;
     }
-    constexpr int threads = 256;
+    constexpr int threads = 32;
     partial_dgamma_reduce_kernel<<<static_cast<int>(hidden_size), threads, 0, at::cuda::getCurrentCUDAStream()>>>(
         partial_dgamma.data_ptr<float>(),
         dgamma.data_ptr<float>(),
