@@ -38,6 +38,39 @@ __global__ void row_rms_coeff_kernel(
     }
 }
 
+__global__ void row_rms_coeff_warp_kernel(
+    const float* __restrict__ row_rms_partial,
+    float* __restrict__ coeff,
+    int64_t rows,
+    int64_t partial_cols,
+    int64_t hidden_size,
+    float eps
+) {
+    constexpr int WARPS_PER_BLOCK = 4;
+    const int warp = threadIdx.x / 32;
+    const int lane = threadIdx.x % 32;
+    const int64_t row = static_cast<int64_t>(blockIdx.x) * WARPS_PER_BLOCK + warp;
+    if (row >= rows) {
+        return;
+    }
+    const int64_t base = row * partial_cols;
+    float low = lane < partial_cols ? row_rms_partial[base + lane] : 0.0f;
+    if (lane + 64 < partial_cols) {
+        low += row_rms_partial[base + lane + 64];
+    }
+    float high = lane + 32 < partial_cols ? row_rms_partial[base + lane + 32] : 0.0f;
+    if (lane + 96 < partial_cols) {
+        high += row_rms_partial[base + lane + 96];
+    }
+    float sum = low + high;
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        sum += __shfl_down_sync(0xffffffffu, sum, offset);
+    }
+    if (lane == 0) {
+        coeff[row] = rsqrtf(sum / static_cast<float>(hidden_size) + eps);
+    }
+}
+
 inline void check_row_rms_reduce_args(
     const at::Tensor& row_rms_partial,
     const at::Tensor& coeff,
@@ -71,16 +104,30 @@ inline void row_rms_reduce_entrypoint(
     if (rows == 0) {
         return;
     }
-    dim3 grid(rows);
-    dim3 block(256);
-    row_rms_coeff_kernel<<<grid, block, 0, at::cuda::getCurrentCUDAStream()>>>(
-        row_rms_partial.data_ptr<float>(),
-        coeff.data_ptr<float>(),
-        rows,
-        partial_cols,
-        hidden_size,
-        static_cast<float>(eps)
-    );
+    if (partial_cols <= 128) {
+        constexpr int WARPS_PER_BLOCK = 4;
+        dim3 grid((rows + WARPS_PER_BLOCK - 1) / WARPS_PER_BLOCK);
+        dim3 block(32 * WARPS_PER_BLOCK);
+        row_rms_coeff_warp_kernel<<<grid, block, 0, at::cuda::getCurrentCUDAStream()>>>(
+            row_rms_partial.data_ptr<float>(),
+            coeff.data_ptr<float>(),
+            rows,
+            partial_cols,
+            hidden_size,
+            static_cast<float>(eps)
+        );
+    } else {
+        dim3 grid(rows);
+        dim3 block(256);
+        row_rms_coeff_kernel<<<grid, block, 0, at::cuda::getCurrentCUDAStream()>>>(
+            row_rms_partial.data_ptr<float>(),
+            coeff.data_ptr<float>(),
+            rows,
+            partial_cols,
+            hidden_size,
+            static_cast<float>(eps)
+        );
+    }
     C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
