@@ -16,26 +16,23 @@ __global__ void row_partial_dot_kernel(
     int64_t rows,
     int64_t hidden_size
 ) {
-    __shared__ float scratch[32];
+    constexpr int WARPS_PER_BLOCK = 4;
+    const int warp = threadIdx.x / 32;
+    const int lane = threadIdx.x % 32;
     const int64_t row = static_cast<int64_t>(blockIdx.x);
-    const int64_t slice = static_cast<int64_t>(blockIdx.y);
-    const int tid = threadIdx.x;
-    if (row >= rows || slice >= hidden_size / 32 || tid >= 32) {
+    const int64_t slice = static_cast<int64_t>(blockIdx.y) * WARPS_PER_BLOCK + warp;
+    if (row >= rows || slice >= hidden_size / 32) {
         return;
     }
-    const int64_t col = slice * 32 + tid;
+    const int64_t col = slice * 32 + lane;
     const int64_t idx = row * hidden_size + col;
     const float g = gamma == nullptr ? 1.0f : __bfloat162float(gamma[col]);
-    scratch[tid] = __bfloat162float(x[idx]) * __bfloat162float(dy[idx]) * g;
-    __syncthreads();
-    for (int stride = 16; stride > 0; stride >>= 1) {
-        if (tid < stride) {
-            scratch[tid] += scratch[tid + stride];
-        }
-        __syncthreads();
+    float sum = __bfloat162float(x[idx]) * __bfloat162float(dy[idx]) * g;
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        sum += __shfl_down_sync(0xffffffffu, sum, offset);
     }
-    if (tid == 0) {
-        partial_dot[row * (hidden_size / 32) + slice] = scratch[0];
+    if (lane == 0) {
+        partial_dot[row * (hidden_size / 32) + slice] = sum;
     }
 }
 
@@ -237,8 +234,9 @@ inline void partial_dot_entrypoint(
     const __nv_bfloat16* gamma_ptr = gamma_opt.has_value()
         ? reinterpret_cast<const __nv_bfloat16*>(gamma_opt.value().data_ptr())
         : nullptr;
-    dim3 grid(rows, hidden_size / 32);
-    dim3 block(32);
+    constexpr int WARPS_PER_BLOCK = 4;
+    dim3 grid(rows, (hidden_size / 32 + WARPS_PER_BLOCK - 1) / WARPS_PER_BLOCK);
+    dim3 block(32 * WARPS_PER_BLOCK);
     row_partial_dot_kernel<<<grid, block, 0, at::cuda::getCurrentCUDAStream()>>>(
         reinterpret_cast<const __nv_bfloat16*>(x.data_ptr()),
         reinterpret_cast<const __nv_bfloat16*>(dy.data_ptr()),
