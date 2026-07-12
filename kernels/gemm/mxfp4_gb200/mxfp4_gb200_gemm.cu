@@ -2462,6 +2462,16 @@ void mxfp4_batched_gemm_rope_live64_config_entrypoint(
 
     const int64_t M = D_out_list[0].size(0);
     const int64_t N_out = D_out_list[0].size(1);
+    if (config_id == 7 || config_id == 9 || config_id == 10) {
+        bool unequal_output_widths = false;
+        for (int i = 1; i < n; ++i) {
+            unequal_output_widths |= D_out_list[i].size(1) != N_out;
+        }
+        TORCH_CHECK(
+            !unequal_output_widths,
+            "F2 MXFP4 config ", config_id,
+            " is unsupported for unequal-width live64 outputs");
+    }
 
     auto build_and_launch = [&]<typename C>() {
         using G = mxfp4_batched_gemm::globals<C>;
