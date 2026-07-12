@@ -777,6 +777,9 @@ void nvfp4_w13_swiglu_quant_gemm_entrypoint(
     const int64_t K = A.size(1) * 2;
     TORCH_CHECK(M % 256 == 0 && H % 128 == 0 && K % 128 == 0,
                 "v5 W13 SwiGLU producer requires M divisible by 256 and H,K by 128");
+    TORCH_CHECK(M <= 1024,
+                "v5 W13 SwiGLU producer is fail-closed for M>1024 because the "
+                "native payload contract is only proven exact through M=1024");
     TORCH_CHECK(A_sc.numel() == M * K / 16,
                 "A_sc must have M*K/16 fp8 elements");
     TORCH_CHECK(B1_sc.numel() == H * K / 16,
