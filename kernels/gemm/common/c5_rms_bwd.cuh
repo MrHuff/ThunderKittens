@@ -208,6 +208,69 @@ __global__ void dgamma_native_order_kernel(
     }
 }
 
+template<int COLS_PER_BLOCK>
+__global__ void dgamma_native_order_columns_kernel(
+    const __nv_bfloat16* __restrict__ x,
+    const __nv_bfloat16* __restrict__ dy,
+    const float* __restrict__ coeff,
+    float* __restrict__ dgamma,
+    int64_t rows,
+    int64_t hidden_size
+) {
+    static_assert(COLS_PER_BLOCK > 1);
+    __shared__ float scratch[COLS_PER_BLOCK * 256];
+    const int64_t col_base = static_cast<int64_t>(blockIdx.x) * COLS_PER_BLOCK;
+    const int tid = threadIdx.x;
+    float partial[COLS_PER_BLOCK]{};
+    for (int64_t row = tid; row < rows; row += blockDim.x) {
+        const int64_t idx = row * hidden_size + col_base;
+        const float row_coeff = coeff[row];
+#pragma unroll
+        for (int col = 0; col < COLS_PER_BLOCK; col += 2) {
+            if (col_base + col + 1 < hidden_size) {
+                const float2 x_pair = __bfloat1622float2(
+                    *reinterpret_cast<const __nv_bfloat162*>(x + idx + col));
+                const float2 dy_pair = __bfloat1622float2(
+                    *reinterpret_cast<const __nv_bfloat162*>(dy + idx + col));
+                partial[col] += dy_pair.x * x_pair.x * row_coeff;
+                partial[col + 1] += dy_pair.y * x_pair.y * row_coeff;
+            } else if (col_base + col < hidden_size) {
+                partial[col] += (
+                    __bfloat162float(dy[idx + col])
+                    * __bfloat162float(x[idx + col])
+                    * row_coeff
+                );
+            }
+        }
+    }
+#pragma unroll
+    for (int col = 0; col < COLS_PER_BLOCK; ++col) {
+        scratch[col * 256 + tid] = partial[col];
+    }
+    __syncthreads();
+    for (int stride = 128; stride >= 32; stride >>= 1) {
+        if (tid < stride) {
+#pragma unroll
+            for (int col = 0; col < COLS_PER_BLOCK; ++col) {
+                scratch[col * 256 + tid] += scratch[col * 256 + tid + stride];
+            }
+        }
+        __syncthreads();
+    }
+    if (tid < 32) {
+#pragma unroll
+        for (int col = 0; col < COLS_PER_BLOCK; ++col) {
+            float total = scratch[col * 256 + tid];
+            for (int offset = 16; offset > 0; offset >>= 1) {
+                total += __shfl_down_sync(0xffffffffu, total, offset);
+            }
+            if (tid == 0 && col_base + col < hidden_size) {
+                dgamma[col_base + col] = total;
+            }
+        }
+    }
+}
+
 __device__ __forceinline__ float warp_sum(float value) {
     for (int offset = 16; offset > 0; offset >>= 1) {
         value += __shfl_down_sync(0xffffffffu, value, offset);
@@ -577,15 +640,23 @@ inline void dgamma_native_order_entrypoint(
         dgamma.zero_();
         return;
     }
-    dgamma_native_order_kernel<<<static_cast<int>(hidden_size), 256, 0,
-        at::cuda::getCurrentCUDAStream()>>>(
-        reinterpret_cast<const __nv_bfloat16*>(x.data_ptr()),
-        reinterpret_cast<const __nv_bfloat16*>(dy.data_ptr()),
-        coeff.data_ptr<float>(),
-        dgamma.data_ptr<float>(),
-        rows,
-        hidden_size
-    );
+    const auto stream = at::cuda::getCurrentCUDAStream();
+    if (hidden_size >= 4096 && hidden_size % 4 == 0) {
+        dgamma_native_order_columns_kernel<4><<<static_cast<int>(hidden_size / 4), 256, 0, stream>>>(
+            reinterpret_cast<const __nv_bfloat16*>(x.data_ptr()),
+            reinterpret_cast<const __nv_bfloat16*>(dy.data_ptr()),
+            coeff.data_ptr<float>(), dgamma.data_ptr<float>(), rows, hidden_size);
+    } else if (hidden_size % 2 == 0) {
+        dgamma_native_order_columns_kernel<2><<<static_cast<int>(hidden_size / 2), 256, 0, stream>>>(
+            reinterpret_cast<const __nv_bfloat16*>(x.data_ptr()),
+            reinterpret_cast<const __nv_bfloat16*>(dy.data_ptr()),
+            coeff.data_ptr<float>(), dgamma.data_ptr<float>(), rows, hidden_size);
+    } else {
+        dgamma_native_order_kernel<<<static_cast<int>(hidden_size), 256, 0, stream>>>(
+            reinterpret_cast<const __nv_bfloat16*>(x.data_ptr()),
+            reinterpret_cast<const __nv_bfloat16*>(dy.data_ptr()),
+            coeff.data_ptr<float>(), dgamma.data_ptr<float>(), rows, hidden_size);
+    }
     C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
