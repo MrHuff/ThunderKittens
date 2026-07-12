@@ -1,5 +1,6 @@
 #include <torch/extension.h>
 #include <ATen/cuda/CUDAContext.h>
+#include <c10/cuda/CUDAGuard.h>
 
 #include <cuda.h>
 #include <cuda_bf16.h>
@@ -6740,6 +6741,7 @@ void nvfp4_localcta_w2_dgrad_silu_quant_gemm_entrypoint(
     kittens::py::device_check(A, A_sc, A_sg, B, B_sc, B_sg, h3, h1_raw,
                               row_fp4_cat, row_sc_prepared_cat, row_sg_cat,
                               col_fp4_cat, col_sc_prepared_cat, col_sg_cat);
+    const c10::cuda::CUDAGuard device_guard(A.device());
 
     if (config_id == 6) {
         TORCH_CHECK(row_outer0_opt.has_value() && row_outer1_opt.has_value() &&
@@ -6761,6 +6763,8 @@ void nvfp4_localcta_w2_dgrad_silu_quant_gemm_entrypoint(
                         tensor->sizes() == torch::IntArrayRef({1, H / 256}),
                         "localCTA G1 col outer SG must be float32 [1,H/256]");
         }
+        kittens::py::device_check(
+            A, row_outer0, row_outer1, col_outer0, col_outer1);
         launch_fast_g1_silu_dgrad_quant_with_config<
             localcta_fast_g1_amax_config, localcta_fast_g1_quant_config>(
             A, A_sc, A_sg, B, B_sc, B_sg, h3, h1_raw,

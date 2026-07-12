@@ -11,6 +11,7 @@
 #include "mxfp4_silu_dgrad_quant_gemm.cuh"
 #include "mxfp4_sqrelu_quant_gemm.cuh"
 #include "mxfp4_swiglu_quant_gemm.cuh"
+#include <c10/cuda/CUDAGuard.h>
 #include <cstdlib>
 #include <cstdint>
 #include <cstring>
@@ -1637,6 +1638,9 @@ static void mxfp4_gemm_silu_dgrad_quant_entrypoint_impl(
                 "A/B shapes must produce an MxH W2 dgrad tile");
     TORCH_CHECK(M % 256 == 0 && H % 256 == 0 && K % 256 == 0,
                 "mxfp4_gemm_silu_dgrad_quant requires M,H,K divisible by 256");
+    TORCH_CHECK(M <= 32768,
+                "mxfp4_gemm_silu_dgrad_quant is fail-closed for M>32768 because "
+                "its native completion contract supports at most 128 M/256 tiles");
     TORCH_CHECK(row_fp4.is_cuda() && row_fp4.is_contiguous() && row_fp4.dim() == 2 &&
                 row_fp4.scalar_type() == at::kFloat4_e2m1fn_x2 &&
                 row_fp4.size(0) == M && row_fp4.size(1) == H,
@@ -1658,6 +1662,13 @@ static void mxfp4_gemm_silu_dgrad_quant_entrypoint_impl(
     TORCH_CHECK(col1_sc.is_cuda() && col1_sc.is_contiguous() && col1_sc.scalar_type() == at::kByte &&
                 col1_sc.sizes() == at::IntArrayRef({H / 128, M / 128, 32, 16}),
                 "col1_sc must have shape (H/128, M/128, 32, 16)");
+    kittens::py::device_check(
+        A, A_sc, B, B_sc, h3, h1_raw,
+        row_fp4, row_sc, col0_fp4, col0_sc, col1_fp4, col1_sc);
+    if (sig_h1 != nullptr) {
+        kittens::py::device_check(A, *sig_h1);
+    }
+    const c10::cuda::CUDAGuard device_guard(A.device());
 
     auto launch_mode = [&]<int MODE>() {
         switch (config_id) {

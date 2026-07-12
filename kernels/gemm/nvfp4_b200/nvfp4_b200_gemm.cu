@@ -9,6 +9,7 @@
 #include "nvfp4_accum_gemm.cuh"
 #include "nvfp4_fused_gemm.cuh"
 #include "nvfp4_persistent_gemm.cuh"
+#include <c10/cuda/CUDAGuard.h>
 #include <optional>
 
 #ifndef TORCH_COMPILE
@@ -1958,6 +1959,9 @@ void nvfp4_w2_dgrad_silu_quant_gemm_entrypoint(
     const int64_t K = A.size(1) * 2;
     TORCH_CHECK(M % 256 == 0 && H % 128 == 0 && K % 256 == 0,
                 "v5 G1 producer requires M,K divisible by 256 and H by 128");
+    TORCH_CHECK(M < 32768,
+                "v5 G1 producer is fail-closed for M>=32768 because its "
+                "native completion contract supports at most 127 M/256 tiles");
     TORCH_CHECK(h3.is_cuda() && h3.is_contiguous() && h3.scalar_type() == at::kBFloat16 &&
                 h3.sizes() == at::IntArrayRef({M, H}), "h3 must be contiguous CUDA bf16 [M,H]");
     TORCH_CHECK(h1_raw.is_cuda() && h1_raw.is_contiguous() && h1_raw.scalar_type() == at::kBFloat16 &&
@@ -1991,6 +1995,7 @@ void nvfp4_w2_dgrad_silu_quant_gemm_entrypoint(
     kittens::py::device_check(A, A_sc, A_sg, B, B_sc, B_sg, h3, h1_raw,
                               row0_fp4, row0_sc, col0_fp4, col0_sc,
                               row1_fp4, row1_sc, col1_fp4, col1_sc, sg);
+    const c10::cuda::CUDAGuard device_guard(A.device());
 
     using AmaxC = nvfp4_gemm::config<
         128, 2, 4, 12, 2, true, 256, true, 2, 256,
