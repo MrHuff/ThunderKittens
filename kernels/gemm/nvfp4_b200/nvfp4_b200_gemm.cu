@@ -1058,10 +1058,66 @@ void nvfp4_grouped_gemm_rope_live64_entrypoint(
         .seq_mask = static_cast<int>(rope_seq_len - 1),
     };
 
-    using C = nvfp4_gemm::config<256, 5, 8, 4, 2, false, 256, true, 2, 256, true>;
-    run_grouped_gemm_rope_live64_with_config<C>(
-        A, A_sc, A_sc_global, B, B_sc, B_sg_per_tile,
-        D, D_K, D_V, rope_live64, silu_dim);
+    const bool measured_shape = (
+        A.size(0) == 1024 && A.size(1) * 2 == 2048 &&
+        D.size(1) == 2048 && D_K.size(1) == 2048 && D_V.size(1) == 2048);
+    int config_id = measured_shape ? 1 : 0;
+    if (const char* value = std::getenv("USE_TK_NVFP4_QKV_ROPE_LIVE64_CONFIG_ID")) {
+        config_id = std::atoi(value);
+    }
+    TORCH_CHECK(config_id == 0 || config_id == 1, "live64 config id must be 0 or 1");
+    TORCH_CHECK(config_id == 0 || measured_shape,
+                "live64 config 1 is validated only for M=1024,K=2048,Q=K=V=2048");
+    if (config_id == 1) {
+        using C = nvfp4_gemm::config<256, 5, 8, 12, 2, false, 256, true, 2, 256, true>;
+        run_grouped_gemm_rope_live64_with_config<C>(
+            A, A_sc, A_sc_global, B, B_sc, B_sg_per_tile,
+            D, D_K, D_V, rope_live64, silu_dim);
+    } else {
+        using C = nvfp4_gemm::config<256, 5, 8, 4, 2, false, 256, true, 2, 256, true>;
+        run_grouped_gemm_rope_live64_with_config<C>(
+            A, A_sc, A_sc_global, B, B_sc, B_sg_per_tile,
+            D, D_K, D_V, rope_live64, silu_dim);
+    }
+}
+
+void nvfp4_grouped_gemm_rope_live64_config_entrypoint(
+    const at::Tensor &A,
+    const at::Tensor &A_sc,
+    const at::Tensor &A_sc_global,
+    const at::Tensor &B,
+    const at::Tensor &B_sc,
+    const at::Tensor &B_sg_per_tile,
+    at::Tensor &D,
+    at::Tensor &D_K,
+    at::Tensor &D_V,
+    const at::Tensor &rope_cs,
+    int64_t rope_seq_len,
+    int64_t config_id
+) {
+    TORCH_CHECK(D.size(0) == A.size(0) && D_K.size(0) == A.size(0) && D_V.size(0) == A.size(0),
+                "Q/K/V output rows must match A rows");
+    TORCH_CHECK(D.size(1) + D_K.size(1) + D_V.size(1) == B.size(0),
+                "Q/K/V output columns must sum to B rows");
+    nvfp4_check_rope_live64_qkv_args(D, D_K, D_V, rope_cs, rope_seq_len);
+    nvfp4_rope_epilogue::rope_live64_desc rope_live64 {
+        .cs = reinterpret_cast<const float2*>(rope_cs.data_ptr<float>()),
+        .seq_len = static_cast<int>(rope_seq_len),
+        .seq_mask = static_cast<int>(rope_seq_len - 1),
+    };
+    if (config_id == 0) {
+        using C = nvfp4_gemm::config<256, 5, 8, 4, 2, false, 256, true, 2, 256, true>;
+        run_grouped_gemm_rope_live64_with_config<C>(
+            A, A_sc, A_sc_global, B, B_sc, B_sg_per_tile,
+            D, D_K, D_V, rope_live64);
+    } else if (config_id == 1) {
+        using C = nvfp4_gemm::config<256, 5, 8, 12, 2, false, 256, true, 2, 256, true>;
+        run_grouped_gemm_rope_live64_with_config<C>(
+            A, A_sc, A_sc_global, B, B_sc, B_sg_per_tile,
+            D, D_K, D_V, rope_live64);
+    } else {
+        TORCH_CHECK(false, "live64 config_id must be 0 or 1");
+    }
 }
 
 void nvfp4_quantize_entrypoint(
@@ -2577,6 +2633,12 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           pybind11::arg("D"), pybind11::arg("D_K"), pybind11::arg("D_V"),
           pybind11::arg("rope_cs"), pybind11::arg("rope_seq_len"),
           pybind11::arg("silu_dim") = 0);
+    m.def("nvfp4_grouped_gemm_rope_live64_config", &nvfp4_grouped_gemm_rope_live64_config_entrypoint,
+          "Explicit live64 grouped-GEMM config selector",
+          pybind11::arg("A"), pybind11::arg("A_sc"), pybind11::arg("A_sc_global"),
+          pybind11::arg("B"), pybind11::arg("B_sc"), pybind11::arg("B_sg_per_tile"),
+          pybind11::arg("D"), pybind11::arg("D_K"), pybind11::arg("D_V"),
+          pybind11::arg("rope_cs"), pybind11::arg("rope_seq_len"), pybind11::arg("config_id"));
     m.def("nvfp4_grouped_gemm_nopdl", &nvfp4_grouped_gemm_nopdl_entrypoint,
           "Non-PDL grouped GEMM for multi-stream and CUDA graph usage",
           pybind11::arg("A"), pybind11::arg("A_sc"), pybind11::arg("A_sc_global"),

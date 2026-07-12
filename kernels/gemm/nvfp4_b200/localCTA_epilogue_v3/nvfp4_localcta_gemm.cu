@@ -4862,21 +4862,93 @@ void nvfp4_localcta_grouped_gemm_rope_live64_entrypoint(
         .seq_len = static_cast<int>(rope_seq_len),
         .seq_mask = static_cast<int>(rope_seq_len - 1),
     };
+    const bool measured_shape = (
+        A.size(0) == 1024 && A.size(1) * 2 == 2048 &&
+        D.size(1) == 2048 && D_K.size(1) == 2048 && D_V.size(1) == 2048);
+    int config_id = measured_shape ? 1 : 0;
+    if (const char* value = std::getenv("USE_TK_LOCALCTA_V4_QKV_ROPE_LIVE64_CONFIG_ID")) {
+        config_id = std::atoi(value);
+    }
+    TORCH_CHECK(config_id == 0 || config_id == 1, "live64 config id must be 0 or 1");
+    TORCH_CHECK(config_id == 0 || measured_shape,
+                "live64 config 1 is validated only for M=1024,K=2048,Q=K=V=2048");
+    auto launch_selected = [&](const at::Tensor& A_sg, const at::Tensor& B_sg) {
+        if (config_id == 1) {
+            launch_fast_grouped_gemm_with_config<localcta_fast_largek_rope_config>(
+                A, A_sc, A_sg, B, B_sc, B_sg,
+                D, std::optional<at::Tensor>(D_K), std::optional<at::Tensor>(D_V), silu_dim, rope_live64);
+        } else {
+            launch_fast_grouped_gemm_with_config<localcta_fast_grouped_rope_config>(
+                A, A_sc, A_sg, B, B_sc, B_sg,
+                D, std::optional<at::Tensor>(D_K), std::optional<at::Tensor>(D_V), silu_dim, rope_live64);
+        }
+    };
 
     if (sg_contract == SGContractMode::TileGrid256) {
         check_v3_tilegrid256_gemm_inputs(A, A_sc, A_sg_chunks, B, B_sc, B_sg_chunks);
-        launch_fast_grouped_gemm_rope_live64(
-            A, A_sc, torch::Tensor(), B, B_sc, torch::Tensor(),
-            D, std::optional<at::Tensor>(D_K), std::optional<at::Tensor>(D_V), silu_dim, rope_live64);
+        launch_selected(torch::Tensor(), torch::Tensor());
         return;
     }
 
     auto A_sg_outer = normalize_outer_scale_tiles_tensor(A_sg_chunks, A.size(0) / 256, true);
     auto B_sg_outer = normalize_outer_scale_tiles_tensor(B_sg_chunks, B.size(0) / 256, false);
     check_v3_fast_gemm_inputs(A, A_sc, A_sg_outer, B, B_sc, B_sg_outer);
-    launch_fast_grouped_gemm_rope_live64(
-        A, A_sc, A_sg_outer, B, B_sc, B_sg_outer,
-        D, std::optional<at::Tensor>(D_K), std::optional<at::Tensor>(D_V), silu_dim, rope_live64);
+    launch_selected(A_sg_outer, B_sg_outer);
+}
+
+void nvfp4_localcta_grouped_gemm_rope_live64_config_entrypoint(
+    const at::Tensor& A,
+    const at::Tensor& A_sc,
+    const at::Tensor& A_sg_chunks,
+    const at::Tensor& B,
+    const at::Tensor& B_sc,
+    const at::Tensor& B_sg_chunks,
+    at::Tensor& D,
+    at::Tensor& D_K,
+    at::Tensor& D_V,
+    const at::Tensor& rope_cs,
+    int64_t rope_seq_len,
+    int64_t config_id
+) {
+    const auto sg_contract = infer_regular_sg_contract(A, A_sg_chunks, B, B_sg_chunks);
+    TORCH_CHECK(sg_contract != SGContractMode::ChunkGrid128,
+                "live64 RoPE epilogue is only implemented for fast outer-scale localCTA grouped GEMM");
+    TORCH_CHECK(D.size(1) + D_K.size(1) + D_V.size(1) == B.size(0),
+                "Q/K/V output columns must sum to B rows");
+    check_output_matrix(D, "D", A.size(0), D.size(1));
+    check_output_matrix(D_K, "D_K", A.size(0), D_K.size(1));
+    check_output_matrix(D_V, "D_V", A.size(0), D_V.size(1));
+    check_rope_live64_qkv_args(D, D_K, D_V, rope_cs, rope_seq_len);
+    nvfp4_rope_epilogue::rope_live64_desc rope_live64 {
+        .cs = reinterpret_cast<const float2*>(rope_cs.data_ptr<float>()),
+        .seq_len = static_cast<int>(rope_seq_len),
+        .seq_mask = static_cast<int>(rope_seq_len - 1),
+    };
+
+    auto launch = [&]<typename C>(const at::Tensor& A_sg, const at::Tensor& B_sg) {
+        launch_fast_grouped_gemm_with_config<C>(
+            A, A_sc, A_sg, B, B_sc, B_sg,
+            D, std::optional<at::Tensor>(D_K), std::optional<at::Tensor>(D_V), 0, rope_live64);
+    };
+    auto launch_selected = [&](const at::Tensor& A_sg, const at::Tensor& B_sg) {
+        if (config_id == 0) {
+            launch.template operator()<localcta_fast_grouped_rope_config>(A_sg, B_sg);
+        } else if (config_id == 1) {
+            launch.template operator()<localcta_fast_largek_rope_config>(A_sg, B_sg);
+        } else {
+            TORCH_CHECK(false, "live64 config_id must be 0 or 1");
+        }
+    };
+
+    if (sg_contract == SGContractMode::TileGrid256) {
+        check_v3_tilegrid256_gemm_inputs(A, A_sc, A_sg_chunks, B, B_sc, B_sg_chunks);
+        launch_selected(torch::Tensor(), torch::Tensor());
+        return;
+    }
+    auto A_sg_outer = normalize_outer_scale_tiles_tensor(A_sg_chunks, A.size(0) / 256, true);
+    auto B_sg_outer = normalize_outer_scale_tiles_tensor(B_sg_chunks, B.size(0) / 256, false);
+    check_v3_fast_gemm_inputs(A, A_sc, A_sg_outer, B, B_sc, B_sg_outer);
+    launch_selected(A_sg_outer, B_sg_outer);
 }
 
 void nvfp4_localcta_grouped_gemm_rope_entrypoint(
@@ -6893,6 +6965,12 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           pybind11::arg("D"), pybind11::arg("D_K"), pybind11::arg("D_V"),
           pybind11::arg("rope_cs"), pybind11::arg("rope_seq_len"),
           pybind11::arg("silu_dim") = 0);
+    m.def("nvfp4_localcta_grouped_gemm_rope_live64_config",
+          &nvfp4_localcta_grouped_gemm_rope_live64_config_entrypoint,
+          pybind11::arg("A"), pybind11::arg("A_sc"), pybind11::arg("A_sg_chunks"),
+          pybind11::arg("B"), pybind11::arg("B_sc"), pybind11::arg("B_sg_chunks"),
+          pybind11::arg("D"), pybind11::arg("D_K"), pybind11::arg("D_V"),
+          pybind11::arg("rope_cs"), pybind11::arg("rope_seq_len"), pybind11::arg("config_id"));
     m.def("nvfp4_localcta_grouped_gemm_rope", &nvfp4_localcta_grouped_gemm_rope_entrypoint,
           pybind11::arg("A"), pybind11::arg("A_sc"), pybind11::arg("A_sg_chunks"),
           pybind11::arg("B"), pybind11::arg("B_sc"), pybind11::arg("B_sg_chunks"),
