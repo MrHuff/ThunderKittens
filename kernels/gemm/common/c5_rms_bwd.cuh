@@ -286,6 +286,123 @@ __global__ void dgamma_native_order_columns_virtual256_kernel(
     }
 }
 
+template<int COLS_PER_BLOCK, int ROW_THREADS>
+__global__ void finish_all_native_order_kernel(
+    const float* __restrict__ partial_dot,
+    const __nv_bfloat16* __restrict__ x,
+    const __nv_bfloat16* __restrict__ dy,
+    const __nv_bfloat16* __restrict__ gamma,
+    const float* __restrict__ coeff,
+    float* __restrict__ dot,
+    __nv_bfloat16* __restrict__ dx,
+    float* __restrict__ dgamma,
+    int64_t rows,
+    int64_t hidden_size,
+    int64_t partial_cols
+) {
+    static_assert(COLS_PER_BLOCK == 2 || COLS_PER_BLOCK == 4);
+    static_assert(ROW_THREADS == 64 || ROW_THREADS == 128);
+    constexpr int PHYSICAL_THREADS = 128;
+    constexpr int VIRTUAL_LANES_PER_THREAD = 256 / PHYSICAL_THREADS;
+    __shared__ float scratch[COLS_PER_BLOCK * PHYSICAL_THREADS];
+    const int tid = threadIdx.x;
+    const int64_t block = static_cast<int64_t>(blockIdx.x);
+
+    if (block < rows) {
+        const int64_t row = block;
+        float sum = 0.0f;
+        if (tid < ROW_THREADS) {
+            const int64_t partial_base = row * partial_cols;
+            for (int64_t col = tid; col < partial_cols; col += ROW_THREADS) {
+                sum += partial_dot[partial_base + col];
+            }
+            scratch[tid] = sum;
+        }
+        __syncthreads();
+        for (int stride = ROW_THREADS / 2; stride > 0; stride >>= 1) {
+            if (tid < stride) {
+                scratch[tid] += scratch[tid + stride];
+            }
+            __syncthreads();
+        }
+        if (tid < ROW_THREADS) {
+            const float row_dot = scratch[0];
+            if (tid == 0) {
+                dot[row] = row_dot;
+            }
+            const float inv = coeff[row];
+            const float dot_mean = row_dot / static_cast<float>(hidden_size);
+            const float inv3_dot = inv * inv * inv * dot_mean;
+            const int64_t row_base = row * hidden_size;
+            for (int64_t col = tid; col < hidden_size; col += ROW_THREADS) {
+                const int64_t idx = row_base + col;
+                const float g = gamma == nullptr ? 1.0f : __bfloat162float(gamma[col]);
+                const float x_val = __bfloat162float(x[idx]);
+                const float dy_val = __bfloat162float(dy[idx]);
+                const float dx_val = inv * (dy_val * g) - x_val * inv3_dot;
+                dx[idx] = __float2bfloat16(dx_val);
+            }
+        }
+        return;
+    }
+
+    const int64_t col_base = (block - rows) * COLS_PER_BLOCK;
+    float partial[VIRTUAL_LANES_PER_THREAD][COLS_PER_BLOCK]{};
+#pragma unroll
+    for (int virtual_lane = 0; virtual_lane < VIRTUAL_LANES_PER_THREAD; ++virtual_lane) {
+        const int virtual_tid = tid + virtual_lane * PHYSICAL_THREADS;
+        for (int64_t row = virtual_tid; row < rows; row += 256) {
+            const int64_t idx = row * hidden_size + col_base;
+            const float row_coeff = coeff[row];
+#pragma unroll
+            for (int col = 0; col < COLS_PER_BLOCK; col += 2) {
+                if (col_base + col + 1 < hidden_size) {
+                    const float2 x_pair = __bfloat1622float2(
+                        *reinterpret_cast<const __nv_bfloat162*>(x + idx + col));
+                    const float2 dy_pair = __bfloat1622float2(
+                        *reinterpret_cast<const __nv_bfloat162*>(dy + idx + col));
+                    partial[virtual_lane][col] += dy_pair.x * x_pair.x * row_coeff;
+                    partial[virtual_lane][col + 1] += dy_pair.y * x_pair.y * row_coeff;
+                } else if (col_base + col < hidden_size) {
+                    partial[virtual_lane][col] += (
+                        __bfloat162float(dy[idx + col])
+                        * __bfloat162float(x[idx + col])
+                        * row_coeff
+                    );
+                }
+            }
+        }
+    }
+#pragma unroll
+    for (int col = 0; col < COLS_PER_BLOCK; ++col) {
+        scratch[col * PHYSICAL_THREADS + tid] =
+            partial[0][col] + partial[1][col];
+    }
+    __syncthreads();
+    for (int stride = PHYSICAL_THREADS / 2; stride >= 32; stride >>= 1) {
+        if (tid < stride) {
+#pragma unroll
+            for (int col = 0; col < COLS_PER_BLOCK; ++col) {
+                scratch[col * PHYSICAL_THREADS + tid] +=
+                    scratch[col * PHYSICAL_THREADS + tid + stride];
+            }
+        }
+        __syncthreads();
+    }
+    if (tid < 32) {
+#pragma unroll
+        for (int col = 0; col < COLS_PER_BLOCK; ++col) {
+            float total = scratch[col * PHYSICAL_THREADS + tid];
+            for (int offset = 16; offset > 0; offset >>= 1) {
+                total += __shfl_down_sync(0xffffffffu, total, offset);
+            }
+            if (tid == 0 && col_base + col < hidden_size) {
+                dgamma[col_base + col] = total;
+            }
+        }
+    }
+}
+
 __device__ __forceinline__ float warp_sum(float value) {
     for (int offset = 16; offset > 0; offset >>= 1) {
         value += __shfl_down_sync(0xffffffffu, value, offset);
@@ -685,6 +802,99 @@ inline void dgamma_native_order_entrypoint(
             reinterpret_cast<const __nv_bfloat16*>(x.data_ptr()),
             reinterpret_cast<const __nv_bfloat16*>(dy.data_ptr()),
             coeff.data_ptr<float>(), dgamma.data_ptr<float>(), rows, hidden_size);
+    }
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+inline void finish_all_native_order_entrypoint(
+    const at::Tensor& partial_dot,
+    const at::Tensor& x,
+    const at::Tensor& dy,
+    const at::Tensor& coeff,
+    at::Tensor& dot,
+    at::Tensor& dx,
+    at::Tensor& dgamma,
+    int64_t hidden_size,
+    std::optional<at::Tensor> gamma_opt = std::nullopt
+) {
+    check_matrix_bf16(x, "x");
+    check_matrix_bf16(dy, "dy");
+    check_matrix_bf16(dx, "dx");
+    TORCH_CHECK(dy.sizes() == x.sizes(), "dy shape must match x");
+    TORCH_CHECK(dx.sizes() == x.sizes(), "dx shape must match x");
+    TORCH_CHECK(hidden_size == x.size(1), "hidden_size must equal x.shape[1]");
+    TORCH_CHECK(hidden_size > 0 && hidden_size % 32 == 0,
+                "hidden_size must be positive and divisible by 32");
+    TORCH_CHECK(hidden_size % 2 == 0,
+                "combined G4 finish requires an even hidden size");
+    const int64_t rows = x.size(0);
+    check_gamma(gamma_opt, hidden_size);
+    check_partial_dot(partial_dot, rows, hidden_size);
+    check_vector_fp32(coeff, "coeff", rows);
+    check_vector_fp32(dot, "dot", rows);
+    check_dgamma(dgamma, hidden_size);
+    const int64_t partial_cols = partial_dot.size(1);
+    TORCH_CHECK(partial_cols > 0 && partial_cols <= 128,
+                "combined G4 finish supports 1..128 partial columns");
+    const auto device = x.device();
+    TORCH_CHECK(dy.device() == device && partial_dot.device() == device &&
+                    coeff.device() == device && dot.device() == device &&
+                    dx.device() == device && dgamma.device() == device,
+                "partial_dot, x, dy, coeff, dot, dx, and dgamma must share one CUDA device");
+    if (gamma_opt.has_value()) {
+        TORCH_CHECK(gamma_opt.value().device() == device,
+                    "gamma must share the input CUDA device");
+    }
+    c10::cuda::CUDAGuard device_guard(device);
+    if (rows == 0) {
+        dgamma.zero_();
+        return;
+    }
+    const __nv_bfloat16* gamma_ptr = gamma_opt.has_value()
+        ? reinterpret_cast<const __nv_bfloat16*>(gamma_opt.value().data_ptr())
+        : nullptr;
+    const auto stream = at::cuda::getCurrentCUDAStream();
+    const int64_t row_threads = reduce_dot_apply_dx_threads(partial_cols);
+    TORCH_CHECK(row_threads <= 128,
+                "combined G4 finish requires at most 128 row-reduction threads");
+    if (hidden_size >= 4096 && hidden_size % 4 == 0) {
+        const int blocks = static_cast<int>(rows + hidden_size / 4);
+        if (row_threads == 64) {
+            finish_all_native_order_kernel<4, 64><<<blocks, 128, 0, stream>>>(
+                partial_dot.data_ptr<float>(),
+                reinterpret_cast<const __nv_bfloat16*>(x.data_ptr()),
+                reinterpret_cast<const __nv_bfloat16*>(dy.data_ptr()),
+                gamma_ptr, coeff.data_ptr<float>(), dot.data_ptr<float>(),
+                reinterpret_cast<__nv_bfloat16*>(dx.data_ptr()), dgamma.data_ptr<float>(),
+                rows, hidden_size, partial_cols);
+        } else {
+            finish_all_native_order_kernel<4, 128><<<blocks, 128, 0, stream>>>(
+                partial_dot.data_ptr<float>(),
+                reinterpret_cast<const __nv_bfloat16*>(x.data_ptr()),
+                reinterpret_cast<const __nv_bfloat16*>(dy.data_ptr()),
+                gamma_ptr, coeff.data_ptr<float>(), dot.data_ptr<float>(),
+                reinterpret_cast<__nv_bfloat16*>(dx.data_ptr()), dgamma.data_ptr<float>(),
+                rows, hidden_size, partial_cols);
+        }
+    } else {
+        const int blocks = static_cast<int>(rows + hidden_size / 2);
+        if (row_threads == 64) {
+            finish_all_native_order_kernel<2, 64><<<blocks, 128, 0, stream>>>(
+                partial_dot.data_ptr<float>(),
+                reinterpret_cast<const __nv_bfloat16*>(x.data_ptr()),
+                reinterpret_cast<const __nv_bfloat16*>(dy.data_ptr()),
+                gamma_ptr, coeff.data_ptr<float>(), dot.data_ptr<float>(),
+                reinterpret_cast<__nv_bfloat16*>(dx.data_ptr()), dgamma.data_ptr<float>(),
+                rows, hidden_size, partial_cols);
+        } else {
+            finish_all_native_order_kernel<2, 128><<<blocks, 128, 0, stream>>>(
+                partial_dot.data_ptr<float>(),
+                reinterpret_cast<const __nv_bfloat16*>(x.data_ptr()),
+                reinterpret_cast<const __nv_bfloat16*>(dy.data_ptr()),
+                gamma_ptr, coeff.data_ptr<float>(), dot.data_ptr<float>(),
+                reinterpret_cast<__nv_bfloat16*>(dx.data_ptr()), dgamma.data_ptr<float>(),
+                rows, hidden_size, partial_cols);
+        }
     }
     C10_CUDA_KERNEL_LAUNCH_CHECK();
 }

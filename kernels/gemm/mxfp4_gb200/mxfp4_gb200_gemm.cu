@@ -2636,6 +2636,13 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           "MXFP4 G4 dgamma in the production native reduction order",
           pybind11::arg("x"), pybind11::arg("dy"),
           pybind11::arg("coeff"), pybind11::arg("dgamma"));
+    m.def("mxfp4_g4_rms_bwd_finish_all_native_order",
+          &c5_rms_bwd::finish_all_native_order_entrypoint,
+          "MXFP4 G4 reduce/apply dx and dgamma in one native launch",
+          pybind11::arg("partial_dot"), pybind11::arg("x"), pybind11::arg("dy"),
+          pybind11::arg("coeff"), pybind11::arg("dot"), pybind11::arg("dx"),
+          pybind11::arg("dgamma"), pybind11::arg("hidden_size"),
+          pybind11::arg("gamma") = std::nullopt);
     m.def("mxfp4_g5_rms_bwd_partial_dgamma", &c5_rms_bwd::partial_dgamma_entrypoint,
           "G5 RMSNorm backward partial dgamma over 256-row tiles",
           pybind11::arg("x"), pybind11::arg("dy"),
