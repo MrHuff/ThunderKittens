@@ -208,8 +208,8 @@ __global__ void dgamma_native_order_kernel(
     }
 }
 
-template<int COLS_PER_BLOCK>
-__global__ void dgamma_native_order_columns_kernel(
+template<int COLS_PER_BLOCK, int PHYSICAL_THREADS>
+__global__ void dgamma_native_order_columns_virtual256_kernel(
     const __nv_bfloat16* __restrict__ x,
     const __nv_bfloat16* __restrict__ dy,
     const float* __restrict__ coeff,
@@ -218,41 +218,56 @@ __global__ void dgamma_native_order_columns_kernel(
     int64_t hidden_size
 ) {
     static_assert(COLS_PER_BLOCK > 1);
-    __shared__ float scratch[COLS_PER_BLOCK * 256];
+    static_assert(PHYSICAL_THREADS == 64 || PHYSICAL_THREADS == 128);
+    constexpr int VIRTUAL_LANES_PER_THREAD = 256 / PHYSICAL_THREADS;
+    __shared__ float scratch[COLS_PER_BLOCK * PHYSICAL_THREADS];
     const int64_t col_base = static_cast<int64_t>(blockIdx.x) * COLS_PER_BLOCK;
     const int tid = threadIdx.x;
-    float partial[COLS_PER_BLOCK]{};
-    for (int64_t row = tid; row < rows; row += blockDim.x) {
-        const int64_t idx = row * hidden_size + col_base;
-        const float row_coeff = coeff[row];
+    float partial[VIRTUAL_LANES_PER_THREAD][COLS_PER_BLOCK]{};
 #pragma unroll
-        for (int col = 0; col < COLS_PER_BLOCK; col += 2) {
-            if (col_base + col + 1 < hidden_size) {
-                const float2 x_pair = __bfloat1622float2(
-                    *reinterpret_cast<const __nv_bfloat162*>(x + idx + col));
-                const float2 dy_pair = __bfloat1622float2(
-                    *reinterpret_cast<const __nv_bfloat162*>(dy + idx + col));
-                partial[col] += dy_pair.x * x_pair.x * row_coeff;
-                partial[col + 1] += dy_pair.y * x_pair.y * row_coeff;
-            } else if (col_base + col < hidden_size) {
-                partial[col] += (
-                    __bfloat162float(dy[idx + col])
-                    * __bfloat162float(x[idx + col])
-                    * row_coeff
-                );
+    for (int virtual_lane = 0; virtual_lane < VIRTUAL_LANES_PER_THREAD; ++virtual_lane) {
+        const int virtual_tid = tid + virtual_lane * PHYSICAL_THREADS;
+        for (int64_t row = virtual_tid; row < rows; row += 256) {
+            const int64_t idx = row * hidden_size + col_base;
+            const float row_coeff = coeff[row];
+#pragma unroll
+            for (int col = 0; col < COLS_PER_BLOCK; col += 2) {
+                if (col_base + col + 1 < hidden_size) {
+                    const float2 x_pair = __bfloat1622float2(
+                        *reinterpret_cast<const __nv_bfloat162*>(x + idx + col));
+                    const float2 dy_pair = __bfloat1622float2(
+                        *reinterpret_cast<const __nv_bfloat162*>(dy + idx + col));
+                    partial[virtual_lane][col] += dy_pair.x * x_pair.x * row_coeff;
+                    partial[virtual_lane][col + 1] += dy_pair.y * x_pair.y * row_coeff;
+                } else if (col_base + col < hidden_size) {
+                    partial[virtual_lane][col] += (
+                        __bfloat162float(dy[idx + col])
+                        * __bfloat162float(x[idx + col])
+                        * row_coeff
+                    );
+                }
             }
         }
     }
 #pragma unroll
     for (int col = 0; col < COLS_PER_BLOCK; ++col) {
-        scratch[col * 256 + tid] = partial[col];
+        float combined;
+        if constexpr (PHYSICAL_THREADS == 128) {
+            combined = partial[0][col] + partial[1][col];
+        } else {
+            const float stride128_lo = partial[0][col] + partial[2][col];
+            const float stride128_hi = partial[1][col] + partial[3][col];
+            combined = stride128_lo + stride128_hi;
+        }
+        scratch[col * PHYSICAL_THREADS + tid] = combined;
     }
     __syncthreads();
-    for (int stride = 128; stride >= 32; stride >>= 1) {
+    for (int stride = PHYSICAL_THREADS / 2; stride >= 32; stride >>= 1) {
         if (tid < stride) {
 #pragma unroll
             for (int col = 0; col < COLS_PER_BLOCK; ++col) {
-                scratch[col * 256 + tid] += scratch[col * 256 + tid + stride];
+                scratch[col * PHYSICAL_THREADS + tid] +=
+                    scratch[col * PHYSICAL_THREADS + tid + stride];
             }
         }
         __syncthreads();
@@ -260,7 +275,7 @@ __global__ void dgamma_native_order_columns_kernel(
     if (tid < 32) {
 #pragma unroll
         for (int col = 0; col < COLS_PER_BLOCK; ++col) {
-            float total = scratch[col * 256 + tid];
+            float total = scratch[col * PHYSICAL_THREADS + tid];
             for (int offset = 16; offset > 0; offset >>= 1) {
                 total += __shfl_down_sync(0xffffffffu, total, offset);
             }
@@ -644,18 +659,24 @@ inline void dgamma_native_order_entrypoint(
     TORCH_CHECK(hidden_size > 0, "hidden_size must be positive");
     check_vector_fp32(coeff, "coeff", rows);
     check_dgamma(dgamma, hidden_size);
+    const auto device = x.device();
+    TORCH_CHECK(dy.device() == device && coeff.device() == device && dgamma.device() == device,
+                "x, dy, coeff, and dgamma must share one CUDA device");
+    c10::cuda::CUDAGuard device_guard(device);
     if (rows == 0) {
         dgamma.zero_();
         return;
     }
     const auto stream = at::cuda::getCurrentCUDAStream();
     if (hidden_size >= 4096 && hidden_size % 4 == 0) {
-        dgamma_native_order_columns_kernel<4><<<static_cast<int>(hidden_size / 4), 256, 0, stream>>>(
+        dgamma_native_order_columns_virtual256_kernel<4, 128>
+            <<<static_cast<int>(hidden_size / 4), 128, 0, stream>>>(
             reinterpret_cast<const __nv_bfloat16*>(x.data_ptr()),
             reinterpret_cast<const __nv_bfloat16*>(dy.data_ptr()),
             coeff.data_ptr<float>(), dgamma.data_ptr<float>(), rows, hidden_size);
     } else if (hidden_size % 2 == 0) {
-        dgamma_native_order_columns_kernel<2><<<static_cast<int>(hidden_size / 2), 256, 0, stream>>>(
+        dgamma_native_order_columns_virtual256_kernel<2, 128>
+            <<<static_cast<int>(hidden_size / 2), 128, 0, stream>>>(
             reinterpret_cast<const __nv_bfloat16*>(x.data_ptr()),
             reinterpret_cast<const __nv_bfloat16*>(dy.data_ptr()),
             coeff.data_ptr<float>(), dgamma.data_ptr<float>(), rows, hidden_size);
