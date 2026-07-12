@@ -603,6 +603,14 @@ inline void reduce_dot_apply_dx_native_order_config_entrypoint(
     C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
+constexpr int64_t reduce_dot_apply_dx_threads(int64_t partial_cols) {
+    return partial_cols < 64 ? 64 : (partial_cols <= 128 ? 128 : 256);
+}
+
+static_assert(reduce_dot_apply_dx_threads(32) == 64);
+static_assert(reduce_dot_apply_dx_threads(64) == 128);
+static_assert(reduce_dot_apply_dx_threads(128) == 128);
+
 inline void reduce_dot_apply_dx_native_order_entrypoint(
     const at::Tensor& partial_dot,
     const at::Tensor& x,
@@ -616,7 +624,7 @@ inline void reduce_dot_apply_dx_native_order_entrypoint(
     const int64_t partial_cols = partial_dot.dim() == 2 ? partial_dot.size(1) : 0;
     TORCH_CHECK(partial_cols > 0 && partial_cols <= 256,
                 "fused reduce/apply supports 1..256 partial columns");
-    const int64_t threads = partial_cols <= 64 ? 64 : (partial_cols <= 128 ? 128 : 256);
+    const int64_t threads = reduce_dot_apply_dx_threads(partial_cols);
     reduce_dot_apply_dx_native_order_config_entrypoint(
         partial_dot, x, dy, coeff, dot, dx, hidden_size, threads, gamma_opt
     );
