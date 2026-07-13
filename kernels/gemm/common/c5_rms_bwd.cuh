@@ -166,6 +166,57 @@ __global__ void row_dot_reduce_apply_dx_native_order_kernel(
     }
 }
 
+__global__ void row_dot_reduce_apply_dx_kernel(
+    const float* __restrict__ partial_dot,
+    const __nv_bfloat16* __restrict__ x,
+    const __nv_bfloat16* __restrict__ dy,
+    const __nv_bfloat16* __restrict__ gamma,
+    const float* __restrict__ coeff,
+    float* __restrict__ dot,
+    __nv_bfloat16* __restrict__ dx,
+    int64_t rows,
+    int64_t hidden_size,
+    int64_t partial_cols
+) {
+    __shared__ float scratch[256];
+    const int64_t row = static_cast<int64_t>(blockIdx.x);
+    if (row >= rows) {
+        return;
+    }
+    const int tid = threadIdx.x;
+    float sum = 0.0f;
+    const int64_t partial_base = row * partial_cols;
+    for (int64_t col = tid; col < partial_cols; col += blockDim.x) {
+        sum += partial_dot[partial_base + col];
+    }
+    scratch[tid] = sum;
+    __syncthreads();
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            scratch[tid] += scratch[tid + stride];
+        }
+        __syncthreads();
+    }
+    const float row_dot = scratch[0];
+    if (tid == 0) {
+        dot[row] = row_dot;
+    }
+    const float r = coeff[row];
+    const int64_t row_base = row * hidden_size;
+    #pragma unroll 1
+    for (int64_t col = tid; col < hidden_size; col += blockDim.x) {
+        const int64_t idx = row_base + col;
+        const float g = gamma == nullptr ? 1.0f : __bfloat162float(gamma[col]);
+        const float x_val = __bfloat162float(x[idx]);
+        const float dy_gamma = __bfloat162float(dy[idx]) * g;
+        float correction_base = x_val * (r * r * r / static_cast<float>(hidden_size));
+        asm volatile("" : "+f"(correction_base));
+        const float scaled_dy = r * dy_gamma;
+        const float dx_val = __fmaf_rn(-correction_base, row_dot, scaled_dy);
+        dx[idx] = __float2bfloat16(dx_val);
+    }
+}
+
 __global__ void dgamma_native_order_kernel(
     const __nv_bfloat16* __restrict__ x,
     const __nv_bfloat16* __restrict__ dy,
@@ -629,6 +680,60 @@ inline void apply_dx_entrypoint(
         reinterpret_cast<__nv_bfloat16*>(dx.data_ptr()),
         numel,
         hidden_size
+    );
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+inline void reduce_dot_apply_dx_entrypoint(
+    const at::Tensor& partial_dot,
+    const at::Tensor& x,
+    const at::Tensor& dy,
+    const at::Tensor& coeff,
+    at::Tensor& dot,
+    at::Tensor& dx,
+    int64_t hidden_size,
+    std::optional<at::Tensor> gamma_opt = std::nullopt
+) {
+    check_matrix_bf16(x, "x");
+    check_matrix_bf16(dy, "dy");
+    check_matrix_bf16(dx, "dx");
+    TORCH_CHECK(dy.sizes() == x.sizes(), "dy shape must match x");
+    TORCH_CHECK(dx.sizes() == x.sizes(), "dx shape must match x");
+    TORCH_CHECK(hidden_size == x.size(1), "hidden_size must equal x.shape[1]");
+    TORCH_CHECK(hidden_size > 0 && hidden_size % 32 == 0,
+                "hidden_size must be positive and divisible by 32");
+    const int64_t rows = x.size(0);
+    check_gamma(gamma_opt, hidden_size);
+    check_partial_dot(partial_dot, rows, hidden_size);
+    check_vector_fp32(coeff, "coeff", rows);
+    check_vector_fp32(dot, "dot", rows);
+    const auto device = x.device();
+    TORCH_CHECK(dy.device() == device && partial_dot.device() == device &&
+                    coeff.device() == device && dot.device() == device && dx.device() == device,
+                "partial_dot, x, dy, coeff, dot, and dx must share one CUDA device");
+    if (gamma_opt.has_value()) {
+        TORCH_CHECK(gamma_opt.value().device() == device,
+                    "gamma must share the input CUDA device");
+    }
+    if (rows == 0) {
+        return;
+    }
+    const __nv_bfloat16* gamma_ptr = gamma_opt.has_value()
+        ? reinterpret_cast<const __nv_bfloat16*>(gamma_opt.value().data_ptr())
+        : nullptr;
+    c10::cuda::CUDAGuard device_guard(device);
+    row_dot_reduce_apply_dx_kernel<<<static_cast<int>(rows), 256, 0,
+        at::cuda::getCurrentCUDAStream()>>>(
+        partial_dot.data_ptr<float>(),
+        reinterpret_cast<const __nv_bfloat16*>(x.data_ptr()),
+        reinterpret_cast<const __nv_bfloat16*>(dy.data_ptr()),
+        gamma_ptr,
+        coeff.data_ptr<float>(),
+        dot.data_ptr<float>(),
+        reinterpret_cast<__nv_bfloat16*>(dx.data_ptr()),
+        rows,
+        hidden_size,
+        partial_dot.size(1)
     );
     C10_CUDA_KERNEL_LAUNCH_CHECK();
 }

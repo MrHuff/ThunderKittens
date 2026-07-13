@@ -2523,6 +2523,11 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           pybind11::arg("coeff"), pybind11::arg("dot"),
           pybind11::arg("dx"), pybind11::arg("hidden_size"),
           pybind11::arg("gamma") = std::nullopt);
+    m.def("c5_rms_bwd_reduce_apply_dx", &c5_rms_bwd::reduce_dot_apply_dx_entrypoint,
+          "C5 reduce row dot and apply exact RMSNorm backward dx in one launch",
+          pybind11::arg("partial_dot"), pybind11::arg("x"), pybind11::arg("dy"),
+          pybind11::arg("coeff"), pybind11::arg("dot"), pybind11::arg("dx"),
+          pybind11::arg("hidden_size"), pybind11::arg("gamma") = std::nullopt);
     m.def("g4_rms_bwd_apply_dx_native_order", &c5_rms_bwd::apply_dx_native_order_entrypoint,
           "G4 apply RMSNorm backward dx in the production native operation order",
           pybind11::arg("x"), pybind11::arg("dy"),
