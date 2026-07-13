@@ -1,6 +1,7 @@
 #pragma once
 
 #include <ATen/ATen.h>
+#include <ATen/MemoryOverlap.h>
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAException.h>
 #include <c10/cuda/CUDAGuard.h>
@@ -8,6 +9,19 @@
 #include <optional>
 
 namespace c5_rms_bwd {
+
+inline void check_no_overlap(
+    const at::Tensor& output,
+    const char* output_name,
+    const at::Tensor& input,
+    const char* input_name
+) {
+    const auto overlap = at::get_overlap_status(output, input);
+    TORCH_CHECK(
+        overlap == at::MemOverlapStatus::No,
+        "C5 fused output ", output_name, " must not overlap ", input_name
+    );
+}
 
 __global__ void row_partial_dot_kernel(
     const __nv_bfloat16* __restrict__ x,
@@ -717,6 +731,19 @@ inline void reduce_dot_apply_dx_entrypoint(
     }
     if (rows == 0) {
         return;
+    }
+    check_no_overlap(dot, "dot", partial_dot, "partial_dot");
+    check_no_overlap(dot, "dot", x, "x");
+    check_no_overlap(dot, "dot", dy, "dy");
+    check_no_overlap(dot, "dot", coeff, "coeff");
+    check_no_overlap(dot, "dot", dx, "dx");
+    check_no_overlap(dx, "dx", partial_dot, "partial_dot");
+    check_no_overlap(dx, "dx", x, "x");
+    check_no_overlap(dx, "dx", dy, "dy");
+    check_no_overlap(dx, "dx", coeff, "coeff");
+    if (gamma_opt.has_value()) {
+        check_no_overlap(dot, "dot", gamma_opt.value(), "gamma");
+        check_no_overlap(dx, "dx", gamma_opt.value(), "gamma");
     }
     const __nv_bfloat16* gamma_ptr = gamma_opt.has_value()
         ? reinterpret_cast<const __nv_bfloat16*>(gamma_opt.value().data_ptr())
