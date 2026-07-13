@@ -175,6 +175,7 @@ int main() {
 #include "../common/c1_rms_reduce.cuh"
 #include "../common/c5_rms_bwd.cuh"
 #include "../common/c1_residual_rms.cuh"
+#include "../common/c3_row_scale.cuh"
 
 __global__ void v5_rmsnorm_bwd_dx_kernel(
     const __nv_bfloat16* __restrict__ d_normed,
@@ -500,7 +501,12 @@ void nvfp4_gemm_row_scale_entrypoint(
     const at::Tensor &row_scale_coeff,
     at::Tensor &D
 ) {
-    kittens::py::device_check(A, A_sc, A_sc_global, B, B_sc, B_sc_global, row_scale_coeff, D);
+    TORCH_CHECK(A.is_cuda(), "C3 A must be CUDA");
+    kittens::py::device_check(
+        A, A_sc, A_sc_global, B, B_sc, B_sc_global, row_scale_coeff, D);
+    c3_row_scale::check_nvfp4_contract(
+        A, A_sc, A_sc_global, B, B_sc, B_sc_global, row_scale_coeff, D);
+    const c10::cuda::CUDAGuard device_guard(A.device());
     int K = B.size(1) * 2;
     int N_out = D.size(1);
     if (K <= 2048 && N_out <= 4096) {

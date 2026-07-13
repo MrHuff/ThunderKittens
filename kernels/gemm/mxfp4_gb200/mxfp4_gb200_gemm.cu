@@ -170,6 +170,7 @@ int main() {
 #include "../common/c1_rms_reduce.cuh"
 #include "../common/c5_rms_bwd.cuh"
 #include "../common/c1_residual_rms.cuh"
+#include "../common/c3_row_scale.cuh"
 
 namespace {
 
@@ -1039,7 +1040,10 @@ void mxfp4_gemm_row_scale_entrypoint(
     const at::Tensor &row_scale_coeff,
     at::Tensor &D
 ) {
+    TORCH_CHECK(A.is_cuda(), "C3 A must be CUDA");
     kittens::py::device_check(A, A_sc, B, B_sc, row_scale_coeff, D);
+    c3_row_scale::check_mxfp4_contract(A, A_sc, B, B_sc, row_scale_coeff, D);
+    const c10::cuda::CUDAGuard device_guard(A.device());
     launch_mxfp4_gemm_dense_row_scale<mxfp4_gemm::config<256, 5, 8, 4, 2, false, 256, false, false, false, false, true>>(
         A, A_sc, B, B_sc, row_scale_coeff, D);
 }

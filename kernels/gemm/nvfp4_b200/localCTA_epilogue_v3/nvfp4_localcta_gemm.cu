@@ -28,6 +28,7 @@
 #include "../../common/c1_rms_reduce.cuh"
 #include "../../common/c5_rms_bwd.cuh"
 #include "../../common/c1_residual_rms.cuh"
+#include "../../common/c3_row_scale.cuh"
 #include "nvfp4_localcta_silu_dgrad_quant_gemm.cuh"  // fused W2-dgrad -> SiLU split2 quant producer
 #include "nvfp4_localcta_swiglu_quant_gemm.cuh"      // fused W1/W3 GEMM -> SwiGLU W2 payload producer
 
@@ -4693,6 +4694,12 @@ void nvfp4_localcta_gemm_row_scale_entrypoint(
     const at::Tensor& row_scale_coeff,
     at::Tensor& D
 ) {
+    TORCH_CHECK(A.is_cuda(), "C3 A must be CUDA");
+    kittens::py::device_check(
+        A, A_sc, A_sg_chunks, B, B_sc, B_sg_chunks, row_scale_coeff, D);
+    c3_row_scale::check_nvfp4_contract(
+        A, A_sc, A_sg_chunks, B, B_sc, B_sg_chunks, row_scale_coeff, D);
+    const c10::cuda::CUDAGuard device_guard(A.device());
     const auto sg_contract = infer_regular_sg_contract(A, A_sg_chunks, B, B_sg_chunks);
     TORCH_CHECK(
         sg_contract != SGContractMode::ChunkGrid128,
