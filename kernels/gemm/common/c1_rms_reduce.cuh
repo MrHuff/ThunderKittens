@@ -1,12 +1,12 @@
 #pragma once
 
 #include <ATen/ATen.h>
-#include <ATen/MemoryOverlap.h>
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAGuard.h>
 #include <c10/cuda/CUDAException.h>
 
 #include <cmath>
+#include <cstdint>
 
 #include "kittens.cuh"
 
@@ -18,11 +18,16 @@ inline void check_no_overlap(
     const at::Tensor& input,
     const char* input_name
 ) {
-    if (writable.storage().unsafeGetStorageImpl() != input.storage().unsafeGetStorageImpl()) {
+    const auto writable_begin = reinterpret_cast<uintptr_t>(writable.data_ptr());
+    const auto input_begin = reinterpret_cast<uintptr_t>(input.data_ptr());
+    const auto writable_bytes = static_cast<uintptr_t>(writable.nbytes());
+    const auto input_bytes = static_cast<uintptr_t>(input.nbytes());
+    if (writable_bytes == 0 || input_bytes == 0) {
         return;
     }
     TORCH_CHECK(
-        at::get_overlap_status(writable, input) == at::MemOverlapStatus::No,
+        writable_begin + writable_bytes <= input_begin ||
+            input_begin + input_bytes <= writable_begin,
         "C4 ", writable_name, " must not overlap ", input_name
     );
 }
@@ -38,6 +43,7 @@ inline void check_c2_c3_output_overlap(
     check_no_overlap(coeff, "coeff", D, "D");
     (check_no_overlap(coeff, "coeff", reads, "a GEMM read input"), ...);
     check_no_overlap(D, "D", row_rms_partial, "row_rms_partial");
+    (check_no_overlap(D, "D", reads, "a GEMM read input"), ...);
 }
 
 template <bool EARLY_PDL_ARRIVE = false>
