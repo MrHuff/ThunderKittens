@@ -169,6 +169,7 @@ int main() {
 #include "pyutils/torchutils.cuh"
 #include "../common/c1_rms_reduce.cuh"
 #include "../common/c5_rms_bwd.cuh"
+#include "../common/c1_residual_rms.cuh"
 
 namespace {
 
@@ -997,10 +998,15 @@ void mxfp4_gemm_residual_rms_entrypoint(
     std::optional<at::Tensor> gamma_opt = std::nullopt
 ) {
     check_output_matrix(R, "R", D.size(0), D.size(1));
-    kittens::py::device_check(A, A_sc, B, B_sc, R, D, row_rms_partial);
+    TORCH_CHECK(A.is_cuda(), "A must be CUDA");
     if (gamma_opt.has_value()) {
-        kittens::py::device_check(gamma_opt.value());
+        kittens::py::device_check(
+            A, A_sc, B, B_sc, R, D, row_rms_partial, gamma_opt.value());
+    } else {
+        kittens::py::device_check(A, A_sc, B, B_sc, R, D, row_rms_partial);
     }
+    c1_residual_rms::check_output_overlap_contract(D, row_rms_partial, R, gamma_opt);
+    const c10::cuda::CUDAGuard device_guard(A.device());
     launch_mxfp4_gemm_dense_residual_rms<mxfp4_gemm::config<256, 5, 8, 4, 2, false, 256, false, true, false, true>>(
         A, A_sc, B, B_sc, R, D, row_rms_partial, gamma_opt);
 }

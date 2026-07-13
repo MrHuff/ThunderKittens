@@ -27,6 +27,7 @@
 #include "../nvfp4_split3_accum_gemm.cuh"
 #include "../../common/c1_rms_reduce.cuh"
 #include "../../common/c5_rms_bwd.cuh"
+#include "../../common/c1_residual_rms.cuh"
 #include "nvfp4_localcta_silu_dgrad_quant_gemm.cuh"  // fused W2-dgrad -> SiLU split2 quant producer
 #include "nvfp4_localcta_swiglu_quant_gemm.cuh"      // fused W1/W3 GEMM -> SwiGLU W2 payload producer
 
@@ -4616,6 +4617,18 @@ void nvfp4_localcta_gemm_residual_rms_entrypoint(
     at::Tensor& row_rms_partial,
     std::optional<at::Tensor> gamma_opt = std::nullopt
 ) {
+    TORCH_CHECK(A.is_cuda(), "A must be CUDA");
+    if (gamma_opt.has_value()) {
+        kittens::py::device_check(
+            A, A_sc, A_sg_chunks, B, B_sc, B_sg_chunks,
+            R, D, row_rms_partial, gamma_opt.value());
+    } else {
+        kittens::py::device_check(
+            A, A_sc, A_sg_chunks, B, B_sc, B_sg_chunks,
+            R, D, row_rms_partial);
+    }
+    c1_residual_rms::check_output_overlap_contract(D, row_rms_partial, R, gamma_opt);
+    const c10::cuda::CUDAGuard device_guard(A.device());
     const auto sg_contract = infer_regular_sg_contract(A, A_sg_chunks, B, B_sg_chunks);
     TORCH_CHECK(
         sg_contract != SGContractMode::ChunkGrid128,

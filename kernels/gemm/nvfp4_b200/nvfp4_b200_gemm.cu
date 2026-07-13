@@ -174,6 +174,7 @@ int main() {
 #include "ATen/Functions.h"
 #include "../common/c1_rms_reduce.cuh"
 #include "../common/c5_rms_bwd.cuh"
+#include "../common/c1_residual_rms.cuh"
 
 __global__ void v5_rmsnorm_bwd_dx_kernel(
     const __nv_bfloat16* __restrict__ d_normed,
@@ -428,10 +429,18 @@ void nvfp4_gemm_residual_rms_entrypoint(
     at::Tensor &row_rms_partial,
     std::optional<at::Tensor> gamma_opt
 ) {
-    kittens::py::device_check(A, A_sc, A_sc_global, B, B_sc, B_sc_global, R, D, row_rms_partial);
+    TORCH_CHECK(A.is_cuda(), "A must be CUDA");
     if (gamma_opt.has_value()) {
-        kittens::py::device_check(gamma_opt.value());
+        kittens::py::device_check(
+            A, A_sc, A_sc_global, B, B_sc, B_sc_global,
+            R, D, row_rms_partial, gamma_opt.value());
+    } else {
+        kittens::py::device_check(
+            A, A_sc, A_sc_global, B, B_sc, B_sc_global,
+            R, D, row_rms_partial);
     }
+    c1_residual_rms::check_output_overlap_contract(D, row_rms_partial, R, gamma_opt);
+    const c10::cuda::CUDAGuard device_guard(A.device());
     int K = B.size(1) * 2;
     int N_out = D.size(1);
     if (K <= 2048 && N_out <= 4096) {
