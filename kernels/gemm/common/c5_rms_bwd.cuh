@@ -6,6 +6,7 @@
 #include <c10/cuda/CUDAException.h>
 #include <c10/cuda/CUDAGuard.h>
 #include <cuda_bf16.h>
+#include <cstdint>
 #include <optional>
 
 namespace c5_rms_bwd {
@@ -20,6 +21,25 @@ inline void check_no_overlap(
     TORCH_CHECK(
         overlap == at::MemOverlapStatus::No,
         "C5 fused output ", output_name, " must not overlap ", input_name
+    );
+}
+
+inline void check_no_contiguous_byte_overlap(
+    const at::Tensor& output,
+    const char* output_name,
+    const at::Tensor& input,
+    const char* input_name
+) {
+    if (output.numel() == 0 || input.numel() == 0) {
+        return;
+    }
+    const auto output_begin = reinterpret_cast<std::uintptr_t>(output.data_ptr());
+    const auto input_begin = reinterpret_cast<std::uintptr_t>(input.data_ptr());
+    const auto output_end = output_begin + output.numel() * output.element_size();
+    const auto input_end = input_begin + input.numel() * input.element_size();
+    TORCH_CHECK(
+        output_end <= input_begin || input_end <= output_begin,
+        "C5 combined output ", output_name, " must not overlap ", input_name
     );
 }
 
@@ -219,6 +239,79 @@ __global__ void row_dot_reduce_apply_dx_kernel(
     const int64_t row_base = row * hidden_size;
     #pragma unroll 1
     for (int64_t col = tid; col < hidden_size; col += blockDim.x) {
+        const int64_t idx = row_base + col;
+        const float g = gamma == nullptr ? 1.0f : __bfloat162float(gamma[col]);
+        const float x_val = __bfloat162float(x[idx]);
+        const float dy_gamma = __bfloat162float(dy[idx]) * g;
+        float correction_base = x_val * (r * r * r / static_cast<float>(hidden_size));
+        asm volatile("" : "+f"(correction_base));
+        const float scaled_dy = r * dy_gamma;
+        const float dx_val = __fmaf_rn(-correction_base, row_dot, scaled_dy);
+        dx[idx] = __float2bfloat16(dx_val);
+    }
+}
+
+template<int THREADS>
+__global__ void row_partial_dot_reduce_apply_dx_kernel(
+    const __nv_bfloat16* __restrict__ x,
+    const __nv_bfloat16* __restrict__ dy,
+    const __nv_bfloat16* __restrict__ gamma,
+    const float* __restrict__ coeff,
+    float* __restrict__ partial_dot,
+    float* __restrict__ dot,
+    __nv_bfloat16* __restrict__ dx,
+    int64_t rows,
+    int64_t hidden_size,
+    int64_t partial_cols
+) {
+    static_assert(THREADS == 128 || THREADS == 256);
+    constexpr int WARPS_PER_BLOCK = THREADS / 32;
+    __shared__ float scratch[256];
+    const int64_t row = static_cast<int64_t>(blockIdx.x);
+    if (row >= rows) {
+        return;
+    }
+    const int tid = threadIdx.x;
+    const int warp = tid / 32;
+    const int lane = tid % 32;
+    const int64_t row_base = row * hidden_size;
+    const int64_t partial_base = row * partial_cols;
+
+    for (int64_t slice = warp; slice < partial_cols; slice += WARPS_PER_BLOCK) {
+        const int64_t col = slice * 32 + lane;
+        const int64_t idx = row_base + col;
+        const float g = gamma == nullptr ? 1.0f : __bfloat162float(gamma[col]);
+        float sum = __bfloat162float(x[idx]) * __bfloat162float(dy[idx]) * g;
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            sum += __shfl_down_sync(0xffffffffu, sum, offset);
+        }
+        if (lane == 0) {
+            partial_dot[partial_base + slice] = sum;
+            scratch[slice] = sum;
+        }
+    }
+    for (int index = tid; index < 256; index += THREADS) {
+        if (index >= partial_cols) {
+            scratch[index] = 0.0f;
+        }
+    }
+    __syncthreads();
+
+    // Start at 128 for both launch sizes to preserve the committed 256-lane
+    // reduction tree, including its first add against zero-padded lanes.
+    for (int stride = 128; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            scratch[tid] += scratch[tid + stride];
+        }
+        __syncthreads();
+    }
+    const float row_dot = scratch[0];
+    if (tid == 0) {
+        dot[row] = row_dot;
+    }
+    const float r = coeff[row];
+#pragma unroll 1
+    for (int64_t col = tid; col < hidden_size; col += THREADS) {
         const int64_t idx = row_base + col;
         const float g = gamma == nullptr ? 1.0f : __bfloat162float(gamma[col]);
         const float x_val = __bfloat162float(x[idx]);
@@ -762,6 +855,84 @@ inline void reduce_dot_apply_dx_entrypoint(
         hidden_size,
         partial_dot.size(1)
     );
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+inline void partial_dot_reduce_apply_dx_entrypoint(
+    const at::Tensor& x,
+    const at::Tensor& dy,
+    const at::Tensor& coeff,
+    at::Tensor& partial_dot,
+    at::Tensor& dot,
+    at::Tensor& dx,
+    int64_t hidden_size,
+    std::optional<at::Tensor> gamma_opt = std::nullopt
+) {
+    check_matrix_bf16(x, "x");
+    check_matrix_bf16(dy, "dy");
+    check_matrix_bf16(dx, "dx");
+    TORCH_CHECK(dy.sizes() == x.sizes(), "dy shape must match x");
+    TORCH_CHECK(dx.sizes() == x.sizes(), "dx shape must match x");
+    TORCH_CHECK(hidden_size == x.size(1), "hidden_size must equal x.shape[1]");
+    TORCH_CHECK(hidden_size > 0 && hidden_size % 32 == 0,
+                "hidden_size must be positive and divisible by 32");
+    TORCH_CHECK(hidden_size <= 4096,
+                "C5 combined partial/reduce/apply supports hidden_size <= 4096");
+    const int64_t rows = x.size(0);
+    check_gamma(gamma_opt, hidden_size);
+    check_partial_dot(partial_dot, rows, hidden_size);
+    check_vector_fp32(coeff, "coeff", rows);
+    check_vector_fp32(dot, "dot", rows);
+    const auto device = x.device();
+    TORCH_CHECK(dy.device() == device && partial_dot.device() == device &&
+                    coeff.device() == device && dot.device() == device && dx.device() == device,
+                "partial_dot, x, dy, coeff, dot, and dx must share one CUDA device");
+    if (gamma_opt.has_value()) {
+        TORCH_CHECK(gamma_opt.value().device() == device,
+                    "gamma must share the input CUDA device");
+    }
+    check_no_contiguous_byte_overlap(partial_dot, "partial_dot", x, "x");
+    check_no_contiguous_byte_overlap(partial_dot, "partial_dot", dy, "dy");
+    check_no_contiguous_byte_overlap(partial_dot, "partial_dot", coeff, "coeff");
+    check_no_contiguous_byte_overlap(partial_dot, "partial_dot", dot, "dot");
+    check_no_contiguous_byte_overlap(partial_dot, "partial_dot", dx, "dx");
+    check_no_contiguous_byte_overlap(dot, "dot", x, "x");
+    check_no_contiguous_byte_overlap(dot, "dot", dy, "dy");
+    check_no_contiguous_byte_overlap(dot, "dot", coeff, "coeff");
+    check_no_contiguous_byte_overlap(dot, "dot", dx, "dx");
+    check_no_contiguous_byte_overlap(dx, "dx", x, "x");
+    check_no_contiguous_byte_overlap(dx, "dx", dy, "dy");
+    check_no_contiguous_byte_overlap(dx, "dx", coeff, "coeff");
+    if (gamma_opt.has_value()) {
+        check_no_contiguous_byte_overlap(
+            partial_dot, "partial_dot", gamma_opt.value(), "gamma");
+        check_no_contiguous_byte_overlap(dot, "dot", gamma_opt.value(), "gamma");
+        check_no_contiguous_byte_overlap(dx, "dx", gamma_opt.value(), "gamma");
+    }
+    if (rows == 0) {
+        return;
+    }
+    const __nv_bfloat16* gamma_ptr = gamma_opt.has_value()
+        ? reinterpret_cast<const __nv_bfloat16*>(gamma_opt.value().data_ptr())
+        : nullptr;
+    c10::cuda::CUDAGuard device_guard(device);
+    if (hidden_size < 4096) {
+        row_partial_dot_reduce_apply_dx_kernel<128><<<static_cast<int>(rows), 128, 0,
+            at::cuda::getCurrentCUDAStream()>>>(
+            reinterpret_cast<const __nv_bfloat16*>(x.data_ptr()),
+            reinterpret_cast<const __nv_bfloat16*>(dy.data_ptr()),
+            gamma_ptr, coeff.data_ptr<float>(), partial_dot.data_ptr<float>(),
+            dot.data_ptr<float>(), reinterpret_cast<__nv_bfloat16*>(dx.data_ptr()),
+            rows, hidden_size, partial_dot.size(1));
+    } else {
+        row_partial_dot_reduce_apply_dx_kernel<256><<<static_cast<int>(rows), 256, 0,
+            at::cuda::getCurrentCUDAStream()>>>(
+            reinterpret_cast<const __nv_bfloat16*>(x.data_ptr()),
+            reinterpret_cast<const __nv_bfloat16*>(dy.data_ptr()),
+            gamma_ptr, coeff.data_ptr<float>(), partial_dot.data_ptr<float>(),
+            dot.data_ptr<float>(), reinterpret_cast<__nv_bfloat16*>(dx.data_ptr()),
+            rows, hidden_size, partial_dot.size(1));
+    }
     C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
