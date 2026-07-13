@@ -524,6 +524,125 @@ void nvfp4_gemm_row_scale_entrypoint(
     }
 }
 
+void check_c4_nvfp4_prepared_gemm_inputs(
+    const at::Tensor &A,
+    const at::Tensor &A_sc,
+    const at::Tensor &A_sc_global,
+    const at::Tensor &B,
+    const at::Tensor &B_sc,
+    const at::Tensor &B_sc_global,
+    const at::Tensor &D
+) {
+    const auto check_tma_alignment = [](const at::Tensor &t, const char *name) {
+        TORCH_CHECK(
+            (reinterpret_cast<uintptr_t>(t.data_ptr()) & 0xF) == 0,
+            "C4 ", name, " data pointer must be 16-byte aligned"
+        );
+    };
+    const auto check_fp4 = [](const at::Tensor &t, const char *name) {
+        TORCH_CHECK(t.is_cuda(), "C4 ", name, " must be CUDA");
+        TORCH_CHECK(t.is_contiguous(), "C4 ", name, " must be contiguous");
+        TORCH_CHECK(t.dim() == 2, "C4 ", name, " must be 2D");
+        TORCH_CHECK(
+            t.scalar_type() == at::kFloat4_e2m1fn_x2,
+            "C4 ", name, " must be fp4x2"
+        );
+    };
+    check_fp4(A, "A");
+    check_fp4(B, "B");
+    check_tma_alignment(A, "A");
+    check_tma_alignment(B, "B");
+    const int64_t M = A.size(0);
+    const int64_t N = B.size(0);
+    const int64_t K = A.size(1) * 2;
+    TORCH_CHECK(A.size(1) == B.size(1), "C4 A and B must share packed K");
+    TORCH_CHECK(
+        M > 0 && N > 0 && K > 0 &&
+        M % 256 == 0 && N % 256 == 0 && K % 256 == 0,
+        "C4 overlap GEMM M, N, and K must be positive multiples of 256"
+    );
+    const auto check_scale = [K](
+        const at::Tensor &t, const char *name, int64_t rows
+    ) {
+        TORCH_CHECK(t.is_cuda(), "C4 ", name, " must be CUDA");
+        TORCH_CHECK(t.is_contiguous(), "C4 ", name, " must be contiguous");
+        TORCH_CHECK(
+            t.scalar_type() == at::kFloat8_e4m3fn,
+            "C4 ", name, " must be fp8 e4m3"
+        );
+        TORCH_CHECK(
+            t.dim() == 3 && t.size(0) == rows / 128 &&
+            t.size(1) == K / 64 && t.size(2) == 512,
+            "C4 ", name,
+            " must be prepared [rows/128,K/64,512]"
+        );
+    };
+    check_scale(A_sc, "A_sc", M);
+    check_scale(B_sc, "B_sc", N);
+    check_tma_alignment(A_sc, "A_sc");
+    check_tma_alignment(B_sc, "B_sc");
+    const auto check_global = [](const at::Tensor &t, const char *name) {
+        TORCH_CHECK(t.is_cuda(), "C4 ", name, " must be CUDA");
+        TORCH_CHECK(t.is_contiguous(), "C4 ", name, " must be contiguous");
+        TORCH_CHECK(
+            t.scalar_type() == at::kFloat && t.dim() == 1 && t.numel() == 1,
+            "C4 ", name, " must be contiguous float32 [1]"
+        );
+    };
+    check_global(A_sc_global, "A_sg");
+    check_global(B_sc_global, "B_sg");
+    check_tma_alignment(D, "D");
+}
+
+void nvfp4_c4_c2_c3_overlap_entrypoint(
+    const at::Tensor &A,
+    const at::Tensor &A_sc,
+    const at::Tensor &A_sc_global,
+    const at::Tensor &B,
+    const at::Tensor &B_sc,
+    const at::Tensor &B_sc_global,
+    const at::Tensor &row_rms_partial,
+    int64_t hidden_size,
+    double eps,
+    at::Tensor &row_scale_coeff,
+    at::Tensor &D
+) {
+    TORCH_CHECK(A.is_cuda(), "C4 A must be CUDA");
+    kittens::py::device_check(
+        A, A_sc, A_sc_global, B, B_sc, B_sc_global,
+        row_rms_partial, row_scale_coeff, D);
+    check_c4_nvfp4_prepared_gemm_inputs(
+        A, A_sc, A_sc_global, B, B_sc, B_sc_global, D);
+    TORCH_CHECK(
+        hidden_size == A.size(1) * 2,
+        "C4 hidden_size must equal logical GEMM K"
+    );
+    c3_row_scale::check_nvfp4_contract(
+        A, A_sc, A_sc_global, B, B_sc, B_sc_global, row_scale_coeff, D);
+    c1_rms_reduce::check_row_rms_reduce_pdl_args(
+        row_rms_partial, row_scale_coeff, hidden_size, eps);
+    c1_rms_reduce::check_c2_c3_output_overlap(
+        row_rms_partial, row_scale_coeff, D,
+        A, A_sc, A_sc_global, B, B_sc, B_sc_global);
+    const c10::cuda::CUDAGuard device_guard(A.device());
+    c1_rms_reduce::launch_row_rms_reduce_pdl_unchecked(
+        row_rms_partial, row_scale_coeff, hidden_size, eps);
+    const int K = B.size(1) * 2;
+    if (K <= 2048) {
+        using C = nvfp4_gemm::config<
+            256, 5, 8, 4, 2, false, 256, true, 2, 256,
+            false, false, false, true, false, 0, false, true>;
+        run_gemm_row_scale_with_config<C>(
+            A, A_sc, A_sc_global, B, B_sc, B_sc_global, row_scale_coeff, D);
+    } else {
+        using C = nvfp4_gemm::config<
+            256, 4, 8, 12, 2, false, 256, true, 2, 256,
+            false, false, false, true, false, 0, false, true>;
+        run_gemm_row_scale_with_config<C>(
+            A, A_sc, A_sc_global, B, B_sc, B_sc_global, row_scale_coeff, D);
+    }
+}
+
 // ================================================================
 // Non-PDL standard GEMM: USE_PDL=false, CLUSTER_SIZE=1.
 // Safe for CUDA graph capture and replay.
@@ -2514,6 +2633,11 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           pybind11::arg("A"), pybind11::arg("A_sc"), pybind11::arg("A_sc_global"),
           pybind11::arg("B"), pybind11::arg("B_sc"), pybind11::arg("B_sc_global"),
           pybind11::arg("row_scale_coeff"), pybind11::arg("D"));
+    m.def("nvfp4_c4_c2_c3_overlap", &nvfp4_c4_c2_c3_overlap_entrypoint,
+          pybind11::arg("A"), pybind11::arg("A_sc"), pybind11::arg("A_sc_global"),
+          pybind11::arg("B"), pybind11::arg("B_sc"), pybind11::arg("B_sc_global"),
+          pybind11::arg("row_rms_partial"), pybind11::arg("hidden_size"),
+          pybind11::arg("eps"), pybind11::arg("row_scale_coeff"), pybind11::arg("D"));
     m.def("nvfp4_gemm_rms_bwd_partial_dot", &nvfp4_gemm_rms_bwd_partial_dot_entrypoint,
           "NVFP4 GEMM with adjacent G4 RMSNorm-backward partial-dot epilogue",
           pybind11::arg("A"), pybind11::arg("A_sc"), pybind11::arg("A_sc_global"),

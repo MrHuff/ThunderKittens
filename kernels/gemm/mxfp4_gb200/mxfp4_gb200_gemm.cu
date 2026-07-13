@@ -1048,6 +1048,80 @@ void mxfp4_gemm_row_scale_entrypoint(
         A, A_sc, B, B_sc, row_scale_coeff, D);
 }
 
+void check_c4_mxfp4_gemm_inputs(
+    const at::Tensor &A,
+    const at::Tensor &A_sc,
+    const at::Tensor &B,
+    const at::Tensor &B_sc,
+    const at::Tensor &D
+) {
+    const auto check_tma_alignment = [](const at::Tensor &t, const char *name) {
+        TORCH_CHECK(
+            (reinterpret_cast<uintptr_t>(t.data_ptr()) & 0xF) == 0,
+            name, " data pointer must be 16-byte aligned"
+        );
+    };
+    check_fp4_matrix(A, "C4 A");
+    check_fp4_matrix(B, "C4 B");
+    check_tma_alignment(A, "C4 A");
+    check_tma_alignment(B, "C4 B");
+    const int64_t M = A.size(0);
+    const int64_t N = B.size(0);
+    const int64_t K = A.size(1) * 2;
+    TORCH_CHECK(A.size(1) == B.size(1), "C4 A and B must share packed K");
+    TORCH_CHECK(
+        M > 0 && N > 0 && K > 0 &&
+        M % 256 == 0 && N % 256 == 0 && K % 256 == 0,
+        "C4 overlap GEMM M, N, and K must be positive multiples of 256"
+    );
+    check_mxfp4_scale_tensor(A_sc, "C4 A_sc", M, K, false);
+    check_mxfp4_scale_tensor(B_sc, "C4 B_sc", N, K, false);
+    TORCH_CHECK(
+        A_sc.scalar_type() == at::kByte,
+        "C4 A_sc must use the production uint8 E8M0 layout"
+    );
+    TORCH_CHECK(
+        B_sc.scalar_type() == at::kByte,
+        "C4 B_sc must use the production uint8 E8M0 layout"
+    );
+    check_tma_alignment(A_sc, "C4 A_sc");
+    check_tma_alignment(B_sc, "C4 B_sc");
+    check_tma_alignment(D, "C4 D");
+}
+
+void mxfp4_c4_c2_c3_overlap_entrypoint(
+    const at::Tensor &A,
+    const at::Tensor &A_sc,
+    const at::Tensor &B,
+    const at::Tensor &B_sc,
+    const at::Tensor &row_rms_partial,
+    int64_t hidden_size,
+    double eps,
+    at::Tensor &row_scale_coeff,
+    at::Tensor &D
+) {
+    TORCH_CHECK(A.is_cuda(), "C4 A must be CUDA");
+    kittens::py::device_check(
+        A, A_sc, B, B_sc, row_rms_partial, row_scale_coeff, D);
+    check_c4_mxfp4_gemm_inputs(A, A_sc, B, B_sc, D);
+    TORCH_CHECK(
+        hidden_size == A.size(1) * 2,
+        "C4 hidden_size must equal logical GEMM K"
+    );
+    c3_row_scale::check_mxfp4_contract(A, A_sc, B, B_sc, row_scale_coeff, D);
+    c1_rms_reduce::check_row_rms_reduce_pdl_args(
+        row_rms_partial, row_scale_coeff, hidden_size, eps);
+    c1_rms_reduce::check_c2_c3_output_overlap(
+        row_rms_partial, row_scale_coeff, D, A, A_sc, B, B_sc);
+    const c10::cuda::CUDAGuard device_guard(A.device());
+    c1_rms_reduce::launch_row_rms_reduce_pdl_unchecked(
+        row_rms_partial, row_scale_coeff, hidden_size, eps);
+    launch_mxfp4_gemm_dense_row_scale<mxfp4_gemm::config<
+        256, 5, 8, 4, 2, false, 256,
+        false, false, false, false, true, false, true>>(
+        A, A_sc, B, B_sc, row_scale_coeff, D);
+}
+
 void mxfp4_gemm_residual_config_entrypoint(
     const at::Tensor &A,
     const at::Tensor &A_sc,
@@ -2625,6 +2699,11 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           pybind11::arg("A"), pybind11::arg("A_sc"),
           pybind11::arg("B"), pybind11::arg("B_sc"),
           pybind11::arg("row_scale_coeff"), pybind11::arg("D"));
+    m.def("mxfp4_c4_c2_c3_overlap", &mxfp4_c4_c2_c3_overlap_entrypoint,
+          pybind11::arg("A"), pybind11::arg("A_sc"),
+          pybind11::arg("B"), pybind11::arg("B_sc"),
+          pybind11::arg("row_rms_partial"), pybind11::arg("hidden_size"),
+          pybind11::arg("eps"), pybind11::arg("row_scale_coeff"), pybind11::arg("D"));
     m.def("mxfp4_gemm_rms_bwd_partial_dot", &mxfp4_gemm_rms_bwd_partial_dot_entrypoint,
           "MXFP4 GEMM with adjacent G4 RMSNorm-backward partial-dot epilogue",
           pybind11::arg("A"), pybind11::arg("A_sc"),

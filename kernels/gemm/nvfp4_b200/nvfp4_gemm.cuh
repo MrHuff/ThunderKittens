@@ -32,7 +32,8 @@ template <
     bool _FUSE_C3_ROW_SCALE = false,
     bool _FUSE_G1_SILU_DGRAD_QUANT = false,
     int _G1_MODE = 0,
-    bool _FUSE_G4_RMS_BWD = false
+    bool _FUSE_G4_RMS_BWD = false,
+    bool _DEFER_C3_PDL_WAIT = false
 >
 struct config {
     static_assert(_Nb == 128 || _Nb == 256, "Nb must be 128 or 256");
@@ -72,6 +73,7 @@ struct config {
     static constexpr bool FUSE_G1_SILU_DGRAD_QUANT = _FUSE_G1_SILU_DGRAD_QUANT;
     static constexpr int G1_MODE = _G1_MODE;
     static constexpr bool FUSE_G4_RMS_BWD = _FUSE_G4_RMS_BWD;
+    static constexpr bool DEFER_C3_PDL_WAIT = _DEFER_C3_PDL_WAIT;
     static_assert(G1_MODE >= 0 && G1_MODE <= 4, "unsupported G1 epilogue mode");
 
     // Output cache policy for TMA stores
@@ -634,7 +636,7 @@ __device__ inline void kernel_impl(const globals<C> &g) {
         const int lane = threadIdx.x % WARP_THREADS;
         if (warp_id == 3 && warp::elect_leader()) {
             // Load input tiles to shared memory
-            if constexpr (C::USE_PDL) pdl::wait();
+            if constexpr (C::USE_PDL && !C::DEFER_C3_PDL_WAIT) pdl::wait();
             everyone::tma::cluster::wait();
             for (int block_idx = cluster_id; block_idx < num_blocks; block_idx += gridDim.x / C::CLUSTER_SIZE) {
                 int supergroup_idx = block_idx / num_blocks_per_supergroup;
@@ -654,7 +656,7 @@ __device__ inline void kernel_impl(const globals<C> &g) {
             }
         } else if (warp_id == 2 && warp::elect_leader()) {
             // Load input scales to shared memory
-            if constexpr (C::USE_PDL) pdl::wait();
+            if constexpr (C::USE_PDL && !C::DEFER_C3_PDL_WAIT) pdl::wait();
             everyone::tma::cluster::wait();
             for (int block_idx = cluster_id; block_idx < num_blocks; block_idx += gridDim.x / C::CLUSTER_SIZE) {
                 int supergroup_idx = block_idx / num_blocks_per_supergroup;
@@ -800,6 +802,10 @@ __device__ inline void kernel_impl(const globals<C> &g) {
         const float default_a_sg = g.A_sc_global[{0}];
         const float default_b_sg = g.B_sc_global[{0}];
         uint32_t residual_load_phase = 0;
+
+        if constexpr (C::DEFER_C3_PDL_WAIT) {
+            pdl::wait();
+        }
 
         for (int block_idx = cluster_id; block_idx < num_blocks; block_idx += gridDim.x / C::CLUSTER_SIZE) {
             int supergroup_idx = block_idx / num_blocks_per_supergroup;
@@ -1247,7 +1253,7 @@ __device__ inline void kernel_chunk_grid(const globals<C> &g) {
     if (warpgroup_id >= C::CONSUMER_WARPGROUPS && warp::elect_leader()) {
         int warp_id = group<WARPGROUP_WARPS*C::PRODUCER_WARPGROUPS>::warpid();
         if (warp_id == 3) {
-            if constexpr (C::USE_PDL) pdl::wait();
+            if constexpr (C::USE_PDL && !C::DEFER_C3_PDL_WAIT) pdl::wait();
             everyone::tma::cluster::wait();
             for (int block_idx = cluster_id; block_idx < num_blocks; block_idx += gridDim.x / C::CLUSTER_SIZE) {
                 int supergroup_idx = block_idx / num_blocks_per_supergroup;
@@ -1266,7 +1272,7 @@ __device__ inline void kernel_chunk_grid(const globals<C> &g) {
                 }
             }
         } else if (warp_id == 2) {
-            if constexpr (C::USE_PDL) pdl::wait();
+            if constexpr (C::USE_PDL && !C::DEFER_C3_PDL_WAIT) pdl::wait();
             everyone::tma::cluster::wait();
             for (int block_idx = cluster_id; block_idx < num_blocks; block_idx += gridDim.x / C::CLUSTER_SIZE) {
                 int supergroup_idx = block_idx / num_blocks_per_supergroup;
@@ -1347,6 +1353,10 @@ __device__ inline void kernel_chunk_grid(const globals<C> &g) {
         uint32_t output_phasebits = 0xFFFF0000;
         const int A_sg_stride = g.a_sg_stride < 0 ? -g.a_sg_stride : g.a_sg_stride;
         const int B_sg_stride = g.b_sg_stride < 0 ? -g.b_sg_stride : g.b_sg_stride;
+
+        if constexpr (C::DEFER_C3_PDL_WAIT) {
+            pdl::wait();
+        }
 
         for (int block_idx = cluster_id; block_idx < num_blocks; block_idx += gridDim.x / C::CLUSTER_SIZE) {
             int supergroup_idx = block_idx / num_blocks_per_supergroup;

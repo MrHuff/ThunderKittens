@@ -54,6 +54,12 @@ using localcta_fast_largek_g4_config = nvfp4_gemm::config<
     false, false, false, false, false, 0, true>;
 using localcta_fast_smallk_row_scale_config = nvfp4_gemm::config<256, 5, 8, 4, 2, false, 256, true, 2, 256, false, false, false, true>;
 using localcta_fast_largek_row_scale_config = nvfp4_gemm::config<256, 5, 8, 12, 2, false, 256, true, 2, 256, false, false, false, true>;
+using localcta_fast_smallk_c4_overlap_config = nvfp4_gemm::config<
+    256, 5, 8, 4, 2, false, 256, true, 2, 256,
+    false, false, false, true, false, 0, false, true>;
+using localcta_fast_largek_c4_overlap_config = nvfp4_gemm::config<
+    256, 5, 8, 12, 2, false, 256, true, 2, 256,
+    false, false, false, true, false, 0, false, true>;
 using localcta_fast_grouped_config = nvfp4_gemm::config<256, 5, 8, 4, 2, false>;
 using localcta_fast_g1_amax_config = nvfp4_gemm::config<
     128, 2, 4, 12, 2, true, 256, true, 2, 256,
@@ -4721,6 +4727,100 @@ void nvfp4_localcta_gemm_row_scale_entrypoint(
         row_scale_coeff, D);
 }
 
+void nvfp4_localcta_c4_c2_c3_overlap_entrypoint(
+    const at::Tensor& A,
+    const at::Tensor& A_sc,
+    const at::Tensor& A_sg_chunks,
+    const at::Tensor& B,
+    const at::Tensor& B_sc,
+    const at::Tensor& B_sg_chunks,
+    const at::Tensor& row_rms_partial,
+    int64_t hidden_size,
+    double eps,
+    at::Tensor& row_scale_coeff,
+    at::Tensor& D
+) {
+    TORCH_CHECK(A.is_cuda(), "C4 A must be CUDA");
+    kittens::py::device_check(
+        A, A_sc, A_sg_chunks, B, B_sc, B_sg_chunks,
+        row_rms_partial, row_scale_coeff, D);
+    check_fp4_matrix(A, "C4 A");
+    check_fp4_matrix(B, "C4 B");
+    TORCH_CHECK(A.size(1) == B.size(1), "C4 A and B must share packed K");
+    const int64_t M = A.size(0);
+    const int64_t N = B.size(0);
+    const int64_t K = A.size(1) * 2;
+    TORCH_CHECK(
+        M > 0 && N > 0 && K > 0 &&
+        M % 256 == 0 && N % 256 == 0 && K % 256 == 0,
+        "C4 overlap GEMM M, N, and K must be positive multiples of 256"
+    );
+    TORCH_CHECK(
+        A_sc.dim() == 3 && A_sc.size(0) == M / 128 &&
+        A_sc.size(1) == K / 64 && A_sc.size(2) == 512,
+        "C4 A_sc must be prepared [rows/128,K/64,512]"
+    );
+    TORCH_CHECK(
+        B_sc.dim() == 3 && B_sc.size(0) == N / 128 &&
+        B_sc.size(1) == K / 64 && B_sc.size(2) == 512,
+        "C4 B_sc must be prepared [rows/128,K/64,512]"
+    );
+    check_scale_tensor(A_sc, "C4 A_sc", M, K);
+    check_scale_tensor(B_sc, "C4 B_sc", N, K);
+    const auto check_tma_alignment = [](const at::Tensor& t, const char* name) {
+        TORCH_CHECK(
+            (reinterpret_cast<uintptr_t>(t.data_ptr()) & 0xF) == 0,
+            name, " data pointer must be 16-byte aligned"
+        );
+    };
+    check_tma_alignment(A, "C4 A");
+    check_tma_alignment(B, "C4 B");
+    check_tma_alignment(A_sc, "C4 A_sc");
+    check_tma_alignment(B_sc, "C4 B_sc");
+    check_tma_alignment(D, "C4 D");
+    const auto check_sg_input = [](
+        const at::Tensor& t, const char* name, int64_t rows
+    ) {
+        TORCH_CHECK(t.is_cuda(), name, " must be CUDA");
+        TORCH_CHECK(t.is_contiguous(), name, " must be contiguous");
+        TORCH_CHECK(t.scalar_type() == at::kFloat, name, " must be float32");
+        TORCH_CHECK(
+            t.dim() == 2 && t.size(0) == rows / 256 && t.size(1) == 1,
+            name, " must be final outer-SG [rows/256,1]"
+        );
+    };
+    check_sg_input(A_sg_chunks, "C4 A_sg", M);
+    check_sg_input(B_sg_chunks, "C4 B_sg", N);
+    TORCH_CHECK(
+        hidden_size == A.size(1) * 2,
+        "C4 hidden_size must equal logical GEMM K"
+    );
+    c3_row_scale::check_nvfp4_contract(
+        A, A_sc, A_sg_chunks, B, B_sc, B_sg_chunks, row_scale_coeff, D);
+    c1_rms_reduce::check_row_rms_reduce_pdl_args(
+        row_rms_partial, row_scale_coeff, hidden_size, eps);
+    c1_rms_reduce::check_c2_c3_output_overlap(
+        row_rms_partial, row_scale_coeff, D,
+        A, A_sc, A_sg_chunks, B, B_sc, B_sg_chunks);
+    const c10::cuda::CUDAGuard device_guard(A.device());
+    auto A_sg_outer = normalize_outer_scale_tiles_tensor(
+        A_sg_chunks, A.size(0) / 256, true);
+    auto B_sg_outer = normalize_outer_scale_tiles_tensor(
+        B_sg_chunks, B.size(0) / 256, false);
+    check_v3_fast_gemm_inputs(A, A_sc, A_sg_outer, B, B_sc, B_sg_outer);
+    check_output_matrix(D, "D", A.size(0), B.size(0));
+    (void)get_unit_scale_tensor(A);
+    c1_rms_reduce::launch_row_rms_reduce_pdl_unchecked(
+        row_rms_partial, row_scale_coeff, hidden_size, eps);
+    if (K <= 2048) {
+        launch_fast_gemm_with_config_row_scale<localcta_fast_smallk_c4_overlap_config>(
+            A, A_sc, A_sg_outer, B, B_sc, B_sg_outer, row_scale_coeff, D);
+    } else {
+        launch_fast_gemm_with_config_row_scale<localcta_fast_largek_c4_overlap_config>(
+            A, A_sc, A_sg_outer, B, B_sc, B_sg_outer, row_scale_coeff, D);
+    }
+}
+
 void nvfp4_localcta_fast_gemm_entrypoint(
     const at::Tensor& A,
     const at::Tensor& A_sc_prepared,
@@ -6844,6 +6944,12 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           pybind11::arg("A"), pybind11::arg("A_sc"), pybind11::arg("A_sg_chunks"),
           pybind11::arg("B"), pybind11::arg("B_sc"), pybind11::arg("B_sg_chunks"),
           pybind11::arg("row_scale_coeff"), pybind11::arg("D"));
+    m.def("nvfp4_localcta_c4_c2_c3_overlap",
+          &nvfp4_localcta_c4_c2_c3_overlap_entrypoint,
+          pybind11::arg("A"), pybind11::arg("A_sc"), pybind11::arg("A_sg_chunks"),
+          pybind11::arg("B"), pybind11::arg("B_sc"), pybind11::arg("B_sg_chunks"),
+          pybind11::arg("row_rms_partial"), pybind11::arg("hidden_size"),
+          pybind11::arg("eps"), pybind11::arg("row_scale_coeff"), pybind11::arg("D"));
     m.def("nvfp4_localcta_gemm_rms_bwd_partial_dot",
           &nvfp4_localcta_gemm_rms_bwd_partial_dot_entrypoint,
           "localCTA v4 GEMM with adjacent G4 RMSNorm-backward partial-dot epilogue",

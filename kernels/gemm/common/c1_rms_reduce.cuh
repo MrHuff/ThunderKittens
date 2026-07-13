@@ -1,12 +1,46 @@
 #pragma once
 
 #include <ATen/ATen.h>
+#include <ATen/MemoryOverlap.h>
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAGuard.h>
 #include <c10/cuda/CUDAException.h>
 
+#include <cmath>
+
+#include "kittens.cuh"
+
 namespace c1_rms_reduce {
 
+inline void check_no_overlap(
+    const at::Tensor& writable,
+    const char* writable_name,
+    const at::Tensor& input,
+    const char* input_name
+) {
+    if (writable.storage().unsafeGetStorageImpl() != input.storage().unsafeGetStorageImpl()) {
+        return;
+    }
+    TORCH_CHECK(
+        at::get_overlap_status(writable, input) == at::MemOverlapStatus::No,
+        "C4 ", writable_name, " must not overlap ", input_name
+    );
+}
+
+template <typename... ReadTensors>
+inline void check_c2_c3_output_overlap(
+    const at::Tensor& row_rms_partial,
+    const at::Tensor& coeff,
+    const at::Tensor& D,
+    const ReadTensors&... reads
+) {
+    check_no_overlap(coeff, "coeff", row_rms_partial, "row_rms_partial");
+    check_no_overlap(coeff, "coeff", D, "D");
+    (check_no_overlap(coeff, "coeff", reads, "a GEMM read input"), ...);
+    check_no_overlap(D, "D", row_rms_partial, "row_rms_partial");
+}
+
+template <bool EARLY_PDL_ARRIVE = false>
 __global__ void row_rms_coeff_kernel(
     const float* __restrict__ row_rms_partial,
     float* __restrict__ coeff,
@@ -15,6 +49,11 @@ __global__ void row_rms_coeff_kernel(
     int64_t hidden_size,
     float eps
 ) {
+    if constexpr (EARLY_PDL_ARRIVE) {
+        if (threadIdx.x == 0) {
+            kittens::pdl::arrive();
+        }
+    }
     __shared__ float scratch[256];
     const int64_t row = static_cast<int64_t>(blockIdx.x);
     if (row >= rows) {
@@ -39,6 +78,7 @@ __global__ void row_rms_coeff_kernel(
     }
 }
 
+template <bool EARLY_PDL_ARRIVE = false>
 __global__ void row_rms_coeff_warp_kernel(
     const float* __restrict__ row_rms_partial,
     float* __restrict__ coeff,
@@ -47,6 +87,11 @@ __global__ void row_rms_coeff_warp_kernel(
     int64_t hidden_size,
     float eps
 ) {
+    if constexpr (EARLY_PDL_ARRIVE) {
+        if (threadIdx.x == 0) {
+            kittens::pdl::arrive();
+        }
+    }
     constexpr int WARPS_PER_BLOCK = 4;
     const int warp = threadIdx.x / 32;
     const int lane = threadIdx.x % 32;
@@ -115,7 +160,7 @@ inline void row_rms_reduce_entrypoint(
             constexpr int WARPS_PER_BLOCK = 4;
             dim3 grid((rows + WARPS_PER_BLOCK - 1) / WARPS_PER_BLOCK);
             dim3 block(32 * WARPS_PER_BLOCK);
-            row_rms_coeff_warp_kernel<<<grid, block, 0, at::cuda::getCurrentCUDAStream()>>>(
+            row_rms_coeff_warp_kernel<><<<grid, block, 0, at::cuda::getCurrentCUDAStream()>>>(
                 row_rms_partial.data_ptr<float>(),
                 coeff.data_ptr<float>(),
                 rows,
@@ -126,7 +171,7 @@ inline void row_rms_reduce_entrypoint(
         } else {
             dim3 grid(rows);
             dim3 block(256);
-            row_rms_coeff_kernel<<<grid, block, 0, at::cuda::getCurrentCUDAStream()>>>(
+            row_rms_coeff_kernel<><<<grid, block, 0, at::cuda::getCurrentCUDAStream()>>>(
                 row_rms_partial.data_ptr<float>(),
                 coeff.data_ptr<float>(),
                 rows,
@@ -142,7 +187,7 @@ inline void row_rms_reduce_entrypoint(
         constexpr int WARPS_PER_BLOCK = 4;
         dim3 grid((rows + WARPS_PER_BLOCK - 1) / WARPS_PER_BLOCK);
         dim3 block(32 * WARPS_PER_BLOCK);
-        row_rms_coeff_warp_kernel<<<grid, block, 0, stream>>>(
+        row_rms_coeff_warp_kernel<><<<grid, block, 0, stream>>>(
             row_rms_partial.data_ptr<float>(),
             coeff.data_ptr<float>(),
             rows,
@@ -153,7 +198,7 @@ inline void row_rms_reduce_entrypoint(
     } else {
         dim3 grid(rows);
         dim3 block(256);
-        row_rms_coeff_kernel<<<grid, block, 0, stream>>>(
+        row_rms_coeff_kernel<><<<grid, block, 0, stream>>>(
             row_rms_partial.data_ptr<float>(),
             coeff.data_ptr<float>(),
             rows,
@@ -163,6 +208,58 @@ inline void row_rms_reduce_entrypoint(
         );
     }
     C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+inline void check_row_rms_reduce_pdl_args(
+    const at::Tensor& row_rms_partial,
+    const at::Tensor& coeff,
+    int64_t hidden_size,
+    double eps
+) {
+    check_row_rms_reduce_args(row_rms_partial, coeff, hidden_size);
+    TORCH_CHECK(std::isfinite(eps) && eps >= 0.0,
+                "C4 eps must be finite and non-negative");
+    const int64_t rows = row_rms_partial.size(0);
+    const int64_t partial_cols = row_rms_partial.size(1);
+    TORCH_CHECK(rows > 0, "C4 overlap requires M > 0");
+    TORCH_CHECK(partial_cols <= 128,
+                "C4 PDL C2 reducer supports at most 128 partial columns");
+}
+
+inline void launch_row_rms_reduce_pdl_unchecked(
+    const at::Tensor& row_rms_partial,
+    at::Tensor& coeff,
+    int64_t hidden_size,
+    double eps
+) {
+    const int64_t rows = row_rms_partial.size(0);
+    const int64_t partial_cols = row_rms_partial.size(1);
+    if (rows == 0) {
+        return;
+    }
+    constexpr int WARPS_PER_BLOCK = 4;
+    dim3 grid((rows + WARPS_PER_BLOCK - 1) / WARPS_PER_BLOCK);
+    dim3 block(32 * WARPS_PER_BLOCK);
+    row_rms_coeff_warp_kernel<true><<<grid, block, 0, at::cuda::getCurrentCUDAStream()>>>(
+        row_rms_partial.data_ptr<float>(),
+        coeff.data_ptr<float>(),
+        rows,
+        partial_cols,
+        hidden_size,
+        static_cast<float>(eps)
+    );
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+inline void row_rms_reduce_pdl_entrypoint(
+    const at::Tensor& row_rms_partial,
+    at::Tensor& coeff,
+    int64_t hidden_size,
+    double eps
+) {
+    check_row_rms_reduce_pdl_args(row_rms_partial, coeff, hidden_size, eps);
+    const c10::cuda::CUDAGuard device_guard(row_rms_partial.device());
+    launch_row_rms_reduce_pdl_unchecked(row_rms_partial, coeff, hidden_size, eps);
 }
 
 } // namespace c1_rms_reduce

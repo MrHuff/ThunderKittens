@@ -25,7 +25,8 @@ template <
     bool _OUTPUT_SCALE = false,
     bool _FUSE_C1_RMS = false,
     bool _FUSE_C3_ROW_SCALE = false,
-    bool _FUSE_G4_RMS_BWD = false
+    bool _FUSE_G4_RMS_BWD = false,
+    bool _DEFER_C3_PDL_WAIT = false
 >
 struct config {
     static_assert(_Nb == 128 || _Nb == 256, "Nb must be 128 or 256");
@@ -59,6 +60,7 @@ struct config {
     static constexpr bool FUSE_C1_RMS = _FUSE_C1_RMS;
     static constexpr bool FUSE_C3_ROW_SCALE = _FUSE_C3_ROW_SCALE;
     static constexpr bool FUSE_G4_RMS_BWD = _FUSE_G4_RMS_BWD;
+    static constexpr bool DEFER_C3_PDL_WAIT = _DEFER_C3_PDL_WAIT;
     static constexpr int B_SC_SIZE = Nb/128;
     static constexpr int MMA_PER_TILE = Kb/128;
 
@@ -468,7 +470,7 @@ __device__ inline void kernel(const globals<C> &g) {
         int warp_id = group<WARPGROUP_WARPS*C::PRODUCER_WARPGROUPS>::warpid();
         if (warp_id == 3) {
             // Load input FP4 tiles to shared memory
-            pdl::wait();
+            if constexpr (!C::DEFER_C3_PDL_WAIT) pdl::wait();
             everyone::tma::cluster::wait();
             for (int block_idx = cluster_id; block_idx < num_blocks; block_idx += gridDim.x / C::CLUSTER_SIZE) {
                 int supergroup_idx = block_idx / num_blocks_per_supergroup;
@@ -497,7 +499,7 @@ __device__ inline void kernel(const globals<C> &g) {
         } else if (warp_id == 2) {
             // Load input scales to shared memory
             // Each iteration loads MMA_PER_TILE (=2) scale tiles per A and B
-            pdl::wait();
+            if constexpr (!C::DEFER_C3_PDL_WAIT) pdl::wait();
             everyone::tma::cluster::wait();
             for (int block_idx = cluster_id; block_idx < num_blocks; block_idx += gridDim.x / C::CLUSTER_SIZE) {
                 int supergroup_idx = block_idx / num_blocks_per_supergroup;
@@ -622,6 +624,9 @@ __device__ inline void kernel(const globals<C> &g) {
         tm_allocator.set_addr(tmem_addr);
         auto out_tm = tm_allocator.template allocate<full_tt_fl<C::Nb>>(0);
         uint32_t residual_load_phase = 0;
+        if constexpr (C::DEFER_C3_PDL_WAIT) {
+            pdl::wait();
+        }
         for (int block_idx = cluster_id; block_idx < num_blocks; block_idx += gridDim.x / C::CLUSTER_SIZE) {
             int supergroup_idx = block_idx / num_blocks_per_supergroup;
             int idx_within_supergroup = block_idx % num_blocks_per_supergroup;
