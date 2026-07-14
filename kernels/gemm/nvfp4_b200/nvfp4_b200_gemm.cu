@@ -10,8 +10,11 @@
 #include "nvfp4_fused_gemm.cuh"
 #include "nvfp4_persistent_gemm.cuh"
 #include <c10/cuda/CUDAGuard.h>
+#include <c10/cuda/CUDAMacros.h>
 #include <array>
+#include <atomic>
 #include <cstdint>
+#include <mutex>
 #include <optional>
 #include <utility>
 
@@ -2565,6 +2568,58 @@ __global__ void sum4_tensors_kernel(
 // D_out = sum_i(A_i × B_i^T), accumulated in TMEM registers.
 // No intermediate D buffers, no sum3 kernel.
 // ================================================================
+template <typename C, typename G, auto Kernel>
+void ensure_batched_accum_kernel_attributes(const G &g) {
+    static_assert(
+        C::CLUSTER_SIZE <= 8,
+        "batched accumulator requires portable cluster dimensions");
+    struct PerDeviceCache {
+        std::array<std::atomic<int>, C10_COMPILE_TIME_MAX_GPUS> max_smem;
+        std::mutex mutex;
+
+        PerDeviceCache() {
+            for (auto &value : max_smem) {
+                value.store(-1, std::memory_order_relaxed);
+            }
+        }
+    };
+    static PerDeviceCache cache;
+
+    const int device = at::cuda::getCurrentCUDAStream().device_index();
+    TORCH_CHECK(
+        device >= 0 && device < C10_COMPILE_TIME_MAX_GPUS,
+        "batched accumulator CUDA device index is out of range");
+    const int required_smem = g.dynamic_shared_memory();
+    auto &configured_smem = cache.max_smem[device];
+    if (required_smem <= configured_smem.load(std::memory_order_acquire)) {
+        return;
+    }
+
+    std::lock_guard<std::mutex> lock(cache.mutex);
+    if (required_smem > configured_smem.load(std::memory_order_relaxed)) {
+        CUDACHECK(cudaFuncSetAttribute(
+            kittens::py::global_kernel<C, G, Kernel>,
+            cudaFuncAttributeMaxDynamicSharedMemorySize,
+            required_smem));
+        configured_smem.store(required_smem, std::memory_order_release);
+    }
+}
+
+void check_batched_accum_output_no_overlap(
+    const at::Tensor &output,
+    const at::Tensor &input,
+    const char *input_name
+) {
+    const auto output_begin = reinterpret_cast<uintptr_t>(output.data_ptr());
+    const auto input_begin = reinterpret_cast<uintptr_t>(input.data_ptr());
+    const auto output_bytes = static_cast<uintptr_t>(output.nbytes());
+    const auto input_bytes = static_cast<uintptr_t>(input.nbytes());
+    TORCH_CHECK(
+        output_begin + output_bytes <= input_begin ||
+            input_begin + input_bytes <= output_begin,
+        "batched accumulation D_out must not overlap ", input_name);
+}
+
 void nvfp4_batched_accum_gemm_entrypoint(
     const std::vector<at::Tensor> &A_list,       // per-batch [M, K/2] fp4x2
     const std::vector<at::Tensor> &A_sc_list,    // per-batch [ntm, ntk, 512] fp8
@@ -2576,10 +2631,70 @@ void nvfp4_batched_accum_gemm_entrypoint(
 ) {
     const int n = (int)A_list.size();
     TORCH_CHECK(n > 0 && n <= 4, "num_batches must be 1..4");
-    TORCH_CHECK(D_out.dim() == 2);
+    TORCH_CHECK(
+        A_sc_list.size() == static_cast<size_t>(n) &&
+        A_sg_list.size() == static_cast<size_t>(n) &&
+        B_list.size() == static_cast<size_t>(n) &&
+        B_sc_list.size() == static_cast<size_t>(n) &&
+        B_sg_list.size() == static_cast<size_t>(n),
+        "all batched accumulation input lists must have the same length");
+    TORCH_CHECK(
+        D_out.is_cuda() && D_out.is_contiguous() && D_out.dim() == 2 &&
+        D_out.scalar_type() == at::kBFloat16,
+        "D_out must be contiguous CUDA bfloat16 [M,N]");
 
+    TORCH_CHECK(A_list[0].dim() == 2, "A_list entries must be rank 2");
     const int64_t M = D_out.size(0);
     const int64_t N_out = D_out.size(1);
+    const int64_t K = 2 * A_list[0].size(1);
+    TORCH_CHECK(
+        M > 0 && N_out > 0 && K > 0 &&
+        M % 256 == 0 && N_out % 256 == 0 && K % 256 == 0,
+        "batched accumulation M,N,K must be positive multiples of 256");
+    for (int i = 0; i < n; ++i) {
+        TORCH_CHECK(
+            A_list[i].dim() == 2 && B_list[i].dim() == 2 &&
+            A_list[i].size(0) == M && B_list[i].size(0) == N_out &&
+            A_list[i].size(1) == B_list[i].size(1),
+            "each A/B pair must be rank 2 with shapes [M,Ki/2] and [N,Ki/2]");
+        const int64_t K_i = 2 * A_list[i].size(1);
+        TORCH_CHECK(
+            A_list[i].is_cuda() && A_list[i].is_contiguous() &&
+            A_list[i].scalar_type() == at::kFloat4_e2m1fn_x2,
+            "A_list entries must be contiguous CUDA fp4 [M,K/2]");
+        TORCH_CHECK(
+            B_list[i].is_cuda() && B_list[i].is_contiguous() &&
+            B_list[i].scalar_type() == at::kFloat4_e2m1fn_x2,
+            "B_list entries must be contiguous CUDA fp4 [N,K/2]");
+        TORCH_CHECK(
+            A_sc_list[i].is_cuda() && A_sc_list[i].is_contiguous() &&
+            A_sc_list[i].scalar_type() == at::kFloat8_e4m3fn &&
+            A_sc_list[i].numel() == M * K_i / 16,
+            "A_sc_list entries must be contiguous CUDA fp8 with M*K/16 elements");
+        TORCH_CHECK(
+            B_sc_list[i].is_cuda() && B_sc_list[i].is_contiguous() &&
+            B_sc_list[i].scalar_type() == at::kFloat8_e4m3fn &&
+            B_sc_list[i].numel() == N_out * K_i / 16,
+            "B_sc_list entries must be contiguous CUDA fp8 with N*K/16 elements");
+        TORCH_CHECK(
+            A_sg_list[i].is_cuda() && A_sg_list[i].is_contiguous() &&
+            A_sg_list[i].scalar_type() == at::kFloat && A_sg_list[i].numel() == 1,
+            "A_sg_list entries must be contiguous CUDA float32 scalars");
+        TORCH_CHECK(
+            B_sg_list[i].is_cuda() && B_sg_list[i].is_contiguous() &&
+            B_sg_list[i].scalar_type() == at::kFloat && B_sg_list[i].numel() == 1,
+            "B_sg_list entries must be contiguous CUDA float32 scalars");
+        kittens::py::device_check(
+            D_out, A_list[i], A_sc_list[i], A_sg_list[i],
+            B_list[i], B_sc_list[i], B_sg_list[i]);
+        check_batched_accum_output_no_overlap(D_out, A_list[i], "A_list");
+        check_batched_accum_output_no_overlap(D_out, A_sc_list[i], "A_sc_list");
+        check_batched_accum_output_no_overlap(D_out, A_sg_list[i], "A_sg_list");
+        check_batched_accum_output_no_overlap(D_out, B_list[i], "B_list");
+        check_batched_accum_output_no_overlap(D_out, B_sc_list[i], "B_sc_list");
+        check_batched_accum_output_no_overlap(D_out, B_sg_list[i], "B_sg_list");
+    }
+    c10::cuda::CUDAGuard device_guard(D_out.device());
 
     if (n == 1) {
         // Single batch: just run regular GEMM directly into D_out
@@ -2623,7 +2738,23 @@ void nvfp4_batched_accum_gemm_entrypoint(
         auto d_gl = kittens::py::tensor_to_gl<typename G::D_gl>(D_out);
         memcpy(&g_host.D_tma, &d_gl.tma_descs.tma_desc, sizeof(CUtensorMap));
 
-        kittens::py::launch_kernel<C, G, nvfp4_batched_accum_gemm::kernel<C>>(g_host);
+        bool use_fixed2_8b_ffn =
+            n == 2 && M == 32768 && N_out == 4096 &&
+            2 * A_list[0].size(1) == 14336;
+        for (int i = 1; i < n && use_fixed2_8b_ffn; ++i) {
+            use_fixed2_8b_ffn = 2 * A_list[i].size(1) == 14336;
+        }
+        if (use_fixed2_8b_ffn) {
+            ensure_batched_accum_kernel_attributes<
+                C, G, nvfp4_batched_accum_gemm::kernel_fixed2<C>>(g_host);
+            kittens::py::launch_kernel<
+                C, G, nvfp4_batched_accum_gemm::kernel_fixed2<C>>(g_host);
+        } else {
+            ensure_batched_accum_kernel_attributes<
+                C, G, nvfp4_batched_accum_gemm::kernel<C>>(g_host);
+            kittens::py::launch_kernel<
+                C, G, nvfp4_batched_accum_gemm::kernel<C>>(g_host);
+        }
     };
 
     build_and_launch.operator()<nvfp4_gemm::config<256, 5, 8, 4, 2, false>>();

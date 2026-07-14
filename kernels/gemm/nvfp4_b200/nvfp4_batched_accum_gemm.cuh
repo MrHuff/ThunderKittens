@@ -348,6 +348,11 @@ __device__ inline void kernel(const globals<C> &g) {
 }
 
 template <typename C>
+__device__ inline void kernel_fixed2(const globals<C> &g) {
+    kernel_impl<C, 2>(g);
+}
+
+template <typename C>
 __device__ inline void kernel_fixed3(const globals<C> &g) {
     kernel_impl<C, 3>(g);
 }
