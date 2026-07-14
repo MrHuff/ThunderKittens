@@ -11,6 +11,7 @@
 #include "nvfp4_persistent_gemm.cuh"
 #include <c10/cuda/CUDAGuard.h>
 #include <array>
+#include <cstdint>
 #include <optional>
 #include <utility>
 
@@ -361,6 +362,21 @@ __global__ void v5_rmsnorm_bwd_dgamma_tiled_kernel(
     }
 }
 
+static void check_rmsnorm_bwd_no_overlap(
+    const at::Tensor& output,
+    const char* output_name,
+    const at::Tensor& read,
+    const char* read_name
+) {
+    const auto output_begin = reinterpret_cast<std::uintptr_t>(output.data_ptr());
+    const auto read_begin = reinterpret_cast<std::uintptr_t>(read.data_ptr());
+    const auto output_end = output_begin + output.numel() * output.element_size();
+    const auto read_end = read_begin + read.numel() * read.element_size();
+    TORCH_CHECK(
+        output_end <= read_begin || read_end <= output_begin,
+        "RMSNorm backward output ", output_name, " must not overlap ", read_name);
+}
+
 void nvfp4_rmsnorm_bwd_entrypoint(
     const at::Tensor& d_normed,
     const at::Tensor& input,
@@ -381,13 +397,17 @@ void nvfp4_rmsnorm_bwd_entrypoint(
     TORCH_CHECK(inv_rms.is_cuda() && inv_rms.is_contiguous()
                     && inv_rms.scalar_type() == at::kFloat,
                 "inv_rms must be contiguous CUDA fp32");
+    kittens::py::device_check(
+        d_normed, input, norm_weight, inv_rms, grad_input, dgamma);
     TORCH_CHECK(d_normed.dim() == 2, "d_normed must be rank-2");
     const int64_t M = d_normed.size(0);
     const int64_t K = d_normed.size(1);
+    TORCH_CHECK(M > 0 && K > 0, "M and K must be positive");
     TORCH_CHECK(input.sizes() == at::IntArrayRef({M, K}), "input shape mismatch");
     TORCH_CHECK(norm_weight.dim() == 1 && norm_weight.numel() == K,
                 "norm_weight must have shape [K]");
-    TORCH_CHECK(inv_rms.numel() == M, "inv_rms must have M elements");
+    TORCH_CHECK(inv_rms.dim() == 1 && inv_rms.numel() == M,
+                "inv_rms must have shape [M]");
     TORCH_CHECK(grad_input.is_cuda() && grad_input.is_contiguous()
                     && grad_input.scalar_type() == at::kBFloat16
                     && grad_input.sizes() == at::IntArrayRef({M, K}),
@@ -397,6 +417,17 @@ void nvfp4_rmsnorm_bwd_entrypoint(
                     && dgamma.dim() == 1 && dgamma.numel() == K,
                 "dgamma must be contiguous CUDA fp32 [K]");
 
+    const std::array<std::pair<const at::Tensor*, const char*>, 4> reads = {{
+        {&d_normed, "d_normed"}, {&input, "input"},
+        {&norm_weight, "norm_weight"}, {&inv_rms, "inv_rms"},
+    }};
+    for (const auto& [read, name] : reads) {
+        check_rmsnorm_bwd_no_overlap(grad_input, "grad_input", *read, name);
+        check_rmsnorm_bwd_no_overlap(dgamma, "dgamma", *read, name);
+    }
+    check_rmsnorm_bwd_no_overlap(grad_input, "grad_input", dgamma, "dgamma");
+
+    const c10::cuda::CUDAGuard device_guard(d_normed.device());
     auto stream = at::cuda::getCurrentCUDAStream();
     constexpr int threads = 256;
     v5_rmsnorm_bwd_dx_kernel<<<static_cast<int>(M), threads, 0, stream>>>(
@@ -407,7 +438,10 @@ void nvfp4_rmsnorm_bwd_entrypoint(
         reinterpret_cast<__nv_bfloat16*>(grad_input.data_ptr()),
         M,
         K);
-    v5_rmsnorm_bwd_dgamma_kernel<<<static_cast<int>(K), threads, 0, stream>>>(
+    constexpr int dgamma_columns = 8;
+    const int64_t dgamma_blocks = (K + dgamma_columns - 1) / dgamma_columns;
+    v5_rmsnorm_bwd_dgamma_tiled_kernel<dgamma_columns><<<
+        static_cast<int>(dgamma_blocks), threads, 0, stream>>>(
         reinterpret_cast<const __nv_bfloat16*>(d_normed.data_ptr()),
         reinterpret_cast<const __nv_bfloat16*>(input.data_ptr()),
         reinterpret_cast<const float*>(inv_rms.data_ptr()),
@@ -464,32 +498,18 @@ void nvfp4_sum3_rmsnorm_bwd_entrypoint(
     TORCH_CHECK(dgamma.is_contiguous() && dgamma.scalar_type() == at::kFloat
                     && dgamma.dim() == 1 && dgamma.numel() == K,
                 "dgamma must be contiguous CUDA fp32 [K]");
-    auto check_no_overlap = [](
-        const at::Tensor& output,
-        const char* output_name,
-        const at::Tensor& read,
-        const char* read_name
-    ) {
-        const auto output_begin = reinterpret_cast<std::uintptr_t>(output.data_ptr());
-        const auto read_begin = reinterpret_cast<std::uintptr_t>(read.data_ptr());
-        const auto output_end = output_begin + output.numel() * output.element_size();
-        const auto read_end = read_begin + read.numel() * read.element_size();
-        TORCH_CHECK(
-            output_end <= read_begin || read_end <= output_begin,
-            "sum3 RMSNorm output ", output_name, " must not overlap ", read_name);
-    };
     const std::array<std::pair<const at::Tensor*, const char*>, 6> reads = {{
         {&d0, "d0"}, {&d1, "d1"}, {&d2, "d2"}, {&input, "input"},
         {&norm_weight, "norm_weight"}, {&inv_rms, "inv_rms"},
     }};
     for (const auto& [read, name] : reads) {
-        check_no_overlap(d_sum, "d_sum", *read, name);
-        check_no_overlap(grad_input, "grad_input", *read, name);
-        check_no_overlap(dgamma, "dgamma", *read, name);
+        check_rmsnorm_bwd_no_overlap(d_sum, "d_sum", *read, name);
+        check_rmsnorm_bwd_no_overlap(grad_input, "grad_input", *read, name);
+        check_rmsnorm_bwd_no_overlap(dgamma, "dgamma", *read, name);
     }
-    check_no_overlap(d_sum, "d_sum", grad_input, "grad_input");
-    check_no_overlap(d_sum, "d_sum", dgamma, "dgamma");
-    check_no_overlap(grad_input, "grad_input", dgamma, "dgamma");
+    check_rmsnorm_bwd_no_overlap(d_sum, "d_sum", grad_input, "grad_input");
+    check_rmsnorm_bwd_no_overlap(d_sum, "d_sum", dgamma, "dgamma");
+    check_rmsnorm_bwd_no_overlap(grad_input, "grad_input", dgamma, "dgamma");
 
     const c10::cuda::CUDAGuard device_guard(d0.device());
     auto stream = at::cuda::getCurrentCUDAStream();
