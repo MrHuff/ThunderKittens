@@ -1826,6 +1826,54 @@ void nvfp4_grouped_gemm_config_nopdl_entrypoint(
 // Batched GEMM entrypoint (z-dim parallel): D_i = A_i × B_i^T
 // Each batch writes to a separate output buffer.
 // ================================================================
+static void check_batched_gemm_no_overlap(
+    const at::Tensor &output,
+    const at::Tensor &input,
+    const char *input_name
+) {
+    const auto output_begin = reinterpret_cast<uintptr_t>(output.data_ptr());
+    const auto input_begin = reinterpret_cast<uintptr_t>(input.data_ptr());
+    const auto output_end = output_begin + static_cast<uintptr_t>(output.nbytes());
+    const auto input_end = input_begin + static_cast<uintptr_t>(input.nbytes());
+    TORCH_CHECK(
+        output_end <= input_begin || input_end <= output_begin,
+        "batched GEMM output must not overlap ", input_name);
+}
+
+template <typename C, typename G, auto Kernel>
+void ensure_batched_gemm_kernel_attributes(const G &g) {
+    struct PerDeviceCache {
+        std::array<std::atomic<int>, C10_COMPILE_TIME_MAX_GPUS> max_smem;
+        std::mutex mutex;
+
+        PerDeviceCache() {
+            for (auto &value : max_smem) {
+                value.store(-1, std::memory_order_relaxed);
+            }
+        }
+    };
+    static PerDeviceCache cache;
+
+    const int device = at::cuda::getCurrentCUDAStream().device_index();
+    TORCH_CHECK(
+        device >= 0 && device < C10_COMPILE_TIME_MAX_GPUS,
+        "batched GEMM CUDA device index is out of range");
+    const int required_smem = g.dynamic_shared_memory();
+    auto &configured_smem = cache.max_smem[device];
+    if (required_smem <= configured_smem.load(std::memory_order_acquire)) {
+        return;
+    }
+
+    std::lock_guard<std::mutex> lock(cache.mutex);
+    if (required_smem > configured_smem.load(std::memory_order_relaxed)) {
+        CUDACHECK(cudaFuncSetAttribute(
+            kittens::py::global_kernel<C, G, Kernel>,
+            cudaFuncAttributeMaxDynamicSharedMemorySize,
+            required_smem));
+        configured_smem.store(required_smem, std::memory_order_release);
+    }
+}
+
 void nvfp4_batched_gemm_entrypoint(
     const std::vector<at::Tensor> &A_list,
     const std::vector<at::Tensor> &A_sc_list,
@@ -1838,11 +1886,104 @@ void nvfp4_batched_gemm_entrypoint(
     const int n = (int)A_list.size();
     TORCH_CHECK(n > 0 && n <= nvfp4_batched_gemm::MAX_BATCHES,
                 "num_batches must be 1..", nvfp4_batched_gemm::MAX_BATCHES);
-    TORCH_CHECK(n == (int)D_list.size());
+    TORCH_CHECK(
+        A_sc_list.size() == static_cast<size_t>(n) &&
+        A_sg_list.size() == static_cast<size_t>(n) &&
+        B_list.size() == static_cast<size_t>(n) &&
+        B_sc_list.size() == static_cast<size_t>(n) &&
+        B_sg_list.size() == static_cast<size_t>(n) &&
+        D_list.size() == static_cast<size_t>(n),
+        "all batched GEMM tensor lists must have the same length");
+    TORCH_CHECK(
+        D_list[0].is_cuda() && D_list[0].is_contiguous() &&
+        D_list[0].dim() == 2 && D_list[0].scalar_type() == at::kBFloat16,
+        "D_list entries must be contiguous CUDA bfloat16 [M,N]");
 
     const int64_t M = D_list[0].size(0);
     const int64_t N_out = D_list[0].size(1);
-    const int K_first = (int)(A_list[0].size(1) * 2);
+    TORCH_CHECK(A_list[0].dim() == 2, "A_list entries must be rank 2");
+    const int64_t K_first = A_list[0].size(1) * 2;
+    TORCH_CHECK(
+        M > 0 && N_out > 0 && K_first > 0 &&
+        M % 256 == 0 && N_out % 256 == 0 && K_first % 256 == 0,
+        "batched GEMM M,N,K must be positive multiples of 256");
+    for (int i = 0; i < n; ++i) {
+        TORCH_CHECK(
+            D_list[i].is_cuda() && D_list[i].is_contiguous() &&
+            D_list[i].dim() == 2 && D_list[i].scalar_type() == at::kBFloat16 &&
+            D_list[i].size(0) == M && D_list[i].size(1) == N_out,
+            "D_list entries must be contiguous CUDA bfloat16 tensors with one shared [M,N] shape");
+        TORCH_CHECK(
+            A_list[i].dim() == 2 && B_list[i].dim() == 2 &&
+            A_list[i].size(0) == M && B_list[i].size(0) == N_out &&
+            A_list[i].size(1) * 2 == K_first &&
+            B_list[i].size(1) * 2 == K_first,
+            "each A/B pair must have shapes [M,K/2] and [N,K/2] with one shared K");
+        TORCH_CHECK(
+            A_list[i].is_cuda() && A_list[i].is_contiguous() &&
+            A_list[i].scalar_type() == at::kFloat4_e2m1fn_x2,
+            "A_list entries must be contiguous CUDA fp4 [M,K/2]");
+        TORCH_CHECK(
+            B_list[i].is_cuda() && B_list[i].is_contiguous() &&
+            B_list[i].scalar_type() == at::kFloat4_e2m1fn_x2,
+            "B_list entries must be contiguous CUDA fp4 [N,K/2]");
+        const bool a_sc_legacy =
+            A_sc_list[i].dim() == 2 &&
+            A_sc_list[i].size(0) == M && A_sc_list[i].size(1) == K_first / 16;
+        const bool a_sc_prepared =
+            A_sc_list[i].dim() == 3 &&
+            A_sc_list[i].size(0) == M / 128 &&
+            A_sc_list[i].size(1) == K_first / 64 &&
+            A_sc_list[i].size(2) == 512;
+        TORCH_CHECK(
+            A_sc_list[i].is_cuda() && A_sc_list[i].is_contiguous() &&
+            A_sc_list[i].scalar_type() == at::kFloat8_e4m3fn &&
+            (a_sc_legacy || a_sc_prepared),
+            "A_sc_list entries must be contiguous CUDA fp8 [M,K/16] or [M/128,K/64,512]");
+        const bool b_sc_legacy =
+            B_sc_list[i].dim() == 2 &&
+            B_sc_list[i].size(0) == N_out && B_sc_list[i].size(1) == K_first / 16;
+        const bool b_sc_prepared =
+            B_sc_list[i].dim() == 3 &&
+            B_sc_list[i].size(0) == N_out / 128 &&
+            B_sc_list[i].size(1) == K_first / 64 &&
+            B_sc_list[i].size(2) == 512;
+        TORCH_CHECK(
+            B_sc_list[i].is_cuda() && B_sc_list[i].is_contiguous() &&
+            B_sc_list[i].scalar_type() == at::kFloat8_e4m3fn &&
+            (b_sc_legacy || b_sc_prepared),
+            "B_sc_list entries must be contiguous CUDA fp8 [N,K/16] or [N/128,K/64,512]");
+        TORCH_CHECK(
+            A_sg_list[i].is_cuda() && A_sg_list[i].is_contiguous() &&
+            A_sg_list[i].scalar_type() == at::kFloat && A_sg_list[i].numel() == 1,
+            "A_sg_list entries must be contiguous CUDA float32 scalars");
+        TORCH_CHECK(
+            B_sg_list[i].is_cuda() && B_sg_list[i].is_contiguous() &&
+            B_sg_list[i].scalar_type() == at::kFloat && B_sg_list[i].numel() == 1,
+            "B_sg_list entries must be contiguous CUDA float32 scalars");
+        kittens::py::device_check(
+            D_list[0], D_list[i], A_list[i], A_sc_list[i], A_sg_list[i],
+            B_list[i], B_sc_list[i], B_sg_list[i]);
+        TORCH_CHECK(
+            reinterpret_cast<uintptr_t>(A_list[i].data_ptr()) % 16 == 0 &&
+            reinterpret_cast<uintptr_t>(A_sc_list[i].data_ptr()) % 16 == 0 &&
+            reinterpret_cast<uintptr_t>(B_list[i].data_ptr()) % 16 == 0 &&
+            reinterpret_cast<uintptr_t>(B_sc_list[i].data_ptr()) % 16 == 0 &&
+            reinterpret_cast<uintptr_t>(D_list[i].data_ptr()) % 16 == 0,
+            "batched GEMM TMA tensor pointers must be 16-byte aligned");
+        for (int output_index = 0; output_index < n; ++output_index) {
+            check_batched_gemm_no_overlap(D_list[output_index], A_list[i], "A_list");
+            check_batched_gemm_no_overlap(D_list[output_index], A_sc_list[i], "A_sc_list");
+            check_batched_gemm_no_overlap(D_list[output_index], A_sg_list[i], "A_sg_list");
+            check_batched_gemm_no_overlap(D_list[output_index], B_list[i], "B_list");
+            check_batched_gemm_no_overlap(D_list[output_index], B_sc_list[i], "B_sc_list");
+            check_batched_gemm_no_overlap(D_list[output_index], B_sg_list[i], "B_sg_list");
+        }
+        for (int output_index = 0; output_index < i; ++output_index) {
+            check_batched_gemm_no_overlap(D_list[i], D_list[output_index], "D_list");
+        }
+    }
+    c10::cuda::CUDAGuard device_guard(D_list[0].device());
 
     auto build_and_launch = [&]<typename C>() {
         using G = nvfp4_batched_gemm::globals<C>;
@@ -1875,6 +2016,8 @@ void nvfp4_batched_gemm_entrypoint(
             g_host.A_sg[i] = A_sg_list[i].data_ptr<float>();
             g_host.B_sg[i] = B_sg_list[i].data_ptr<float>();
         }
+        ensure_batched_gemm_kernel_attributes<
+            C, G, nvfp4_batched_gemm::kernel<C>>(g_host);
         kittens::py::launch_kernel<C, G, nvfp4_batched_gemm::kernel<C>>(g_host);
     };
 
