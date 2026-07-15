@@ -922,6 +922,140 @@ void nvfp4_grouped_gemm_nopdl_entrypoint(
     kittens::py::launch_kernel<C, G, nvfp4_gemm::kernel<C>>(g);
 }
 
+template <typename C, typename G>
+static void ensure_qkv_direct_wgrad_kernel_attributes(const G &g) {
+    struct PerDeviceCache {
+        std::array<std::atomic<int>, C10_COMPILE_TIME_MAX_GPUS> max_smem;
+        std::mutex mutex;
+
+        PerDeviceCache() {
+            for (auto &value : max_smem) {
+                value.store(-1, std::memory_order_relaxed);
+            }
+        }
+    };
+    static PerDeviceCache cache;
+
+    const int device = at::cuda::getCurrentCUDAStream().device_index();
+    TORCH_CHECK(
+        device >= 0 && device < C10_COMPILE_TIME_MAX_GPUS,
+        "direct QKV wgrad CUDA device index is out of range");
+    const int required_smem = g.dynamic_shared_memory();
+    auto &configured_smem = cache.max_smem[device];
+    if (required_smem <= configured_smem.load(std::memory_order_acquire)) {
+        return;
+    }
+
+    std::lock_guard<std::mutex> lock(cache.mutex);
+    if (required_smem > configured_smem.load(std::memory_order_relaxed)) {
+        CUDACHECK(cudaFuncSetAttribute(
+            kittens::py::global_kernel<C, G, nvfp4_gemm::kernel<C>>,
+            cudaFuncAttributeMaxDynamicSharedMemorySize,
+            required_smem));
+        configured_smem.store(required_smem, std::memory_order_release);
+    }
+}
+
+// Direct-layout regular-v5 QKV wgrad. The grouped Q/K/V gradient
+// scale is indexed by output row tile, while normalized X has one scalar SG.
+void nvfp4_grouped_qkv_wgrad_direct_entrypoint(
+    const at::Tensor &dy,
+    const at::Tensor &dy_sc,
+    const at::Tensor &dy_sg_per_tile,
+    const at::Tensor &x,
+    const at::Tensor &x_sc,
+    const at::Tensor &x_sg,
+    at::Tensor &D,
+    bool use_pdl
+) {
+    const auto check_fp4 = [](const at::Tensor &tensor, const char *name) {
+        TORCH_CHECK(tensor.is_cuda(), name, " must be CUDA");
+        TORCH_CHECK(tensor.is_contiguous(), name, " must be contiguous");
+        TORCH_CHECK(tensor.dim() == 2, name, " must be rank 2");
+        TORCH_CHECK(tensor.scalar_type() == at::kFloat4_e2m1fn_x2,
+                    name, " must be fp4x2");
+        TORCH_CHECK((reinterpret_cast<uintptr_t>(tensor.data_ptr()) & 0xF) == 0,
+                    name, " must be 16-byte aligned");
+    };
+    check_fp4(dy, "dy");
+    check_fp4(x, "x");
+    const int64_t N = dy.size(0);
+    const int64_t K = x.size(0);
+    const int64_t M = dy.size(1) * 2;
+    TORCH_CHECK(x.size(1) * 2 == M, "dy and x must share logical reduction M");
+    TORCH_CHECK(N > 0 && K > 0 && M > 0 &&
+                N % 256 == 0 && K % 256 == 0 && M % 256 == 0,
+                "direct QKV wgrad N,K,M must be positive multiples of 256");
+    const auto check_sc = [M](
+        const at::Tensor &tensor, const char *name, int64_t rows
+    ) {
+        TORCH_CHECK(tensor.is_cuda(), name, " must be CUDA");
+        TORCH_CHECK(tensor.is_contiguous(), name, " must be contiguous");
+        TORCH_CHECK(tensor.scalar_type() == at::kFloat8_e4m3fn,
+                    name, " must be fp8 e4m3");
+        TORCH_CHECK(tensor.dim() == 3 && tensor.size(0) == rows / 128 &&
+                    tensor.size(1) == M / 64 && tensor.size(2) == 512,
+                    name, " must be prepared [rows/128,M/64,512]");
+        TORCH_CHECK((reinterpret_cast<uintptr_t>(tensor.data_ptr()) & 0xF) == 0,
+                    name, " must be 16-byte aligned");
+    };
+    check_sc(dy_sc, "dy_sc", N);
+    check_sc(x_sc, "x_sc", K);
+    TORCH_CHECK(dy_sg_per_tile.is_cuda() && dy_sg_per_tile.is_contiguous() &&
+                dy_sg_per_tile.scalar_type() == at::kFloat &&
+                dy_sg_per_tile.dim() == 1 && dy_sg_per_tile.numel() == N / 256,
+                "dy_sg_per_tile must be contiguous CUDA float32 [N/256]");
+    TORCH_CHECK(x_sg.is_cuda() && x_sg.is_contiguous() &&
+                x_sg.scalar_type() == at::kFloat && x_sg.numel() == 1,
+                "x_sg must be contiguous CUDA float32 [1]");
+    TORCH_CHECK(D.is_cuda() && D.is_contiguous() && D.dim() == 2 &&
+                D.scalar_type() == at::kBFloat16 && D.size(0) == N && D.size(1) == K,
+                "D must be contiguous CUDA bfloat16 [N,K]");
+    TORCH_CHECK((reinterpret_cast<uintptr_t>(D.data_ptr()) & 0xF) == 0,
+                "D must be 16-byte aligned");
+    kittens::py::device_check(dy, dy_sc, dy_sg_per_tile, x, x_sc, x_sg, D);
+    c3_row_scale::check_output_no_overlap(D, dy, "dy");
+    c3_row_scale::check_output_no_overlap(D, dy_sc, "dy_sc");
+    c3_row_scale::check_output_no_overlap(D, dy_sg_per_tile, "dy_sg_per_tile");
+    c3_row_scale::check_output_no_overlap(D, x, "x");
+    c3_row_scale::check_output_no_overlap(D, x_sc, "x_sc");
+    c3_row_scale::check_output_no_overlap(D, x_sg, "x_sg");
+    const c10::cuda::CUDAGuard device_guard(D.device());
+
+    auto launch = [&]<typename C>() {
+        using G = nvfp4_gemm::globals<C>;
+        G g {
+            .A = kittens::py::tensor_to_gl<typename G::A_fp4x2_gl>(dy),
+            .A_sc = kittens::py::tensor_to_gl<typename G::A_sc_gl, false>(
+                dy_sc, 1, dy_sc.size(0), dy_sc.size(1), 256),
+            .A_sc_global = kittens::py::tensor_to_gl<typename G::A_sc_global_gl>(x_sg),
+            .B = kittens::py::tensor_to_gl<typename G::B_fp4x2_gl>(x),
+            .B_sc = kittens::py::tensor_to_gl<typename G::B_sc_gl, false>(
+                x_sc, 1, x_sc.size(0), x_sc.size(1), 256),
+            .B_sc_global = kittens::py::tensor_to_gl<typename G::B_sc_global_gl>(x_sg),
+            .D = kittens::py::tensor_to_gl<typename G::D_gl>(D),
+            .D_K = kittens::py::tensor_to_gl<typename G::D_gl>(D),
+            .D_V = kittens::py::tensor_to_gl<typename G::D_gl>(D),
+            .q_dim = 0,
+            .k_dim = 0,
+            .v_dim = 0,
+            .use_split_D = false,
+            .a_sg_per_tile = dy_sg_per_tile.data_ptr<float>(),
+            .a_sg_stride = 1,
+            .b_sg_per_tile = nullptr,
+            .b_sg_stride = 1,
+            .silu_dim = 0
+        };
+        ensure_qkv_direct_wgrad_kernel_attributes<C>(g);
+        kittens::py::launch_kernel<C, G, nvfp4_gemm::kernel<C>>(g);
+    };
+    if (use_pdl) {
+        launch.operator()<nvfp4_gemm::config<256, 5, 8, 4, 2, false, 256, true, 2>>();
+    } else {
+        launch.operator()<nvfp4_gemm::config<256, 5, 8, 4, 2, false, 256, false, 2>>();
+    }
+}
+
 static bool nvfp4_is_power_of_two_i64(int64_t value) {
     return value > 0 && (value & (value - 1)) == 0;
 }
@@ -2222,6 +2356,13 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           pybind11::arg("B"), pybind11::arg("B_sc"), pybind11::arg("B_sg_per_tile"),
           pybind11::arg("D"), pybind11::arg("D_K_opt") = std::nullopt, pybind11::arg("D_V_opt") = std::nullopt,
           pybind11::arg("silu_dim") = 0);
+    m.def("nvfp4_grouped_qkv_wgrad_direct",
+          &nvfp4_grouped_qkv_wgrad_direct_entrypoint,
+          "Direct-layout regular-v5 QKV wgrad with per-row-tile gradient SG",
+          pybind11::arg("dy"), pybind11::arg("dy_sc"),
+          pybind11::arg("dy_sg_per_tile"), pybind11::arg("x"),
+          pybind11::arg("x_sc"), pybind11::arg("x_sg"), pybind11::arg("D"),
+          pybind11::arg("use_pdl") = true);
     m.def("nvfp4_grouped_gemm_config_nopdl", &nvfp4_grouped_gemm_config_nopdl_entrypoint,
           "Non-PDL grouped GEMM with selectable tile config",
           pybind11::arg("A"), pybind11::arg("A_sc"), pybind11::arg("A_sc_global"),
