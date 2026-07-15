@@ -228,6 +228,54 @@ __global__ void v5_rmsnorm_bwd_dx_kernel(
     }
 }
 
+__global__ void v5_rmsnorm_bwd_dx_residual_kernel(
+    const __nv_bfloat16* __restrict__ d_normed,
+    const __nv_bfloat16* __restrict__ input,
+    const __nv_bfloat16* __restrict__ norm_weight,
+    const float* __restrict__ inv_rms,
+    const __nv_bfloat16* __restrict__ residual_grad,
+    __nv_bfloat16* __restrict__ grad_input,
+    int64_t M,
+    int64_t K
+) {
+    __shared__ float scratch[256];
+    const int64_t row = static_cast<int64_t>(blockIdx.x);
+    if (row >= M) {
+        return;
+    }
+    const int tid = threadIdx.x;
+    const int64_t base = row * K;
+    float partial = 0.0f;
+    for (int64_t col = tid; col < K; col += blockDim.x) {
+        const int64_t idx = base + col;
+        const float dy = __bfloat162float(d_normed[idx]);
+        const float x = __bfloat162float(input[idx]);
+        const float gamma = __bfloat162float(norm_weight[col]);
+        partial += dy * gamma * x;
+    }
+    scratch[tid] = partial;
+    __syncthreads();
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            scratch[tid] += scratch[tid + stride];
+        }
+        __syncthreads();
+    }
+    const float inv = inv_rms[row];
+    const float dot_mean = scratch[0] / static_cast<float>(K);
+    const float inv3_dot = inv * inv * inv * dot_mean;
+    for (int64_t col = tid; col < K; col += blockDim.x) {
+        const int64_t idx = base + col;
+        const float dy = __bfloat162float(d_normed[idx]);
+        const float x = __bfloat162float(input[idx]);
+        const float gamma = __bfloat162float(norm_weight[col]);
+        const float dx = inv * (dy * gamma) - x * inv3_dot;
+        // Preserve the accepted two-rounding contract: RMS dx is rounded to
+        // BF16 before the residual gradient is added and rounded again.
+        grad_input[idx] = __hadd(__float2bfloat16(dx), residual_grad[idx]);
+    }
+}
+
 __global__ void v5_sum3_rmsnorm_bwd_dx_kernel(
     const __nv_bfloat16* __restrict__ d0,
     const __nv_bfloat16* __restrict__ d1,
@@ -442,6 +490,88 @@ void nvfp4_rmsnorm_bwd_entrypoint(
         reinterpret_cast<const __nv_bfloat16*>(input.data_ptr()),
         reinterpret_cast<const __nv_bfloat16*>(norm_weight.data_ptr()),
         reinterpret_cast<const float*>(inv_rms.data_ptr()),
+        reinterpret_cast<__nv_bfloat16*>(grad_input.data_ptr()),
+        M,
+        K);
+    constexpr int dgamma_columns = 8;
+    const int64_t dgamma_blocks = (K + dgamma_columns - 1) / dgamma_columns;
+    v5_rmsnorm_bwd_dgamma_tiled_kernel<dgamma_columns><<<
+        static_cast<int>(dgamma_blocks), threads, 0, stream>>>(
+        reinterpret_cast<const __nv_bfloat16*>(d_normed.data_ptr()),
+        reinterpret_cast<const __nv_bfloat16*>(input.data_ptr()),
+        reinterpret_cast<const float*>(inv_rms.data_ptr()),
+        reinterpret_cast<float*>(dgamma.data_ptr()),
+        M,
+        K);
+    CUDACHECK(cudaGetLastError());
+}
+
+void nvfp4_rmsnorm_bwd_residual_entrypoint(
+    const at::Tensor& d_normed,
+    const at::Tensor& input,
+    const at::Tensor& norm_weight,
+    const at::Tensor& inv_rms,
+    const at::Tensor& residual_grad,
+    at::Tensor& grad_input,
+    at::Tensor& dgamma
+) {
+    TORCH_CHECK(d_normed.is_cuda() && d_normed.is_contiguous()
+                    && d_normed.scalar_type() == at::kBFloat16,
+                "d_normed must be contiguous CUDA bf16");
+    TORCH_CHECK(input.is_cuda() && input.is_contiguous()
+                    && input.scalar_type() == at::kBFloat16,
+                "input must be contiguous CUDA bf16");
+    TORCH_CHECK(norm_weight.is_cuda() && norm_weight.is_contiguous()
+                    && norm_weight.scalar_type() == at::kBFloat16,
+                "norm_weight must be contiguous CUDA bf16");
+    TORCH_CHECK(inv_rms.is_cuda() && inv_rms.is_contiguous()
+                    && inv_rms.scalar_type() == at::kFloat,
+                "inv_rms must be contiguous CUDA fp32");
+    TORCH_CHECK(residual_grad.is_cuda() && residual_grad.is_contiguous()
+                    && residual_grad.scalar_type() == at::kBFloat16,
+                "residual_grad must be contiguous CUDA bf16");
+    kittens::py::device_check(
+        d_normed, input, norm_weight, inv_rms, residual_grad, grad_input, dgamma);
+    TORCH_CHECK(d_normed.dim() == 2, "d_normed must be rank-2");
+    const int64_t M = d_normed.size(0);
+    const int64_t K = d_normed.size(1);
+    TORCH_CHECK(M > 0 && K > 0, "M and K must be positive");
+    TORCH_CHECK(input.sizes() == at::IntArrayRef({M, K}), "input shape mismatch");
+    TORCH_CHECK(residual_grad.sizes() == at::IntArrayRef({M, K}),
+                "residual_grad shape mismatch");
+    TORCH_CHECK(norm_weight.dim() == 1 && norm_weight.numel() == K,
+                "norm_weight must have shape [K]");
+    TORCH_CHECK(inv_rms.dim() == 1 && inv_rms.numel() == M,
+                "inv_rms must have shape [M]");
+    TORCH_CHECK(grad_input.is_cuda() && grad_input.is_contiguous()
+                    && grad_input.scalar_type() == at::kBFloat16
+                    && grad_input.sizes() == at::IntArrayRef({M, K}),
+                "grad_input must be contiguous CUDA bf16 [M,K]");
+    TORCH_CHECK(dgamma.is_cuda() && dgamma.is_contiguous()
+                    && dgamma.scalar_type() == at::kFloat
+                    && dgamma.dim() == 1 && dgamma.numel() == K,
+                "dgamma must be contiguous CUDA fp32 [K]");
+
+    const std::array<std::pair<const at::Tensor*, const char*>, 5> reads = {{
+        {&d_normed, "d_normed"}, {&input, "input"},
+        {&norm_weight, "norm_weight"}, {&inv_rms, "inv_rms"},
+        {&residual_grad, "residual_grad"},
+    }};
+    for (const auto& [read, name] : reads) {
+        check_rmsnorm_bwd_no_overlap(grad_input, "grad_input", *read, name);
+        check_rmsnorm_bwd_no_overlap(dgamma, "dgamma", *read, name);
+    }
+    check_rmsnorm_bwd_no_overlap(grad_input, "grad_input", dgamma, "dgamma");
+
+    const c10::cuda::CUDAGuard device_guard(d_normed.device());
+    auto stream = at::cuda::getCurrentCUDAStream();
+    constexpr int threads = 256;
+    v5_rmsnorm_bwd_dx_residual_kernel<<<static_cast<int>(M), threads, 0, stream>>>(
+        reinterpret_cast<const __nv_bfloat16*>(d_normed.data_ptr()),
+        reinterpret_cast<const __nv_bfloat16*>(input.data_ptr()),
+        reinterpret_cast<const __nv_bfloat16*>(norm_weight.data_ptr()),
+        reinterpret_cast<const float*>(inv_rms.data_ptr()),
+        reinterpret_cast<const __nv_bfloat16*>(residual_grad.data_ptr()),
         reinterpret_cast<__nv_bfloat16*>(grad_input.data_ptr()),
         M,
         K);
@@ -3568,6 +3698,12 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           pybind11::arg("d_normed"), pybind11::arg("input"),
           pybind11::arg("norm_weight"), pybind11::arg("inv_rms"),
           pybind11::arg("grad_input"), pybind11::arg("dgamma"));
+    m.def("rmsnorm_bwd_residual_out", &nvfp4_rmsnorm_bwd_residual_entrypoint,
+          "native BF16 RMSNorm backward plus an exact BF16 residual gradient",
+          pybind11::arg("d_normed"), pybind11::arg("input"),
+          pybind11::arg("norm_weight"), pybind11::arg("inv_rms"),
+          pybind11::arg("residual_grad"), pybind11::arg("grad_input"),
+          pybind11::arg("dgamma"));
     m.def("sum3_rmsnorm_bwd_out", &nvfp4_sum3_rmsnorm_bwd_entrypoint,
           "native BF16 sum3 plus RMSNorm backward for plain v5 paths",
           pybind11::arg("d0"), pybind11::arg("d1"), pybind11::arg("d2"),
