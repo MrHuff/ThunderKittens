@@ -553,6 +553,14 @@ static void run_gemm_row_scale_with_config(
 );
 
 template <typename C>
+static void run_gemm_residual_with_config(
+    const at::Tensor &A, const at::Tensor &A_sc, const at::Tensor &A_sc_global,
+    const at::Tensor &B, const at::Tensor &B_sc, const at::Tensor &B_sc_global,
+    const at::Tensor &R,
+    at::Tensor &D
+);
+
+template <typename C>
 static void run_gemm_residual_rms_with_config(
     const at::Tensor &A, const at::Tensor &A_sc, const at::Tensor &A_sc_global,
     const at::Tensor &B, const at::Tensor &B_sc, const at::Tensor &B_sc_global,
@@ -645,6 +653,127 @@ void nvfp4_gemm_entrypoint(
             .b_sg_per_tile = nullptr
         };
         kittens::py::launch_kernel<C, G, nvfp4_gemm::kernel<C>>(g);
+    }
+}
+
+void check_nvfp4_residual_gemm_inputs(
+    const at::Tensor &A,
+    const at::Tensor &A_sc,
+    const at::Tensor &A_sc_global,
+    const at::Tensor &B,
+    const at::Tensor &B_sc,
+    const at::Tensor &B_sc_global,
+    const at::Tensor &R,
+    const at::Tensor &D
+) {
+    const auto check_tma_alignment = [](const at::Tensor &tensor, const char *name) {
+        TORCH_CHECK(
+            (reinterpret_cast<uintptr_t>(tensor.data_ptr()) & 0xF) == 0,
+            "v5 residual ", name, " data pointer must be 16-byte aligned"
+        );
+    };
+    const auto check_fp4 = [](const at::Tensor &tensor, const char *name) {
+        TORCH_CHECK(tensor.is_cuda(), "v5 residual ", name, " must be CUDA");
+        TORCH_CHECK(tensor.is_contiguous(), "v5 residual ", name, " must be contiguous");
+        TORCH_CHECK(tensor.dim() == 2, "v5 residual ", name, " must be 2D");
+        TORCH_CHECK(
+            tensor.scalar_type() == at::kFloat4_e2m1fn_x2,
+            "v5 residual ", name, " must be fp4x2"
+        );
+    };
+    check_fp4(A, "A");
+    check_fp4(B, "B");
+    check_tma_alignment(A, "A");
+    check_tma_alignment(B, "B");
+    const int64_t M = A.size(0);
+    const int64_t N = B.size(0);
+    const int64_t K = A.size(1) * 2;
+    TORCH_CHECK(A.size(1) == B.size(1), "v5 residual A and B must share packed K");
+    TORCH_CHECK(
+        M > 0 && N > 0 && K > 0 &&
+        M % 256 == 0 && N % 256 == 0 && K % 256 == 0,
+        "v5 residual GEMM M, N, and K must be positive multiples of 256"
+    );
+    const auto check_scale = [K](
+        const at::Tensor &tensor, const char *name, int64_t rows
+    ) {
+        TORCH_CHECK(tensor.is_cuda(), "v5 residual ", name, " must be CUDA");
+        TORCH_CHECK(tensor.is_contiguous(), "v5 residual ", name, " must be contiguous");
+        TORCH_CHECK(
+            tensor.scalar_type() == at::kFloat8_e4m3fn,
+            "v5 residual ", name, " must be fp8 e4m3"
+        );
+        TORCH_CHECK(
+            tensor.dim() == 3 && tensor.size(0) == rows / 128 &&
+            tensor.size(1) == K / 64 && tensor.size(2) == 512,
+            "v5 residual ", name, " must be prepared [rows/128,K/64,512]"
+        );
+    };
+    check_scale(A_sc, "A_sc", M);
+    check_scale(B_sc, "B_sc", N);
+    check_tma_alignment(A_sc, "A_sc");
+    check_tma_alignment(B_sc, "B_sc");
+    const auto check_global = [](const at::Tensor &tensor, const char *name) {
+        TORCH_CHECK(tensor.is_cuda(), "v5 residual ", name, " must be CUDA");
+        TORCH_CHECK(tensor.is_contiguous(), "v5 residual ", name, " must be contiguous");
+        TORCH_CHECK(
+            tensor.scalar_type() == at::kFloat && tensor.dim() == 1 && tensor.numel() == 1,
+            "v5 residual ", name, " must be contiguous float32 [1]"
+        );
+    };
+    check_global(A_sc_global, "A_sg");
+    check_global(B_sc_global, "B_sg");
+    for (const auto &[tensor, name] : std::array<std::pair<const at::Tensor*, const char*>, 2>{
+             std::pair{&R, "R"}, std::pair{&D, "D"}}) {
+        TORCH_CHECK(tensor->is_cuda(), "v5 residual ", name, " must be CUDA");
+        TORCH_CHECK(tensor->is_contiguous(), "v5 residual ", name, " must be contiguous");
+        TORCH_CHECK(tensor->scalar_type() == at::kBFloat16,
+                    "v5 residual ", name, " must be bf16");
+        TORCH_CHECK(tensor->dim() == 2 && tensor->size(0) == M && tensor->size(1) == N,
+                    "v5 residual ", name, " must have shape [M,N]");
+        check_tma_alignment(*tensor, name);
+    }
+    c3_row_scale::check_output_no_overlap(D, A, "A");
+    c3_row_scale::check_output_no_overlap(D, A_sc, "A_sc");
+    c3_row_scale::check_output_no_overlap(D, A_sc_global, "A_sg");
+    c3_row_scale::check_output_no_overlap(D, B, "B");
+    c3_row_scale::check_output_no_overlap(D, B_sc, "B_sc");
+    c3_row_scale::check_output_no_overlap(D, B_sc_global, "B_sg");
+    c3_row_scale::check_output_no_overlap(D, R, "R");
+}
+
+void nvfp4_gemm_residual_entrypoint(
+    const at::Tensor &A,
+    const at::Tensor &A_sc,
+    const at::Tensor &A_sc_global,
+    const at::Tensor &B,
+    const at::Tensor &B_sc,
+    const at::Tensor &B_sc_global,
+    const at::Tensor &R,
+    at::Tensor &D
+) {
+    TORCH_CHECK(A.is_cuda(), "A must be CUDA");
+    kittens::py::device_check(A, A_sc, A_sc_global, B, B_sc, B_sc_global, R, D);
+    check_nvfp4_residual_gemm_inputs(
+        A, A_sc, A_sc_global, B, B_sc, B_sc_global, R, D);
+    const c10::cuda::CUDAGuard device_guard(A.device());
+    const int K = B.size(1) * 2;
+    const int N_out = D.size(1);
+    if (K <= 2048 && N_out <= 4096) {
+        using C = nvfp4_gemm::config<
+            256, 5, 8, 4, 2, false, 256, true, 2, 256, false, true>;
+        run_gemm_residual_with_config<C>(
+            A, A_sc, A_sc_global, B, B_sc, B_sc_global, R, D);
+    } else if (K <= 2048) {
+        using C = nvfp4_gemm::config<
+            256, 5, 8, 4, 2, false, 256, true, 2, 256, false, true>;
+        run_gemm_residual_with_config<C>(
+            A, A_sc, A_sc_global, B, B_sc, B_sc_global, R, D);
+    } else {
+        using C = nvfp4_gemm::config<
+            256, 4, 8, 12, 2, false, 256, true, 2, 256, false, true>;
+        run_gemm_residual_with_config<C>(
+            A, A_sc, A_sc_global, B, B_sc, B_sc_global, R, D);
     }
 }
 
@@ -1557,6 +1686,70 @@ static void run_gemm_row_scale_with_config(
         .silu_dim = 0,
         .row_scale_coeff = row_scale_coeff.data_ptr<float>()
     };
+    kittens::py::launch_kernel<C, G, nvfp4_gemm::kernel<C>>(g);
+}
+
+template <typename C>
+static void run_gemm_residual_with_config(
+    const at::Tensor &A, const at::Tensor &A_sc, const at::Tensor &A_sc_global,
+    const at::Tensor &B, const at::Tensor &B_sc, const at::Tensor &B_sc_global,
+    const at::Tensor &R,
+    at::Tensor &D
+) {
+    using G = nvfp4_gemm::globals<C>;
+    G g {
+        .A = kittens::py::tensor_to_gl<typename G::A_fp4x2_gl>(A),
+        .A_sc = kittens::py::tensor_to_gl<typename G::A_sc_gl, false>(A_sc, 1, A_sc.dim() == 2 ? A_sc.size(0)/128 : A_sc.size(0), A_sc.dim() == 2 ? A_sc.size(1)/4 : A_sc.size(1), 256),
+        .A_sc_global = kittens::py::tensor_to_gl<typename G::A_sc_global_gl>(A_sc_global),
+        .B = kittens::py::tensor_to_gl<typename G::B_fp4x2_gl>(B),
+        .B_sc = kittens::py::tensor_to_gl<typename G::B_sc_gl, false>(B_sc, 1, B_sc.dim() == 2 ? B_sc.size(0)/128 : B_sc.size(0), B_sc.dim() == 2 ? B_sc.size(1)/4 : B_sc.size(1), 256),
+        .B_sc_global = kittens::py::tensor_to_gl<typename G::B_sc_global_gl>(B_sc_global),
+        .D = kittens::py::tensor_to_gl<typename G::D_gl>(D),
+        .D_K = kittens::py::tensor_to_gl<typename G::D_gl>(D),
+        .D_V = kittens::py::tensor_to_gl<typename G::D_gl>(D),
+        .q_dim = 0,
+        .k_dim = 0,
+        .v_dim = 0,
+        .use_split_D = false,
+        .a_sg_per_tile = nullptr,
+        .a_sg_stride = 1,
+        .b_sg_per_tile = nullptr,
+        .b_sg_stride = 1,
+        .silu_dim = 0
+    };
+    auto r_gl = kittens::py::tensor_to_gl<typename G::D_gl>(R);
+    memcpy(&g.R_tma, &r_gl.tma_descs.tma_desc, sizeof(CUtensorMap));
+
+    // launch_kernel's attribute cache is process-global, while CUDA function
+    // attributes are device-specific. Keep this new entrypoint valid when a
+    // process first uses the same specialization on a different GPU.
+    struct ResidualAttributeCache {
+        std::atomic<int> max_dynamic_smem[64];
+        std::mutex locks[64];
+        ResidualAttributeCache() {
+            for (auto &value : max_dynamic_smem) {
+                value.store(-1, std::memory_order_relaxed);
+            }
+        }
+    };
+    static ResidualAttributeCache attribute_cache;
+    const int device = D.get_device();
+    TORCH_CHECK(
+        device >= 0 && device < 64,
+        "v5 residual device index is outside the attribute-cache range"
+    );
+    const int dynamic_smem = g.dynamic_shared_memory();
+    if (dynamic_smem > attribute_cache.max_dynamic_smem[device].load(std::memory_order_acquire)) {
+        std::lock_guard<std::mutex> lock(attribute_cache.locks[device]);
+        if (dynamic_smem > attribute_cache.max_dynamic_smem[device].load(std::memory_order_relaxed)) {
+            CUDACHECK(cudaFuncSetAttribute(
+                kittens::py::global_kernel<C, G, nvfp4_gemm::kernel<C>>,
+                cudaFuncAttributeMaxDynamicSharedMemorySize,
+                dynamic_smem));
+            attribute_cache.max_dynamic_smem[device].store(
+                dynamic_smem, std::memory_order_release);
+        }
+    }
     kittens::py::launch_kernel<C, G, nvfp4_gemm::kernel<C>>(g);
 }
 
@@ -3123,6 +3316,11 @@ void nvfp4_persistent_gemm_entrypoint(
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("nvfp4_gemm", &nvfp4_gemm_entrypoint);
+    m.def("nvfp4_gemm_residual", &nvfp4_gemm_residual_entrypoint,
+          "NVFP4 GEMM with fused bf16 residual add",
+          pybind11::arg("A"), pybind11::arg("A_sc"), pybind11::arg("A_sc_global"),
+          pybind11::arg("B"), pybind11::arg("B_sc"), pybind11::arg("B_sc_global"),
+          pybind11::arg("R"), pybind11::arg("D"));
     m.def("nvfp4_gemm_residual_rms", &nvfp4_gemm_residual_rms_entrypoint,
           "NVFP4 residual GEMM with fused partial row RMS stats and optional gamma output",
           pybind11::arg("A"), pybind11::arg("A_sc"), pybind11::arg("A_sc_global"),
