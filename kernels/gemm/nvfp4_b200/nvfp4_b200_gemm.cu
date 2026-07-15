@@ -209,24 +209,12 @@ __global__ void v5_rmsnorm_bwd_dx_kernel(
     }
     scratch[tid] = partial;
     __syncthreads();
-    for (int stride = blockDim.x / 2; stride >= 32; stride >>= 1) {
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
         if (tid < stride) {
             scratch[tid] += scratch[tid + stride];
         }
         __syncthreads();
     }
-    if (tid < 32) {
-        float value = scratch[tid];
-        value += __shfl_down_sync(0xffffffffu, value, 16);
-        value += __shfl_down_sync(0xffffffffu, value, 8);
-        value += __shfl_down_sync(0xffffffffu, value, 4);
-        value += __shfl_down_sync(0xffffffffu, value, 2);
-        value += __shfl_down_sync(0xffffffffu, value, 1);
-        if (tid == 0) {
-            scratch[0] = value;
-        }
-    }
-    __syncthreads();
     const float inv = inv_rms[row];
     const float dot_mean = scratch[0] / static_cast<float>(K);
     const float inv3_dot = inv * inv * inv * dot_mean;
