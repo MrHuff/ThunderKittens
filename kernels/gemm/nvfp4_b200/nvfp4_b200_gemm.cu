@@ -1204,6 +1204,21 @@ static void nvfp4_check_rope_live64_tensor(
     TORCH_CHECK(t.size(2) == 2, name, " third dim must equal 2");
 }
 
+static void nvfp4_check_rope_packed_tensor(
+    const at::Tensor &t,
+    const char *name,
+    int64_t seq_len,
+    int64_t pair_dim
+) {
+    TORCH_CHECK(t.is_cuda(), name, " must be CUDA");
+    TORCH_CHECK(t.is_contiguous(), name, " must be contiguous");
+    TORCH_CHECK(t.dim() == 3, name, " must be 3D");
+    TORCH_CHECK(t.scalar_type() == at::kFloat, name, " must be float32");
+    TORCH_CHECK(t.size(0) == seq_len, name, " seq_len mismatch");
+    TORCH_CHECK(t.size(1) == pair_dim, name, " pair dim mismatch");
+    TORCH_CHECK(t.size(2) == 2, name, " last dim must equal 2");
+}
+
 static void nvfp4_check_rope_live64_qkv_args(
     const at::Tensor &D,
     const at::Tensor &D_K,
@@ -1225,6 +1240,211 @@ static void nvfp4_check_rope_live64_qkv_args(
     TORCH_CHECK(D_V.size(1) % 128 == 0, "V output cols must be divisible by 128");
     nvfp4_check_rope_live64_tensor(rope_cs, "rope_cs", rope_seq_len);
     kittens::py::device_check(D, D_K, D_V, rope_cs);
+}
+
+static void nvfp4_check_rope_packed_cat_args(
+    const at::Tensor &A,
+    const at::Tensor &A_sc,
+    const at::Tensor &A_sc_global,
+    const at::Tensor &B,
+    const at::Tensor &B_sc,
+    const at::Tensor &B_sg_per_tile,
+    const at::Tensor &D,
+    const at::Tensor &rope_cs,
+    int64_t rope_seq_len,
+    int64_t rope_head_dim,
+    int64_t rope_rotary_dim,
+    int64_t q_dim,
+    int64_t k_dim
+) {
+    const auto check_fp4 = [](const at::Tensor &tensor, const char *name) {
+        TORCH_CHECK(tensor.is_cuda(), name, " must be CUDA");
+        TORCH_CHECK(tensor.is_contiguous(), name, " must be contiguous");
+        TORCH_CHECK(tensor.dim() == 2, name, " must be rank 2");
+        TORCH_CHECK(tensor.scalar_type() == at::kFloat4_e2m1fn_x2,
+                    name, " must be fp4x2");
+        TORCH_CHECK((reinterpret_cast<uintptr_t>(tensor.data_ptr()) & 0xF) == 0,
+                    name, " must be 16-byte aligned");
+    };
+    check_fp4(A, "A");
+    check_fp4(B, "B");
+    TORCH_CHECK(A.size(1) == B.size(1), "A and B must share packed K");
+
+    const int64_t M = A.size(0);
+    const int64_t N = B.size(0);
+    const int64_t K = A.size(1) * 2;
+    TORCH_CHECK(M > 0 && N > 0 && K > 0 &&
+                M % 256 == 0 && N % 256 == 0 && K % 256 == 0,
+                "packed-cat RoPE M,N,K must be positive multiples of 256");
+
+    const auto check_sc = [K](
+        const at::Tensor &tensor, const char *name, int64_t rows
+    ) {
+        TORCH_CHECK(tensor.is_cuda(), name, " must be CUDA");
+        TORCH_CHECK(tensor.is_contiguous(), name, " must be contiguous");
+        TORCH_CHECK(tensor.scalar_type() == at::kFloat8_e4m3fn,
+                    name, " must be fp8 e4m3");
+        const bool legacy_2d =
+            tensor.dim() == 2 && tensor.size(0) == rows && tensor.size(1) == K / 16;
+        const bool prepared_3d =
+            tensor.dim() == 3 && tensor.size(0) == rows / 128 &&
+            tensor.size(1) == K / 64 && tensor.size(2) == 512;
+        TORCH_CHECK(legacy_2d || prepared_3d,
+                    name, " must be legacy [rows,K/16] or prepared [rows/128,K/64,512]");
+        TORCH_CHECK((reinterpret_cast<uintptr_t>(tensor.data_ptr()) & 0xF) == 0,
+                    name, " must be 16-byte aligned");
+    };
+    check_sc(A_sc, "A_sc", M);
+    check_sc(B_sc, "B_sc", N);
+    TORCH_CHECK(A_sc_global.is_cuda() && A_sc_global.is_contiguous() &&
+                A_sc_global.scalar_type() == at::kFloat && A_sc_global.numel() == 1,
+                "A_sc_global must be contiguous CUDA float32 [1]");
+    TORCH_CHECK(B_sg_per_tile.is_cuda() && B_sg_per_tile.is_contiguous() &&
+                B_sg_per_tile.scalar_type() == at::kFloat &&
+                B_sg_per_tile.dim() == 1 && B_sg_per_tile.numel() == N / 256,
+                "B_sg_per_tile must be contiguous CUDA float32 [N/256]");
+    TORCH_CHECK(D.is_cuda() && D.is_contiguous() && D.dim() == 2 &&
+                D.scalar_type() == at::kBFloat16 && D.size(0) == M && D.size(1) == N,
+                "D must be contiguous CUDA bfloat16 [M,N]");
+    TORCH_CHECK((reinterpret_cast<uintptr_t>(D.data_ptr()) & 0xF) == 0,
+                "D must be 16-byte aligned");
+
+    TORCH_CHECK(rope_seq_len > 0 && M % rope_seq_len == 0,
+                "rope_seq_len must be positive and divide M");
+    TORCH_CHECK(nvfp4_is_power_of_two_i64(rope_seq_len),
+                "rope_seq_len must be a power of two");
+    TORCH_CHECK(rope_head_dim > 0 && rope_head_dim % 2 == 0,
+                "rope_head_dim must be positive and even");
+    TORCH_CHECK(nvfp4_is_power_of_two_i64(rope_head_dim),
+                "rope_head_dim must be a power of two");
+    TORCH_CHECK(rope_rotary_dim == rope_head_dim,
+                "packed RoPE requires rotary_dim == head_dim");
+    TORCH_CHECK(q_dim > 0 && k_dim > 0 && q_dim + k_dim < N &&
+                q_dim % rope_head_dim == 0 && k_dim % rope_head_dim == 0,
+                "Q/K dimensions must be positive head-aligned prefixes with a V suffix");
+    TORCH_CHECK((N - q_dim - k_dim) % 128 == 0,
+                "V suffix must be divisible by 128");
+    constexpr int kEpilogueCols = 32;
+    TORCH_CHECK(q_dim % kEpilogueCols == 0 &&
+                (q_dim + k_dim) % kEpilogueCols == 0,
+                "Q/K epilogue boundaries must be aligned to 32 columns");
+    TORCH_CHECK(q_dim % 256 == 0 && k_dim % 256 == 0 &&
+                (N - q_dim - k_dim) % 256 == 0,
+                "Q/K/V packed-cat dimensions must each be divisible by 256");
+    TORCH_CHECK(rope_cs.is_cuda() && rope_cs.is_contiguous() &&
+                rope_cs.scalar_type() == at::kFloat && rope_cs.dim() == 3 &&
+                rope_cs.size(0) == rope_seq_len &&
+                rope_cs.size(1) == rope_rotary_dim / 2 && rope_cs.size(2) == 2,
+                "rope_cs must be contiguous CUDA float32 [seq_len,rotary_dim/2,2]");
+    TORCH_CHECK((reinterpret_cast<uintptr_t>(rope_cs.data_ptr()) & 0x7) == 0,
+                "rope_cs must be 8-byte aligned");
+
+    kittens::py::device_check(
+        A, A_sc, A_sc_global, B, B_sc, B_sg_per_tile, D, rope_cs);
+    c3_row_scale::check_output_no_overlap(D, A, "A");
+    c3_row_scale::check_output_no_overlap(D, A_sc, "A_sc");
+    c3_row_scale::check_output_no_overlap(D, A_sc_global, "A_sc_global");
+    c3_row_scale::check_output_no_overlap(D, B, "B");
+    c3_row_scale::check_output_no_overlap(D, B_sc, "B_sc");
+    c3_row_scale::check_output_no_overlap(D, B_sg_per_tile, "B_sg_per_tile");
+    c3_row_scale::check_output_no_overlap(D, rope_cs, "rope_cs");
+}
+
+__global__ void nvfp4_inverse_rope_packed_qk_kernel(
+    const __nv_bfloat16* q,
+    const __nv_bfloat16* k,
+    __nv_bfloat16* q_out,
+    __nv_bfloat16* k_out,
+    const float2* rope_cs,
+    int64_t rows,
+    int64_t q_dim,
+    int64_t k_dim,
+    int pair_dim,
+    int seq_mask
+) {
+    const int64_t q_pairs_per_row = q_dim / 2;
+    const int64_t k_pairs_per_row = k_dim / 2;
+    const int pair_mask = pair_dim - 1;
+    for (int64_t row = blockIdx.x; row < rows; row += gridDim.x) {
+        const int64_t rope_row = (row & seq_mask) * pair_dim;
+        const int64_t q_row = row * q_dim;
+        for (int64_t pair_col = threadIdx.x; pair_col < q_pairs_per_row;
+             pair_col += blockDim.x) {
+            const int64_t elem = q_row + pair_col * 2;
+            const float x = __bfloat162float(q[elem]);
+            const float y = __bfloat162float(q[elem + 1]);
+            const float2 cs = rope_cs[rope_row + (pair_col & pair_mask)];
+            q_out[elem] = __float2bfloat16_rn(__fmaf_rn(y, cs.y, x * cs.x));
+            q_out[elem + 1] = __float2bfloat16_rn(__fmaf_rn(-x, cs.y, y * cs.x));
+        }
+        const int64_t k_row = row * k_dim;
+        for (int64_t pair_col = threadIdx.x; pair_col < k_pairs_per_row;
+             pair_col += blockDim.x) {
+            const int64_t elem = k_row + pair_col * 2;
+            const float x = __bfloat162float(k[elem]);
+            const float y = __bfloat162float(k[elem + 1]);
+            const float2 cs = rope_cs[rope_row + (pair_col & pair_mask)];
+            k_out[elem] = __float2bfloat16_rn(__fmaf_rn(y, cs.y, x * cs.x));
+            k_out[elem + 1] = __float2bfloat16_rn(__fmaf_rn(-x, cs.y, y * cs.x));
+        }
+    }
+}
+
+void nvfp4_inverse_rope_packed_qk_entrypoint(
+    const at::Tensor &q,
+    const at::Tensor &k,
+    const at::Tensor &rope_cs,
+    int64_t rope_seq_len,
+    int64_t rope_head_dim,
+    at::Tensor &q_out,
+    at::Tensor &k_out
+) {
+    TORCH_CHECK(q.is_cuda() && k.is_cuda() && q_out.is_cuda() && k_out.is_cuda(),
+                "Q/K inputs and outputs must be CUDA");
+    TORCH_CHECK(q.scalar_type() == at::kBFloat16 && k.scalar_type() == at::kBFloat16 &&
+                q_out.scalar_type() == at::kBFloat16 && k_out.scalar_type() == at::kBFloat16,
+                "Q/K inputs and outputs must be bf16");
+    TORCH_CHECK(q.dim() == 2 && k.dim() == 2 && q_out.dim() == 2 && k_out.dim() == 2,
+                "Q/K inputs and outputs must be 2D");
+    TORCH_CHECK(q.is_contiguous() && k.is_contiguous() && q_out.is_contiguous() && k_out.is_contiguous(),
+                "Q/K inputs and outputs must be contiguous");
+    TORCH_CHECK(q.sizes() == q_out.sizes() && k.sizes() == k_out.sizes(),
+                "Q/K output shapes must match their inputs");
+    TORCH_CHECK(rope_seq_len > 0 && nvfp4_is_power_of_two_i64(rope_seq_len),
+                "rope_seq_len must be a positive power of two");
+    TORCH_CHECK(rope_head_dim > 0 && rope_head_dim % 2 == 0 &&
+                nvfp4_is_power_of_two_i64(rope_head_dim),
+                "rope_head_dim must be a positive even power of two");
+    TORCH_CHECK(q.size(0) > 0 && q.size(0) == k.size(0) &&
+                q.size(0) % rope_seq_len == 0,
+                "Q/K rows must be nonzero, match, and be divisible by rope_seq_len");
+    TORCH_CHECK(q.size(1) > 0 && k.size(1) > 0 &&
+                q.size(1) % rope_head_dim == 0 && k.size(1) % rope_head_dim == 0,
+                "Q/K columns must be positive multiples of rope_head_dim");
+    nvfp4_check_rope_packed_tensor(
+        rope_cs, "rope_cs", rope_seq_len, rope_head_dim / 2);
+    kittens::py::device_check(q, k, rope_cs, q_out, k_out);
+    c3_row_scale::check_output_no_overlap(q_out, q, "q");
+    c3_row_scale::check_output_no_overlap(q_out, k, "k");
+    c3_row_scale::check_output_no_overlap(q_out, rope_cs, "rope_cs");
+    c3_row_scale::check_output_no_overlap(q_out, k_out, "k_out");
+    c3_row_scale::check_output_no_overlap(k_out, q, "q");
+    c3_row_scale::check_output_no_overlap(k_out, k, "k");
+    c3_row_scale::check_output_no_overlap(k_out, rope_cs, "rope_cs");
+
+    const c10::cuda::CUDAGuard device_guard(q.device());
+    constexpr int threads = 256;
+    const int blocks = static_cast<int>(std::min<int64_t>(q.size(0), 65535));
+    auto stream = at::cuda::getCurrentCUDAStream();
+    nvfp4_inverse_rope_packed_qk_kernel<<<blocks, threads, 0, stream>>>(
+        reinterpret_cast<const __nv_bfloat16*>(q.data_ptr<at::BFloat16>()),
+        reinterpret_cast<const __nv_bfloat16*>(k.data_ptr<at::BFloat16>()),
+        reinterpret_cast<__nv_bfloat16*>(q_out.data_ptr<at::BFloat16>()),
+        reinterpret_cast<__nv_bfloat16*>(k_out.data_ptr<at::BFloat16>()),
+        reinterpret_cast<const float2*>(rope_cs.data_ptr<float>()),
+        q.size(0), q.size(1), k.size(1),
+        static_cast<int>(rope_head_dim / 2), static_cast<int>(rope_seq_len - 1));
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
 template <typename C>
@@ -1269,6 +1489,47 @@ static void run_grouped_gemm_rope_live64_with_config(
     kittens::py::launch_kernel<C, G, nvfp4_gemm::kernel<C>>(g);
 }
 
+template <typename C>
+static void run_grouped_gemm_rope_packed_cat_with_config(
+    const at::Tensor &A,
+    const at::Tensor &A_sc,
+    const at::Tensor &A_sc_global,
+    const at::Tensor &B,
+    const at::Tensor &B_sc,
+    const at::Tensor &B_sg_per_tile,
+    at::Tensor &D,
+    int q_dim,
+    int k_dim,
+    const nvfp4_rope_epilogue::rope_live64_desc &rope_packed
+) {
+    static thread_local at::Tensor dummy_bsg;
+    if (!dummy_bsg.defined()) {
+        dummy_bsg = at::zeros({1}, at::dtype(at::kFloat).device(at::kCUDA));
+    }
+
+    using G = nvfp4_gemm::globals<C>;
+    G g {
+        .A = kittens::py::tensor_to_gl<typename G::A_fp4x2_gl>(A),
+        .A_sc = kittens::py::tensor_to_gl<typename G::A_sc_gl, false>(A_sc, 1, A_sc.dim() == 2 ? A_sc.size(0)/128 : A_sc.size(0), A_sc.dim() == 2 ? A_sc.size(1)/4 : A_sc.size(1), 256),
+        .A_sc_global = kittens::py::tensor_to_gl<typename G::A_sc_global_gl>(A_sc_global),
+        .B = kittens::py::tensor_to_gl<typename G::B_fp4x2_gl>(B),
+        .B_sc = kittens::py::tensor_to_gl<typename G::B_sc_gl, false>(B_sc, 1, B_sc.dim() == 2 ? B_sc.size(0)/128 : B_sc.size(0), B_sc.dim() == 2 ? B_sc.size(1)/4 : B_sc.size(1), 256),
+        .B_sc_global = kittens::py::tensor_to_gl<typename G::B_sc_global_gl>(dummy_bsg),
+        .D = kittens::py::tensor_to_gl<typename G::D_gl>(D),
+        .D_K = kittens::py::tensor_to_gl<typename G::D_gl>(D),
+        .D_V = kittens::py::tensor_to_gl<typename G::D_gl>(D),
+        .q_dim = q_dim,
+        .k_dim = k_dim,
+        .v_dim = static_cast<int>(D.size(1)) - q_dim - k_dim,
+        .use_split_D = false,
+        .b_sg_per_tile = B_sg_per_tile.data_ptr<float>(),
+        .b_sg_stride = 1,
+        .silu_dim = 0,
+        .rope_live64 = rope_packed
+    };
+    kittens::py::launch_kernel<C, G, nvfp4_gemm::kernel<C>>(g);
+}
+
 void nvfp4_grouped_gemm_rope_live64_entrypoint(
     const at::Tensor &A,
     const at::Tensor &A_sc,
@@ -1300,6 +1561,41 @@ void nvfp4_grouped_gemm_rope_live64_entrypoint(
     run_grouped_gemm_rope_live64_with_config<C>(
         A, A_sc, A_sc_global, B, B_sc, B_sg_per_tile,
         D, D_K, D_V, rope_live64, silu_dim);
+}
+
+void nvfp4_grouped_gemm_rope_packed_cat_entrypoint(
+    const at::Tensor &A,
+    const at::Tensor &A_sc,
+    const at::Tensor &A_sc_global,
+    const at::Tensor &B,
+    const at::Tensor &B_sc,
+    const at::Tensor &B_sg_per_tile,
+    at::Tensor &D,
+    const at::Tensor &rope_cs,
+    int64_t rope_seq_len,
+    int64_t rope_head_dim,
+    int64_t rope_rotary_dim,
+    int64_t q_dim,
+    int64_t k_dim
+) {
+    nvfp4_check_rope_packed_cat_args(
+        A, A_sc, A_sc_global, B, B_sc, B_sg_per_tile, D, rope_cs,
+        rope_seq_len, rope_head_dim, rope_rotary_dim, q_dim, k_dim);
+    const c10::cuda::CUDAGuard device_guard(A.device());
+
+    nvfp4_rope_epilogue::rope_live64_desc rope_packed {
+        .cs = reinterpret_cast<const float2*>(rope_cs.data_ptr<float>()),
+        .seq_len = static_cast<int>(rope_seq_len),
+        .seq_mask = static_cast<int>(rope_seq_len - 1),
+        .pair_dim = static_cast<int>(rope_rotary_dim / 2),
+        .head_mask = static_cast<int>(rope_head_dim - 1),
+        .round_input_bf16 = true,
+    };
+
+    using C = nvfp4_gemm::config<256, 5, 8, 4, 2, false, 256, false, 2, 256, true>;
+    run_grouped_gemm_rope_packed_cat_with_config<C>(
+        A, A_sc, A_sc_global, B, B_sc, B_sg_per_tile,
+        D, static_cast<int>(q_dim), static_cast<int>(k_dim), rope_packed);
 }
 
 void nvfp4_quantize_entrypoint(
@@ -2486,6 +2782,18 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           pybind11::arg("D"), pybind11::arg("D_K"), pybind11::arg("D_V"),
           pybind11::arg("rope_cs"), pybind11::arg("rope_seq_len"),
           pybind11::arg("silu_dim") = 0);
+    m.def("nvfp4_grouped_gemm_rope_packed_cat", &nvfp4_grouped_gemm_rope_packed_cat_entrypoint,
+          "Single-output grouped GEMM with packed RoPE on Q/K and an untouched V suffix",
+          pybind11::arg("A"), pybind11::arg("A_sc"), pybind11::arg("A_sc_global"),
+          pybind11::arg("B"), pybind11::arg("B_sc"), pybind11::arg("B_sg_per_tile"),
+          pybind11::arg("D"), pybind11::arg("rope_cs"), pybind11::arg("rope_seq_len"),
+          pybind11::arg("rope_head_dim"), pybind11::arg("rope_rotary_dim"),
+          pybind11::arg("q_dim"), pybind11::arg("k_dim"));
+    m.def("nvfp4_inverse_rope_packed_qk", &nvfp4_inverse_rope_packed_qk_entrypoint,
+          "Apply inverse packed RoPE to contiguous bf16 Q/K in one CUDA launch",
+          pybind11::arg("q"), pybind11::arg("k"), pybind11::arg("rope_cs"),
+          pybind11::arg("rope_seq_len"), pybind11::arg("rope_head_dim"),
+          pybind11::arg("q_out"), pybind11::arg("k_out"));
     m.def("nvfp4_grouped_gemm_nopdl", &nvfp4_grouped_gemm_nopdl_entrypoint,
           "Non-PDL grouped GEMM for multi-stream and CUDA graph usage",
           pybind11::arg("A"), pybind11::arg("A_sc"), pybind11::arg("A_sc_global"),
