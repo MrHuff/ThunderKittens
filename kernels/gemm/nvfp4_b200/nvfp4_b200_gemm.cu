@@ -1242,7 +1242,7 @@ static void nvfp4_check_rope_live64_qkv_args(
     kittens::py::device_check(D, D_K, D_V, rope_cs);
 }
 
-static void nvfp4_check_rope_packed_cat_args(
+static void nvfp4_check_rope_packed_args(
     const at::Tensor &A,
     const at::Tensor &A_sc,
     const at::Tensor &A_sc_global,
@@ -1250,6 +1250,8 @@ static void nvfp4_check_rope_packed_cat_args(
     const at::Tensor &B_sc,
     const at::Tensor &B_sg_per_tile,
     const at::Tensor &D,
+    const at::Tensor *D_K,
+    const at::Tensor *D_V,
     const at::Tensor &rope_cs,
     int64_t rope_seq_len,
     int64_t rope_head_dim,
@@ -1275,7 +1277,7 @@ static void nvfp4_check_rope_packed_cat_args(
     const int64_t K = A.size(1) * 2;
     TORCH_CHECK(M > 0 && N > 0 && K > 0 &&
                 M % 256 == 0 && N % 256 == 0 && K % 256 == 0,
-                "packed-cat RoPE M,N,K must be positive multiples of 256");
+                "packed RoPE M,N,K must be positive multiples of 256");
 
     const auto check_sc = [K](
         const at::Tensor &tensor, const char *name, int64_t rows
@@ -1303,11 +1305,24 @@ static void nvfp4_check_rope_packed_cat_args(
                 B_sg_per_tile.scalar_type() == at::kFloat &&
                 B_sg_per_tile.dim() == 1 && B_sg_per_tile.numel() == N / 256,
                 "B_sg_per_tile must be contiguous CUDA float32 [N/256]");
-    TORCH_CHECK(D.is_cuda() && D.is_contiguous() && D.dim() == 2 &&
-                D.scalar_type() == at::kBFloat16 && D.size(0) == M && D.size(1) == N,
-                "D must be contiguous CUDA bfloat16 [M,N]");
-    TORCH_CHECK((reinterpret_cast<uintptr_t>(D.data_ptr()) & 0xF) == 0,
-                "D must be 16-byte aligned");
+    const auto check_output = [M](
+        const at::Tensor &tensor, const char *name, int64_t cols
+    ) {
+        TORCH_CHECK(tensor.is_cuda() && tensor.is_contiguous() && tensor.dim() == 2 &&
+                    tensor.scalar_type() == at::kBFloat16 &&
+                    tensor.size(0) == M && tensor.size(1) == cols,
+                    name, " must be contiguous CUDA bfloat16 [M,", cols, "]");
+        TORCH_CHECK((reinterpret_cast<uintptr_t>(tensor.data_ptr()) & 0xF) == 0,
+                    name, " must be 16-byte aligned");
+    };
+    const bool split_outputs = D_K != nullptr || D_V != nullptr;
+    TORCH_CHECK((D_K == nullptr) == (D_V == nullptr),
+                "packed RoPE split outputs must provide both K and V");
+    check_output(D, "D", split_outputs ? q_dim : N);
+    if (split_outputs) {
+        check_output(*D_K, "D_K", k_dim);
+        check_output(*D_V, "D_V", N - q_dim - k_dim);
+    }
 
     TORCH_CHECK(rope_seq_len > 0 && M % rope_seq_len == 0,
                 "rope_seq_len must be positive and divide M");
@@ -1330,7 +1345,7 @@ static void nvfp4_check_rope_packed_cat_args(
                 "Q/K epilogue boundaries must be aligned to 32 columns");
     TORCH_CHECK(q_dim % 256 == 0 && k_dim % 256 == 0 &&
                 (N - q_dim - k_dim) % 256 == 0,
-                "Q/K/V packed-cat dimensions must each be divisible by 256");
+                "Q/K/V packed dimensions must each be divisible by 256");
     TORCH_CHECK(rope_cs.is_cuda() && rope_cs.is_contiguous() &&
                 rope_cs.scalar_type() == at::kFloat && rope_cs.dim() == 3 &&
                 rope_cs.size(0) == rope_seq_len &&
@@ -1339,15 +1354,31 @@ static void nvfp4_check_rope_packed_cat_args(
     TORCH_CHECK((reinterpret_cast<uintptr_t>(rope_cs.data_ptr()) & 0x7) == 0,
                 "rope_cs must be 8-byte aligned");
 
-    kittens::py::device_check(
-        A, A_sc, A_sc_global, B, B_sc, B_sg_per_tile, D, rope_cs);
-    c3_row_scale::check_output_no_overlap(D, A, "A");
-    c3_row_scale::check_output_no_overlap(D, A_sc, "A_sc");
-    c3_row_scale::check_output_no_overlap(D, A_sc_global, "A_sc_global");
-    c3_row_scale::check_output_no_overlap(D, B, "B");
-    c3_row_scale::check_output_no_overlap(D, B_sc, "B_sc");
-    c3_row_scale::check_output_no_overlap(D, B_sg_per_tile, "B_sg_per_tile");
-    c3_row_scale::check_output_no_overlap(D, rope_cs, "rope_cs");
+    if (split_outputs) {
+        kittens::py::device_check(
+            A, A_sc, A_sc_global, B, B_sc, B_sg_per_tile,
+            D, *D_K, *D_V, rope_cs);
+    } else {
+        kittens::py::device_check(
+            A, A_sc, A_sc_global, B, B_sc, B_sg_per_tile, D, rope_cs);
+    }
+    const auto check_reads = [&](const at::Tensor &output) {
+        c3_row_scale::check_output_no_overlap(output, A, "A");
+        c3_row_scale::check_output_no_overlap(output, A_sc, "A_sc");
+        c3_row_scale::check_output_no_overlap(output, A_sc_global, "A_sc_global");
+        c3_row_scale::check_output_no_overlap(output, B, "B");
+        c3_row_scale::check_output_no_overlap(output, B_sc, "B_sc");
+        c3_row_scale::check_output_no_overlap(output, B_sg_per_tile, "B_sg_per_tile");
+        c3_row_scale::check_output_no_overlap(output, rope_cs, "rope_cs");
+    };
+    check_reads(D);
+    if (split_outputs) {
+        check_reads(*D_K);
+        check_reads(*D_V);
+        c3_row_scale::check_output_no_overlap(D, *D_K, "D_K");
+        c3_row_scale::check_output_no_overlap(D, *D_V, "D_V");
+        c3_row_scale::check_output_no_overlap(*D_K, *D_V, "D_V");
+    }
 }
 
 __global__ void nvfp4_inverse_rope_packed_qk_kernel(
@@ -1530,6 +1561,43 @@ static void run_grouped_gemm_rope_packed_cat_with_config(
     kittens::py::launch_kernel<C, G, nvfp4_gemm::kernel<C>>(g);
 }
 
+template <typename C>
+static void run_grouped_gemm_rope_packed_split_with_config(
+    const at::Tensor &A,
+    const at::Tensor &A_sc,
+    const at::Tensor &A_sc_global,
+    const at::Tensor &B,
+    const at::Tensor &B_sc,
+    const at::Tensor &B_sg_per_tile,
+    at::Tensor &D,
+    at::Tensor &D_K,
+    at::Tensor &D_V,
+    const nvfp4_rope_epilogue::rope_live64_desc &rope_packed
+) {
+    using G = nvfp4_gemm::globals<C>;
+    G g {
+        .A = kittens::py::tensor_to_gl<typename G::A_fp4x2_gl>(A),
+        .A_sc = kittens::py::tensor_to_gl<typename G::A_sc_gl, false>(A_sc, 1, A_sc.dim() == 2 ? A_sc.size(0)/128 : A_sc.size(0), A_sc.dim() == 2 ? A_sc.size(1)/4 : A_sc.size(1), 256),
+        .A_sc_global = kittens::py::tensor_to_gl<typename G::A_sc_global_gl>(A_sc_global),
+        .B = kittens::py::tensor_to_gl<typename G::B_fp4x2_gl>(B),
+        .B_sc = kittens::py::tensor_to_gl<typename G::B_sc_gl, false>(B_sc, 1, B_sc.dim() == 2 ? B_sc.size(0)/128 : B_sc.size(0), B_sc.dim() == 2 ? B_sc.size(1)/4 : B_sc.size(1), 256),
+        // b_sg_per_tile is the active B-scale contract for this route.
+        .B_sc_global = kittens::py::tensor_to_gl<typename G::B_sc_global_gl>(A_sc_global),
+        .D = kittens::py::tensor_to_gl<typename G::D_gl>(D),
+        .D_K = kittens::py::tensor_to_gl<typename G::D_gl>(D_K),
+        .D_V = kittens::py::tensor_to_gl<typename G::D_gl>(D_V),
+        .q_dim = static_cast<int>(D.size(1)),
+        .k_dim = static_cast<int>(D_K.size(1)),
+        .v_dim = static_cast<int>(D_V.size(1)),
+        .use_split_D = true,
+        .b_sg_per_tile = B_sg_per_tile.data_ptr<float>(),
+        .b_sg_stride = 1,
+        .silu_dim = 0,
+        .rope_live64 = rope_packed
+    };
+    kittens::py::launch_kernel<C, G, nvfp4_gemm::kernel<C>>(g);
+}
+
 void nvfp4_grouped_gemm_rope_live64_entrypoint(
     const at::Tensor &A,
     const at::Tensor &A_sc,
@@ -1578,8 +1646,8 @@ void nvfp4_grouped_gemm_rope_packed_cat_entrypoint(
     int64_t q_dim,
     int64_t k_dim
 ) {
-    nvfp4_check_rope_packed_cat_args(
-        A, A_sc, A_sc_global, B, B_sc, B_sg_per_tile, D, rope_cs,
+    nvfp4_check_rope_packed_args(
+        A, A_sc, A_sc_global, B, B_sc, B_sg_per_tile, D, nullptr, nullptr, rope_cs,
         rope_seq_len, rope_head_dim, rope_rotary_dim, q_dim, k_dim);
     const c10::cuda::CUDAGuard device_guard(A.device());
 
@@ -1596,6 +1664,43 @@ void nvfp4_grouped_gemm_rope_packed_cat_entrypoint(
     run_grouped_gemm_rope_packed_cat_with_config<C>(
         A, A_sc, A_sc_global, B, B_sc, B_sg_per_tile,
         D, static_cast<int>(q_dim), static_cast<int>(k_dim), rope_packed);
+}
+
+void nvfp4_grouped_gemm_rope_packed_split_entrypoint(
+    const at::Tensor &A,
+    const at::Tensor &A_sc,
+    const at::Tensor &A_sc_global,
+    const at::Tensor &B,
+    const at::Tensor &B_sc,
+    const at::Tensor &B_sg_per_tile,
+    at::Tensor &D,
+    at::Tensor &D_K,
+    at::Tensor &D_V,
+    const at::Tensor &rope_cs,
+    int64_t rope_seq_len,
+    int64_t rope_head_dim,
+    int64_t rope_rotary_dim
+) {
+    nvfp4_check_rope_packed_args(
+        A, A_sc, A_sc_global, B, B_sc, B_sg_per_tile,
+        D, &D_K, &D_V, rope_cs,
+        rope_seq_len, rope_head_dim, rope_rotary_dim,
+        D.size(1), D_K.size(1));
+    const c10::cuda::CUDAGuard device_guard(A.device());
+
+    nvfp4_rope_epilogue::rope_live64_desc rope_packed {
+        .cs = reinterpret_cast<const float2*>(rope_cs.data_ptr<float>()),
+        .seq_len = static_cast<int>(rope_seq_len),
+        .seq_mask = static_cast<int>(rope_seq_len - 1),
+        .pair_dim = static_cast<int>(rope_rotary_dim / 2),
+        .head_mask = static_cast<int>(rope_head_dim - 1),
+        .round_input_bf16 = true,
+    };
+
+    using C = nvfp4_gemm::config<256, 5, 8, 4, 2, false, 256, false, 2, 256, true>;
+    run_grouped_gemm_rope_packed_split_with_config<C>(
+        A, A_sc, A_sc_global, B, B_sc, B_sg_per_tile,
+        D, D_K, D_V, rope_packed);
 }
 
 void nvfp4_quantize_entrypoint(
@@ -2789,6 +2894,13 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           pybind11::arg("D"), pybind11::arg("rope_cs"), pybind11::arg("rope_seq_len"),
           pybind11::arg("rope_head_dim"), pybind11::arg("rope_rotary_dim"),
           pybind11::arg("q_dim"), pybind11::arg("k_dim"));
+    m.def("nvfp4_grouped_gemm_rope_packed_split", &nvfp4_grouped_gemm_rope_packed_split_entrypoint,
+          "No-PDL grouped GEMM with distinct Q/K/V outputs and packed RoPE on Q/K",
+          pybind11::arg("A"), pybind11::arg("A_sc"), pybind11::arg("A_sc_global"),
+          pybind11::arg("B"), pybind11::arg("B_sc"), pybind11::arg("B_sg_per_tile"),
+          pybind11::arg("D"), pybind11::arg("D_K"), pybind11::arg("D_V"),
+          pybind11::arg("rope_cs"), pybind11::arg("rope_seq_len"),
+          pybind11::arg("rope_head_dim"), pybind11::arg("rope_rotary_dim"));
     m.def("nvfp4_inverse_rope_packed_qk", &nvfp4_inverse_rope_packed_qk_entrypoint,
           "Apply inverse packed RoPE to contiguous bf16 Q/K in one CUDA launch",
           pybind11::arg("q"), pybind11::arg("k"), pybind11::arg("rope_cs"),
