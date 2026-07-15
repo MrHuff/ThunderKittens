@@ -328,7 +328,7 @@ __device__ inline void apply_rope_live64_if_enabled(
 ) {
     if constexpr (C::ROPE_LIVE64) {
         if (g.rope.enabled()) {
-            if (g.use_split_D && col_offset_elems >= g.q_dim + g.k_dim) {
+            if (col_offset_elems >= g.q_dim + g.k_dim) {
                 return;
             }
             nvfp4_rope_epilogue::apply_inplace(
@@ -342,7 +342,7 @@ __device__ inline void apply_rope_live64_if_enabled(
         if (!g.rope_live64.enabled()) {
             return;
         }
-        if (g.use_split_D && col_offset_elems >= g.q_dim + g.k_dim) {
+        if (col_offset_elems >= g.q_dim + g.k_dim) {
             return;
         }
         nvfp4_rope_epilogue::apply_inplace_live64(
