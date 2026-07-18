@@ -16,11 +16,12 @@ static at::Tensor make_unused_bf16_placeholder(const at::Tensor &ref) {
 
 // BF16 mode: outputs BF16 grad_logits
 template <typename C>
-static void launch_backward_v2_bf16(
+static void launch_backward_v2_bf16_impl(
     const at::Tensor &A, const at::Tensor &A_sc,
     const at::Tensor &B, const at::Tensor &B_sc,
     at::Tensor &grad_out, const at::Tensor &lse, const at::Tensor &targets,
-    float grad_scale, int M, int N, float filter_eps = 0.0f)
+    float grad_scale, const float* grad_output, const int64_t* valid_count,
+    int M, int N, float filter_eps = 0.0f)
 {
     using G = mxfp4_cce_backward_v2::globals<C>;
     G g {
@@ -40,10 +41,45 @@ static void launch_backward_v2_bf16(
         .lse = lse.data_ptr<float>(),
         .targets = targets.data_ptr<int64_t>(),
         .grad_scale = grad_scale,
+        .grad_output = grad_output,
+        .valid_count = valid_count,
         .filter_eps = filter_eps,
         .M = M, .N = N
     };
     kittens::py::launch_kernel<C, G, mxfp4_cce_backward_v2::backward_kernel_v2<C>>(g);
+}
+
+template <typename C>
+static void launch_backward_v2_bf16(
+    const at::Tensor &A, const at::Tensor &A_sc,
+    const at::Tensor &B, const at::Tensor &B_sc,
+    at::Tensor &grad_out, const at::Tensor &lse, const at::Tensor &targets,
+    float grad_scale, int M, int N, float filter_eps = 0.0f)
+{
+    launch_backward_v2_bf16_impl<C>(
+        A, A_sc, B, B_sc, grad_out, lse, targets,
+        grad_scale, nullptr, nullptr, M, N, filter_eps);
+}
+
+template <typename C>
+static void launch_backward_v2_bf16_device_scale(
+    const at::Tensor &A, const at::Tensor &A_sc,
+    const at::Tensor &B, const at::Tensor &B_sc,
+    at::Tensor &grad_out, const at::Tensor &lse, const at::Tensor &targets,
+    const at::Tensor &grad_output, const at::Tensor &valid_count,
+    int M, int N, float filter_eps = 0.0f)
+{
+    TORCH_CHECK(grad_output.is_cuda() && grad_output.is_contiguous() &&
+                    grad_output.scalar_type() == at::kFloat && grad_output.numel() == 1,
+                "grad_output must be a contiguous CUDA float32 scalar");
+    TORCH_CHECK(valid_count.is_cuda() && valid_count.is_contiguous() &&
+                    valid_count.scalar_type() == at::kLong && valid_count.numel() == 1,
+                "valid_count must be a contiguous CUDA int64 scalar");
+    kittens::py::device_check(A, grad_output, valid_count);
+    launch_backward_v2_bf16_impl<C>(
+        A, A_sc, B, B_sc, grad_out, lse, targets,
+        0.0f, grad_output.data_ptr<float>(), valid_count.data_ptr<int64_t>(),
+        M, N, filter_eps);
 }
 
 // FP4 mode: outputs quantized G in MXFP4 format
@@ -269,6 +305,12 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           "MXFP4 CCE backward v2 (BF16 output) L5 SG8");
     m.def("backward_v2_bf16_L4_SG8", &launch_backward_v2_bf16<bwd_v2_bf16_L4_SG8>,
           "MXFP4 CCE backward v2 (BF16 output) L4 SG8");
+    m.def("backward_v2_bf16_device_scale_L5_SG8",
+          &launch_backward_v2_bf16_device_scale<bwd_v2_bf16_L5_SG8>,
+          "MXFP4 CCE backward v2 BF16 output with device-resident loss scale L5 SG8");
+    m.def("backward_v2_bf16_device_scale_L4_SG8",
+          &launch_backward_v2_bf16_device_scale<bwd_v2_bf16_L4_SG8>,
+          "MXFP4 CCE backward v2 BF16 output with device-resident loss scale L4 SG8");
     m.def("backward_v2_fp4_L5_SG8", &launch_backward_v2_fp4<bwd_v2_fp4_L5_SG8>,
           "MXFP4 CCE backward v2 (FP4 RTE output) L5 SG8");
     m.def("backward_v2_fp4_L4_SG8", &launch_backward_v2_fp4<bwd_v2_fp4_L4_SG8>,

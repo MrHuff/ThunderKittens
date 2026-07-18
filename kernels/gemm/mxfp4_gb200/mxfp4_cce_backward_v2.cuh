@@ -458,6 +458,8 @@ struct globals {
     const float* lse;
     const int64_t* targets;
     float grad_scale;
+    const float* grad_output = nullptr;
+    const int64_t* valid_count = nullptr;
     float filter_eps;
     int M;
     int N;
@@ -495,6 +497,15 @@ struct globals {
     }
 };
 
+template <typename C>
+__device__ __forceinline__ float resolve_grad_scale(const globals<C>& g) {
+    if (g.grad_output == nullptr || g.valid_count == nullptr) {
+        return g.grad_scale;
+    }
+    const int64_t count = g.valid_count[0];
+    return count > 0 ? g.grad_output[0] / static_cast<float>(count) : 0.0f;
+}
+
 // =========================================================================
 // Main kernel
 // =========================================================================
@@ -513,6 +524,7 @@ __device__ inline void backward_kernel_v2(const globals<C>& g) {
     }
 
     const int warpgroup_id = warpgroup::groupid();
+    const float grad_scale = resolve_grad_scale(g);
     const int cta_id = cluster_ctarank();
     const int cluster_id = clusterIdx().x;
 
@@ -795,7 +807,7 @@ __device__ inline void backward_kernel_v2(const globals<C>& g) {
                         }
                     }
                 }
-                warp::mul(D_fl, D_fl, g.grad_scale);
+                warp::mul(D_fl, D_fl, grad_scale);
                 warp::copy(D_regs_bf[epi], D_fl);
             }
 
@@ -838,7 +850,7 @@ __device__ inline void backward_kernel_v2(const globals<C>& g) {
                     global_max = __uint_as_float(filter_max_bits[warpgroup_id]);
                 }
                 global_max = __shfl_sync(0xFFFFFFFF, global_max, 0);
-                tile_is_filtered = (global_max < (g.filter_eps * fabsf(g.grad_scale)));
+                tile_is_filtered = (global_max < (g.filter_eps * fabsf(grad_scale)));
             }
 
             if (g.G_tilemask != nullptr && threadIdx.x == 0) {

@@ -22,12 +22,13 @@ static void launch_backward_v5_dC(
     float grad_scale, int M, int N, int K, float filter_eps);
 
 template <typename C>
-static void launch_backward_v5_dE(
+static void launch_backward_v5_dE_impl(
     const at::Tensor &A, const at::Tensor &A_sc, const at::Tensor &A_sc_global,
     const at::Tensor &B, const at::Tensor &B_sc, const at::Tensor &B_sc_global,
     const at::Tensor &C_col, const at::Tensor &C_col_sc, const at::Tensor &C_col_sc_global,
     at::Tensor &dE_out, const at::Tensor &lse, const at::Tensor &targets,
-    float grad_scale, int M, int N, int K, float filter_eps = 0.0f)
+    float grad_scale, const float* grad_output, const int64_t* valid_count,
+    int M, int N, int K, float filter_eps = 0.0f)
 {
     using G = nvfp4_cce_backward_v5_dE::globals<C>;
 
@@ -52,12 +53,51 @@ static void launch_backward_v5_dE(
         .lse = lse.data_ptr<float>(),
         .targets = targets.data_ptr<int64_t>(),
         .grad_scale = grad_scale,
+        .grad_output = grad_output,
+        .valid_count = valid_count,
         .filter_eps = filter_eps,
         .M = M,
         .N = N,
         .K = K,
     };
     kittens::py::launch_kernel<C, G, nvfp4_cce_backward_v5_dE::kernel<C>>(g);
+}
+
+template <typename C>
+static void launch_backward_v5_dE(
+    const at::Tensor &A, const at::Tensor &A_sc, const at::Tensor &A_sc_global,
+    const at::Tensor &B, const at::Tensor &B_sc, const at::Tensor &B_sc_global,
+    const at::Tensor &C_col, const at::Tensor &C_col_sc, const at::Tensor &C_col_sc_global,
+    at::Tensor &dE_out, const at::Tensor &lse, const at::Tensor &targets,
+    float grad_scale, int M, int N, int K, float filter_eps = 0.0f)
+{
+    launch_backward_v5_dE_impl<C>(
+        A, A_sc, A_sc_global, B, B_sc, B_sc_global,
+        C_col, C_col_sc, C_col_sc_global, dE_out, lse, targets,
+        grad_scale, nullptr, nullptr, M, N, K, filter_eps);
+}
+
+template <typename C>
+static void launch_backward_v5_dE_device_scale(
+    const at::Tensor &A, const at::Tensor &A_sc, const at::Tensor &A_sc_global,
+    const at::Tensor &B, const at::Tensor &B_sc, const at::Tensor &B_sc_global,
+    const at::Tensor &C_col, const at::Tensor &C_col_sc, const at::Tensor &C_col_sc_global,
+    at::Tensor &dE_out, const at::Tensor &lse, const at::Tensor &targets,
+    const at::Tensor &grad_output, const at::Tensor &valid_count,
+    int M, int N, int K, float filter_eps = 0.0f)
+{
+    TORCH_CHECK(grad_output.is_cuda() && grad_output.is_contiguous() &&
+                    grad_output.scalar_type() == at::kFloat && grad_output.numel() == 1,
+                "grad_output must be a contiguous CUDA float32 scalar");
+    TORCH_CHECK(valid_count.is_cuda() && valid_count.is_contiguous() &&
+                    valid_count.scalar_type() == at::kLong && valid_count.numel() == 1,
+                "valid_count must be a contiguous CUDA int64 scalar");
+    kittens::py::device_check(A, grad_output, valid_count);
+    launch_backward_v5_dE_impl<C>(
+        A, A_sc, A_sc_global, B, B_sc, B_sc_global,
+        C_col, C_col_sc, C_col_sc_global, dE_out, lse, targets,
+        0.0f, grad_output.data_ptr<float>(), valid_count.data_ptr<int64_t>(),
+        M, N, K, filter_eps);
 }
 
 using bwd_v5_dE_fp4_L4_SG8 = nvfp4_cce_backward_v5_dE::config<2, 8, true>;
@@ -413,12 +453,13 @@ static void launch_debug_experimental_backward_v5_dC_trace(
 }
 
 template <typename C>
-static void launch_backward_v5_dC(
+static void launch_backward_v5_dC_impl(
     const at::Tensor &A, const at::Tensor &A_sc, const at::Tensor &A_sc_global,
     const at::Tensor &B, const at::Tensor &B_sc, const at::Tensor &B_sc_global,
     const at::Tensor &E_col, const at::Tensor &E_col_sc, const at::Tensor &E_col_sc_global,
     at::Tensor &dC_out, const at::Tensor &lse, const at::Tensor &targets,
-    float grad_scale, int M, int N, int K, float filter_eps)
+    float grad_scale, const float* grad_output, const int64_t* valid_count,
+    int M, int N, int K, float filter_eps)
 {
     using G = nvfp4_cce_backward_v5_dC::globals<C>;
 
@@ -443,12 +484,51 @@ static void launch_backward_v5_dC(
         .lse = lse.data_ptr<float>(),
         .targets = targets.data_ptr<int64_t>(),
         .grad_scale = grad_scale,
+        .grad_output = grad_output,
+        .valid_count = valid_count,
         .filter_eps = filter_eps,
         .M = M,
         .N = N,
         .K = K,
     };
     kittens::py::launch_kernel<C, G, nvfp4_cce_backward_v5_dC::kernel<C>>(g);
+}
+
+template <typename C>
+static void launch_backward_v5_dC(
+    const at::Tensor &A, const at::Tensor &A_sc, const at::Tensor &A_sc_global,
+    const at::Tensor &B, const at::Tensor &B_sc, const at::Tensor &B_sc_global,
+    const at::Tensor &E_col, const at::Tensor &E_col_sc, const at::Tensor &E_col_sc_global,
+    at::Tensor &dC_out, const at::Tensor &lse, const at::Tensor &targets,
+    float grad_scale, int M, int N, int K, float filter_eps)
+{
+    launch_backward_v5_dC_impl<C>(
+        A, A_sc, A_sc_global, B, B_sc, B_sc_global,
+        E_col, E_col_sc, E_col_sc_global, dC_out, lse, targets,
+        grad_scale, nullptr, nullptr, M, N, K, filter_eps);
+}
+
+template <typename C>
+static void launch_backward_v5_dC_device_scale(
+    const at::Tensor &A, const at::Tensor &A_sc, const at::Tensor &A_sc_global,
+    const at::Tensor &B, const at::Tensor &B_sc, const at::Tensor &B_sc_global,
+    const at::Tensor &E_col, const at::Tensor &E_col_sc, const at::Tensor &E_col_sc_global,
+    at::Tensor &dC_out, const at::Tensor &lse, const at::Tensor &targets,
+    const at::Tensor &grad_output, const at::Tensor &valid_count,
+    int M, int N, int K, float filter_eps)
+{
+    TORCH_CHECK(grad_output.is_cuda() && grad_output.is_contiguous() &&
+                    grad_output.scalar_type() == at::kFloat && grad_output.numel() == 1,
+                "grad_output must be a contiguous CUDA float32 scalar");
+    TORCH_CHECK(valid_count.is_cuda() && valid_count.is_contiguous() &&
+                    valid_count.scalar_type() == at::kLong && valid_count.numel() == 1,
+                "valid_count must be a contiguous CUDA int64 scalar");
+    kittens::py::device_check(A, grad_output, valid_count);
+    launch_backward_v5_dC_impl<C>(
+        A, A_sc, A_sc_global, B, B_sc, B_sc_global,
+        E_col, E_col_sc, E_col_sc_global, dC_out, lse, targets,
+        0.0f, grad_output.data_ptr<float>(), valid_count.data_ptr<int64_t>(),
+        M, N, K, filter_eps);
 }
 
 template <typename C>
@@ -596,6 +676,12 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           "NVFP4 CCE backward v5 fused dE pass L4 SG8");
     m.def("backward_v5_dC_fp4_L4_SG8", &launch_backward_v5_dC<bwd_v5_dC_fp4_L4_SG8>,
           "NVFP4 CCE backward v5 fused dC pass L4 SG8");
+    m.def("backward_v5_dE_fp4_device_scale_L4_SG8",
+          &launch_backward_v5_dE_device_scale<bwd_v5_dE_fp4_L4_SG8>,
+          "NVFP4 CCE backward v5 dE with device-resident loss scale");
+    m.def("backward_v5_dC_fp4_device_scale_L4_SG8",
+          &launch_backward_v5_dC_device_scale<bwd_v5_dC_fp4_L4_SG8>,
+          "NVFP4 CCE backward v5 dC with device-resident loss scale");
     m.def("debug_v5_dC_stage_fp4_L4_SG8", &launch_debug_backward_v5_dC_stage<bwd_v5_dC_fp4_L4_SG8>,
           "Developer-only NVFP4 CCE v5 dC stage dump L4 SG8");
     m.def("debug_v5_dC_p3_probe_fp4_L4_SG8", &launch_debug_backward_v5_dC_p3_probe<bwd_v5_dC_fp4_L4_SG8>,

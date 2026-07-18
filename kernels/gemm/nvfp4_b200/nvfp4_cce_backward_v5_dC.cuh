@@ -143,6 +143,8 @@ struct debug_globals {
     const float* lse;
     const int64_t* targets;
     float grad_scale;
+    const float* grad_output = nullptr;
+    const int64_t* valid_count = nullptr;
     float filter_eps;
     int M;
     int N;
@@ -239,6 +241,8 @@ struct globals {
     const float* lse;
     const int64_t* targets;
     float grad_scale;
+    const float* grad_output = nullptr;
+    const int64_t* valid_count = nullptr;
     float filter_eps;
     int M;
     int N;
@@ -289,6 +293,15 @@ struct globals {
         return base_total;
     }
 };
+
+template <typename G>
+__device__ __forceinline__ float resolve_grad_scale(const G& g) {
+    if (g.grad_output == nullptr || g.valid_count == nullptr) {
+        return g.grad_scale;
+    }
+    const int64_t count = g.valid_count[0];
+    return count > 0 ? g.grad_output[0] / static_cast<float>(count) : 0.0f;
+}
 
 template <typename C, typename G, bool Debug>
 __device__ inline void kernel_impl(const G& g) {
@@ -678,7 +691,8 @@ __device__ inline void kernel_impl(const G& g) {
         using out_rt_bf = rt_bf<C::Nb / 4, C::Nb_out / C::EPI_PIPE_DEPTH>;
         constexpr float kFp4Max = 6.0f;
         constexpr float kE4M3Max = 448.0f;
-        const float gt_row_sg_val = fmaxf(g.grad_scale / (kFp4Max * kE4M3Max), 1.0e-12f);
+        const float grad_scale = resolve_grad_scale(g);
+        const float gt_row_sg_val = fmaxf(grad_scale / (kFp4Max * kE4M3Max), 1.0e-12f);
         const float g_sg_rcp = 1.0f / gt_row_sg_val;
         int a_clear_phase = 0;
 
@@ -847,7 +861,7 @@ __device__ inline void kernel_impl(const G& g) {
                                 }
                             }
 
-                            warp::mul(D_fl, D_fl, g.grad_scale);
+                            warp::mul(D_fl, D_fl, grad_scale);
                             warp::copy(D_bf, D_fl);
                             warpgroup::sync(1);
                             warpgroup::store(output_tiles.D[0], D_bf);
