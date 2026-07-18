@@ -11,6 +11,7 @@ int main() { return 0; }
 #else
 
 #include "pyutils/torchutils.cuh"
+#include "../common/cce_loss_finalize.cuh"
 
 template <typename C>
 static void launch_nvfp4_cce(
@@ -63,6 +64,21 @@ void nvfp4_cce_entrypoint(
     }
 }
 
+void nvfp4_cce_with_loss_entrypoint(
+    const at::Tensor &A, const at::Tensor &A_sc, const at::Tensor &A_sc_global,
+    const at::Tensor &B, const at::Tensor &B_sc, const at::Tensor &B_sc_global,
+    at::Tensor &lse, at::Tensor &neg_logit,
+    const at::Tensor &targets, at::Tensor &D_scratch,
+    at::Tensor &loss, at::Tensor &valid_count,
+    int M, int N, int64_t ignore_index
+) {
+    nvfp4_cce_entrypoint(
+        A, A_sc, A_sc_global, B, B_sc, B_sc_global,
+        lse, neg_logit, targets, D_scratch, M, N);
+    fp4_cce::launch_finalize_loss(
+        lse, neg_logit, targets, loss, valid_count, M, ignore_index);
+}
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("nvfp4_cce", &nvfp4_cce_entrypoint,
           "NVFP4 Fused Cross-Entropy (no materialized logits)",
@@ -71,6 +87,14 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           pybind11::arg("lse"), pybind11::arg("neg_logit"),
           pybind11::arg("targets"), pybind11::arg("D_scratch"),
           pybind11::arg("M"), pybind11::arg("N"));
+    m.def("nvfp4_cce_with_loss", &nvfp4_cce_with_loss_entrypoint,
+          "NVFP4 fused CCE with native scalar-loss finalization",
+          pybind11::arg("A"), pybind11::arg("A_sc"), pybind11::arg("A_sc_global"),
+          pybind11::arg("B"), pybind11::arg("B_sc"), pybind11::arg("B_sc_global"),
+          pybind11::arg("lse"), pybind11::arg("neg_logit"),
+          pybind11::arg("targets"), pybind11::arg("D_scratch"),
+          pybind11::arg("loss"), pybind11::arg("valid_count"),
+          pybind11::arg("M"), pybind11::arg("N"), pybind11::arg("ignore_index"));
 }
 
 #endif

@@ -5,6 +5,7 @@
 int main() { return 0; }
 #else
 #include "pyutils/torchutils.cuh"
+#include "../common/cce_loss_finalize.cuh"
 
 template <typename C>
 static void launch_pp(
@@ -36,6 +37,21 @@ static void launch_pp(
     kittens::py::launch_kernel<C, G, nvfp4_cce_v2::pp_kernel<C>>(g);
 }
 
+template <typename C>
+static void launch_pp_with_loss(
+    const at::Tensor &A, const at::Tensor &A_sc, const at::Tensor &A_sc_global,
+    const at::Tensor &B, const at::Tensor &B_sc, const at::Tensor &B_sc_global,
+    at::Tensor &lse, at::Tensor &neg_logit,
+    const at::Tensor &targets, at::Tensor &D_scratch,
+    at::Tensor &loss, at::Tensor &valid_count,
+    int M, int N, int64_t ignore_index)
+{
+    launch_pp<C>(A, A_sc, A_sc_global, B, B_sc, B_sc_global,
+                 lse, neg_logit, targets, D_scratch, M, N);
+    fp4_cce::launch_finalize_loss(
+        lse, neg_logit, targets, loss, valid_count, M, ignore_index);
+}
+
 // Ping-pong configs
 using pp_L4_SG8 = nvfp4_cce_v2::pp_config<4, 8, true>;
 using pp_L3_SG8 = nvfp4_cce_v2::pp_config<3, 8, true>;
@@ -43,5 +59,9 @@ using pp_L3_SG8 = nvfp4_cce_v2::pp_config<3, 8, true>;
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("pp_L4_SG8", &launch_pp<pp_L4_SG8>, "NVFP4 CCE v2 ping-pong L4 SG8");
     m.def("pp_L3_SG8", &launch_pp<pp_L3_SG8>, "NVFP4 CCE v2 ping-pong L3 SG8");
+    m.def("pp_L4_SG8_with_loss", &launch_pp_with_loss<pp_L4_SG8>,
+          "NVFP4 CCE v2 ping-pong L4 SG8 with native scalar loss");
+    m.def("pp_L3_SG8_with_loss", &launch_pp_with_loss<pp_L3_SG8>,
+          "NVFP4 CCE v2 ping-pong L3 SG8 with native scalar loss");
 }
 #endif

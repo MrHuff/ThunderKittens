@@ -833,11 +833,13 @@ __device__ inline void kernel_impl(const G& g) {
                                 for (int j = 0; j < logits_rt::width; ++j) {
                                     #pragma unroll
                                     for (int kk = 0; kk < 4; ++kk) {
-                                        if (kk % 2 == 0 && global_row_x >= g.M) {
+                                        if (kk % 2 == 0 &&
+                                            (global_row_x >= g.M || my_targets_x[i] < 0)) {
                                             D_fl.tiles[i][j].data[kk].x = 0.0f;
                                             D_fl.tiles[i][j].data[kk].y = 0.0f;
                                         }
-                                        if (kk % 2 == 1 && global_row_y >= g.M) {
+                                        if (kk % 2 == 1 &&
+                                            (global_row_y >= g.M || my_targets_y[i] < 0)) {
                                             D_fl.tiles[i][j].data[kk].x = 0.0f;
                                             D_fl.tiles[i][j].data[kk].y = 0.0f;
                                         }

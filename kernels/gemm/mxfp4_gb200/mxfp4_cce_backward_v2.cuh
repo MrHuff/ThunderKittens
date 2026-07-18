@@ -782,11 +782,13 @@ __device__ inline void backward_kernel_v2(const globals<C>& g) {
                     for (int j = 0; j < subtile_rt::width; j++) {
                         #pragma unroll
                         for (int k = 0; k < 4; k++) {
-                            if (k % 2 == 0 && global_row_x >= g.M) {
+                            if (k % 2 == 0 &&
+                                (global_row_x >= g.M || my_targets_x[i] < 0)) {
                                 D_fl.tiles[i][j].data[k].x = 0.0f;
                                 D_fl.tiles[i][j].data[k].y = 0.0f;
                             }
-                            if (k % 2 == 1 && global_row_y >= g.M) {
+                            if (k % 2 == 1 &&
+                                (global_row_y >= g.M || my_targets_y[i] < 0)) {
                                 D_fl.tiles[i][j].data[k].x = 0.0f;
                                 D_fl.tiles[i][j].data[k].y = 0.0f;
                             }
