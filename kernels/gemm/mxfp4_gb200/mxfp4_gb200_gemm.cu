@@ -11,6 +11,8 @@
 #include "mxfp4_silu_dgrad_quant_gemm.cuh"
 #include "mxfp4_sqrelu_quant_gemm.cuh"
 #include "mxfp4_swiglu_quant_gemm.cuh"
+#include <ATen/cuda/CUDAContext.h>
+#include <c10/cuda/CUDAException.h>
 #include <c10/cuda/CUDAGuard.h>
 #include <cstdlib>
 #include <cstdint>
@@ -893,6 +895,41 @@ static void launch_mxfp4_gemm_dense_rms_bwd_partial_dot(
 }
 
 template <typename C>
+static void launch_mxfp4_h_residual_carrier(
+    const at::Tensor &A, const at::Tensor &A_sc,
+    const at::Tensor &B, const at::Tensor &B_sc,
+    const at::Tensor &R, const at::Tensor &gamma,
+    at::Tensor &z_out, at::Tensor &row_fp4, at::Tensor &row_sc,
+    at::Tensor &col_fp4, at::Tensor &col_sc, at::Tensor &r_tile,
+    double eps) {
+    using G = mxfp4_gemm::globals<C>;
+    G g {
+        .A = kittens::py::tensor_to_gl<typename G::A_fp4x2_gl>(A),
+        .A_sc = kittens::py::tensor_to_gl<typename G::A_sc_gl>(A_sc),
+        .B = kittens::py::tensor_to_gl<typename G::B_fp4x2_gl>(B),
+        .B_sc = kittens::py::tensor_to_gl<typename G::B_sc_gl>(B_sc),
+        .D = kittens::py::tensor_to_gl<typename G::D_gl>(z_out),
+        .output_scale = nullptr,
+        .h_row_fp4 = reinterpret_cast<uint8_t*>(row_fp4.data_ptr()),
+        .h_row_sc = row_sc.data_ptr<uint8_t>(),
+        .h_col_fp4 = reinterpret_cast<uint8_t*>(col_fp4.data_ptr()),
+        .h_col_sc = col_sc.data_ptr<uint8_t>(),
+        .h_r_tile = r_tile.data_ptr<float>(),
+        .h_gamma = reinterpret_cast<const bf16*>(gamma.data_ptr()),
+        .h_rows = static_cast<int>(R.size(0)),
+        .h_cols = static_cast<int>(R.size(1)),
+        .h_eps = static_cast<float>(eps),
+        .tilemask_ptr = nullptr,
+        .tilemask_rows = 0,
+        .tilemask_cols = 0,
+        .tilemask_transposed = false
+    };
+    auto r_gl = kittens::py::tensor_to_gl<typename G::D_gl>(R);
+    memcpy(&g.R_tma, &r_gl.tma_descs.tma_desc, sizeof(CUtensorMap));
+    kittens::py::launch_kernel<C, G, mxfp4_gemm::kernel<C>>(g);
+}
+
+template <typename C>
 static void launch_mxfp4_gemm_dense_row_scale(
     const at::Tensor &A,
     const at::Tensor &A_sc,
@@ -1010,6 +1047,137 @@ void mxfp4_gemm_residual_rms_entrypoint(
     const c10::cuda::CUDAGuard device_guard(A.device());
     launch_mxfp4_gemm_dense_residual_rms<mxfp4_gemm::config<256, 5, 8, 4, 2, false, 256, false, true, false, true>>(
         A, A_sc, B, B_sc, R, D, row_rms_partial, gamma_opt);
+}
+
+void mxfp4_h_residual_carrier_entrypoint(
+    const at::Tensor &A, const at::Tensor &A_sc,
+    const at::Tensor &B, const at::Tensor &B_sc,
+    const at::Tensor &R, const at::Tensor &gamma,
+    at::Tensor &z_out, at::Tensor &row_fp4, at::Tensor &row_sc,
+    at::Tensor &col_fp4, at::Tensor &col_sc, at::Tensor &r_tile,
+    double eps = 1.0e-5) {
+    const int64_t M = R.size(0), N = R.size(1);
+    TORCH_CHECK(R.is_cuda() && R.is_contiguous() && R.scalar_type() == at::kBFloat16 && R.dim() == 2,
+                "H residual must be contiguous CUDA bf16 [M,N]");
+    TORCH_CHECK(M > 0 && N > 0 && M % 128 == 0 && N % 256 == 0,
+                "H residual dimensions must be positive multiples of 128x256");
+    TORCH_CHECK(gamma.is_cuda() && gamma.is_contiguous() && gamma.scalar_type() == at::kBFloat16 &&
+                    gamma.dim() == 1 && gamma.numel() == N,
+                "H gamma must be contiguous CUDA bf16 [N]");
+    TORCH_CHECK(z_out.is_cuda() && z_out.is_contiguous() && z_out.scalar_type() == at::kBFloat16 &&
+                    z_out.sizes() == R.sizes(), "H z_out must be CUDA bf16 [M,N]");
+    TORCH_CHECK(row_fp4.scalar_type() == at::kFloat4_e2m1fn_x2 && row_fp4.sizes() == at::IntArrayRef({M, N / 2}),
+                "H row_fp4 must be float4_e2m1fn_x2 [M,N/2]");
+    TORCH_CHECK(col_fp4.scalar_type() == at::kFloat4_e2m1fn_x2 && col_fp4.sizes() == at::IntArrayRef({N, M / 2}),
+                "H col_fp4 must be float4_e2m1fn_x2 [N,M/2]");
+    TORCH_CHECK(row_sc.scalar_type() == at::kByte && row_sc.numel() == (M / 128) * (N / 128) * 512,
+                "H row_sc has invalid E8M0 layout");
+    TORCH_CHECK(col_sc.scalar_type() == at::kByte && col_sc.numel() == (N / 128) * (M / 128) * 512,
+                "H col_sc has invalid E8M0 layout");
+    TORCH_CHECK(r_tile.scalar_type() == at::kFloat && r_tile.sizes() == at::IntArrayRef({M / 128, N / 128}),
+                "H r_tile must be fp32 [M/128,N/128]");
+    TORCH_CHECK(std::isfinite(eps) && eps >= 0.0, "H eps must be finite and non-negative");
+    kittens::py::device_check(A, A_sc, B, B_sc, R, gamma, z_out, row_fp4, row_sc, col_fp4, col_sc, r_tile);
+    const c10::cuda::CUDAGuard device_guard(A.device());
+    launch_mxfp4_h_residual_carrier<mxfp4_gemm::config<
+        256, 5, 8, 4, 2, false, 256, false,
+        true, false, false, false, false, false, true>>(
+            A, A_sc, B, B_sc, R, gamma, z_out, row_fp4, row_sc,
+            col_fp4, col_sc, r_tile, eps);
+}
+
+__global__ void mxfp4_h_tile_backward_kernel(
+    const bf16* __restrict__ du, const bf16* __restrict__ z,
+    const bf16* __restrict__ gamma, const float* __restrict__ r_tile,
+    bf16* __restrict__ dx, float* __restrict__ dgamma_partial,
+    int rows, int cols) {
+    const int tile_col = blockIdx.x;
+    const int tile_row = blockIdx.y;
+    const int tid = threadIdx.x;
+    __shared__ float dot_s[256];
+    const int row0 = tile_row * 128;
+    const int col0 = tile_col * 128;
+    float dot = 0.0f;
+    #pragma unroll
+    for (int e = tid; e < 128 * 128; e += 256) {
+        const int r = row0 + e / 128;
+        const int c = col0 + e % 128;
+        const float zv = __bfloat162float(z[r * cols + c]);
+        const float gv = __bfloat162float(du[r * cols + c]) * __bfloat162float(gamma[c]);
+        dot = fmaf(gv, zv, dot);
+    }
+    dot_s[tid] = dot;
+    __syncthreads();
+    for (int stride = 128; stride; stride >>= 1) {
+        if (tid < stride) dot_s[tid] += dot_s[tid + stride];
+        __syncthreads();
+    }
+    const float rt = r_tile[tile_row * (cols / 128) + tile_col];
+    const float corr = (rt * rt * rt) * (dot_s[0] * 0x1p-14f);
+    #pragma unroll
+    for (int e = tid; e < 128 * 128; e += 256) {
+        const int r = row0 + e / 128;
+        const int c = col0 + e % 128;
+        const float zv = __bfloat162float(z[r * cols + c]);
+        const float gv = __bfloat162float(du[r * cols + c]) * __bfloat162float(gamma[c]);
+        dx[r * cols + c] = __float2bfloat16_rn(fmaf(-zv, corr, rt * gv));
+    }
+    if (tid < 128) {
+        const int c = col0 + tid;
+        float dg = 0.0f;
+        #pragma unroll
+        for (int rr = 0; rr < 128; ++rr) {
+            const int off = (row0 + rr) * cols + c;
+            const float norm = __bfloat162float(z[off]) * rt;
+            dg = fmaf(__bfloat162float(du[off]), norm, dg);
+        }
+        dgamma_partial[tile_row * cols + c] = dg;
+    }
+}
+
+__global__ void mxfp4_h_dgamma_reduce_kernel(
+    const float* __restrict__ partial, bf16* __restrict__ dgamma,
+    int tile_rows, int cols) {
+    const int c = blockIdx.x * blockDim.x + threadIdx.x;
+    if (c >= cols) return;
+    float sum = 0.0f;
+    for (int tr = 0; tr < tile_rows; ++tr) {
+        sum += partial[tr * cols + c];
+    }
+    dgamma[c] = __float2bfloat16_rn(sum);
+}
+
+void mxfp4_h_tile_backward_entrypoint(
+    const at::Tensor &du, const at::Tensor &z, const at::Tensor &gamma,
+    const at::Tensor &r_tile, at::Tensor &dx,
+    at::Tensor &dgamma_partial, at::Tensor &dgamma) {
+    TORCH_CHECK(du.is_cuda() && du.is_contiguous() && du.scalar_type() == at::kBFloat16 && du.dim() == 2,
+                "H du must be contiguous CUDA bf16 [M,N]");
+    TORCH_CHECK(z.sizes() == du.sizes() && z.scalar_type() == at::kBFloat16 && z.is_contiguous(),
+                "H z must match du");
+    const int64_t M = du.size(0), N = du.size(1);
+    TORCH_CHECK(M % 128 == 0 && N % 128 == 0, "H backward shape must be divisible by 128x128");
+    TORCH_CHECK(gamma.scalar_type() == at::kBFloat16 && gamma.is_contiguous() && gamma.numel() == N,
+                "H backward gamma must be bf16 [N]");
+    TORCH_CHECK(r_tile.scalar_type() == at::kFloat && r_tile.is_contiguous() &&
+                    r_tile.sizes() == at::IntArrayRef({M / 128, N / 128}), "H backward r_tile shape mismatch");
+    TORCH_CHECK(dx.scalar_type() == at::kBFloat16 && dx.is_contiguous() && dx.sizes() == du.sizes(),
+                "H backward dx must be bf16 [M,N]");
+    TORCH_CHECK(dgamma_partial.scalar_type() == at::kFloat && dgamma_partial.is_contiguous() &&
+                    dgamma_partial.sizes() == at::IntArrayRef({M / 128, N}), "H dgamma_partial shape mismatch");
+    TORCH_CHECK(dgamma.scalar_type() == at::kBFloat16 && dgamma.is_contiguous() && dgamma.numel() == N,
+                "H dgamma must be bf16 [N]");
+    kittens::py::device_check(du, z, gamma, r_tile, dx, dgamma_partial, dgamma);
+    const c10::cuda::CUDAGuard device_guard(du.device());
+    const auto stream = at::cuda::getCurrentCUDAStream(du.get_device());
+    mxfp4_h_tile_backward_kernel<<<dim3(N / 128, M / 128), 256, 0, stream>>>(
+        reinterpret_cast<const bf16*>(du.data_ptr()), reinterpret_cast<const bf16*>(z.data_ptr()),
+        reinterpret_cast<const bf16*>(gamma.data_ptr()), r_tile.data_ptr<float>(),
+        reinterpret_cast<bf16*>(dx.data_ptr()), dgamma_partial.data_ptr<float>(), M, N);
+    mxfp4_h_dgamma_reduce_kernel<<<(N + 255) / 256, 256, 0, stream>>>(
+        dgamma_partial.data_ptr<float>(), reinterpret_cast<bf16*>(dgamma.data_ptr()),
+        M / 128, N);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
 void mxfp4_gemm_rms_bwd_partial_dot_entrypoint(
@@ -2694,6 +2862,18 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           pybind11::arg("B"), pybind11::arg("B_sc"),
           pybind11::arg("R"), pybind11::arg("D"),
           pybind11::arg("row_rms_partial"), pybind11::arg("gamma") = std::nullopt);
+    m.def("mxfp4_h_residual_carrier", &mxfp4_h_residual_carrier_entrypoint,
+          "MXFP4 residual GEMM with direct 128x128 tile-RMS row/column carrier",
+          pybind11::arg("A"), pybind11::arg("A_sc"), pybind11::arg("B"),
+          pybind11::arg("B_sc"), pybind11::arg("R"), pybind11::arg("gamma"),
+          pybind11::arg("z_out"), pybind11::arg("row_fp4"), pybind11::arg("row_sc"),
+          pybind11::arg("col_fp4"), pybind11::arg("col_sc"), pybind11::arg("r_tile"),
+          pybind11::arg("eps") = 1.0e-5);
+    m.def("mxfp4_h_tile_backward", &mxfp4_h_tile_backward_entrypoint,
+          "Native MX H tile-RMS backward and deterministic dgamma reduction",
+          pybind11::arg("du"), pybind11::arg("z"), pybind11::arg("gamma"),
+          pybind11::arg("r_tile"), pybind11::arg("dx"),
+          pybind11::arg("dgamma_partial"), pybind11::arg("dgamma"));
     m.def("mxfp4_gemm_row_scale", &mxfp4_gemm_row_scale_entrypoint,
           "MXFP4 GEMM with fused C3 row-scale output epilogue",
           pybind11::arg("A"), pybind11::arg("A_sc"),
