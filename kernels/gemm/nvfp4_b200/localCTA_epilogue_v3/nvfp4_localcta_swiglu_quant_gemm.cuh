@@ -363,6 +363,7 @@ __device__ __forceinline__ uint32_t cluster_load_shared_u32(const uint32_t* ptr,
     return value;
 }
 
+template <typename C>
 __device__ __forceinline__ void localcta_block_quant_params(
     float block_amax,
     float chunk_s_enc,
@@ -371,15 +372,28 @@ __device__ __forceinline__ void localcta_block_quant_params(
     uint8_t& stored_scale_byte)
 {
     (void)chunk_sg;
-    __nv_fp8_e4m3 mult_fp8 = static_cast<__nv_fp8_e4m3>(FP8_E4M3_MAX);
-    if (block_amax > 1.0e-9f && chunk_s_enc > 0.0f) {
-        const float mult = fminf(6.0f / (block_amax * chunk_s_enc), 3.4028235e+38f);
-        mult_fp8 = static_cast<__nv_fp8_e4m3>(mult);
+    if constexpr (C::ENCODE_CENTRIC) {
+        __nv_fp8_e4m3 mult_fp8 = static_cast<__nv_fp8_e4m3>(FP8_E4M3_MAX);
+        if (block_amax > 0.0f && chunk_s_enc > 0.0f) {
+            const float mult = fminf(6.0f / (block_amax * chunk_s_enc), 3.4028235e+38f);
+            mult_fp8 = static_cast<__nv_fp8_e4m3>(mult);
+        }
+        const float mult_val = static_cast<float>(mult_fp8);
+        coeff = mult_val * chunk_s_enc;
+        const __nv_fp8_e4m3 stored = static_cast<__nv_fp8_e4m3>(1.0f / mult_val);
+        stored_scale_byte = *reinterpret_cast<const uint8_t*>(&stored);
+    } else {
+        __nv_fp8_e4m3 stored = static_cast<__nv_fp8_e4m3>(0.0f);
+        if (chunk_s_enc > 0.0f) {
+            stored = static_cast<__nv_fp8_e4m3>(
+                fminf((block_amax / 6.0f) * chunk_s_enc, 3.4028235e+38f));
+        }
+        const float stored_val = static_cast<float>(stored);
+        coeff = (stored_val > 0.0f && chunk_s_enc > 0.0f)
+            ? fminf(chunk_s_enc / stored_val, 3.4028235e+38f)
+            : 0.0f;
+        stored_scale_byte = *reinterpret_cast<const uint8_t*>(&stored);
     }
-    const float mult_val = static_cast<float>(mult_fp8);
-    coeff = mult_val * chunk_s_enc;
-    const __nv_fp8_e4m3 stored = static_cast<__nv_fp8_e4m3>(1.0f / mult_val);
-    stored_scale_byte = *reinterpret_cast<const uint8_t*>(&stored);
 }
 
 template <typename C, typename subtile_rt>
@@ -564,7 +578,7 @@ __device__ __noinline__ void quantize_cols_from_stage(
 
         float coeff;
         uint8_t stored_scale;
-        localcta_block_quant_params(block_amax, chunk_s_enc, chunk_sg, coeff, stored_scale);
+        localcta_block_quant_params<C>(block_amax, chunk_s_enc, chunk_sg, coeff, stored_scale);
 
         const uint32_t packed_lo = mul_cvt_bf16_to_fp4_8x_rn(
             *reinterpret_cast<const uint64_t*>(&cached[0]),
