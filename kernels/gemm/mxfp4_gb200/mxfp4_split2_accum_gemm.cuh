@@ -15,7 +15,8 @@ using namespace kittens;
 static constexpr int NUM_SPLITS = 2;
 
 template <int _Nb, int _LOAD_PIPE_DEPTH, int _EPI_PIPE_DEPTH, int _SUPERGROUP_SIZE,
-          int _NUM_D_TILES, bool _OVERLAP_EPI, int _CLUSTER_SIZE = 2, bool _USE_PDL = false>
+          int _NUM_D_TILES, bool _OVERLAP_EPI, int _CLUSTER_SIZE = 2,
+          bool _USE_PDL = false, bool _FUSE_H_BWD = false>
 struct config {
     static_assert(_Nb == 128 || _Nb == 256, "Nb must be 128 or 256");
     static_assert(_LOAD_PIPE_DEPTH > 0 && _LOAD_PIPE_DEPTH <= 5, "LOAD_PIPE_DEPTH must be > 0 and <= 5");
@@ -27,6 +28,9 @@ struct config {
 
     static constexpr int CLUSTER_SIZE = _CLUSTER_SIZE;
     static constexpr bool USE_PDL = _USE_PDL;
+    static constexpr bool FUSE_H_BWD = _FUSE_H_BWD;
+    static_assert(!FUSE_H_BWD || (_Nb == 256 && _EPI_PIPE_DEPTH == 8),
+                  "H backward requires 256 columns in eight 32-column slices");
 
     static constexpr int CONSUMER_WARPGROUPS = 1;
     static constexpr int PRODUCER_WARPGROUPS = 1;
@@ -93,6 +97,11 @@ struct globals {
     int num_red_blocks[NUM_SPLITS];
     int num_row_blocks;
     int num_col_blocks;
+    const bf16* h_z;
+    const bf16* h_gamma;
+    const float* h_r_tile;
+    float* h_dgamma_partial;
+    int h_cols;
 
     struct input_tiles_t {
         A_fp4x2_tile A;
@@ -121,6 +130,102 @@ struct globals {
         return shm;
     }
 };
+
+template <typename RT, typename G>
+__device__ inline float h_dot_slice(
+    const RT &du, const G &g, int warp_row, int col_base) {
+    const int lane = warp::laneid();
+    const int lane_pair = lane & 3;
+    const int row_pair = lane >> 2;
+    float dot = 0.0f;
+    #pragma unroll
+    for (int i = 0; i < RT::height; ++i) {
+        const int r0 = warp_row + i * 16 + row_pair;
+        const int r1 = r0 + 8;
+        #pragma unroll
+        for (int j = 0; j < RT::width; ++j) {
+            const int c0 = col_base + j * 16 + lane_pair * 2;
+            const int c1 = c0 + 8;
+            const auto &q = du.tiles[i][j].data;
+            #define H_DOT(ROW, COL, V) \
+                dot = fmaf((__bfloat162float(V) * __bfloat162float(g.h_gamma[COL])), \
+                           __bfloat162float(g.h_z[static_cast<long long>(ROW) * g.h_cols + (COL)]), dot)
+            H_DOT(r0, c0, q[0].x); H_DOT(r0, c0 + 1, q[0].y);
+            H_DOT(r1, c0, q[1].x); H_DOT(r1, c0 + 1, q[1].y);
+            H_DOT(r0, c1, q[2].x); H_DOT(r0, c1 + 1, q[2].y);
+            H_DOT(r1, c1, q[3].x); H_DOT(r1, c1 + 1, q[3].y);
+            #undef H_DOT
+        }
+    }
+    return dot;
+}
+
+__device__ inline float h_reduce_dot(float value, float *scratch) {
+    #pragma unroll
+    for (int d = 16; d; d >>= 1)
+        value += __shfl_down_sync(0xffffffffu, value, d);
+    if (warp::laneid() == 0) scratch[warpgroup::warpid()] = value;
+    warpgroup::sync(1);
+    if (warpgroup::warpid() == 0) {
+        float total = warp::laneid() < WARPGROUP_WARPS ? scratch[warp::laneid()] : 0.0f;
+        #pragma unroll
+        for (int d = 16; d; d >>= 1)
+            total += __shfl_down_sync(0xffffffffu, total, d);
+        if (warp::laneid() == 0) scratch[WARPGROUP_WARPS] = total;
+    }
+    warpgroup::sync(1);
+    return scratch[WARPGROUP_WARPS];
+}
+
+template <typename RT, typename G>
+__device__ inline void h_apply_dx_and_stage_dgamma(
+    RT &du, const G &g, float (*stage)[33], float r, float corr,
+    int warp_row, int col_base) {
+    const int lane = warp::laneid();
+    const int lane_pair = lane & 3;
+    const int row_pair = lane >> 2;
+    #pragma unroll
+    for (int i = 0; i < RT::height; ++i) {
+        const int lr0 = i * 16 + row_pair;
+        const int lr1 = lr0 + 8;
+        const int r0 = warp_row + lr0;
+        const int r1 = warp_row + lr1;
+        #pragma unroll
+        for (int j = 0; j < RT::width; ++j) {
+            const int p = j * 8 + lane_pair;
+            const int c0 = col_base + p * 2;
+            const int c1 = c0 + 8;
+            auto &q = du.tiles[i][j].data;
+            #define H_APPLY(ROW, COL, V, OUT) do { \
+                const float dv = __bfloat162float(V); \
+                const float zv = __bfloat162float(g.h_z[static_cast<long long>(ROW) * g.h_cols + (COL)]); \
+                const float gv = dv * __bfloat162float(g.h_gamma[COL]); \
+                OUT = __float2bfloat16_rn(fmaf(-zv, corr, r * gv)); \
+            } while (0)
+            const float z00 = __bfloat162float(g.h_z[static_cast<long long>(r0) * g.h_cols + c0]);
+            const float z01 = __bfloat162float(g.h_z[static_cast<long long>(r0) * g.h_cols + c0 + 1]);
+            const float z10 = __bfloat162float(g.h_z[static_cast<long long>(r1) * g.h_cols + c0]);
+            const float z11 = __bfloat162float(g.h_z[static_cast<long long>(r1) * g.h_cols + c0 + 1]);
+            const float z08 = __bfloat162float(g.h_z[static_cast<long long>(r0) * g.h_cols + c1]);
+            const float z09 = __bfloat162float(g.h_z[static_cast<long long>(r0) * g.h_cols + c1 + 1]);
+            const float z18 = __bfloat162float(g.h_z[static_cast<long long>(r1) * g.h_cols + c1]);
+            const float z19 = __bfloat162float(g.h_z[static_cast<long long>(r1) * g.h_cols + c1 + 1]);
+            stage[p * 2][lr0] = __bfloat162float(q[0].x) * z00 * r;
+            stage[p * 2 + 1][lr0] = __bfloat162float(q[0].y) * z01 * r;
+            stage[p * 2][lr1] = __bfloat162float(q[1].x) * z10 * r;
+            stage[p * 2 + 1][lr1] = __bfloat162float(q[1].y) * z11 * r;
+            stage[(p + 4) * 2][lr0] = __bfloat162float(q[2].x) * z08 * r;
+            stage[(p + 4) * 2 + 1][lr0] = __bfloat162float(q[2].y) * z09 * r;
+            stage[(p + 4) * 2][lr1] = __bfloat162float(q[3].x) * z18 * r;
+            stage[(p + 4) * 2 + 1][lr1] = __bfloat162float(q[3].y) * z19 * r;
+            H_APPLY(r0, c0, q[0].x, q[0].x); H_APPLY(r0, c0 + 1, q[0].y, q[0].y);
+            H_APPLY(r1, c0, q[1].x, q[1].x); H_APPLY(r1, c0 + 1, q[1].y, q[1].y);
+            H_APPLY(r0, c1, q[2].x, q[2].x); H_APPLY(r0, c1 + 1, q[2].y, q[2].y);
+            H_APPLY(r1, c1, q[3].x, q[3].x); H_APPLY(r1, c1 + 1, q[3].y, q[3].y);
+            #undef H_APPLY
+        }
+    }
+}
 
 template <typename C>
 __device__ inline void kernel(const globals<C> &g) {
@@ -163,6 +268,11 @@ __device__ inline void kernel(const globals<C> &g) {
     __shared__ semaphore inputs_finished[C::LOAD_PIPE_DEPTH];
     __shared__ semaphore outputs_arrived;
     __shared__ semaphore outputs_finished;
+    __shared__ float h_reduce[C::FUSE_H_BWD ? WARPGROUP_WARPS + 1 : 1];
+    __shared__ float h_dgamma
+        [C::FUSE_H_BWD ? WARPGROUP_WARPS : 1]
+        [C::FUSE_H_BWD ? 32 : 1]
+        [C::FUSE_H_BWD ? 33 : 1];
     if (threadIdx.x == 32) {
         init_semaphore(tmem_provisioned, 0, 1);
         #pragma unroll
@@ -352,6 +462,49 @@ __device__ inline void kernel(const globals<C> &g) {
             tensor_before_thread_sync();
             warpgroup::sync(1);
             warpgroup::tma::cluster::arrive(outputs_finished, 0, 1);
+
+            if constexpr (C::FUSE_H_BWD) {
+                constexpr int SLICES_PER_TILE = 4;
+                const int row_tile = row_block_idx * 2 + cta_id;
+                const int warp_row = row_tile * 128 + warpgroup::warpid() * 32;
+                #pragma unroll
+                for (int tile = 0; tile < 2; ++tile) {
+                    float dot = 0.0f;
+                    #pragma unroll
+                    for (int q = 0; q < SLICES_PER_TILE; ++q) {
+                        const int i = tile * SLICES_PER_TILE + q;
+                        const int col = col_block_idx * C::Nb + i * 32;
+                        dot += h_dot_slice(D_reg[i], g, warp_row, col);
+                    }
+                    dot = h_reduce_dot(dot, h_reduce);
+                    const int h_col_tile = col_block_idx * 2 + tile;
+                    const float r = g.h_r_tile[row_tile * (g.h_cols / 128) + h_col_tile];
+                    const float corr = (r * r * r) * (dot * 0x1p-14f);
+                    #pragma unroll
+                    for (int q = 0; q < SLICES_PER_TILE; ++q) {
+                        const int i = tile * SLICES_PER_TILE + q;
+                        const int col = col_block_idx * C::Nb + i * 32;
+                        auto *stage = h_dgamma[warpgroup::warpid()];
+                        h_apply_dx_and_stage_dgamma(
+                            D_reg[i], g, stage, r, corr, warp_row, col);
+                        __syncwarp();
+                        float dg = 0.0f;
+                        #pragma unroll
+                        for (int rr = 0; rr < 32; ++rr)
+                            dg += stage[warp::laneid()][rr];
+                        stage[warp::laneid()][32] = dg;
+                        warpgroup::sync(1);
+                        if (warpgroup::warpid() == 0) {
+                            float total = 0.0f;
+                            #pragma unroll
+                            for (int w = 0; w < WARPGROUP_WARPS; ++w)
+                                total += h_dgamma[w][warp::laneid()][32];
+                            g.h_dgamma_partial[row_tile * g.h_cols + col + warp::laneid()] = total;
+                        }
+                        warpgroup::sync(1);
+                    }
+                }
+            }
 
             #pragma unroll
             for (int i = 0; i < C::EPI_PIPE_DEPTH; ++i) {
