@@ -176,6 +176,19 @@ int main() {
 #include "pyutils/torchutils.cuh"
 #include "ATen/Functions.h"
 
+namespace c3_row_scale {
+static void check_output_no_overlap(
+    const at::Tensor& output, const at::Tensor& input, const char* input_name
+) {
+    const auto out_begin = reinterpret_cast<std::uintptr_t>(output.data_ptr());
+    const auto in_begin = reinterpret_cast<std::uintptr_t>(input.data_ptr());
+    const auto out_end = out_begin + output.numel() * output.element_size();
+    const auto in_end = in_begin + input.numel() * input.element_size();
+    TORCH_CHECK(out_end <= in_begin || in_end <= out_begin,
+                "output must not overlap ", input_name);
+}
+}  // namespace c3_row_scale
+
 __global__ void v5_rmsnorm_bwd_dx_kernel(
     const __nv_bfloat16* __restrict__ d_normed,
     const __nv_bfloat16* __restrict__ input,
