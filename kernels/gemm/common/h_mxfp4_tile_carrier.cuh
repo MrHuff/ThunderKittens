@@ -35,6 +35,68 @@ __device__ __forceinline__ float fp4_rcp(uint8_t e) {
     return 6.0f * __uint_as_float(static_cast<uint32_t>(254 - e) << 23);
 }
 
+__device__ __forceinline__ uint32_t pack_fp4_8(
+    uint64_t in03, uint64_t in47, float coeff) {
+    uint32_t out;
+    asm volatile(
+        "{\n"
+        ".reg.b64 coeff2;\n\t"
+        "mov.b64 coeff2, {%3, %3};\n\t"
+        ".reg.b16 b0, b1, b2, b3, b4, b5, b6, b7;\n\t"
+        "mov.b64 {b0, b1, b2, b3}, %1;\n\t"
+        "mov.b64 {b4, b5, b6, b7}, %2;\n\t"
+        ".reg.b32 f0, f1, f2, f3, f4, f5, f6, f7;\n\t"
+        "cvt.f32.bf16 f0, b0;\n\t"
+        "cvt.f32.bf16 f1, b1;\n\t"
+        "cvt.f32.bf16 f2, b2;\n\t"
+        "cvt.f32.bf16 f3, b3;\n\t"
+        "cvt.f32.bf16 f4, b4;\n\t"
+        "cvt.f32.bf16 f5, b5;\n\t"
+        "cvt.f32.bf16 f6, b6;\n\t"
+        "cvt.f32.bf16 f7, b7;\n\t"
+        ".reg.b64 f01, f23, f45, f67;\n\t"
+        "mov.b64 f01, {f0, f1};\n\t"
+        "mov.b64 f23, {f2, f3};\n\t"
+        "mov.b64 f45, {f4, f5};\n\t"
+        "mov.b64 f67, {f6, f7};\n\t"
+        "mul.f32x2 f01, f01, coeff2;\n\t"
+        "mul.f32x2 f23, f23, coeff2;\n\t"
+        "mul.f32x2 f45, f45, coeff2;\n\t"
+        "mul.f32x2 f67, f67, coeff2;\n\t"
+        "mov.b64 {f1, f0}, f01;\n\t"
+        "mov.b64 {f3, f2}, f23;\n\t"
+        "mov.b64 {f5, f4}, f45;\n\t"
+        "mov.b64 {f7, f6}, f67;\n\t"
+        ".reg.b8 q0, q1, q2, q3;\n\t"
+        "cvt.rn.satfinite.e2m1x2.f32 q0, f0, f1;\n\t"
+        "cvt.rn.satfinite.e2m1x2.f32 q1, f2, f3;\n\t"
+        "cvt.rn.satfinite.e2m1x2.f32 q2, f4, f5;\n\t"
+        "cvt.rn.satfinite.e2m1x2.f32 q3, f6, f7;\n\t"
+        "mov.b32 %0, {q0, q1, q2, q3};\n\t"
+        "}"
+        : "=r"(out)
+        : "l"(in03), "l"(in47), "f"(coeff));
+    return out;
+}
+
+__device__ __forceinline__ uint4 pack_fp4_32(
+    const kittens::bf16_2 (&cached)[16], float coeff) {
+    uint4 out;
+    out.x = pack_fp4_8(
+        *reinterpret_cast<const uint64_t*>(&cached[0]),
+        *reinterpret_cast<const uint64_t*>(&cached[2]), coeff);
+    out.y = pack_fp4_8(
+        *reinterpret_cast<const uint64_t*>(&cached[4]),
+        *reinterpret_cast<const uint64_t*>(&cached[6]), coeff);
+    out.z = pack_fp4_8(
+        *reinterpret_cast<const uint64_t*>(&cached[8]),
+        *reinterpret_cast<const uint64_t*>(&cached[10]), coeff);
+    out.w = pack_fp4_8(
+        *reinterpret_cast<const uint64_t*>(&cached[12]),
+        *reinterpret_cast<const uint64_t*>(&cached[14]), coeff);
+    return out;
+}
+
 template <typename RT>
 __device__ __forceinline__ float sumsq(const RT& x) {
     float s = 0.0f;
@@ -118,10 +180,8 @@ __device__ __forceinline__ void emit_32x32(
     const uint8_t e = e8m0_mode1(amax);
     const float rcp = fp4_rcp(e);
     uint8_t* row_ptr = reinterpret_cast<uint8_t*>(g.h_row_fp4);
-    #pragma unroll
-    for (int p = 0; p < 16; ++p)
-        row_ptr[row * (g.h_cols / 2) + col_start / 2 + p] =
-            fp4_pair(__bfloat162float(cached[p].x), __bfloat162float(cached[p].y), rcp);
+    *reinterpret_cast<uint4*>(row_ptr + row * (g.h_cols / 2) + col_start / 2) =
+        pack_fp4_32(cached, rcp);
     const int rsb = row / 128, jig = row % 32, grp = (row % 128) / 32;
     g.h_row_sc[((rsb * (g.h_cols / 128) + col_start / 128) * 512) + jig * 16 + grp * 4 + (col_start % 128) / 32] = e;
 
@@ -141,10 +201,8 @@ __device__ __forceinline__ void emit_32x32(
     const float crcp = fp4_rcp(ce);
     const int gc = col_start + local_col;
     uint8_t* col_ptr = reinterpret_cast<uint8_t*>(g.h_col_fp4);
-    #pragma unroll
-    for (int p = 0; p < 16; ++p)
-        col_ptr[gc * (g.h_rows / 2) + warp_row / 2 + p] =
-            fp4_pair(__bfloat162float(cached[p].x), __bfloat162float(cached[p].y), crcp);
+    *reinterpret_cast<uint4*>(col_ptr + gc * (g.h_rows / 2) + warp_row / 2) =
+        pack_fp4_32(cached, crcp);
     const int chunk = (gc / 128) * (g.h_rows / 128) + warp_row / 128;
     const int idx = (gc % 32) * 16 + ((gc / 32) % 4) * 4 + ((warp_row / 32) % 4);
     g.h_col_sc[chunk * 512 + idx] = ce;

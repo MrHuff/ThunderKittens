@@ -733,45 +733,47 @@ __device__ inline void kernel(const globals<C> &g) {
                 static_assert(SLICE == 32 && C::EPI_PIPE_DEPTH == 8);
                 using H_rt_fl = rt_fl<C::Mb / 8, SLICE>;
                 using H_rt_bf = rt_bf<C::Mb / 8, SLICE>;
-                H_rt_bf z[C::EPI_PIPE_DEPTH];
-                #pragma unroll
-                for (int i = 0; i < C::EPI_PIPE_DEPTH; ++i) {
-                    H_rt_fl f;
-                    warpgroup::load_async(
-                        f, out_tm.template subtile<full_tt_fl<SLICE>>(0, SLICE * i));
-                    warp::mul(f, f, gemm_scale);
-                    warp::copy(z[i], f);
-                }
-                tensor_load_wait();
-                tensor_before_thread_sync();
-                warpgroup::sync(1);
-                warpgroup::tma::cluster::arrive(outputs_finished, 0, 1);
-
-                #pragma unroll
-                for (int i = 0; i < C::EPI_PIPE_DEPTH; ++i) {
-                    const int slot = i % C::NUM_D_TILES;
-                    warpgroup::tma::store_async_read_wait<C::NUM_D_TILES - 1>();
-                    warpgroup::sync(1);
-                    maybe_add_residual_tile<C>(
-                        g, output_tiles.D[slot], z[i], residual_load_arrived,
-                        residual_load_phase, row_block_idx * 2 + cta_id,
-                        col_block_idx * C::EPI_PIPE_DEPTH + i);
-                    warpgroup::store(output_tiles.D[slot], z[i]);
-                    warpgroup::sync(1);
-                    warpgroup::tma::store_async<dim::ROW, cache_policy::EVICT_FIRST>(
-                        g.D, output_tiles.D[slot],
-                        {row_block_idx * 2 + cta_id,
-                         col_block_idx * C::EPI_PIPE_DEPTH + i});
-                }
-
                 const int row_tile = row_block_idx * 2 + cta_id;
                 const int warp_row = row_tile * 128 + warpgroup::warpid() * 32;
                 #pragma unroll
                 for (int tile = 0; tile < 2; ++tile) {
+                    H_rt_bf z[SLICES_PER_TILE];
+                    #pragma unroll
+                    for (int q = 0; q < SLICES_PER_TILE; ++q) {
+                        const int i = tile * SLICES_PER_TILE + q;
+                        H_rt_fl f;
+                        warpgroup::load_async(
+                            f, out_tm.template subtile<full_tt_fl<SLICE>>(0, SLICE * i));
+                        warp::mul(f, f, gemm_scale);
+                        warp::copy(z[q], f);
+                    }
+                    tensor_load_wait();
+                    tensor_before_thread_sync();
+                    warpgroup::sync(1);
+                    if (tile == 1)
+                        warpgroup::tma::cluster::arrive(outputs_finished, 0, 1);
+
+                    #pragma unroll
+                    for (int q = 0; q < SLICES_PER_TILE; ++q) {
+                        const int i = tile * SLICES_PER_TILE + q;
+                        const int slot = i % C::NUM_D_TILES;
+                        warpgroup::tma::store_async_read_wait<C::NUM_D_TILES - 1>();
+                        warpgroup::sync(1);
+                        maybe_add_residual_tile<C>(
+                            g, output_tiles.D[slot], z[q], residual_load_arrived,
+                            residual_load_phase, row_tile,
+                            col_block_idx * C::EPI_PIPE_DEPTH + i);
+                        warpgroup::store(output_tiles.D[slot], z[q]);
+                        warpgroup::sync(1);
+                        warpgroup::tma::store_async<dim::ROW, cache_policy::EVICT_FIRST>(
+                            g.D, output_tiles.D[slot],
+                            {row_tile, col_block_idx * C::EPI_PIPE_DEPTH + i});
+                    }
+
                     float s = 0.0f;
                     #pragma unroll
                     for (int q = 0; q < SLICES_PER_TILE; ++q)
-                        s += h_mxfp4_tile_carrier::sumsq(z[tile * SLICES_PER_TILE + q]);
+                        s += h_mxfp4_tile_carrier::sumsq(z[q]);
                     const float r = h_mxfp4_tile_carrier::tile_rsqrt(s, h_reduce, g.h_eps);
                     if (threadIdx.x % 128 == 0 && warpgroup::warpid() == 0)
                         g.h_r_tile[row_tile * (g.h_cols / 128) + col_block_idx * 2 + tile] = r;
@@ -781,7 +783,7 @@ __device__ inline void kernel(const globals<C> &g) {
                         const int col = col_block_idx * C::Nb + i * SLICE;
                         auto* pairs = h_stage[warpgroup::warpid()];
                         h_mxfp4_tile_carrier::normalize_gamma_to_stage(
-                            z[i], pairs, r, g.h_gamma, col);
+                            z[q], pairs, r, g.h_gamma, col);
                         __syncwarp();
                         h_mxfp4_tile_carrier::emit_32x32(g, pairs, warp_row, col);
                     }
