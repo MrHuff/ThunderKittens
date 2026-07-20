@@ -170,6 +170,320 @@ int main() {
 
 #include "pyutils/torchutils.cuh"
 #include "ATen/Functions.h"
+#include <ATen/MemoryOverlap.h>
+#include <c10/cuda/CUDAGuard.h>
+#include <cub/block/block_reduce.cuh>
+
+template <int BLOCK_SIZE>
+__device__ __forceinline__ float v5_sum3_block_reduce_sum(float value) {
+    using BlockReduce = cub::BlockReduce<float, BLOCK_SIZE>;
+    __shared__ typename BlockReduce::TempStorage storage;
+    return BlockReduce(storage).Sum(value);
+}
+
+template <int BLOCK_SIZE>
+__global__ void v5_sum3_rmsnorm_bwd_dx_kernel(
+    const __nv_bfloat16* __restrict__ d0,
+    const __nv_bfloat16* __restrict__ d1,
+    const __nv_bfloat16* __restrict__ d2,
+    const __nv_bfloat16* __restrict__ input,
+    const __nv_bfloat16* __restrict__ norm_weight,
+    const float* __restrict__ inv_rms,
+    __nv_bfloat16* __restrict__ d_sum,
+    __nv_bfloat16* __restrict__ grad_input,
+    int M,
+    int K
+) {
+    int row = blockIdx.x;
+    if (row >= M) {
+        return;
+    }
+    int tid = threadIdx.x;
+    const __nv_bfloat16* row_d0 = d0 + row * K;
+    const __nv_bfloat16* row_d1 = d1 + row * K;
+    const __nv_bfloat16* row_d2 = d2 + row * K;
+    const __nv_bfloat16* row_input = input + row * K;
+    __nv_bfloat16* row_sum = d_sum + row * K;
+    __nv_bfloat16* row_dx = grad_input + row * K;
+    float inv = inv_rms[row];
+    float local_sum = 0.0f;
+
+    for (int col = tid; col < K; col += BLOCK_SIZE) {
+        __nv_bfloat16 dy_bf16 = __hadd(
+            __hadd(row_d0[col], row_d1[col]), row_d2[col]
+        );
+        row_sum[col] = dy_bf16;
+        float x = __bfloat162float(row_input[col]);
+        float gamma = __bfloat162float(norm_weight[col]);
+        float d_y = __bfloat162float(dy_bf16);
+        float normed = x * inv * gamma;
+        local_sum += d_y * normed;
+    }
+    float reduced = v5_sum3_block_reduce_sum<BLOCK_SIZE>(local_sum);
+    __shared__ float mean;
+    if (tid == 0) {
+        mean = reduced / static_cast<float>(K);
+    }
+    __syncthreads();
+
+    float mean_value = mean;
+    for (int col = tid; col < K; col += BLOCK_SIZE) {
+        float x = __bfloat162float(row_input[col]);
+        float gamma = __bfloat162float(norm_weight[col]);
+        float d_y = __bfloat162float(row_sum[col]);
+        float d_z = d_y * gamma;
+        float dx = inv * (d_z - x * inv * mean_value);
+        row_dx[col] = __float2bfloat16(dx);
+    }
+}
+
+template <int BLOCK_SIZE, int ITEMS_PER_THREAD>
+__global__ void v5_sum3_rmsnorm_bwd_dx_k4096_kernel(
+    const __nv_bfloat16* __restrict__ d0,
+    const __nv_bfloat16* __restrict__ d1,
+    const __nv_bfloat16* __restrict__ d2,
+    const __nv_bfloat16* __restrict__ input,
+    const __nv_bfloat16* __restrict__ norm_weight,
+    const float* __restrict__ inv_rms,
+    __nv_bfloat16* __restrict__ d_sum,
+    __nv_bfloat16* __restrict__ grad_input,
+    int M
+) {
+    static_assert(BLOCK_SIZE * ITEMS_PER_THREAD == 4096);
+    int row = blockIdx.x;
+    if (row >= M) {
+        return;
+    }
+    int tid = threadIdx.x;
+    constexpr int K = BLOCK_SIZE * ITEMS_PER_THREAD;
+    const __nv_bfloat16* row_d0 = d0 + row * K;
+    const __nv_bfloat16* row_d1 = d1 + row * K;
+    const __nv_bfloat16* row_d2 = d2 + row * K;
+    const __nv_bfloat16* row_input = input + row * K;
+    __nv_bfloat16* row_sum = d_sum + row * K;
+    __nv_bfloat16* row_dx = grad_input + row * K;
+    __nv_bfloat16 dy_cache[ITEMS_PER_THREAD];
+    __nv_bfloat16 x_cache[ITEMS_PER_THREAD];
+    __nv_bfloat16 gamma_cache[ITEMS_PER_THREAD];
+    float inv = inv_rms[row];
+    float local_sum = 0.0f;
+
+    #pragma unroll
+    for (int item = 0; item < ITEMS_PER_THREAD; ++item) {
+        int col = tid + item * BLOCK_SIZE;
+        __nv_bfloat16 dy_bf16 = __hadd(
+            __hadd(row_d0[col], row_d1[col]), row_d2[col]
+        );
+        __nv_bfloat16 x_bf16 = row_input[col];
+        __nv_bfloat16 gamma_bf16 = norm_weight[col];
+        dy_cache[item] = dy_bf16;
+        x_cache[item] = x_bf16;
+        gamma_cache[item] = gamma_bf16;
+        row_sum[col] = dy_bf16;
+        float x = __bfloat162float(x_bf16);
+        float gamma = __bfloat162float(gamma_bf16);
+        float d_y = __bfloat162float(dy_bf16);
+        float normed = x * inv * gamma;
+        local_sum += d_y * normed;
+    }
+    float reduced = v5_sum3_block_reduce_sum<BLOCK_SIZE>(local_sum);
+    __shared__ float mean;
+    if (tid == 0) {
+        mean = reduced / static_cast<float>(K);
+    }
+    __syncthreads();
+
+    float mean_value = mean;
+    #pragma unroll
+    for (int item = 0; item < ITEMS_PER_THREAD; ++item) {
+        int col = tid + item * BLOCK_SIZE;
+        float x = __bfloat162float(x_cache[item]);
+        float gamma = __bfloat162float(gamma_cache[item]);
+        float d_y = __bfloat162float(dy_cache[item]);
+        float d_z = d_y * gamma;
+        float dx = inv * (d_z - x * inv * mean_value);
+        row_dx[col] = __float2bfloat16(dx);
+    }
+}
+
+template <int ROW_TILE = 256>
+__global__ void v5_sum3_rmsnorm_bwd_dgamma_partial_kernel(
+    const __nv_bfloat16* __restrict__ d_sum,
+    const __nv_bfloat16* __restrict__ input,
+    const float* __restrict__ inv_rms,
+    float* __restrict__ partials,
+    int M,
+    int K
+) {
+    int col = static_cast<int>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (col >= K) {
+        return;
+    }
+    int row_start = static_cast<int>(blockIdx.y) * ROW_TILE;
+    int row_end = min(row_start + ROW_TILE, M);
+    float partial = 0.0f;
+    for (int row = row_start; row < row_end; ++row) {
+        int idx = row * K + col;
+        partial += __bfloat162float(d_sum[idx])
+            * __bfloat162float(input[idx])
+            * inv_rms[row];
+    }
+    partials[static_cast<int>(blockIdx.y) * K + col] = partial;
+}
+
+template <typename output_t>
+__global__ void v5_sum3_rmsnorm_bwd_dgamma_reduce_kernel(
+    const float* __restrict__ partials,
+    output_t* __restrict__ dgamma,
+    int row_tiles,
+    int K
+) {
+    int col = static_cast<int>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (col >= K) {
+        return;
+    }
+    float sum = 0.0f;
+    for (int tile = 0; tile < row_tiles; ++tile) {
+        sum += partials[tile * K + col];
+    }
+    if constexpr (std::is_same_v<output_t, __nv_bfloat16>) {
+        dgamma[col] = __float2bfloat16_rn(sum);
+    } else {
+        dgamma[col] = sum;
+    }
+}
+
+void nvfp4_sum3_rmsnorm_bwd_out_entrypoint(
+    const at::Tensor& d0,
+    const at::Tensor& d1,
+    const at::Tensor& d2,
+    const at::Tensor& input,
+    const at::Tensor& norm_weight,
+    const at::Tensor& inv_rms,
+    at::Tensor& d_sum,
+    at::Tensor& grad_input,
+    at::Tensor& dgamma_partials,
+    at::Tensor& dgamma
+) {
+    TORCH_CHECK(d0.is_cuda() && d0.is_contiguous()
+                    && d0.scalar_type() == at::kBFloat16 && d0.dim() == 2,
+                "d0 must be contiguous CUDA bf16 [M,K]");
+    const int64_t M64 = d0.size(0);
+    const int64_t K64 = d0.size(1);
+    TORCH_CHECK(M64 > 0 && K64 > 0 && M64 <= INT_MAX && K64 <= INT_MAX
+                    && M64 <= INT_MAX / K64,
+                "sum3_rmsnorm_bwd_out requires positive int32-indexable M*K");
+    const int M = static_cast<int>(M64);
+    const int K = static_cast<int>(K64);
+    auto check_bf16_matrix = [&](const at::Tensor& tensor, const char* name) {
+        TORCH_CHECK(tensor.is_cuda() && tensor.is_contiguous()
+                        && tensor.scalar_type() == at::kBFloat16
+                        && tensor.sizes() == d0.sizes(),
+                    name, " must be contiguous CUDA bf16 [M,K]");
+    };
+    check_bf16_matrix(d1, "d1");
+    check_bf16_matrix(d2, "d2");
+    check_bf16_matrix(input, "input");
+    check_bf16_matrix(d_sum, "d_sum");
+    check_bf16_matrix(grad_input, "grad_input");
+    TORCH_CHECK(norm_weight.is_cuda() && norm_weight.is_contiguous()
+                    && norm_weight.scalar_type() == at::kBFloat16
+                    && norm_weight.dim() == 1 && norm_weight.numel() == K,
+                "norm_weight must be contiguous CUDA bf16 [K]");
+    TORCH_CHECK(inv_rms.is_cuda() && inv_rms.is_contiguous()
+                    && inv_rms.scalar_type() == at::kFloat
+                    && inv_rms.numel() == M,
+                "inv_rms must be contiguous CUDA fp32 [M]");
+    constexpr int row_tile = 256;
+    const int row_tiles = (M + row_tile - 1) / row_tile;
+    TORCH_CHECK(dgamma_partials.is_cuda() && dgamma_partials.is_contiguous()
+                    && dgamma_partials.scalar_type() == at::kFloat
+                    && dgamma_partials.dim() == 2
+                    && dgamma_partials.size(0) == row_tiles
+                    && dgamma_partials.size(1) == K,
+                "dgamma_partials must be contiguous CUDA fp32 [ceil(M/256),K]");
+    TORCH_CHECK(dgamma.is_cuda() && dgamma.is_contiguous()
+                    && (dgamma.scalar_type() == at::kFloat
+                        || dgamma.scalar_type() == at::kBFloat16)
+                    && dgamma.dim() == 1 && dgamma.numel() == K,
+                "dgamma must be contiguous CUDA fp32 or bf16 [K]");
+    kittens::py::device_check(d0, d1, d2, input, norm_weight, inv_rms,
+                              d_sum, grad_input, dgamma_partials, dgamma);
+
+    const at::Tensor* outputs[] = {
+        &d_sum, &grad_input, &dgamma_partials, &dgamma,
+    };
+    const at::Tensor* inputs[] = {
+        &d0, &d1, &d2, &input, &norm_weight, &inv_rms,
+    };
+    for (const at::Tensor* output : outputs) {
+        for (const at::Tensor* read : inputs) {
+            at::assert_no_overlap(*output, *read);
+        }
+    }
+    for (int i = 0; i < 4; ++i) {
+        for (int j = i + 1; j < 4; ++j) {
+            at::assert_no_overlap(*outputs[i], *outputs[j]);
+        }
+    }
+
+    const c10::cuda::CUDAGuard device_guard(d0.device());
+    auto stream = at::cuda::getCurrentCUDAStream();
+    constexpr int dx_threads = 512;
+    if (K == 4096) {
+        v5_sum3_rmsnorm_bwd_dx_k4096_kernel<dx_threads, 8>
+            <<<M, dx_threads, 0, stream>>>(
+                reinterpret_cast<const __nv_bfloat16*>(d0.data_ptr<at::BFloat16>()),
+                reinterpret_cast<const __nv_bfloat16*>(d1.data_ptr<at::BFloat16>()),
+                reinterpret_cast<const __nv_bfloat16*>(d2.data_ptr<at::BFloat16>()),
+                reinterpret_cast<const __nv_bfloat16*>(input.data_ptr<at::BFloat16>()),
+                reinterpret_cast<const __nv_bfloat16*>(norm_weight.data_ptr<at::BFloat16>()),
+                inv_rms.data_ptr<float>(),
+                reinterpret_cast<__nv_bfloat16*>(d_sum.data_ptr<at::BFloat16>()),
+                reinterpret_cast<__nv_bfloat16*>(grad_input.data_ptr<at::BFloat16>()),
+                M);
+    } else {
+        v5_sum3_rmsnorm_bwd_dx_kernel<dx_threads>
+            <<<M, dx_threads, 0, stream>>>(
+            reinterpret_cast<const __nv_bfloat16*>(d0.data_ptr<at::BFloat16>()),
+            reinterpret_cast<const __nv_bfloat16*>(d1.data_ptr<at::BFloat16>()),
+            reinterpret_cast<const __nv_bfloat16*>(d2.data_ptr<at::BFloat16>()),
+            reinterpret_cast<const __nv_bfloat16*>(input.data_ptr<at::BFloat16>()),
+            reinterpret_cast<const __nv_bfloat16*>(norm_weight.data_ptr<at::BFloat16>()),
+            inv_rms.data_ptr<float>(),
+            reinterpret_cast<__nv_bfloat16*>(d_sum.data_ptr<at::BFloat16>()),
+            reinterpret_cast<__nv_bfloat16*>(grad_input.data_ptr<at::BFloat16>()),
+            M,
+            K);
+    }
+    constexpr int dgamma_threads = 256;
+    const int col_tiles = (K + dgamma_threads - 1) / dgamma_threads;
+    v5_sum3_rmsnorm_bwd_dgamma_partial_kernel<row_tile>
+        <<<dim3(col_tiles, row_tiles), dgamma_threads, 0, stream>>>(
+            reinterpret_cast<const __nv_bfloat16*>(d_sum.data_ptr<at::BFloat16>()),
+            reinterpret_cast<const __nv_bfloat16*>(input.data_ptr<at::BFloat16>()),
+            inv_rms.data_ptr<float>(),
+            dgamma_partials.data_ptr<float>(),
+            M,
+            K);
+    if (dgamma.scalar_type() == at::kBFloat16) {
+        v5_sum3_rmsnorm_bwd_dgamma_reduce_kernel
+            <<<col_tiles, dgamma_threads, 0, stream>>>(
+                dgamma_partials.data_ptr<float>(),
+                reinterpret_cast<__nv_bfloat16*>(
+                    dgamma.data_ptr<at::BFloat16>()),
+                row_tiles,
+                K);
+    } else {
+        v5_sum3_rmsnorm_bwd_dgamma_reduce_kernel
+            <<<col_tiles, dgamma_threads, 0, stream>>>(
+                dgamma_partials.data_ptr<float>(),
+                dgamma.data_ptr<float>(),
+                row_tiles,
+                K);
+    }
+    CUDACHECK(cudaGetLastError());
+}
 
 void nvfp4_gemm_entrypoint(
     const at::Tensor &A,
@@ -1734,6 +2048,13 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("sum3_bf16", &sum3_bf16_entrypoint,
           "Fused 3-way bf16 sum: out = A + B + C (single kernel)",
           pybind11::arg("A"), pybind11::arg("B"), pybind11::arg("C"), pybind11::arg("out"));
+    m.def("sum3_rmsnorm_bwd_out", &nvfp4_sum3_rmsnorm_bwd_out_entrypoint,
+          "Native BF16 sum3 plus RMSNorm backward into caller-owned outputs",
+          pybind11::arg("d0"), pybind11::arg("d1"), pybind11::arg("d2"),
+          pybind11::arg("input"), pybind11::arg("norm_weight"),
+          pybind11::arg("inv_rms"), pybind11::arg("d_sum"),
+          pybind11::arg("grad_input"), pybind11::arg("dgamma_partials"),
+          pybind11::arg("dgamma"));
     m.def("fp32_to_fp4x2", &fp32_to_fp4x2_entrypoint);
     m.def("fp4x2_to_fp32", &fp4x2_to_fp32_entrypoint);
     m.def("nvfp4_fused_gemm", &nvfp4_fused_gemm_entrypoint,
