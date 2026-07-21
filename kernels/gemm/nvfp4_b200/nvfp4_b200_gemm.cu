@@ -173,6 +173,7 @@ int main() {
 #include <ATen/MemoryOverlap.h>
 #include <c10/cuda/CUDAGuard.h>
 #include <cub/block/block_reduce.cuh>
+#include "../common/c1_rms_reduce.cuh"
 
 namespace c3_row_scale {
 static void check_output_no_overlap(
@@ -1501,7 +1502,8 @@ static void run_gemm_residual_with_config(
     const at::Tensor &A, const at::Tensor &A_sc, const at::Tensor &A_sc_global,
     const at::Tensor &B, const at::Tensor &B_sc, const at::Tensor &B_sc_global,
     const at::Tensor &R,
-    at::Tensor &D
+    at::Tensor &D,
+    at::Tensor *row_rms_partial = nullptr
 ) {
     using G = nvfp4_gemm::globals<C>;
     G g {
@@ -1533,6 +1535,10 @@ static void run_gemm_residual_with_config(
         .b_sg_chunk_grid = nullptr,
         .b_sg_chunk_stride = 1,
         .silu_dim = 0,
+        .row_rms_partial = row_rms_partial == nullptr
+            ? nullptr : row_rms_partial->data_ptr<float>(),
+        .row_rms_partial_stride = row_rms_partial == nullptr
+            ? 0 : static_cast<int>(row_rms_partial->size(1)),
     };
     auto r_gl = kittens::py::tensor_to_gl<typename G::D_gl>(R);
     memcpy(&g.R_tma, &r_gl.tma_descs.tma_desc, sizeof(CUtensorMap));
@@ -1688,6 +1694,72 @@ void nvfp4_gemm_residual_entrypoint(
         run_gemm_residual_with_config<C>(
             A, A_sc, A_sc_global, B, B_sc, B_sc_global, R, D);
     }
+}
+
+void nvfp4_gemm_residual_rms_entrypoint(
+    const at::Tensor &A,
+    const at::Tensor &A_sc,
+    const at::Tensor &A_sc_global,
+    const at::Tensor &B,
+    const at::Tensor &B_sc,
+    const at::Tensor &B_sc_global,
+    const at::Tensor &R,
+    at::Tensor &D,
+    at::Tensor &row_rms_partial
+) {
+    check_nvfp4_residual_gemm_inputs(
+        A, A_sc, A_sc_global, B, B_sc, B_sc_global, R, D);
+    const int64_t M = D.size(0);
+    const int64_t N = D.size(1);
+    TORCH_CHECK(N <= 4096,
+                "v5 residual RMS currently supports hidden_size <= 4096");
+    TORCH_CHECK(row_rms_partial.is_cuda() &&
+                    row_rms_partial.is_contiguous() &&
+                    row_rms_partial.scalar_type() == at::kFloat &&
+                    row_rms_partial.dim() == 2 &&
+                    row_rms_partial.size(0) == M &&
+                    row_rms_partial.size(1) == N / 32,
+                "row_rms_partial must be contiguous CUDA float32 [M,N/32]");
+    kittens::py::device_check(
+        A, A_sc, A_sc_global, B, B_sc, B_sc_global,
+        R, D, row_rms_partial);
+    at::assert_no_overlap(row_rms_partial, A);
+    at::assert_no_overlap(row_rms_partial, A_sc);
+    at::assert_no_overlap(row_rms_partial, A_sc_global);
+    at::assert_no_overlap(row_rms_partial, B);
+    at::assert_no_overlap(row_rms_partial, B_sc);
+    at::assert_no_overlap(row_rms_partial, B_sc_global);
+    at::assert_no_overlap(row_rms_partial, R);
+    at::assert_no_overlap(row_rms_partial, D);
+
+    const c10::cuda::CUDAGuard device_guard(A.device());
+    const int K = B.size(1) * 2;
+    if (K <= 2048) {
+        using C = nvfp4_gemm::config<
+            256, 5, 8, 4, 2, false, 256, true, 2, 256,
+            false, true, false, true>;
+        run_gemm_residual_with_config<C>(
+            A, A_sc, A_sc_global, B, B_sc, B_sc_global,
+            R, D, &row_rms_partial);
+    } else {
+        using C = nvfp4_gemm::config<
+            256, 4, 8, 12, 2, false, 256, true, 2, 256,
+            false, true, false, true>;
+        run_gemm_residual_with_config<C>(
+            A, A_sc, A_sc_global, B, B_sc, B_sc_global,
+            R, D, &row_rms_partial);
+    }
+}
+
+void nvfp4_row_rms_reduce_entrypoint(
+    const at::Tensor &row_rms_partial,
+    at::Tensor &inv_rms,
+    int64_t hidden_size,
+    double epsilon
+) {
+    const c10::cuda::CUDAGuard device_guard(row_rms_partial.device());
+    c1_rms_reduce::row_rms_reduce_entrypoint(
+        row_rms_partial, inv_rms, hidden_size, epsilon);
 }
 
 template <typename C>
@@ -2735,6 +2807,16 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           pybind11::arg("A"), pybind11::arg("A_sc"), pybind11::arg("A_sc_global"),
           pybind11::arg("B"), pybind11::arg("B_sc"), pybind11::arg("B_sc_global"),
           pybind11::arg("R"), pybind11::arg("D"));
+    m.def("nvfp4_gemm_residual_rms", &nvfp4_gemm_residual_rms_entrypoint,
+          "NVFP4 residual GEMM with exact-row RMS partials",
+          pybind11::arg("A"), pybind11::arg("A_sc"), pybind11::arg("A_sc_global"),
+          pybind11::arg("B"), pybind11::arg("B_sc"), pybind11::arg("B_sc_global"),
+          pybind11::arg("R"), pybind11::arg("D"),
+          pybind11::arg("row_rms_partial"));
+    m.def("nvfp4_row_rms_reduce", &nvfp4_row_rms_reduce_entrypoint,
+          "Reduce residual-GEMM row partials to inverse RMS",
+          pybind11::arg("row_rms_partial"), pybind11::arg("inv_rms"),
+          pybind11::arg("hidden_size"), pybind11::arg("epsilon"));
     m.def("nvfp4_gemm_nopdl", &nvfp4_gemm_nopdl_entrypoint,
           "Non-PDL GEMM for CUDA graph capture (CLUSTER_SIZE=1, USE_PDL=false)");
     m.def("nvfp4_gemm_config", &nvfp4_gemm_config_entrypoint,
