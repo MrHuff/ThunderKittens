@@ -1,5 +1,6 @@
 #include <torch/extension.h>
 #include <ATen/cuda/CUDAContext.h>
+#include <c10/cuda/CUDAGuard.h>
 
 #include <cuda.h>
 #include <cuda_bf16.h>
@@ -38,6 +39,8 @@ using localcta_fast_smallk_config = nvfp4_gemm::config<256, 5, 8, 4, 2, false>;
 using localcta_fast_largek_config = nvfp4_gemm::config<256, 5, 8, 12, 2, false>;
 using localcta_fast_smallk_residual_config = nvfp4_gemm::config<256, 5, 8, 4, 2, false, 256, true, 2, 256, false, true>;
 using localcta_fast_largek_residual_config = nvfp4_gemm::config<256, 5, 8, 12, 2, false, 256, true, 2, 256, false, true>;
+using localcta_fast_smallk_h_config = nvfp4_gemm::config<256, 5, 8, 4, 2, false, 256, true, 2, 256, false, true, true>;
+using localcta_fast_largek_h_config = nvfp4_gemm::config<256, 5, 8, 12, 2, false, 256, true, 2, 256, false, true, true>;
 using localcta_fast_grouped_config = nvfp4_gemm::config<256, 5, 8, 4, 2, false>;
 using localcta_fast_largek_rope_config = nvfp4_gemm::config<256, 5, 8, 12, 2, false, 256, true, 2, 256, true>;
 using localcta_fast_grouped_rope_config = nvfp4_gemm::config<256, 5, 8, 4, 2, false, 256, true, 2, 256, true>;
@@ -1285,6 +1288,75 @@ void launch_fast_gemm_with_config_residual(
 }
 
 template <typename C>
+void launch_fast_gemm_with_config_h(
+    const at::Tensor& A,
+    const at::Tensor& A_sc,
+    const at::Tensor& A_sg_tiles,
+    const at::Tensor& B,
+    const at::Tensor& B_sc,
+    const at::Tensor& B_sg_tiles,
+    const at::Tensor& R,
+    const at::Tensor& gamma,
+    at::Tensor& D,
+    at::Tensor& inverse_rms_tiles,
+    at::Tensor& tile_amax,
+    at::Tensor& row_outer_scales,
+    at::Tensor& col_outer_scales,
+    float eps
+) {
+    using G = nvfp4_gemm::globals<C>;
+    auto one = get_unit_scale_tensor(A);
+    const auto a_sg_desc = check_outer_scale_tiles(
+        A_sg_tiles, "A_sg_tiles", A.size(0) / C::Mb, true);
+    const auto b_sg_desc = check_outer_scale_tiles(
+        B_sg_tiles, "B_sg_tiles", B.size(0) / C::Nb, false);
+    check_output_matrix(R, "R", D.size(0), D.size(1));
+    G g {
+        .A = kittens::py::tensor_to_gl<typename G::A_fp4x2_gl>(A),
+        .A_sc = kittens::py::tensor_to_gl<typename G::A_sc_gl, false>(
+            A_sc, 1, A_sc.size(0), A_sc.size(1), 256),
+        .A_sc_global = kittens::py::tensor_to_gl<typename G::A_sc_global_gl>(one),
+        .B = kittens::py::tensor_to_gl<typename G::B_fp4x2_gl>(B),
+        .B_sc = kittens::py::tensor_to_gl<typename G::B_sc_gl, false>(
+            B_sc, 1, B_sc.size(0), B_sc.size(1), 256),
+        .B_sc_global = kittens::py::tensor_to_gl<typename G::B_sc_global_gl>(one),
+        .D = kittens::py::tensor_to_gl<typename G::D_gl>(D),
+        .D_K = kittens::py::tensor_to_gl<typename G::D_gl>(D),
+        .D_V = kittens::py::tensor_to_gl<typename G::D_gl>(D),
+        .q_dim = 0,
+        .k_dim = 0,
+        .v_dim = 0,
+        .use_split_D = false,
+        .a_sg_per_tile = a_sg_desc.ptr,
+        .a_sg_stride = a_sg_desc.stride,
+        .b_sg_per_tile = b_sg_desc.ptr,
+        .b_sg_stride = b_sg_desc.stride,
+        .silu_dim = 0,
+        .h_r_tile = inverse_rms_tiles.data_ptr<float>(),
+        .h_amax_tile = tile_amax.data_ptr<float>(),
+        .h_gamma = reinterpret_cast<const kittens::bf16*>(gamma.data_ptr()),
+        .h_cols = static_cast<int>(D.size(1)),
+        .h_eps = eps,
+    };
+    auto residual_gl = kittens::py::tensor_to_gl<typename G::D_gl>(R);
+    std::memcpy(
+        &g.R_tma, &residual_gl.tma_descs.tma_desc, sizeof(CUtensorMap));
+    kittens::py::launch_kernel<C, G, nvfp4_gemm::kernel<C>>(g);
+
+    auto stream = at::cuda::getCurrentCUDAStream();
+    const int tile_rows = static_cast<int>(D.size(0) / 128);
+    const int tile_cols = static_cast<int>(D.size(1) / 128);
+    h_nvfp4_tile_carrier::localcta_reduce_kernel<256><<<
+        tile_rows / 2 + tile_cols / 2, 256, 0, stream>>>(
+        tile_amax.data_ptr<float>(),
+        row_outer_scales.data_ptr<float>(),
+        col_outer_scales.data_ptr<float>(),
+        tile_rows,
+        tile_cols);
+    CUDACHECK(cudaGetLastError());
+}
+
+template <typename C>
 void launch_fast_grouped_gemm_with_config(
     const at::Tensor& A,
     const at::Tensor& A_sc_prepared,
@@ -1552,6 +1624,36 @@ void launch_fast_regular_gemm_residual(
     } else {
         launch_fast_gemm_with_config_residual<localcta_fast_largek_residual_config>(
             A, A_sc_prepared, A_sg_tiles, B, B_sc_prepared, B_sg_tiles, R, D);
+    }
+}
+
+void launch_fast_regular_gemm_h(
+    const at::Tensor& A,
+    const at::Tensor& A_sc,
+    const at::Tensor& A_sg_tiles,
+    const at::Tensor& B,
+    const at::Tensor& B_sc,
+    const at::Tensor& B_sg_tiles,
+    const at::Tensor& R,
+    const at::Tensor& gamma,
+    at::Tensor& D,
+    at::Tensor& inverse_rms_tiles,
+    at::Tensor& tile_amax,
+    at::Tensor& row_outer_scales,
+    at::Tensor& col_outer_scales,
+    float eps
+) {
+    const int64_t K = A.size(1) * 2;
+    if (K <= 2048) {
+        launch_fast_gemm_with_config_h<localcta_fast_smallk_h_config>(
+            A, A_sc, A_sg_tiles, B, B_sc, B_sg_tiles, R, gamma, D,
+            inverse_rms_tiles, tile_amax,
+            row_outer_scales, col_outer_scales, eps);
+    } else {
+        launch_fast_gemm_with_config_h<localcta_fast_largek_h_config>(
+            A, A_sc, A_sg_tiles, B, B_sc, B_sg_tiles, R, gamma, D,
+            inverse_rms_tiles, tile_amax,
+            row_outer_scales, col_outer_scales, eps);
     }
 }
 
@@ -4061,6 +4163,79 @@ void nvfp4_localcta_gemm_residual_entrypoint(
     launch_fast_regular_gemm_residual(A, A_sc, A_sg_outer, B, B_sc, B_sg_outer, R, D);
 }
 
+void nvfp4_localcta_h_residual_carrier_entrypoint(
+    const at::Tensor& A,
+    const at::Tensor& A_sc,
+    const at::Tensor& A_sg,
+    const at::Tensor& B,
+    const at::Tensor& B_sc,
+    const at::Tensor& B_sg,
+    const at::Tensor& R,
+    const at::Tensor& gamma,
+    at::Tensor& D,
+    at::Tensor& inverse_rms_tiles,
+    at::Tensor& tile_amax,
+    at::Tensor& row_outer_scales,
+    at::Tensor& col_outer_scales,
+    double eps
+) {
+    const auto sg_contract = infer_regular_sg_contract(A, A_sg, B, B_sg);
+    TORCH_CHECK(
+        sg_contract == SGContractMode::OuterScale,
+        "localCTA H carrier requires the v4 outer-scale contract");
+    auto A_sg_outer = normalize_outer_scale_tiles_tensor(
+        A_sg, A.size(0) / 256, true);
+    auto B_sg_outer = normalize_outer_scale_tiles_tensor(
+        B_sg, B.size(0) / 256, false);
+    check_v3_fast_gemm_inputs(
+        A, A_sc, A_sg_outer, B, B_sc, B_sg_outer);
+    const int64_t M = A.size(0);
+    const int64_t N = B.size(0);
+    TORCH_CHECK(
+        M % 256 == 0 && N % 256 == 0,
+        "localCTA H carrier requires M and N multiples of 256");
+    check_output_matrix(R, "R", M, N);
+    check_output_matrix(D, "D", M, N);
+    TORCH_CHECK(
+        gamma.is_cuda() && gamma.is_contiguous() && gamma.dim() == 1 &&
+            gamma.scalar_type() == at::kBFloat16 && gamma.numel() == N,
+        "localCTA H gamma must be contiguous CUDA bf16 [N]");
+    TORCH_CHECK(
+        inverse_rms_tiles.is_cuda() && inverse_rms_tiles.is_contiguous() &&
+            inverse_rms_tiles.scalar_type() == at::kFloat &&
+            inverse_rms_tiles.sizes() ==
+                at::IntArrayRef({M / 128, N / 128}),
+        "localCTA H inverse_rms_tiles must be float32 [M/128,N/128]");
+    TORCH_CHECK(
+        tile_amax.is_cuda() && tile_amax.is_contiguous() &&
+            tile_amax.scalar_type() == at::kFloat &&
+            tile_amax.sizes() == inverse_rms_tiles.sizes(),
+        "localCTA H tile_amax must match inverse_rms_tiles");
+    TORCH_CHECK(
+        row_outer_scales.is_cuda() && row_outer_scales.is_contiguous() &&
+            row_outer_scales.scalar_type() == at::kFloat &&
+            row_outer_scales.numel() == M / 256,
+        "localCTA H row_outer_scales must contain M/256 float32 values");
+    TORCH_CHECK(
+        col_outer_scales.is_cuda() && col_outer_scales.is_contiguous() &&
+            col_outer_scales.scalar_type() == at::kFloat &&
+            col_outer_scales.numel() == N / 256,
+        "localCTA H col_outer_scales must contain N/256 float32 values");
+    TORCH_CHECK(
+        std::isfinite(eps) && eps >= 0.0,
+        "localCTA H epsilon must be finite and non-negative");
+    kittens::py::device_check(
+        A, A_sc, A_sg_outer, B, B_sc, B_sg_outer, R, gamma, D,
+        inverse_rms_tiles, tile_amax,
+        row_outer_scales, col_outer_scales);
+    const c10::cuda::CUDAGuard device_guard(A.device());
+    launch_fast_regular_gemm_h(
+        A, A_sc, A_sg_outer, B, B_sc, B_sg_outer, R, gamma, D,
+        inverse_rms_tiles, tile_amax,
+        row_outer_scales, col_outer_scales,
+        static_cast<float>(eps));
+}
+
 void nvfp4_localcta_fast_gemm_entrypoint(
     const at::Tensor& A,
     const at::Tensor& A_sc_prepared,
@@ -5459,6 +5634,16 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           pybind11::arg("A"), pybind11::arg("A_sc"), pybind11::arg("A_sg_chunks"),
           pybind11::arg("B"), pybind11::arg("B_sc"), pybind11::arg("B_sg_chunks"),
           pybind11::arg("R"), pybind11::arg("D"));
+    m.def("nvfp4_localcta_h_residual_carrier",
+          &nvfp4_localcta_h_residual_carrier_entrypoint,
+          "localCTA residual GEMM plus native 128x128 tile-RMS carrier",
+          pybind11::arg("A"), pybind11::arg("A_sc"), pybind11::arg("A_sg"),
+          pybind11::arg("B"), pybind11::arg("B_sc"), pybind11::arg("B_sg"),
+          pybind11::arg("R"), pybind11::arg("gamma"), pybind11::arg("D"),
+          pybind11::arg("inverse_rms_tiles"), pybind11::arg("tile_amax"),
+          pybind11::arg("row_outer_scales"),
+          pybind11::arg("col_outer_scales"),
+          pybind11::arg("eps") = 1.0e-5);
     m.def("nvfp4_localcta_fast_gemm", &nvfp4_localcta_fast_gemm_entrypoint,
           pybind11::arg("A"), pybind11::arg("A_sc_prepared"),
           pybind11::arg("B"), pybind11::arg("B_sc_prepared"),

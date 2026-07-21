@@ -6,6 +6,7 @@
 
 #include "kittens.cuh"
 #include "nvfp4_rope_epilogue.cuh"
+#include "../common/h_nvfp4_tile_carrier.cuh"
 
 using namespace kittens;
 
@@ -23,7 +24,8 @@ template <
     int _CLUSTER_SIZE = 2,
     int _Kb = 256,
     bool _ROPE_LIVE64 = false,
-    bool _FUSE_RESIDUAL = false
+    bool _FUSE_RESIDUAL = false,
+    bool _FUSE_H_NV_CARRIER = false
 >
 struct config {
     static_assert(_Nb == 128 || _Nb == 256, "Nb must be 128 or 256");
@@ -58,6 +60,12 @@ struct config {
     static constexpr int NUM_D_TILES = _NUM_D_TILES;
     static constexpr bool ROPE_LIVE64 = _ROPE_LIVE64;
     static constexpr bool FUSE_RESIDUAL = _FUSE_RESIDUAL;
+    static constexpr bool FUSE_H_NV_CARRIER = _FUSE_H_NV_CARRIER;
+    static_assert(
+        !FUSE_H_NV_CARRIER ||
+            (FUSE_RESIDUAL && !_OVERLAP_EPI && _Nb == 256 &&
+             _EPI_PIPE_DEPTH == 8),
+        "H NV carrier requires residual and 256 columns in eight slices");
 
     // Output cache policy for TMA stores
     static constexpr auto D_CACHE_POLICY = cache_policy::EVICT_FIRST;
@@ -140,6 +148,11 @@ struct globals {
     nvfp4_rope_epilogue::rope_desc rope;
     nvfp4_rope_epilogue::rope_live64_desc rope_live64;
     CUtensorMap R_tma;   // optional residual descriptor, M x N
+    float* h_r_tile;               // inverse RMS [M/128,N/128]
+    float* h_amax_tile;            // normalized BF16 amax [M/128,N/128]
+    const bf16* h_gamma;           // post-tile-RMS gamma [N]
+    int h_cols;
+    float h_eps;
 
     struct input_tiles_t {
         A_fp4x2_tile A;
@@ -397,6 +410,8 @@ __device__ inline void kernel_impl(const globals<C> &g) {
     __shared__ semaphore outputs_arrived;
     __shared__ semaphore outputs_finished;
     __shared__ semaphore residual_load_arrived;
+    __shared__ float h_reduce[
+        C::FUSE_H_NV_CARRIER ? WARPGROUP_WARPS + 1 : 1];
     if (threadIdx.x == 32) {
         init_semaphore(tmem_provisioned, 0, 1);
         init_semaphore(tmem_finished, 0, 1);
@@ -611,7 +626,93 @@ __device__ inline void kernel_impl(const globals<C> &g) {
             wait(outputs_arrived, get_phasebit<0>(phasebits, 0));
 
             // Load the output from tensor memory into registers and store to HBM
-            if constexpr (C::OVERLAP_EPI) {
+            if constexpr (C::FUSE_H_NV_CARRIER) {
+                constexpr int SLICE = C::Nb / C::EPI_PIPE_DEPTH;
+                constexpr int SLICES_PER_TILE = 128 / SLICE;
+                static_assert(SLICE == 32 && C::EPI_PIPE_DEPTH == 8);
+                using H_rt_fl = rt_fl<C::Mb / 8, SLICE>;
+                using H_rt_bf = rt_bf<C::Mb / 8, SLICE>;
+                const int row_tile = row_block_idx * 2 + cta_id;
+                #pragma unroll
+                for (int tile = 0; tile < 2; ++tile) {
+                    H_rt_bf z[SLICES_PER_TILE];
+                    #pragma unroll
+                    for (int q = 0; q < SLICES_PER_TILE; ++q) {
+                        const int i = tile * SLICES_PER_TILE + q;
+                        H_rt_fl f;
+                        warpgroup::load_async(
+                            f,
+                            out_tm.template subtile<full_tt_fl<SLICE>>(
+                                0, SLICE * i));
+                        warp::mul(f, f, gs);
+                        const int col_offset_elems =
+                            (C::EPI_PIPE_DEPTH * col_block_idx + i) * SLICE;
+                        if (g.silu_dim > 0 &&
+                            col_offset_elems < g.silu_dim) {
+                            apply_silu_inplace(f);
+                        }
+                        apply_rope_live64_if_enabled(
+                            f, g, row_block_idx, cta_id, col_offset_elems);
+                        warp::copy(z[q], f);
+                    }
+                    tensor_load_wait();
+                    tensor_before_thread_sync();
+                    warpgroup::sync(1);
+                    if (tile == 1) {
+                        warpgroup::tma::cluster::arrive(
+                            outputs_finished, 0, 1);
+                    }
+
+                    #pragma unroll
+                    for (int q = 0; q < SLICES_PER_TILE; ++q) {
+                        const int i = tile * SLICES_PER_TILE + q;
+                        const int slot = i % C::NUM_D_TILES;
+                        warpgroup::tma::store_async_read_wait<
+                            C::NUM_D_TILES - 1>();
+                        warpgroup::sync(1);
+                        maybe_add_residual_tile<C>(
+                            g, output_tiles.D[slot], z[q],
+                            residual_load_arrived, residual_load_phase,
+                            row_tile,
+                            C::EPI_PIPE_DEPTH * col_block_idx + i);
+                        warpgroup::store(output_tiles.D[slot], z[q]);
+                        warpgroup::sync(1);
+                        warpgroup::tma::store_async<
+                            dim::ROW, C::D_CACHE_POLICY>(
+                            g.D, output_tiles.D[slot],
+                            {row_tile,
+                             C::EPI_PIPE_DEPTH * col_block_idx + i});
+                    }
+
+                    float sum = 0.0f;
+                    #pragma unroll
+                    for (int q = 0; q < SLICES_PER_TILE; ++q) {
+                        sum += h_nvfp4_tile_carrier::sumsq(z[q]);
+                    }
+                    const float r = h_nvfp4_tile_carrier::tile_rsqrt(
+                        sum, h_reduce, g.h_eps);
+                    float amax = 0.0f;
+                    #pragma unroll
+                    for (int q = 0; q < SLICES_PER_TILE; ++q) {
+                        const int i = tile * SLICES_PER_TILE + q;
+                        const int col = col_block_idx * C::Nb + i * SLICE;
+                        amax = fmaxf(
+                            amax,
+                            h_nvfp4_tile_carrier::normalized_gamma_amax(
+                                z[q], r, g.h_gamma, col));
+                    }
+                    amax = h_nvfp4_tile_carrier::reduce_max(
+                        amax, h_reduce);
+                    if (warpgroup::warpid() == 0 &&
+                        warp::laneid() == 0) {
+                        const int col_tile = col_block_idx * 2 + tile;
+                        const int idx =
+                            row_tile * (g.h_cols / 128) + col_tile;
+                        g.h_r_tile[idx] = r;
+                        g.h_amax_tile[idx] = amax;
+                    }
+                }
+            } else if constexpr (C::OVERLAP_EPI) {
                 #pragma unroll
                 for (int i = 0; i < C::EPI_PIPE_DEPTH; i++) {
                     rt_fl<C::Mb / 8, C::Nb/C::EPI_PIPE_DEPTH> D_reg;
