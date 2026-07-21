@@ -24,6 +24,9 @@ struct rope_live64_desc {
     const float2* cs = nullptr;
     int seq_len = 0;
     int seq_mask = 0;
+    int pair_dim = 32;
+    int head_mask = 63;
+    bool round_input_bf16 = false;
 
     __host__ __device__ inline bool enabled() const {
         return cs != nullptr && seq_len > 0;
@@ -145,7 +148,17 @@ __device__ inline void apply_inplace_live64(
                     j * tile_col_dim +
                     (k / 2) * (tile_col_dim / 2) +
                     (warp_lane % 4) * 2;
-                const float2 cs = rope.cs[(row & rope.seq_mask) * 32 + ((col_even & 63) >> 1)];
+                const float2 cs = rope.cs[
+                    (row & rope.seq_mask) * rope.pair_dim +
+                    ((col_even & rope.head_mask) >> 1)
+                ];
+                if constexpr (std::is_same_v<typename RT::dtype, float2>) {
+                    if (rope.round_input_bf16) {
+                        auto &value = tile.tiles[i][j].data[k];
+                        value.x = __bfloat162float(__float2bfloat16_rn(value.x));
+                        value.y = __bfloat162float(__float2bfloat16_rn(value.y));
+                    }
+                }
                 tile.tiles[i][j].data[k] = rotate_pair(tile.tiles[i][j].data[k], cs.x, cs.y);
             }
         }
