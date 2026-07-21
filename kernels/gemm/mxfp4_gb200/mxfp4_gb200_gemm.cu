@@ -9,6 +9,10 @@
 #include "mxfp4_split2_accum_gemm.cuh"
 #include "mxfp4_split3_accum_gemm.cuh"
 #include "mxfp4_silu_dgrad_quant_gemm.cuh"
+#include <ATen/cuda/CUDAContext.h>
+#include <c10/cuda/CUDAException.h>
+#include <c10/cuda/CUDAGuard.h>
+#include <cmath>
 #include <cstdlib>
 #include <cstdint>
 #include <cstring>
@@ -170,6 +174,8 @@ namespace {
 using mxfp4_onepass_cfg1 = mxfp4_split2_accum_gemm::config<128, 5, 4, 12, 2, true, 2, false>;
 using mxfp4_onepass_cfg3 = mxfp4_split2_accum_gemm::config<256, 5, 8, 4, 2, false, 2, false>;
 using mxfp4_onepass_cfg5 = mxfp4_split2_accum_gemm::config<256, 5, 8, 12, 2, false, 2, false>;
+using mxfp4_onepass_cfg5_h = mxfp4_split2_accum_gemm::config<
+    256, 5, 8, 12, 2, false, 2, false, true>;
 using mxfp4_split3_onepass_cfg1 = mxfp4_split3_accum_gemm::config<128, 5, 4, 12, 2, true, 2, false>;
 using mxfp4_split3_onepass_cfg3 = mxfp4_split3_accum_gemm::config<256, 5, 8, 4, 2, false, 2, false>;
 using mxfp4_split3_onepass_cfg5 = mxfp4_split3_accum_gemm::config<256, 5, 8, 12, 2, false, 2, false>;
@@ -498,7 +504,11 @@ void launch_mxfp4_split2_dgrad_gemm_strided_onepass_with_config(
     const std::vector<int64_t>& A_col_widths,
     const std::vector<at::Tensor>& B_list,
     const std::vector<at::Tensor>& B_sc_list,
-    at::Tensor& D_out
+    at::Tensor& D_out,
+    const at::Tensor* h_z = nullptr,
+    const at::Tensor* h_gamma = nullptr,
+    const at::Tensor* h_r_tile = nullptr,
+    at::Tensor* h_dgamma_partial = nullptr
 ) {
     using G = mxfp4_split2_accum_gemm::globals<C>;
     G g_host;
@@ -512,6 +522,14 @@ void launch_mxfp4_split2_dgrad_gemm_strided_onepass_with_config(
 
     g_host.num_row_blocks = static_cast<int>(M / C::Mb);
     g_host.num_col_blocks = static_cast<int>(N_out / C::Nb);
+    if constexpr (C::FUSE_H_BWD) {
+        g_host.h_z = reinterpret_cast<const bf16*>(h_z->data_ptr());
+        g_host.h_gamma =
+            reinterpret_cast<const bf16*>(h_gamma->data_ptr());
+        g_host.h_r_tile = h_r_tile->data_ptr<float>();
+        g_host.h_dgamma_partial = h_dgamma_partial->data_ptr<float>();
+        g_host.h_cols = static_cast<int>(N_out);
+    }
 
     for (int i = 0; i < 2; ++i) {
         constexpr int64_t swizzle_elements = 128;
@@ -788,6 +806,49 @@ static void launch_mxfp4_gemm_dense_residual(
 }
 
 template <typename C>
+static void launch_mxfp4_h_residual_carrier(
+    const at::Tensor &A,
+    const at::Tensor &A_sc,
+    const at::Tensor &B,
+    const at::Tensor &B_sc,
+    const at::Tensor &R,
+    const at::Tensor &gamma,
+    at::Tensor &z_out,
+    at::Tensor &row_fp4,
+    at::Tensor &row_sc,
+    at::Tensor &col_fp4,
+    at::Tensor &col_sc,
+    at::Tensor &r_tile,
+    double eps
+) {
+    using G = mxfp4_gemm::globals<C>;
+    G g {
+        .A = kittens::py::tensor_to_gl<typename G::A_fp4x2_gl>(A),
+        .A_sc = kittens::py::tensor_to_gl<typename G::A_sc_gl>(A_sc),
+        .B = kittens::py::tensor_to_gl<typename G::B_fp4x2_gl>(B),
+        .B_sc = kittens::py::tensor_to_gl<typename G::B_sc_gl>(B_sc),
+        .D = kittens::py::tensor_to_gl<typename G::D_gl>(z_out),
+        .output_scale = nullptr,
+        .h_row_fp4 = reinterpret_cast<uint8_t*>(row_fp4.data_ptr()),
+        .h_row_sc = row_sc.data_ptr<uint8_t>(),
+        .h_col_fp4 = reinterpret_cast<uint8_t*>(col_fp4.data_ptr()),
+        .h_col_sc = col_sc.data_ptr<uint8_t>(),
+        .h_r_tile = r_tile.data_ptr<float>(),
+        .h_gamma = reinterpret_cast<const bf16*>(gamma.data_ptr()),
+        .h_rows = static_cast<int>(R.size(0)),
+        .h_cols = static_cast<int>(R.size(1)),
+        .h_eps = static_cast<float>(eps),
+        .tilemask_ptr = nullptr,
+        .tilemask_rows = 0,
+        .tilemask_cols = 0,
+        .tilemask_transposed = false
+    };
+    auto r_gl = kittens::py::tensor_to_gl<typename G::D_gl>(R);
+    memcpy(&g.R_tma, &r_gl.tma_descs.tma_desc, sizeof(CUtensorMap));
+    kittens::py::launch_kernel<C, G, mxfp4_gemm::kernel<C>>(g);
+}
+
+template <typename C>
 static void launch_mxfp4_gemm_masked(
     const at::Tensor &A,
     const at::Tensor &A_sc,
@@ -851,6 +912,217 @@ void mxfp4_gemm_residual_entrypoint(
     kittens::py::device_check(A, A_sc, B, B_sc, R, D);
     launch_mxfp4_gemm_dense_residual<mxfp4_gemm::config<256, 5, 8, 4, 2, false, 256, false, true>>(
         A, A_sc, B, B_sc, R, D);
+}
+
+void mxfp4_h_residual_carrier_entrypoint(
+    const at::Tensor &A,
+    const at::Tensor &A_sc,
+    const at::Tensor &B,
+    const at::Tensor &B_sc,
+    const at::Tensor &R,
+    const at::Tensor &gamma,
+    at::Tensor &z_out,
+    at::Tensor &row_fp4,
+    at::Tensor &row_sc,
+    at::Tensor &col_fp4,
+    at::Tensor &col_sc,
+    at::Tensor &r_tile,
+    double eps = 1.0e-5
+) {
+    check_fp4_matrix(A, "A");
+    check_fp4_matrix(B, "B");
+    TORCH_CHECK(A.size(1) == B.size(1), "H A and B logical K mismatch");
+    const int64_t M = A.size(0);
+    const int64_t N = B.size(0);
+    check_output_matrix(R, "R", M, N);
+    check_output_matrix(z_out, "z_out", M, N);
+    TORCH_CHECK(
+        M > 0 && N > 0 && M % 128 == 0 && N % 256 == 0,
+        "H output dimensions must be positive multiples of 128x256");
+    TORCH_CHECK(
+        gamma.is_cuda() && gamma.is_contiguous() &&
+            gamma.scalar_type() == at::kBFloat16 && gamma.dim() == 1 &&
+            gamma.numel() == N,
+        "H gamma must be contiguous CUDA bf16 [N]");
+    TORCH_CHECK(
+        row_fp4.is_cuda() && row_fp4.is_contiguous() &&
+            row_fp4.scalar_type() == at::kFloat4_e2m1fn_x2 &&
+            row_fp4.sizes() == at::IntArrayRef({M, N / 2}),
+        "H row_fp4 must be contiguous CUDA float4_e2m1fn_x2 [M,N/2]");
+    TORCH_CHECK(
+        col_fp4.is_cuda() && col_fp4.is_contiguous() &&
+            col_fp4.scalar_type() == at::kFloat4_e2m1fn_x2 &&
+            col_fp4.sizes() == at::IntArrayRef({N, M / 2}),
+        "H col_fp4 must be contiguous CUDA float4_e2m1fn_x2 [N,M/2]");
+    TORCH_CHECK(
+        row_sc.is_cuda() && row_sc.is_contiguous() &&
+            row_sc.scalar_type() == at::kByte &&
+            row_sc.sizes() == at::IntArrayRef({M / 128, N / 128, 32, 16}),
+        "H row_sc must have contiguous E8M0 layout [M/128,N/128,32,16]");
+    TORCH_CHECK(
+        col_sc.is_cuda() && col_sc.is_contiguous() &&
+            col_sc.scalar_type() == at::kByte &&
+            col_sc.sizes() == at::IntArrayRef({N / 128, M / 128, 32, 16}),
+        "H col_sc must have contiguous E8M0 layout [N/128,M/128,32,16]");
+    TORCH_CHECK(
+        r_tile.is_cuda() && r_tile.is_contiguous() &&
+            r_tile.scalar_type() == at::kFloat &&
+            r_tile.sizes() == at::IntArrayRef({M / 128, N / 128}),
+        "H r_tile must be contiguous CUDA fp32 [M/128,N/128]");
+    TORCH_CHECK(
+        std::isfinite(eps) && eps >= 0.0,
+        "H eps must be finite and non-negative");
+    kittens::py::device_check(
+        A, A_sc, B, B_sc, R, gamma, z_out, row_fp4, row_sc,
+        col_fp4, col_sc, r_tile);
+    const c10::cuda::CUDAGuard device_guard(A.device());
+    launch_mxfp4_h_residual_carrier<mxfp4_gemm::config<
+        256, 5, 4, 12, 2, false, 256, false, true, false, true>>(
+        A, A_sc, B, B_sc, R, gamma, z_out, row_fp4, row_sc,
+        col_fp4, col_sc, r_tile, eps);
+}
+
+__global__ void mxfp4_h_tile_backward_kernel(
+    const bf16* __restrict__ du,
+    const bf16* __restrict__ z,
+    const bf16* __restrict__ gamma,
+    const float* __restrict__ r_tile,
+    bf16* __restrict__ dx,
+    float* __restrict__ dgamma_partial,
+    int rows,
+    int cols
+) {
+    const int tile_col = blockIdx.x;
+    const int tile_row = blockIdx.y;
+    const int tid = threadIdx.x;
+    __shared__ float dot_s[256];
+    const int row0 = tile_row * 128;
+    const int col0 = tile_col * 128;
+    float dot = 0.0f;
+    #pragma unroll
+    for (int e = tid; e < 128 * 128; e += 256) {
+        const int r = row0 + e / 128;
+        const int c = col0 + e % 128;
+        const float zv = __bfloat162float(z[r * cols + c]);
+        const float gv =
+            __bfloat162float(du[r * cols + c]) *
+            __bfloat162float(gamma[c]);
+        dot = fmaf(gv, zv, dot);
+    }
+    dot_s[tid] = dot;
+    __syncthreads();
+    for (int stride = 128; stride; stride >>= 1) {
+        if (tid < stride) dot_s[tid] += dot_s[tid + stride];
+        __syncthreads();
+    }
+    const float rt = r_tile[tile_row * (cols / 128) + tile_col];
+    const float corr = (rt * rt * rt) * (dot_s[0] * 0x1p-14f);
+    #pragma unroll
+    for (int e = tid; e < 128 * 128; e += 256) {
+        const int r = row0 + e / 128;
+        const int c = col0 + e % 128;
+        const float zv = __bfloat162float(z[r * cols + c]);
+        const float gv =
+            __bfloat162float(du[r * cols + c]) *
+            __bfloat162float(gamma[c]);
+        dx[r * cols + c] =
+            __float2bfloat16_rn(fmaf(-zv, corr, rt * gv));
+    }
+    if (tid < 128) {
+        const int c = col0 + tid;
+        float dg = 0.0f;
+        #pragma unroll
+        for (int rr = 0; rr < 128; ++rr) {
+            const int off = (row0 + rr) * cols + c;
+            const float norm = __bfloat162float(z[off]) * rt;
+            dg = fmaf(__bfloat162float(du[off]), norm, dg);
+        }
+        dgamma_partial[tile_row * cols + c] = dg;
+    }
+}
+
+__global__ void mxfp4_h_dgamma_reduce_kernel(
+    const float* __restrict__ partial,
+    bf16* __restrict__ dgamma,
+    int tile_rows,
+    int cols
+) {
+    const int c = blockIdx.x * blockDim.x + threadIdx.x;
+    if (c >= cols) return;
+    float sum = 0.0f;
+    for (int tr = 0; tr < tile_rows; ++tr) {
+        sum += partial[tr * cols + c];
+    }
+    dgamma[c] = __float2bfloat16_rn(sum);
+}
+
+void mxfp4_h_tile_backward_entrypoint(
+    const at::Tensor &du,
+    const at::Tensor &z,
+    const at::Tensor &gamma,
+    const at::Tensor &r_tile,
+    at::Tensor &dx,
+    at::Tensor &dgamma_partial,
+    at::Tensor &dgamma
+) {
+    TORCH_CHECK(
+        du.is_cuda() && du.is_contiguous() &&
+            du.scalar_type() == at::kBFloat16 && du.dim() == 2,
+        "H du must be contiguous CUDA bf16 [M,N]");
+    TORCH_CHECK(
+        z.is_cuda() && z.is_contiguous() &&
+            z.scalar_type() == at::kBFloat16 && z.sizes() == du.sizes(),
+        "H z must match du");
+    const int64_t M = du.size(0);
+    const int64_t N = du.size(1);
+    TORCH_CHECK(
+        M > 0 && N > 0 && M % 128 == 0 && N % 128 == 0,
+        "H backward shape must be divisible by 128x128");
+    TORCH_CHECK(
+        gamma.is_cuda() && gamma.is_contiguous() &&
+            gamma.scalar_type() == at::kBFloat16 && gamma.dim() == 1 &&
+            gamma.numel() == N,
+        "H backward gamma must be contiguous CUDA bf16 [N]");
+    TORCH_CHECK(
+        r_tile.is_cuda() && r_tile.is_contiguous() &&
+            r_tile.scalar_type() == at::kFloat &&
+            r_tile.sizes() == at::IntArrayRef({M / 128, N / 128}),
+        "H backward r_tile shape mismatch");
+    TORCH_CHECK(
+        dx.is_cuda() && dx.is_contiguous() &&
+            dx.scalar_type() == at::kBFloat16 && dx.sizes() == du.sizes(),
+        "H backward dx must be CUDA bf16 [M,N]");
+    TORCH_CHECK(
+        dgamma_partial.is_cuda() && dgamma_partial.is_contiguous() &&
+            dgamma_partial.scalar_type() == at::kFloat &&
+            dgamma_partial.sizes() == at::IntArrayRef({M / 128, N}),
+        "H dgamma_partial shape mismatch");
+    TORCH_CHECK(
+        dgamma.is_cuda() && dgamma.is_contiguous() &&
+            dgamma.scalar_type() == at::kBFloat16 && dgamma.dim() == 1 &&
+            dgamma.numel() == N,
+        "H dgamma must be CUDA bf16 [N]");
+    kittens::py::device_check(
+        du, z, gamma, r_tile, dx, dgamma_partial, dgamma);
+    const c10::cuda::CUDAGuard device_guard(du.device());
+    const auto stream = at::cuda::getCurrentCUDAStream(du.get_device());
+    mxfp4_h_tile_backward_kernel<<<
+        dim3(N / 128, M / 128), 256, 0, stream>>>(
+        reinterpret_cast<const bf16*>(du.data_ptr()),
+        reinterpret_cast<const bf16*>(z.data_ptr()),
+        reinterpret_cast<const bf16*>(gamma.data_ptr()),
+        r_tile.data_ptr<float>(),
+        reinterpret_cast<bf16*>(dx.data_ptr()),
+        dgamma_partial.data_ptr<float>(),
+        M,
+        N);
+    mxfp4_h_dgamma_reduce_kernel<<<
+        (N + 255) / 256, 256, 0, stream>>>(
+        dgamma_partial.data_ptr<float>(),
+        reinterpret_cast<bf16*>(dgamma.data_ptr()),
+        M / 128,
+        N);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
 void mxfp4_gemm_residual_config_entrypoint(
@@ -2167,6 +2439,86 @@ void mxfp4_split2_dgrad_strided_onepass_gemm_entrypoint(
         static_cast<int>(config_idx));
 }
 
+void mxfp4_split2_dgrad_strided_onepass_h_gemm_entrypoint(
+    const at::Tensor& A_full,
+    const std::vector<at::Tensor>& A_sc_list,
+    const std::vector<int64_t>& A_col_offsets,
+    const std::vector<int64_t>& A_col_widths,
+    const std::vector<at::Tensor>& B_list,
+    const std::vector<at::Tensor>& B_sc_list,
+    const at::Tensor& z,
+    const at::Tensor& gamma,
+    const at::Tensor& r_tile,
+    at::Tensor& D_out,
+    at::Tensor& dgamma_partial,
+    at::Tensor& dgamma,
+    int64_t config_idx
+) {
+    check_mxfp4_split2_dgrad_inputs(
+        A_full, A_sc_list, A_col_offsets, A_col_widths,
+        B_list, B_sc_list);
+    TORCH_CHECK(
+        B_list.size() == 2,
+        "split2 H dgrad expects exactly 2 B tensors");
+    check_output_matrix(D_out, "D_out", A_full.size(0), B_list[0].size(0));
+    const int64_t M = D_out.size(0);
+    const int64_t N = D_out.size(1);
+    TORCH_CHECK(
+        config_idx == -1 || config_idx == 5,
+        "split2 H dgrad supports only production config 5");
+    TORCH_CHECK(
+        M > 0 && N > 0 && M % 128 == 0 && N % 256 == 0,
+        "split2 H dgrad output must be divisible by 128x256");
+    TORCH_CHECK(
+        z.is_cuda() && z.is_contiguous() &&
+            z.scalar_type() == at::kBFloat16 && z.sizes() == D_out.sizes(),
+        "split2 H z must match D_out bf16 [M,N]");
+    TORCH_CHECK(
+        gamma.is_cuda() && gamma.is_contiguous() &&
+            gamma.scalar_type() == at::kBFloat16 && gamma.dim() == 1 &&
+            gamma.numel() == N,
+        "split2 H gamma must be contiguous CUDA bf16 [N]");
+    TORCH_CHECK(
+        r_tile.is_cuda() && r_tile.is_contiguous() &&
+            r_tile.scalar_type() == at::kFloat &&
+            r_tile.sizes() == at::IntArrayRef({M / 128, N / 128}),
+        "split2 H r_tile must be contiguous CUDA fp32 [M/128,N/128]");
+    TORCH_CHECK(
+        dgamma_partial.is_cuda() && dgamma_partial.is_contiguous() &&
+            dgamma_partial.scalar_type() == at::kFloat &&
+            dgamma_partial.sizes() == at::IntArrayRef({M / 128, N}),
+        "split2 H dgamma_partial must be contiguous CUDA fp32 [M/128,N]");
+    TORCH_CHECK(
+        dgamma.is_cuda() && dgamma.is_contiguous() &&
+            dgamma.scalar_type() == at::kBFloat16 && dgamma.dim() == 1 &&
+            dgamma.numel() == N,
+        "split2 H dgamma must be contiguous CUDA bf16 [N]");
+    kittens::py::device_check(
+        A_full, z, gamma, r_tile, D_out, dgamma_partial, dgamma);
+    const c10::cuda::CUDAGuard device_guard(A_full.device());
+    launch_mxfp4_split2_dgrad_gemm_strided_onepass_with_config<
+        mxfp4_onepass_cfg5_h>(
+        A_full,
+        A_sc_list,
+        A_col_offsets,
+        A_col_widths,
+        B_list,
+        B_sc_list,
+        D_out,
+        &z,
+        &gamma,
+        &r_tile,
+        &dgamma_partial);
+    const auto stream = at::cuda::getCurrentCUDAStream(A_full.get_device());
+    mxfp4_h_dgamma_reduce_kernel<<<
+        (N + 255) / 256, 256, 0, stream>>>(
+        dgamma_partial.data_ptr<float>(),
+        reinterpret_cast<bf16*>(dgamma.data_ptr()),
+        M / 128,
+        N);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
 void mxfp4_split3_dgrad_strided_onepass_gemm_entrypoint(
     const at::Tensor& A_full,
     const std::vector<at::Tensor>& A_sc_list,
@@ -2205,6 +2557,21 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           pybind11::arg("A"), pybind11::arg("A_sc"),
           pybind11::arg("B"), pybind11::arg("B_sc"),
           pybind11::arg("R"), pybind11::arg("D"));
+    m.def("mxfp4_h_residual_carrier", &mxfp4_h_residual_carrier_entrypoint,
+          "MXFP4 residual GEMM with direct 128x128 tile-RMS row/column carrier",
+          pybind11::arg("A"), pybind11::arg("A_sc"),
+          pybind11::arg("B"), pybind11::arg("B_sc"),
+          pybind11::arg("R"), pybind11::arg("gamma"),
+          pybind11::arg("z_out"), pybind11::arg("row_fp4"),
+          pybind11::arg("row_sc"), pybind11::arg("col_fp4"),
+          pybind11::arg("col_sc"), pybind11::arg("r_tile"),
+          pybind11::arg("eps") = 1.0e-5);
+    m.def("mxfp4_h_tile_backward", &mxfp4_h_tile_backward_entrypoint,
+          "Native MX H tile-RMS backward and deterministic dgamma reduction",
+          pybind11::arg("du"), pybind11::arg("z"),
+          pybind11::arg("gamma"), pybind11::arg("r_tile"),
+          pybind11::arg("dx"), pybind11::arg("dgamma_partial"),
+          pybind11::arg("dgamma"));
     m.def("mxfp4_gemm_residual_config", &mxfp4_gemm_residual_config_entrypoint,
           "Dense GEMM with fused bf16 residual add and explicit kernel config",
           pybind11::arg("A"), pybind11::arg("A_sc"),
@@ -2431,6 +2798,22 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           pybind11::arg("B_list"),
           pybind11::arg("B_sc_list"),
           pybind11::arg("D_out"),
+          pybind11::arg("config_idx") = -1);
+    m.def("mxfp4_split2_dgrad_strided_onepass_h_gemm",
+          &mxfp4_split2_dgrad_strided_onepass_h_gemm_entrypoint,
+          "MXFP4 split2 one-pass dgrad with fused H tile backward",
+          pybind11::arg("A_full"),
+          pybind11::arg("A_sc_list"),
+          pybind11::arg("A_col_offsets"),
+          pybind11::arg("A_col_widths"),
+          pybind11::arg("B_list"),
+          pybind11::arg("B_sc_list"),
+          pybind11::arg("z"),
+          pybind11::arg("gamma"),
+          pybind11::arg("r_tile"),
+          pybind11::arg("D_out"),
+          pybind11::arg("dgamma_partial"),
+          pybind11::arg("dgamma"),
           pybind11::arg("config_idx") = -1);
     m.def("mxfp4_split3_dgrad_strided_onepass_gemm",
           &mxfp4_split3_dgrad_strided_onepass_gemm_entrypoint,
