@@ -1080,7 +1080,8 @@ static void nvfp4_check_rope_packed_args(
     }
 }
 
-__global__ void nvfp4_inverse_rope_packed_qk_kernel(
+template <bool INVERSE>
+__global__ void nvfp4_rope_packed_qk_kernel(
     const __nv_bfloat16* q,
     const __nv_bfloat16* k,
     __nv_bfloat16* q_out,
@@ -1104,8 +1105,13 @@ __global__ void nvfp4_inverse_rope_packed_qk_kernel(
             const float x = __bfloat162float(q[elem]);
             const float y = __bfloat162float(q[elem + 1]);
             const float2 cs = rope_cs[rope_row + (pair_col & pair_mask)];
-            q_out[elem] = __float2bfloat16_rn(__fmaf_rn(y, cs.y, x * cs.x));
-            q_out[elem + 1] = __float2bfloat16_rn(__fmaf_rn(-x, cs.y, y * cs.x));
+            if constexpr (INVERSE) {
+                q_out[elem] = __float2bfloat16_rn(__fmaf_rn(y, cs.y, x * cs.x));
+                q_out[elem + 1] = __float2bfloat16_rn(__fmaf_rn(-x, cs.y, y * cs.x));
+            } else {
+                q_out[elem] = __float2bfloat16_rn(__fmaf_rn(-y, cs.y, x * cs.x));
+                q_out[elem + 1] = __float2bfloat16_rn(__fmaf_rn(x, cs.y, y * cs.x));
+            }
         }
         const int64_t k_row = row * k_dim;
         for (int64_t pair_col = threadIdx.x; pair_col < k_pairs_per_row;
@@ -1114,13 +1120,19 @@ __global__ void nvfp4_inverse_rope_packed_qk_kernel(
             const float x = __bfloat162float(k[elem]);
             const float y = __bfloat162float(k[elem + 1]);
             const float2 cs = rope_cs[rope_row + (pair_col & pair_mask)];
-            k_out[elem] = __float2bfloat16_rn(__fmaf_rn(y, cs.y, x * cs.x));
-            k_out[elem + 1] = __float2bfloat16_rn(__fmaf_rn(-x, cs.y, y * cs.x));
+            if constexpr (INVERSE) {
+                k_out[elem] = __float2bfloat16_rn(__fmaf_rn(y, cs.y, x * cs.x));
+                k_out[elem + 1] = __float2bfloat16_rn(__fmaf_rn(-x, cs.y, y * cs.x));
+            } else {
+                k_out[elem] = __float2bfloat16_rn(__fmaf_rn(-y, cs.y, x * cs.x));
+                k_out[elem + 1] = __float2bfloat16_rn(__fmaf_rn(x, cs.y, y * cs.x));
+            }
         }
     }
 }
 
-void nvfp4_inverse_rope_packed_qk_entrypoint(
+template <bool INVERSE>
+void nvfp4_rope_packed_qk_entrypoint(
     const at::Tensor &q,
     const at::Tensor &k,
     const at::Tensor &rope_cs,
@@ -1166,7 +1178,7 @@ void nvfp4_inverse_rope_packed_qk_entrypoint(
     constexpr int threads = 256;
     const int blocks = static_cast<int>(std::min<int64_t>(q.size(0), 65535));
     auto stream = at::cuda::getCurrentCUDAStream();
-    nvfp4_inverse_rope_packed_qk_kernel<<<blocks, threads, 0, stream>>>(
+    nvfp4_rope_packed_qk_kernel<INVERSE><<<blocks, threads, 0, stream>>>(
         reinterpret_cast<const __nv_bfloat16*>(q.data_ptr<at::BFloat16>()),
         reinterpret_cast<const __nv_bfloat16*>(k.data_ptr<at::BFloat16>()),
         reinterpret_cast<__nv_bfloat16*>(q_out.data_ptr<at::BFloat16>()),
@@ -1175,6 +1187,32 @@ void nvfp4_inverse_rope_packed_qk_entrypoint(
         q.size(0), q.size(1), k.size(1),
         static_cast<int>(rope_head_dim / 2), static_cast<int>(rope_seq_len - 1));
     C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+void nvfp4_forward_rope_packed_qk_entrypoint(
+    const at::Tensor &q,
+    const at::Tensor &k,
+    const at::Tensor &rope_cs,
+    int64_t rope_seq_len,
+    int64_t rope_head_dim,
+    at::Tensor &q_out,
+    at::Tensor &k_out
+) {
+    nvfp4_rope_packed_qk_entrypoint<false>(
+        q, k, rope_cs, rope_seq_len, rope_head_dim, q_out, k_out);
+}
+
+void nvfp4_inverse_rope_packed_qk_entrypoint(
+    const at::Tensor &q,
+    const at::Tensor &k,
+    const at::Tensor &rope_cs,
+    int64_t rope_seq_len,
+    int64_t rope_head_dim,
+    at::Tensor &q_out,
+    at::Tensor &k_out
+) {
+    nvfp4_rope_packed_qk_entrypoint<true>(
+        q, k, rope_cs, rope_seq_len, rope_head_dim, q_out, k_out);
 }
 
 template <typename C>
@@ -2857,6 +2895,11 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           pybind11::arg("rope_head_dim"), pybind11::arg("rope_rotary_dim"));
     m.def("nvfp4_inverse_rope_packed_qk", &nvfp4_inverse_rope_packed_qk_entrypoint,
           "Apply inverse packed RoPE to contiguous bf16 Q/K in one CUDA launch",
+          pybind11::arg("q"), pybind11::arg("k"), pybind11::arg("rope_cs"),
+          pybind11::arg("rope_seq_len"), pybind11::arg("rope_head_dim"),
+          pybind11::arg("q_out"), pybind11::arg("k_out"));
+    m.def("nvfp4_forward_rope_packed_qk", &nvfp4_forward_rope_packed_qk_entrypoint,
+          "Apply forward packed RoPE to contiguous bf16 Q/K in one CUDA launch",
           pybind11::arg("q"), pybind11::arg("k"), pybind11::arg("rope_cs"),
           pybind11::arg("rope_seq_len"), pybind11::arg("rope_head_dim"),
           pybind11::arg("q_out"), pybind11::arg("k_out"));
