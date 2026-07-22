@@ -24,7 +24,8 @@ template <
     bool _ROPE_LIVE64_RHT32 = false,
     bool _FUSE_RESIDUAL = false,
     bool _OUTPUT_SCALE = false,
-    bool _FUSE_H_MX_CARRIER = false
+    bool _FUSE_H_MX_CARRIER = false,
+    bool _FUSE_C1_RMS_CTA = false
 >
 struct config {
     static_assert(_Nb == 128 || _Nb == 256, "Nb must be 128 or 256");
@@ -56,10 +57,17 @@ struct config {
     static constexpr bool FUSE_RESIDUAL = _FUSE_RESIDUAL;
     static constexpr bool OUTPUT_SCALE = _OUTPUT_SCALE;
     static constexpr bool FUSE_H_MX_CARRIER = _FUSE_H_MX_CARRIER;
+    static constexpr bool FUSE_C1_RMS_CTA = _FUSE_C1_RMS_CTA;
     static_assert(
         !FUSE_H_MX_CARRIER ||
             (_FUSE_RESIDUAL && !_OVERLAP_EPI && _Nb == 256),
         "H MX carrier requires residual, retained epilogue, and Nb=256");
+    static_assert(
+        !FUSE_C1_RMS_CTA ||
+            (_FUSE_RESIDUAL && !_OVERLAP_EPI && _Nb == 256),
+        "exact row RMS carrier requires residual, retained epilogue, and Nb=256");
+    static_assert(!(FUSE_H_MX_CARRIER && FUSE_C1_RMS_CTA),
+                  "exact row RMS and tile RMS carriers are distinct epilogues");
     static constexpr int B_SC_SIZE = Nb/128;
     static constexpr int MMA_PER_TILE = Kb/128;
 
@@ -118,6 +126,8 @@ struct globals {
     mxfp4_rope_epilogue::rope_desc rope;
     mxfp4_rope_epilogue::rope_live64_desc rope_live64;
     const float* output_scale;     // optional scalar epilogue multiplier
+    float* row_rms_partial;        // optional [M,N/256] BF16-output row sumsq
+    int row_rms_partial_stride;
     uint8_t* h_row_fp4;            // H row payload [M,N/2]
     uint8_t* h_row_sc;             // H row E8M0 [M/128,N/128,32,16]
     uint8_t* h_col_fp4;            // H column payload [N,M/2]
@@ -240,6 +250,57 @@ __device__ inline void maybe_add_residual_tile(
     }
 }
 
+template <typename C, typename RT>
+__device__ inline void accumulate_c1_cta_row_rms_partial(
+    const globals<C>& g,
+    const RT& D_reg,
+    float* scratch,
+    bool initialize,
+    bool finalize,
+    int row_tile,
+    int col_block
+) {
+    if constexpr (C::FUSE_C1_RMS_CTA) {
+        rt_fl<RT::rows, RT::cols> D_fl;
+        rt_fl<RT::rows, RT::cols> D_sq;
+        typename decltype(D_fl)::col_vec row_sums;
+        warp::copy(D_fl, D_reg);
+        warp::mul(D_sq, D_fl, D_fl);
+        warp::row_sum(row_sums, D_sq);
+        const int lane = warp::laneid();
+        const int warp_row_base =
+            row_tile * (C::Mb / 2) +
+            warpgroup::warpid() * decltype(row_sums)::length;
+        const int scratch_base =
+            warpgroup::warpid() * decltype(row_sums)::length;
+        if ((lane & 3) == 0) {
+            #pragma unroll
+            for (int i = 0; i < decltype(row_sums)::outer_dim; ++i) {
+                const int row_x = warp_row_base + i * 16 + lane / 4;
+                const int row_y = row_x + 8;
+                const int scratch_x = scratch_base + i * 16 + lane / 4;
+                const int scratch_y = scratch_x + 8;
+                const float sum_x = row_sums[i][0].x;
+                const float sum_y = row_sums[i][0].y;
+                if (finalize) {
+                    g.row_rms_partial[
+                        row_x * g.row_rms_partial_stride + col_block] =
+                        initialize ? sum_x : scratch[scratch_x] + sum_x;
+                    g.row_rms_partial[
+                        row_y * g.row_rms_partial_stride + col_block] =
+                        initialize ? sum_y : scratch[scratch_y] + sum_y;
+                } else if (initialize) {
+                    scratch[scratch_x] = sum_x;
+                    scratch[scratch_y] = sum_y;
+                } else {
+                    scratch[scratch_x] += sum_x;
+                    scratch[scratch_y] += sum_y;
+                }
+            }
+        }
+    }
+}
+
 template <typename C>
 __device__ inline void kernel(const globals<C> &g) {
     using G = globals<C>;
@@ -291,6 +352,8 @@ __device__ inline void kernel(const globals<C> &g) {
         [C::FUSE_H_MX_CARRIER ? WARPGROUP_WARPS : 1]
         [C::FUSE_H_MX_CARRIER ? C::Nb / C::EPI_PIPE_DEPTH / 2 : 1]
         [C::FUSE_H_MX_CARRIER ? 33 : 1];
+    __shared__ float c1_row_sums[
+        C::FUSE_C1_RMS_CTA ? C::Mb / 2 : 1];
     if (threadIdx.x == 32) {
         init_semaphore(tmem_provisioned, 0, 1);
         #pragma unroll
@@ -723,6 +786,13 @@ __device__ inline void kernel(const globals<C> &g) {
                     warpgroup::store(output_tiles.D[smem_slot], D_reg[i]);
                     warpgroup::sync(1);
                     warpgroup::tma::store_async<dim::ROW, cache_policy::EVICT_FIRST>(g.D, output_tiles.D[smem_slot], {row_block_idx * 2 + cta_id, col_block_idx * C::EPI_PIPE_DEPTH + i});
+                    if constexpr (C::FUSE_C1_RMS_CTA) {
+                        accumulate_c1_cta_row_rms_partial<C>(
+                            g, D_reg[i], c1_row_sums,
+                            i == 0, i == C::EPI_PIPE_DEPTH - 1,
+                            row_block_idx * 2 + cta_id,
+                            col_block_idx);
+                    }
                 }
             }
             update_phasebit<0>(phasebits, 0);
