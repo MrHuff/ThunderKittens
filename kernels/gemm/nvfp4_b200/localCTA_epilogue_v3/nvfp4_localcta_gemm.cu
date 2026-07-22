@@ -1,4 +1,5 @@
 #include <torch/extension.h>
+#include <ATen/MemoryOverlap.h>
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAGuard.h>
 
@@ -39,6 +40,8 @@ using localcta_fast_smallk_config = nvfp4_gemm::config<256, 5, 8, 4, 2, false>;
 using localcta_fast_largek_config = nvfp4_gemm::config<256, 5, 8, 12, 2, false>;
 using localcta_fast_smallk_residual_config = nvfp4_gemm::config<256, 5, 8, 4, 2, false, 256, true, 2, 256, false, true>;
 using localcta_fast_largek_residual_config = nvfp4_gemm::config<256, 5, 8, 12, 2, false, 256, true, 2, 256, false, true>;
+using localcta_fast_smallk_residual_rms_config = nvfp4_gemm::config<256, 5, 8, 4, 2, false, 256, true, 2, 256, false, true, false, true, true>;
+using localcta_fast_largek_residual_rms_config = nvfp4_gemm::config<256, 5, 8, 12, 2, false, 256, true, 2, 256, false, true, false, true, true>;
 using localcta_fast_smallk_h_config = nvfp4_gemm::config<256, 5, 8, 4, 2, false, 256, true, 2, 256, false, true, true>;
 using localcta_fast_largek_h_config = nvfp4_gemm::config<256, 5, 8, 12, 2, false, 256, true, 2, 256, false, true, true>;
 using localcta_fast_grouped_config = nvfp4_gemm::config<256, 5, 8, 4, 2, false>;
@@ -1248,7 +1251,8 @@ void launch_fast_gemm_with_config_residual(
     const at::Tensor& B_sc_prepared,
     const at::Tensor& B_sg_tiles,
     const at::Tensor& R,
-    at::Tensor& D
+    at::Tensor& D,
+    at::Tensor* row_rms_partial = nullptr
 ) {
     using G = nvfp4_gemm::globals<C>;
     auto one = get_unit_scale_tensor(A);
@@ -1280,7 +1284,11 @@ void launch_fast_gemm_with_config_residual(
         .a_sg_stride = has_tile_scales ? a_sg_desc.stride : 1,
         .b_sg_per_tile = has_tile_scales ? b_sg_desc.ptr : nullptr,
         .b_sg_stride = has_tile_scales ? b_sg_desc.stride : 1,
-        .silu_dim = 0
+        .silu_dim = 0,
+        .row_rms_partial = row_rms_partial == nullptr
+            ? nullptr : row_rms_partial->data_ptr<float>(),
+        .row_rms_partial_stride = row_rms_partial == nullptr
+            ? 0 : static_cast<int>(row_rms_partial->size(1))
     };
     auto r_gl = kittens::py::tensor_to_gl<typename G::D_gl>(R);
     std::memcpy(&g.R_tma, &r_gl.tma_descs.tma_desc, sizeof(CUtensorMap));
@@ -1624,6 +1632,29 @@ void launch_fast_regular_gemm_residual(
     } else {
         launch_fast_gemm_with_config_residual<localcta_fast_largek_residual_config>(
             A, A_sc_prepared, A_sg_tiles, B, B_sc_prepared, B_sg_tiles, R, D);
+    }
+}
+
+void launch_fast_regular_gemm_residual_rms(
+    const at::Tensor& A,
+    const at::Tensor& A_sc_prepared,
+    const at::Tensor& A_sg_tiles,
+    const at::Tensor& B,
+    const at::Tensor& B_sc_prepared,
+    const at::Tensor& B_sg_tiles,
+    const at::Tensor& R,
+    at::Tensor& D,
+    at::Tensor& row_rms_partial
+) {
+    const int64_t K = A.size(1) * 2;
+    if (K <= 2048) {
+        launch_fast_gemm_with_config_residual<localcta_fast_smallk_residual_rms_config>(
+            A, A_sc_prepared, A_sg_tiles, B, B_sc_prepared, B_sg_tiles,
+            R, D, &row_rms_partial);
+    } else {
+        launch_fast_gemm_with_config_residual<localcta_fast_largek_residual_rms_config>(
+            A, A_sc_prepared, A_sg_tiles, B, B_sc_prepared, B_sg_tiles,
+            R, D, &row_rms_partial);
     }
 }
 
@@ -4163,6 +4194,59 @@ void nvfp4_localcta_gemm_residual_entrypoint(
     launch_fast_regular_gemm_residual(A, A_sc, A_sg_outer, B, B_sc, B_sg_outer, R, D);
 }
 
+void nvfp4_localcta_gemm_residual_rms_entrypoint(
+    const at::Tensor& A,
+    const at::Tensor& A_sc,
+    const at::Tensor& A_sg_chunks,
+    const at::Tensor& B,
+    const at::Tensor& B_sc,
+    const at::Tensor& B_sg_chunks,
+    const at::Tensor& R,
+    at::Tensor& D,
+    at::Tensor& row_rms_partial
+) {
+    const auto sg_contract = infer_regular_sg_contract(
+        A, A_sg_chunks, B, B_sg_chunks);
+    TORCH_CHECK(
+        sg_contract == SGContractMode::OuterScale,
+        "localCTA exact residual RMS requires the v4 outer-SG contract");
+    auto A_sg_outer = normalize_outer_scale_tiles_tensor(
+        A_sg_chunks, A.size(0) / 256, true);
+    auto B_sg_outer = normalize_outer_scale_tiles_tensor(
+        B_sg_chunks, B.size(0) / 256, false);
+    check_v3_fast_gemm_inputs(
+        A, A_sc, A_sg_outer, B, B_sc, B_sg_outer);
+    const int64_t M = A.size(0);
+    const int64_t N = B.size(0);
+    check_output_matrix(R, "R", M, N);
+    check_output_matrix(D, "D", M, N);
+    TORCH_CHECK(
+        N <= 4096 && N % 32 == 0,
+        "localCTA exact residual RMS requires 32-aligned N <= 4096");
+    TORCH_CHECK(
+        row_rms_partial.is_cuda() && row_rms_partial.is_contiguous() &&
+            row_rms_partial.scalar_type() == at::kFloat &&
+            row_rms_partial.dim() == 2 &&
+            row_rms_partial.size(0) == M &&
+            row_rms_partial.size(1) == N / 256,
+        "row_rms_partial must be contiguous CUDA float32 [M,N/256]");
+    kittens::py::device_check(
+        A, A_sc, A_sg_outer, B, B_sc, B_sg_outer,
+        R, D, row_rms_partial);
+    at::assert_no_overlap(row_rms_partial, A);
+    at::assert_no_overlap(row_rms_partial, A_sc);
+    at::assert_no_overlap(row_rms_partial, A_sg_outer);
+    at::assert_no_overlap(row_rms_partial, B);
+    at::assert_no_overlap(row_rms_partial, B_sc);
+    at::assert_no_overlap(row_rms_partial, B_sg_outer);
+    at::assert_no_overlap(row_rms_partial, R);
+    at::assert_no_overlap(row_rms_partial, D);
+    const c10::cuda::CUDAGuard device_guard(A.device());
+    launch_fast_regular_gemm_residual_rms(
+        A, A_sc, A_sg_outer, B, B_sc, B_sg_outer,
+        R, D, row_rms_partial);
+}
+
 void nvfp4_localcta_h_residual_carrier_entrypoint(
     const at::Tensor& A,
     const at::Tensor& A_sc,
@@ -5634,6 +5718,13 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           pybind11::arg("A"), pybind11::arg("A_sc"), pybind11::arg("A_sg_chunks"),
           pybind11::arg("B"), pybind11::arg("B_sc"), pybind11::arg("B_sg_chunks"),
           pybind11::arg("R"), pybind11::arg("D"));
+    m.def("nvfp4_localcta_gemm_residual_rms",
+          &nvfp4_localcta_gemm_residual_rms_entrypoint,
+          "localCTA v4 residual GEMM with exact-row RMS partials",
+          pybind11::arg("A"), pybind11::arg("A_sc"), pybind11::arg("A_sg_chunks"),
+          pybind11::arg("B"), pybind11::arg("B_sc"), pybind11::arg("B_sg_chunks"),
+          pybind11::arg("R"), pybind11::arg("D"),
+          pybind11::arg("row_rms_partial"));
     m.def("nvfp4_localcta_h_residual_carrier",
           &nvfp4_localcta_h_residual_carrier_entrypoint,
           "localCTA residual GEMM plus native 128x128 tile-RMS carrier",

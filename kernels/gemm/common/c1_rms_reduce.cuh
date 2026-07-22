@@ -47,7 +47,7 @@ inline void row_rms_reduce_entrypoint(
                 "row_rms_partial must be contiguous CUDA tensor");
     TORCH_CHECK(row_rms_partial.scalar_type() == at::kFloat &&
                     row_rms_partial.dim() == 2,
-                "row_rms_partial must be float32 [M,N/32]");
+                "row_rms_partial must be float32 [M,P]");
     TORCH_CHECK(coeff.is_cuda() && coeff.is_contiguous() &&
                     coeff.scalar_type() == at::kFloat && coeff.dim() == 1,
                 "coeff must be contiguous CUDA float32 [M]");
@@ -55,10 +55,12 @@ inline void row_rms_reduce_entrypoint(
                 "coeff length must match row_rms_partial rows");
     TORCH_CHECK(hidden_size > 0 && hidden_size % 32 == 0,
                 "hidden_size must be a positive multiple of 32");
-    TORCH_CHECK(row_rms_partial.size(1) == hidden_size / 32,
-                "row_rms_partial columns must equal hidden_size / 32");
+    TORCH_CHECK(row_rms_partial.size(1) > 0 &&
+                    row_rms_partial.size(1) <= hidden_size / 32 &&
+                    hidden_size % row_rms_partial.size(1) == 0,
+                "row_rms_partial columns must evenly partition hidden_size");
     TORCH_CHECK(row_rms_partial.size(1) <= 128,
-                "warp reducer supports hidden_size <= 4096");
+                "warp reducer supports at most 128 partial columns");
     TORCH_CHECK(std::isfinite(eps) && eps >= 0.0,
                 "eps must be finite and non-negative");
     TORCH_CHECK(row_rms_partial.get_device() == coeff.get_device(),

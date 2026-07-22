@@ -26,7 +26,8 @@ template <
     bool _ROPE_LIVE64 = false,
     bool _FUSE_RESIDUAL = false,
     bool _FUSE_H_NV_CARRIER = false,
-    bool _FUSE_C1_RMS = false
+    bool _FUSE_C1_RMS = false,
+    bool _FUSE_C1_RMS_CTA = false
 >
 struct config {
     static_assert(_Nb == 128 || _Nb == 256, "Nb must be 128 or 256");
@@ -63,6 +64,7 @@ struct config {
     static constexpr bool FUSE_RESIDUAL = _FUSE_RESIDUAL;
     static constexpr bool FUSE_H_NV_CARRIER = _FUSE_H_NV_CARRIER;
     static constexpr bool FUSE_C1_RMS = _FUSE_C1_RMS;
+    static constexpr bool FUSE_C1_RMS_CTA = _FUSE_C1_RMS_CTA;
     static_assert(
         !FUSE_H_NV_CARRIER ||
             (FUSE_RESIDUAL && !_OVERLAP_EPI && _Nb == 256 &&
@@ -70,6 +72,10 @@ struct config {
         "H NV carrier requires residual and 256 columns in eight slices");
     static_assert(!(FUSE_H_NV_CARRIER && FUSE_C1_RMS),
                   "exact row RMS and tile RMS carriers are distinct epilogues");
+    static_assert(
+        !FUSE_C1_RMS_CTA ||
+            (FUSE_C1_RMS && FUSE_RESIDUAL && !OVERLAP_EPI),
+        "CTA row RMS reduction requires the non-overlapped residual epilogue");
 
     // Output cache policy for TMA stores
     static constexpr auto D_CACHE_POLICY = cache_policy::EVICT_FIRST;
@@ -157,7 +163,7 @@ struct globals {
     const bf16* h_gamma;           // post-tile-RMS gamma [N]
     int h_cols;
     float h_eps;
-    float* row_rms_partial;        // [M,N/32] BF16-output partial sumsq
+    float* row_rms_partial;        // BF16-output row sumsq partials
     int row_rms_partial_stride;
 
     struct input_tiles_t {
@@ -390,6 +396,52 @@ __device__ inline void write_c1_row_rms_partial(
                     row_sums[i][0].x;
                 g.row_rms_partial[
                     row_y * g.row_rms_partial_stride + col_tile] =
+                    row_sums[i][0].y;
+            }
+        }
+    }
+}
+
+template <typename C, typename RT, typename RV>
+__device__ inline void accumulate_c1_cta_row_rms_partial(
+    const RT& D_reg,
+    RV& row_sums,
+    bool initialize
+) {
+    if constexpr (C::FUSE_C1_RMS_CTA) {
+        rt_fl<RT::rows, RT::cols> D_fl;
+        rt_fl<RT::rows, RT::cols> D_sq;
+        warp::copy(D_fl, D_reg);
+        warp::mul(D_sq, D_fl, D_fl);
+        if (initialize) {
+            warp::row_sum(row_sums, D_sq);
+        } else {
+            warp::row_sum(row_sums, D_sq, row_sums);
+        }
+    }
+}
+
+template <typename C, typename RV>
+__device__ inline void write_c1_cta_row_rms_partial(
+    const globals<C>& g,
+    const RV& row_sums,
+    int row_tile,
+    int col_block
+) {
+    if constexpr (C::FUSE_C1_RMS_CTA) {
+        const int lane = warp::laneid();
+        const int warp_row_base =
+            row_tile * (C::Mb / 2) + warpgroup::warpid() * RV::length;
+        if ((lane & 3) == 0) {
+            #pragma unroll
+            for (int i = 0; i < RV::outer_dim; ++i) {
+                const int row_x = warp_row_base + i * 16 + lane / 4;
+                const int row_y = row_x + 8;
+                g.row_rms_partial[
+                    row_x * g.row_rms_partial_stride + col_block] =
+                    row_sums[i][0].x;
+                g.row_rms_partial[
+                    row_y * g.row_rms_partial_stride + col_block] =
                     row_sums[i][0].y;
             }
         }
@@ -810,6 +862,9 @@ __device__ inline void kernel_impl(const globals<C> &g) {
                 }
             } else {
                 rt_bf<C::Mb / 8, C::Nb/C::EPI_PIPE_DEPTH> D_reg[C::EPI_PIPE_DEPTH];
+                using c1_slice_t =
+                    rt_fl<C::Mb / 8, C::Nb / C::EPI_PIPE_DEPTH>;
+                typename c1_slice_t::col_vec c1_cta_row_sums;
                 #pragma unroll
                 for (int i = 0; i < C::EPI_PIPE_DEPTH; i++) {
                     rt_fl<C::Mb / 8, C::Nb/C::EPI_PIPE_DEPTH> D_reg_fl;
@@ -838,10 +893,12 @@ __device__ inline void kernel_impl(const globals<C> &g) {
                         residual_load_arrived, residual_load_phase,
                         row_block_idx * 2 + cta_id,
                         C::EPI_PIPE_DEPTH * col_block_idx + i);
-                    write_c1_row_rms_partial<C>(
-                        g, D_reg[i],
-                        row_block_idx * 2 + cta_id,
-                        C::EPI_PIPE_DEPTH * col_block_idx + i);
+                    if constexpr (!C::FUSE_C1_RMS_CTA) {
+                        write_c1_row_rms_partial<C>(
+                            g, D_reg[i],
+                            row_block_idx * 2 + cta_id,
+                            C::EPI_PIPE_DEPTH * col_block_idx + i);
+                    }
                     warpgroup::store(output_tiles.D[i%C::NUM_D_TILES], D_reg[i]);
                     warpgroup::sync(1);
                     if (g.use_split_D) {
@@ -859,7 +916,14 @@ __device__ inline void kernel_impl(const globals<C> &g) {
                     } else {
                         warpgroup::tma::store_async<dim::ROW, C::D_CACHE_POLICY>(g.D, output_tiles.D[i%C::NUM_D_TILES], {row_block_idx*2 + cta_id, C::EPI_PIPE_DEPTH*col_block_idx + i});
                     }
+                    if constexpr (C::FUSE_C1_RMS_CTA) {
+                        accumulate_c1_cta_row_rms_partial<C>(
+                            D_reg[i], c1_cta_row_sums, i == 0);
+                    }
                 }
+                write_c1_cta_row_rms_partial<C>(
+                    g, c1_cta_row_sums,
+                    row_block_idx * 2 + cta_id, col_block_idx);
             }
             update_phasebit<0>(phasebits, 0);
         }
