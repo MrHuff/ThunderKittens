@@ -27,7 +27,8 @@ template <
     bool _FUSE_RESIDUAL = false,
     bool _FUSE_H_NV_CARRIER = false,
     bool _FUSE_C1_RMS = false,
-    bool _FUSE_C1_RMS_CTA = false
+    bool _FUSE_C1_RMS_CTA = false,
+    bool _PIPELINE_RESIDUAL = false
 >
 struct config {
     static_assert(_Nb == 128 || _Nb == 256, "Nb must be 128 or 256");
@@ -65,6 +66,7 @@ struct config {
     static constexpr bool FUSE_H_NV_CARRIER = _FUSE_H_NV_CARRIER;
     static constexpr bool FUSE_C1_RMS = _FUSE_C1_RMS;
     static constexpr bool FUSE_C1_RMS_CTA = _FUSE_C1_RMS_CTA;
+    static constexpr bool PIPELINE_RESIDUAL = _PIPELINE_RESIDUAL;
     static_assert(
         !FUSE_H_NV_CARRIER ||
             (FUSE_RESIDUAL && !_OVERLAP_EPI && _Nb == 256 &&
@@ -76,6 +78,10 @@ struct config {
         !FUSE_C1_RMS_CTA ||
             (FUSE_C1_RMS && FUSE_RESIDUAL && !OVERLAP_EPI),
         "CTA row RMS reduction requires the non-overlapped residual epilogue");
+    static_assert(
+        !PIPELINE_RESIDUAL ||
+            (FUSE_RESIDUAL && !OVERLAP_EPI && !FUSE_H_NV_CARRIER),
+        "residual prefetch pipeline requires the ordinary non-overlapped residual epilogue");
 
     // Output cache policy for TMA stores
     static constexpr auto D_CACHE_POLICY = cache_policy::EVICT_FIRST;
@@ -105,6 +111,14 @@ struct tma_dev_proxy {
     __device__ inline void prefetch() const {
         asm volatile("{prefetch.tensormap [%0];}" :: "l"(reinterpret_cast<uint64_t>(dev_tma)) : "memory");
     }
+};
+
+template <typename Tile, bool Enabled>
+struct residual_tiles_storage {};
+
+template <typename Tile>
+struct residual_tiles_storage<Tile, true> {
+    Tile R[2];
 };
 
 template <typename C>
@@ -174,7 +188,7 @@ struct globals {
         A_sc_tile A;
         B_sc_tile B[C::B_SC_SIZE];
     };
-    struct outputs_t {
+    struct outputs_t : residual_tiles_storage<D_tile, C::PIPELINE_RESIDUAL> {
         D_tile D[C::NUM_D_TILES];
     };
 
@@ -340,6 +354,42 @@ __device__ inline void apply_chunk_scales_to_stage(
 }
 
 template <typename C>
+__device__ inline void prefetch_residual_tile(
+    const globals<C> &g,
+    typename globals<C>::D_tile &smem_tile,
+    semaphore &residual_load_arrived,
+    int row_tile,
+    int col_tile
+) {
+    if constexpr (C::FUSE_RESIDUAL) {
+        tma_dev_proxy<typename globals<C>::D_gl> R_proxy(&g.R_tma);
+        if (warpgroup::warpid() == 0 && warp::laneid() == 0) {
+            tma::expect_bytes(residual_load_arrived, sizeof(typename globals<C>::D_tile));
+            tma::load_async(smem_tile, R_proxy, {row_tile, col_tile}, residual_load_arrived);
+        }
+    }
+}
+
+template <typename C>
+__device__ inline void add_prefetched_residual_tile(
+    typename globals<C>::D_tile &smem_tile,
+    rt_bf<C::Mb / 8, C::Nb / C::EPI_PIPE_DEPTH> &D_reg,
+    semaphore &residual_load_arrived,
+    uint32_t &residual_load_phase
+) {
+    if constexpr (C::FUSE_RESIDUAL) {
+        wait(residual_load_arrived, residual_load_phase);
+        residual_load_phase ^= 1;
+        warpgroup::sync(1);
+
+        rt_bf<C::Mb / 8, C::Nb / C::EPI_PIPE_DEPTH> R_reg;
+        warpgroup::load(R_reg, smem_tile);
+        warpgroup::sync(1);
+        warp::add(D_reg, D_reg, R_reg);
+    }
+}
+
+template <typename C>
 __device__ inline void maybe_add_residual_tile(
     const globals<C> &g,
     typename globals<C>::D_tile &smem_tile,
@@ -349,22 +399,11 @@ __device__ inline void maybe_add_residual_tile(
     int row_tile,
     int col_tile
 ) {
-    if constexpr (!C::FUSE_RESIDUAL) {
-        return;
-    } else {
-        tma_dev_proxy<typename globals<C>::D_gl> R_proxy(&g.R_tma);
-        if (warpgroup::warpid() == 0 && warp::laneid() == 0) {
-            tma::expect_bytes(residual_load_arrived, sizeof(typename globals<C>::D_tile));
-            tma::load_async(smem_tile, R_proxy, {row_tile, col_tile}, residual_load_arrived);
-        }
-        wait(residual_load_arrived, residual_load_phase);
-        residual_load_phase ^= 1;
-        warpgroup::sync(1);
-
-        rt_bf<C::Mb / 8, C::Nb / C::EPI_PIPE_DEPTH> R_reg;
-        warpgroup::load(R_reg, smem_tile);
-        warpgroup::sync(1);
-        warp::add(D_reg, D_reg, R_reg);
+    if constexpr (C::FUSE_RESIDUAL) {
+        prefetch_residual_tile<C>(
+            g, smem_tile, residual_load_arrived, row_tile, col_tile);
+        add_prefetched_residual_tile<C>(
+            smem_tile, D_reg, residual_load_arrived, residual_load_phase);
     }
 }
 
@@ -501,7 +540,8 @@ __device__ inline void kernel_impl(const globals<C> &g) {
     __shared__ semaphore inputs_finished[C::LOAD_PIPE_DEPTH];
     __shared__ semaphore outputs_arrived;
     __shared__ semaphore outputs_finished;
-    __shared__ semaphore residual_load_arrived;
+    __shared__ semaphore residual_load_arrived[
+        C::PIPELINE_RESIDUAL ? 2 : 1];
     __shared__ float h_reduce[
         C::FUSE_H_NV_CARRIER ? WARPGROUP_WARPS + 1 : 1];
     if (threadIdx.x == 32) {
@@ -518,7 +558,10 @@ __device__ inline void kernel_impl(const globals<C> &g) {
         init_semaphore(outputs_arrived, 0, 1);
         init_semaphore(outputs_finished, 0, C::CLUSTER_SIZE);
         if constexpr (C::FUSE_RESIDUAL) {
-            init_semaphore(residual_load_arrived, 0, 1);
+            #pragma unroll
+            for (int i = 0; i < (C::PIPELINE_RESIDUAL ? 2 : 1); ++i) {
+                init_semaphore(residual_load_arrived[i], 0, 1);
+            }
         }
     }
     everyone::tma::cluster::arrive_aligned();
@@ -695,7 +738,7 @@ __device__ inline void kernel_impl(const globals<C> &g) {
         auto out_tm = tm_allocator.template allocate<full_tt_fl<C::Nb>>(0);
         const float default_a_sg = g.A_sc_global[{0}];
         const float default_b_sg = g.B_sc_global[{0}];
-        uint32_t residual_load_phase = 0;
+        uint32_t residual_load_phase[C::PIPELINE_RESIDUAL ? 2 : 1] = {};
 
         for (int block_idx = cluster_id; block_idx < num_blocks; block_idx += gridDim.x / C::CLUSTER_SIZE) {
             int supergroup_idx = block_idx / num_blocks_per_supergroup;
@@ -764,7 +807,7 @@ __device__ inline void kernel_impl(const globals<C> &g) {
                         warpgroup::sync(1);
                         maybe_add_residual_tile<C>(
                             g, output_tiles.D[slot], z[q],
-                            residual_load_arrived, residual_load_phase,
+                            residual_load_arrived[0], residual_load_phase[0],
                             row_tile,
                             C::EPI_PIPE_DEPTH * col_block_idx + i);
                         warpgroup::store(output_tiles.D[slot], z[q]);
@@ -831,7 +874,7 @@ __device__ inline void kernel_impl(const globals<C> &g) {
                         warp::copy(D_reg_bf, D_reg);
                         maybe_add_residual_tile<C>(
                             g, output_tiles.D[i%C::NUM_D_TILES], D_reg_bf,
-                            residual_load_arrived, residual_load_phase,
+                            residual_load_arrived[0], residual_load_phase[0],
                             row_block_idx * 2 + cta_id,
                             C::EPI_PIPE_DEPTH * col_block_idx + i);
                         write_c1_row_rms_partial<C>(
@@ -884,15 +927,41 @@ __device__ inline void kernel_impl(const globals<C> &g) {
                 tensor_before_thread_sync();
                 warpgroup::sync(1);
                 warpgroup::tma::cluster::arrive(outputs_finished, 0, 1); // signal CTA 0
+                if constexpr (C::PIPELINE_RESIDUAL) {
+                    #pragma unroll
+                    for (int i = 0; i < 2; ++i) {
+                        prefetch_residual_tile<C>(
+                            g, output_tiles.R[i], residual_load_arrived[i],
+                            row_block_idx * 2 + cta_id,
+                            C::EPI_PIPE_DEPTH * col_block_idx + i);
+                    }
+                }
                 #pragma unroll
                 for (int i = 0; i < C::EPI_PIPE_DEPTH; i++) {
                     warpgroup::tma::store_async_read_wait<C::NUM_D_TILES-1>();
                     warpgroup::sync(1);
-                    maybe_add_residual_tile<C>(
-                        g, output_tiles.D[i%C::NUM_D_TILES], D_reg[i],
-                        residual_load_arrived, residual_load_phase,
-                        row_block_idx * 2 + cta_id,
-                        C::EPI_PIPE_DEPTH * col_block_idx + i);
+                    if constexpr (C::PIPELINE_RESIDUAL) {
+                        constexpr int residual_pipe_depth = 2;
+                        const int slot = i % residual_pipe_depth;
+                        add_prefetched_residual_tile<C>(
+                            output_tiles.R[slot], D_reg[i],
+                            residual_load_arrived[slot],
+                            residual_load_phase[slot]);
+                        if (i + residual_pipe_depth < C::EPI_PIPE_DEPTH) {
+                            prefetch_residual_tile<C>(
+                                g, output_tiles.R[slot],
+                                residual_load_arrived[slot],
+                                row_block_idx * 2 + cta_id,
+                                C::EPI_PIPE_DEPTH * col_block_idx +
+                                    i + residual_pipe_depth);
+                        }
+                    } else {
+                        maybe_add_residual_tile<C>(
+                            g, output_tiles.D[i%C::NUM_D_TILES], D_reg[i],
+                            residual_load_arrived[0], residual_load_phase[0],
+                            row_block_idx * 2 + cta_id,
+                            C::EPI_PIPE_DEPTH * col_block_idx + i);
+                    }
                     if constexpr (!C::FUSE_C1_RMS_CTA) {
                         write_c1_row_rms_partial<C>(
                             g, D_reg[i],

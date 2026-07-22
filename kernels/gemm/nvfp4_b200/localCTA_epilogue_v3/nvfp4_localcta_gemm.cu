@@ -42,6 +42,8 @@ using localcta_fast_smallk_residual_config = nvfp4_gemm::config<256, 5, 8, 4, 2,
 using localcta_fast_largek_residual_config = nvfp4_gemm::config<256, 5, 8, 12, 2, false, 256, true, 2, 256, false, true>;
 using localcta_fast_smallk_residual_rms_config = nvfp4_gemm::config<256, 5, 8, 4, 2, false, 256, true, 2, 256, false, true, false, true, true>;
 using localcta_fast_largek_residual_rms_config = nvfp4_gemm::config<256, 5, 8, 12, 2, false, 256, true, 2, 256, false, true, false, true, true>;
+using localcta_fast_smallk_residual_rms_pipeline_config = nvfp4_gemm::config<256, 5, 8, 4, 2, false, 256, true, 2, 256, false, true, false, true, true, true>;
+using localcta_fast_largek_residual_rms_pipeline_config = nvfp4_gemm::config<256, 5, 8, 12, 2, false, 256, true, 2, 256, false, true, false, true, true, true>;
 using localcta_fast_smallk_h_config = nvfp4_gemm::config<256, 5, 8, 4, 2, false, 256, true, 2, 256, false, true, true>;
 using localcta_fast_largek_h_config = nvfp4_gemm::config<256, 5, 8, 12, 2, false, 256, true, 2, 256, false, true, true>;
 using localcta_fast_grouped_config = nvfp4_gemm::config<256, 5, 8, 4, 2, false>;
@@ -1647,14 +1649,29 @@ void launch_fast_regular_gemm_residual_rms(
     at::Tensor& row_rms_partial
 ) {
     const int64_t K = A.size(1) * 2;
+    const char* pipeline_env = std::getenv("USE_TK_LOCALCTA_V4_RESIDUAL_PIPELINE");
+    const bool use_pipeline =
+        pipeline_env == nullptr || std::string(pipeline_env) != "0";
     if (K <= 2048) {
-        launch_fast_gemm_with_config_residual<localcta_fast_smallk_residual_rms_config>(
-            A, A_sc_prepared, A_sg_tiles, B, B_sc_prepared, B_sg_tiles,
-            R, D, &row_rms_partial);
+        if (use_pipeline) {
+            launch_fast_gemm_with_config_residual<localcta_fast_smallk_residual_rms_pipeline_config>(
+                A, A_sc_prepared, A_sg_tiles, B, B_sc_prepared, B_sg_tiles,
+                R, D, &row_rms_partial);
+        } else {
+            launch_fast_gemm_with_config_residual<localcta_fast_smallk_residual_rms_config>(
+                A, A_sc_prepared, A_sg_tiles, B, B_sc_prepared, B_sg_tiles,
+                R, D, &row_rms_partial);
+        }
     } else {
-        launch_fast_gemm_with_config_residual<localcta_fast_largek_residual_rms_config>(
-            A, A_sc_prepared, A_sg_tiles, B, B_sc_prepared, B_sg_tiles,
-            R, D, &row_rms_partial);
+        if (use_pipeline) {
+            launch_fast_gemm_with_config_residual<localcta_fast_largek_residual_rms_pipeline_config>(
+                A, A_sc_prepared, A_sg_tiles, B, B_sc_prepared, B_sg_tiles,
+                R, D, &row_rms_partial);
+        } else {
+            launch_fast_gemm_with_config_residual<localcta_fast_largek_residual_rms_config>(
+                A, A_sc_prepared, A_sg_tiles, B, B_sc_prepared, B_sg_tiles,
+                R, D, &row_rms_partial);
+        }
     }
 }
 
