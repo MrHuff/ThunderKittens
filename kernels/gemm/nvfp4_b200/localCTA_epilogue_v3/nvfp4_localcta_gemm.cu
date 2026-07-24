@@ -38,6 +38,12 @@ using localcta_parity_config = nvfp4_localcta_gemm::config<256, 5, 8, 4, 2, fals
 using localcta_tilegrid256_config = nvfp4_localcta_gemm::config<256, 5, 8, 12, 2, false, 256, true, 2, 256>;
 using localcta_fast_smallk_config = nvfp4_gemm::config<256, 5, 8, 4, 2, false>;
 using localcta_fast_largek_config = nvfp4_gemm::config<256, 5, 8, 12, 2, false>;
+using localcta_fast_config6 = nvfp4_gemm::config<256, 4, 8, 12, 2, false>;
+using localcta_fast_config12 = nvfp4_gemm::config<256, 5, 8, 1, 2, false>;
+using localcta_fast_config13 = nvfp4_gemm::config<256, 5, 8, 2, 2, false>;
+using localcta_fast_config25 = nvfp4_gemm::config<256, 4, 8, 1, 2, false>;
+using localcta_fast_config27 = nvfp4_gemm::config<256, 4, 8, 2, 2, false>;
+using localcta_fast_config28 = nvfp4_gemm::config<256, 4, 8, 8, 2, false>;
 using localcta_fast_smallk_residual_config = nvfp4_gemm::config<256, 5, 8, 4, 2, false, 256, true, 2, 256, false, true>;
 using localcta_fast_largek_residual_config = nvfp4_gemm::config<256, 5, 8, 12, 2, false, 256, true, 2, 256, false, true>;
 using localcta_fast_smallk_residual_rms_config = nvfp4_gemm::config<256, 5, 8, 4, 2, false, 256, true, 2, 256, false, true, false, true, true>;
@@ -171,6 +177,15 @@ bool use_v3_split2_onepass() {
 
 bool use_v4_pack4_fold_outer_sg() {
     const char* value = std::getenv("USE_TK_LOCALCTA_V4_PACK4_FOLD_OUTER_SG");
+    if (value == nullptr) {
+        return true;
+    }
+    return std::strcmp(value, "0") != 0;
+}
+
+bool use_v4_exact_gemm_selectors() {
+    const char* value =
+        std::getenv("USE_TK_LOCALCTA_V4_EXACT_GEMM_SELECTORS");
     if (value == nullptr) {
         return true;
     }
@@ -1607,7 +1622,61 @@ void launch_fast_regular_gemm(
     const at::Tensor& B_sg_tiles,
     at::Tensor& D
 ) {
+    const int64_t M = D.size(0);
+    const int64_t N = D.size(1);
     const int64_t K = A.size(1) * 2;
+    const bool exact_selectors = (
+        use_v4_exact_gemm_selectors()
+        && A_sg_tiles.defined() && A_sg_tiles.numel() > 0
+        && B_sg_tiles.defined() && B_sg_tiles.numel() > 0
+    );
+    if (exact_selectors) {
+        if (
+            (M == 32768 && N == 4096 && K == 4096)
+            || (M == 24576 && N == 4096 && K == 4096)
+            || (M == 24576 && N == 4096 && K == 8192)
+        ) {
+            launch_fast_gemm_with_config<localcta_fast_config28>(
+                A, A_sc_prepared, A_sg_tiles,
+                B, B_sc_prepared, B_sg_tiles, D);
+            return;
+        }
+        if (M == 32768 && N == 14336 && K == 4096) {
+            launch_fast_gemm_with_config<localcta_fast_config25>(
+                A, A_sc_prepared, A_sg_tiles,
+                B, B_sc_prepared, B_sg_tiles, D);
+            return;
+        }
+        if (M == 4096 && N == 14336 && K == 32768) {
+            launch_fast_gemm_with_config<localcta_fast_config6>(
+                A, A_sc_prepared, A_sg_tiles,
+                B, B_sc_prepared, B_sg_tiles, D);
+            return;
+        }
+        if (
+            (M == 24576 && N == 21504 && K == 4096)
+            || (M == 24576 && N == 4096 && K == 21504)
+            || (M == 21504 && N == 4096 && K == 24576)
+            || (M == 24576 && N == 18688 && K == 4096)
+        ) {
+            launch_fast_gemm_with_config<localcta_fast_config12>(
+                A, A_sc_prepared, A_sg_tiles,
+                B, B_sc_prepared, B_sg_tiles, D);
+            return;
+        }
+        if (M == 24576 && N == 4096 && K == 18688) {
+            launch_fast_gemm_with_config<localcta_fast_config13>(
+                A, A_sc_prepared, A_sg_tiles,
+                B, B_sc_prepared, B_sg_tiles, D);
+            return;
+        }
+        if (M == 24576 && N == 8192 && K == 4096) {
+            launch_fast_gemm_with_config<localcta_fast_config27>(
+                A, A_sc_prepared, A_sg_tiles,
+                B, B_sc_prepared, B_sg_tiles, D);
+            return;
+        }
+    }
     if (K <= 2048) {
         launch_fast_gemm_with_config<localcta_fast_smallk_config>(
             A, A_sc_prepared, A_sg_tiles, B, B_sc_prepared, B_sg_tiles, D);
@@ -1615,6 +1684,84 @@ void launch_fast_regular_gemm(
         launch_fast_gemm_with_config<localcta_fast_largek_config>(
             A, A_sc_prepared, A_sg_tiles, B, B_sc_prepared, B_sg_tiles, D);
     }
+}
+
+void launch_fast_regular_gemm_config(
+    const at::Tensor& A,
+    const at::Tensor& A_sc_prepared,
+    const at::Tensor& A_sg_tiles,
+    const at::Tensor& B,
+    const at::Tensor& B_sc_prepared,
+    const at::Tensor& B_sg_tiles,
+    at::Tensor& D,
+    int config_id
+) {
+#define LOCALCTA_FAST_GEMM_CONFIG_CASES(X) \
+    X(0,  256, 4, 16,  1, 2, false) \
+    X(1,  256, 4, 16,  4, 2, false) \
+    X(2,  256, 4, 16, 12, 2, false) \
+    X(3,  256, 5,  8,  4, 2, true ) \
+    X(4,  256, 5,  8, 12, 2, true ) \
+    X(5,  256, 5,  8,  4, 2, false) \
+    X(6,  256, 4,  8, 12, 2, false) \
+    X(7,  128, 5,  4, 12, 2, true ) \
+    X(8,  128, 4,  4, 12, 2, false) \
+    X(9,  128, 5,  4,  4, 2, true ) \
+    X(10, 256, 5, 16,  4, 2, true ) \
+    X(11, 256, 5, 16, 12, 2, true ) \
+    X(12, 256, 5,  8,  1, 2, false) \
+    X(13, 256, 5,  8,  2, 2, false) \
+    X(14, 256, 5,  8,  8, 2, false) \
+    X(15, 256, 5,  8, 12, 2, false) \
+    X(16, 256, 5,  8,  1, 2, true ) \
+    X(17, 256, 5,  8,  2, 2, true ) \
+    X(18, 256, 5,  8,  8, 2, true ) \
+    X(19, 256, 5, 16,  1, 2, false) \
+    X(20, 256, 5, 16,  2, 2, false) \
+    X(21, 256, 5, 16,  8, 2, false) \
+    X(22, 256, 5, 16,  1, 2, true ) \
+    X(23, 256, 5, 16,  2, 2, true ) \
+    X(24, 256, 5, 16,  8, 2, true ) \
+    X(25, 256, 4,  8,  1, 2, false) \
+    X(26, 256, 4,  8,  4, 2, false) \
+    X(27, 256, 4,  8,  2, 2, false) \
+    X(28, 256, 4,  8,  8, 2, false) \
+    X(29, 256, 3,  8,  4, 2, false) \
+    X(30, 256, 3, 16,  4, 2, false) \
+    X(31, 256, 4, 16,  2, 2, false) \
+    X(32, 256, 4, 16,  8, 2, false) \
+    X(33, 256, 4, 16,  1, 2, true ) \
+    X(34, 256, 4, 16,  4, 2, true ) \
+    X(35, 128, 5,  8,  4, 2, false) \
+    X(36, 128, 5,  8, 12, 2, false) \
+    X(37, 128, 5,  8,  1, 2, false) \
+    X(38, 128, 5,  8,  4, 2, true ) \
+    X(39, 128, 5,  8, 12, 2, true ) \
+    X(40, 128, 4,  8,  4, 2, false) \
+    X(41, 128, 4,  8, 12, 2, false) \
+    X(42, 128, 5,  4,  1, 2, false) \
+    X(43, 128, 5,  4,  2, 2, false) \
+    X(44, 128, 5,  4,  1, 2, true ) \
+    X(45, 128, 4,  4,  4, 2, false) \
+    X(46, 128, 4,  4,  1, 2, false)
+#define LOCALCTA_FAST_GEMM_DISPATCH_CASE(ID, NB, LP, EP, SG, DT, OVERLAP) \
+        case ID: \
+            launch_fast_gemm_with_config< \
+                nvfp4_gemm::config<NB, LP, EP, SG, DT, OVERLAP>>( \
+                    A, A_sc_prepared, A_sg_tiles, \
+                    B, B_sc_prepared, B_sg_tiles, D); \
+            return;
+    switch (config_id) {
+        LOCALCTA_FAST_GEMM_CONFIG_CASES(
+            LOCALCTA_FAST_GEMM_DISPATCH_CASE)
+        default:
+            TORCH_CHECK(
+                false,
+                "Unsupported localCTA fast GEMM config_id=", config_id,
+                " (valid: 0-46)");
+    }
+#undef LOCALCTA_FAST_GEMM_DISPATCH_CASE
+#undef LOCALCTA_FAST_GEMM_CONFIG_CASES
 }
 
 void launch_fast_regular_gemm_residual(
@@ -4184,6 +4331,29 @@ void nvfp4_localcta_gemm_entrypoint(
     launch_fast_regular_gemm(A, A_sc, A_sg_outer, B, B_sc, B_sg_outer, D);
 }
 
+void nvfp4_localcta_fast_gemm_outer_sg_config_entrypoint(
+    const at::Tensor& A,
+    const at::Tensor& A_sc,
+    const at::Tensor& A_sg,
+    const at::Tensor& B,
+    const at::Tensor& B_sc,
+    const at::Tensor& B_sg,
+    at::Tensor& D,
+    int config_id
+) {
+    auto A_sg_outer =
+        normalize_outer_scale_tiles_tensor(A_sg, A.size(0) / 256, true);
+    auto B_sg_outer =
+        normalize_outer_scale_tiles_tensor(B_sg, B.size(0) / 256, false);
+    check_v3_fast_gemm_inputs(
+        A, A_sc, A_sg_outer, B, B_sc, B_sg_outer);
+    check_output_matrix(D, "D", A.size(0), B.size(0));
+    launch_fast_regular_gemm_config(
+        A, A_sc, A_sg_outer,
+        B, B_sc, B_sg_outer,
+        D, config_id);
+}
+
 void nvfp4_localcta_gemm_residual_entrypoint(
     const at::Tensor& A,
     const at::Tensor& A_sc,
@@ -5756,6 +5926,13 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           pybind11::arg("A"), pybind11::arg("A_sc_prepared"),
           pybind11::arg("B"), pybind11::arg("B_sc_prepared"),
           pybind11::arg("D"));
+    m.def("nvfp4_localcta_fast_gemm_outer_sg_config",
+          &nvfp4_localcta_fast_gemm_outer_sg_config_entrypoint,
+          pybind11::arg("A"), pybind11::arg("A_sc"),
+          pybind11::arg("A_sg"),
+          pybind11::arg("B"), pybind11::arg("B_sc"),
+          pybind11::arg("B_sg"),
+          pybind11::arg("D"), pybind11::arg("config_id"));
     m.def("nvfp4_localcta_fast_gemm_residual", &nvfp4_localcta_fast_gemm_residual_entrypoint,
           pybind11::arg("A"), pybind11::arg("A_sc_prepared"),
           pybind11::arg("B"), pybind11::arg("B_sc_prepared"),
