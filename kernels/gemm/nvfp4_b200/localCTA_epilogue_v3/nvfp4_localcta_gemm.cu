@@ -44,6 +44,7 @@ using localcta_fast_config13 = nvfp4_gemm::config<256, 5, 8, 2, 2, false>;
 using localcta_fast_config25 = nvfp4_gemm::config<256, 4, 8, 1, 2, false>;
 using localcta_fast_config27 = nvfp4_gemm::config<256, 4, 8, 2, 2, false>;
 using localcta_fast_config28 = nvfp4_gemm::config<256, 4, 8, 8, 2, false>;
+using localcta_fast_config28_residual_config = nvfp4_gemm::config<256, 4, 8, 8, 2, false, 256, true, 2, 256, false, true>;
 using localcta_fast_smallk_residual_config = nvfp4_gemm::config<256, 5, 8, 4, 2, false, 256, true, 2, 256, false, true>;
 using localcta_fast_largek_residual_config = nvfp4_gemm::config<256, 5, 8, 12, 2, false, 256, true, 2, 256, false, true>;
 using localcta_fast_smallk_residual_rms_config = nvfp4_gemm::config<256, 5, 8, 4, 2, false, 256, true, 2, 256, false, true, false, true, true>;
@@ -186,6 +187,15 @@ bool use_v4_pack4_fold_outer_sg() {
 bool use_v4_exact_gemm_selectors() {
     const char* value =
         std::getenv("USE_TK_LOCALCTA_V4_EXACT_GEMM_SELECTORS");
+    if (value == nullptr) {
+        return true;
+    }
+    return std::strcmp(value, "0") != 0;
+}
+
+bool use_v4_exact_residual_gemm_selectors() {
+    const char* value =
+        std::getenv("USE_TK_LOCALCTA_V4_EXACT_RESIDUAL_GEMM_SELECTORS");
     if (value == nullptr) {
         return true;
     }
@@ -1781,7 +1791,20 @@ void launch_fast_regular_gemm_residual(
     const at::Tensor& R,
     at::Tensor& D
 ) {
+    const int64_t M = D.size(0);
+    const int64_t N = D.size(1);
     const int64_t K = A.size(1) * 2;
+    const bool exact_selectors = (
+        use_v4_exact_residual_gemm_selectors()
+        && A_sg_tiles.defined() && A_sg_tiles.numel() > 0
+        && B_sg_tiles.defined() && B_sg_tiles.numel() > 0
+    );
+    if (exact_selectors && M == 32768 && N == 4096 && K == 21504) {
+        launch_fast_gemm_with_config_residual<localcta_fast_config28_residual_config>(
+            A, A_sc_prepared, A_sg_tiles,
+            B, B_sc_prepared, B_sg_tiles, R, D);
+        return;
+    }
     if (K <= 2048) {
         launch_fast_gemm_with_config_residual<localcta_fast_smallk_residual_config>(
             A, A_sc_prepared, A_sg_tiles, B, B_sc_prepared, B_sg_tiles, R, D);
