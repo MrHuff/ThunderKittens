@@ -1670,6 +1670,12 @@ void launch_fast_regular_gemm(
                 B, B_sc_prepared, B_sg_tiles, D);
             return;
         }
+        if (M == 18688 && N == 4096 && K == 24576) {
+            launch_fast_gemm_with_config<localcta_fast_config12>(
+                A, A_sc_prepared, A_sg_tiles,
+                B, B_sc_prepared, B_sg_tiles, D);
+            return;
+        }
         if (M == 24576 && N == 8192 && K == 4096) {
             launch_fast_gemm_with_config<localcta_fast_config27>(
                 A, A_sc_prepared, A_sg_tiles,
