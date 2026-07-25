@@ -25,7 +25,8 @@ template <
     bool _FUSE_RESIDUAL = false,
     bool _OUTPUT_SCALE = false,
     bool _FUSE_H_MX_CARRIER = false,
-    bool _FUSE_C1_RMS_CTA = false
+    bool _FUSE_C1_RMS_CTA = false,
+    bool _USE_PDL = true
 >
 struct config {
     static_assert(_Nb == 128 || _Nb == 256, "Nb must be 128 or 256");
@@ -37,7 +38,7 @@ struct config {
     static_assert(_EPI_PIPE_DEPTH <= 1 || _NUM_D_TILES >= 2, "NUM_D_TILES must be at least 2 if EPI_PIPE_DEPTH > 1");
 
     static constexpr int CLUSTER_SIZE = 2;
-    static constexpr bool USE_PDL = true;
+    static constexpr bool USE_PDL = _USE_PDL;
 
     static constexpr int CONSUMER_WARPGROUPS = 1;
     static constexpr int PRODUCER_WARPGROUPS = 1;
@@ -376,7 +377,7 @@ __device__ inline void kernel(const globals<C> &g) {
         int warp_id = group<WARPGROUP_WARPS*C::PRODUCER_WARPGROUPS>::warpid();
         if (warp_id == 3) {
             // Load input FP4 tiles to shared memory
-            pdl::wait();
+            if constexpr (C::USE_PDL) pdl::wait();
             everyone::tma::cluster::wait();
             for (int block_idx = cluster_id; block_idx < num_blocks; block_idx += gridDim.x / C::CLUSTER_SIZE) {
                 int supergroup_idx = block_idx / num_blocks_per_supergroup;
@@ -405,7 +406,7 @@ __device__ inline void kernel(const globals<C> &g) {
         } else if (warp_id == 2) {
             // Load input scales to shared memory
             // Each iteration loads MMA_PER_TILE (=2) scale tiles per A and B
-            pdl::wait();
+            if constexpr (C::USE_PDL) pdl::wait();
             everyone::tma::cluster::wait();
             for (int block_idx = cluster_id; block_idx < num_blocks; block_idx += gridDim.x / C::CLUSTER_SIZE) {
                 int supergroup_idx = block_idx / num_blocks_per_supergroup;
@@ -801,7 +802,7 @@ __device__ inline void kernel(const globals<C> &g) {
         // Ensure all TMA stores have committed before signaling the next
         // kernel can start (matches NVFP4 pattern).
         warpgroup::tma::store_async_read_wait<0>();
-        warpgroup::pdl::arrive();
+        if constexpr (C::USE_PDL) warpgroup::pdl::arrive();
         if (warpgroup::warpid() == 0) tm_allocator.deprovision();
     }
 }

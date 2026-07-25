@@ -979,7 +979,7 @@ void mxfp4_gemm_residual_rms_entrypoint(
     const c10::cuda::CUDAGuard device_guard(A.device());
 
     using cde_config = mxfp4_gemm::config<
-        256, 5, 4, 12, 2, false, 256, false, true, false, false, true>;
+        256, 5, 4, 12, 2, false, 256, false, true, false, false, true, false>;
     launch_mxfp4_gemm_dense_residual_rms<cde_config>(
         A, A_sc, B, B_sc, R, D, row_rms_partial);
 }
