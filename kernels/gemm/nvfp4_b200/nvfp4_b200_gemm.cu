@@ -8,6 +8,8 @@
 #include "nvfp4_accum_gemm.cuh"
 #include "nvfp4_fused_gemm.cuh"
 #include "nvfp4_persistent_gemm.cuh"
+#include <cstdint>
+#include <cstring>
 #include <optional>
 
 #ifndef TORCH_COMPILE
@@ -669,11 +671,20 @@ void nvfp4_batched_gemm_entrypoint(
         G g_host;
         memset(&g_host, 0, sizeof(G));
         g_host.num_batches = n;
-        g_host.num_row_blocks = (int)(M / C::Mb);
-        g_host.num_col_blocks = (int)(N_out / C::Nb);
-        g_host.num_red_blocks = (int)(2 * A_list[0].size(1) / C::Kb);
+        static_assert(sizeof(G) <= 32764, "Batched GEMM kernel arguments exceed CUDA's limit");
 
         for (int i = 0; i < n; ++i) {
+            const int64_t M_i = D_list[i].size(0);
+            const int64_t N_i = D_list[i].size(1);
+            const int64_t K_i = 2 * A_list[i].size(1);
+            TORCH_CHECK(A_list[i].size(0) == M_i);
+            TORCH_CHECK(B_list[i].size(0) == N_i);
+            TORCH_CHECK(2 * B_list[i].size(1) == K_i);
+            TORCH_CHECK(M_i % C::Mb == 0 && N_i % C::Nb == 0 && K_i % C::Kb == 0);
+            g_host.num_row_blocks[i] = (int)(M_i / C::Mb);
+            g_host.num_col_blocks[i] = (int)(N_i / C::Nb);
+            g_host.num_red_blocks[i] = (int)(K_i / C::Kb);
+
             auto a_gl = kittens::py::tensor_to_gl<typename G::A_fp4x2_gl>(A_list[i]);
             auto a_sc_gl = kittens::py::tensor_to_gl<typename G::A_sc_gl, false>(
                 A_sc_list[i], 1,
@@ -704,6 +715,244 @@ void nvfp4_batched_gemm_entrypoint(
         build_and_launch.operator()<nvfp4_gemm::config<256, 5, 8, 4, 2, false>>();
     } else {
         build_and_launch.operator()<nvfp4_gemm::config<256, 5, 8, 4, 2, false>>();
+    }
+}
+
+// Batched GEMM for row-major FP4 views with a larger parent row stride.
+// This is needed when a single bulk quantization produces transposed expert
+// payloads as [K, E * M / 2]: each [K, M / 2] expert view is pitched, but does
+// not otherwise require a materializing copy.
+void nvfp4_batched_gemm_pitched_entrypoint(
+    const std::vector<at::Tensor> &A_list,
+    const std::vector<at::Tensor> &A_sc_list,
+    const std::vector<at::Tensor> &A_sg_list,
+    const std::vector<at::Tensor> &B_list,
+    const std::vector<at::Tensor> &B_sc_list,
+    const std::vector<at::Tensor> &B_sg_list,
+    std::vector<at::Tensor> &D_list,
+    bool flatten_batches,
+    int config_id
+) {
+    const int n = (int)A_list.size();
+    TORCH_CHECK(n > 0 && n <= nvfp4_batched_gemm::MAX_BATCHES,
+                "num_batches must be 1..", nvfp4_batched_gemm::MAX_BATCHES);
+    TORCH_CHECK(n == (int)A_sc_list.size());
+    TORCH_CHECK(n == (int)A_sg_list.size());
+    TORCH_CHECK(n == (int)B_list.size());
+    TORCH_CHECK(n == (int)B_sc_list.size());
+    TORCH_CHECK(n == (int)B_sg_list.size());
+    TORCH_CHECK(n == (int)D_list.size());
+
+    auto build_and_launch = [&]<typename C>() {
+        using G = nvfp4_batched_gemm::globals<C>;
+        G g_host;
+        memset(&g_host, 0, sizeof(G));
+        g_host.num_batches = n;
+        g_host.flatten_batches = flatten_batches ? 1 : 0;
+        g_host.batch_block_offsets[0] = 0;
+        static_assert(sizeof(G) <= 32764, "Batched GEMM kernel arguments exceed CUDA's limit");
+
+        auto create_pitched_fp4_tma = [](
+            CUtensorMap *tma_map,
+            const at::Tensor &tensor,
+            int tile_rows
+        ) {
+            TORCH_CHECK(tensor.is_cuda() && tensor.dim() == 2);
+            TORCH_CHECK(tensor.scalar_type() == at::kFloat4_e2m1fn_x2);
+            TORCH_CHECK(tensor.stride(1) == 1, "FP4 inner dimension must be contiguous");
+            TORCH_CHECK(tensor.element_size() == 1);
+
+            constexpr uint32_t tma_dim = 5;
+            constexpr uint64_t swizzle_elements = 128;
+            const uint64_t rows = (uint64_t)tensor.size(0);
+            const uint64_t packed_cols = (uint64_t)tensor.size(1);
+            const uint64_t row_stride_bytes =
+                (uint64_t)tensor.stride(0) * (uint64_t)tensor.element_size();
+            uint64_t gmem_shape[5] = {
+                swizzle_elements,
+                rows,
+                (packed_cols + swizzle_elements - 1) / swizzle_elements,
+                1,
+                1,
+            };
+            uint64_t gmem_stride[4] = {
+                row_stride_bytes,
+                128,
+                rows * row_stride_bytes,
+                rows * row_stride_bytes,
+            };
+            uint32_t smem_shape[5] = {
+                (uint32_t)swizzle_elements,
+                (uint32_t)tile_rows,
+                1,
+                1,
+                1,
+            };
+            uint32_t smem_stride[5] = {1, 1, 1, 1, 1};
+            CUresult result = cuTensorMapEncodeTiled(
+                tma_map,
+                CU_TENSOR_MAP_DATA_TYPE_UINT8,
+                tma_dim,
+                tensor.data_ptr(),
+                gmem_shape,
+                gmem_stride,
+                smem_shape,
+                smem_stride,
+                CU_TENSOR_MAP_INTERLEAVE_NONE,
+                CU_TENSOR_MAP_SWIZZLE_128B,
+                CU_TENSOR_MAP_L2_PROMOTION_NONE,
+                CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE
+            );
+            TORCH_CHECK(result == CUDA_SUCCESS, "Failed to create pitched FP4 TMA descriptor");
+        };
+
+        auto create_pitched_sc_tma = [](
+            CUtensorMap *tma_map,
+            const at::Tensor &tensor
+        ) {
+            TORCH_CHECK(tensor.is_cuda() && tensor.dim() == 3);
+            TORCH_CHECK(
+                tensor.scalar_type() == at::kFloat8_e4m3fn
+                    || tensor.scalar_type() == at::kByte
+            );
+            TORCH_CHECK(tensor.element_size() == 1);
+            TORCH_CHECK(tensor.size(2) == 512);
+            TORCH_CHECK(tensor.stride(2) == 1);
+            TORCH_CHECK(tensor.stride(1) == 512);
+
+            // The scale payload is FP8 but the TK scale tile loads pairs as
+            // half: logical [depth, rows, 256] over physical
+            // [depth, rows, 512] bytes. The scale tile is explicitly
+            // non-swizzled because its bytes are already GEMM-swizzled.
+            constexpr uint32_t tma_dim = 4;
+            const uint64_t depth = (uint64_t)tensor.size(0);
+            const uint64_t rows = (uint64_t)tensor.size(1);
+            const uint64_t depth_stride_bytes =
+                (uint64_t)tensor.stride(0) * (uint64_t)tensor.element_size();
+            const uint64_t row_stride_bytes =
+                (uint64_t)tensor.stride(1) * (uint64_t)tensor.element_size();
+            uint64_t gmem_shape[4] = {
+                256,
+                rows,
+                depth,
+                1,
+            };
+            uint64_t gmem_stride[3] = {
+                row_stride_bytes,
+                depth_stride_bytes,
+                depth * depth_stride_bytes,
+            };
+            uint32_t smem_shape[4] = {256, 4, 1, 1};
+            uint32_t smem_stride[4] = {1, 1, 1, 1};
+            CUresult result = cuTensorMapEncodeTiled(
+                tma_map,
+                CU_TENSOR_MAP_DATA_TYPE_FLOAT16,
+                tma_dim,
+                tensor.data_ptr(),
+                gmem_shape,
+                gmem_stride,
+                smem_shape,
+                smem_stride,
+                CU_TENSOR_MAP_INTERLEAVE_NONE,
+                CU_TENSOR_MAP_SWIZZLE_NONE,
+                CU_TENSOR_MAP_L2_PROMOTION_NONE,
+                CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE
+            );
+            TORCH_CHECK(result == CUDA_SUCCESS, "Failed to create pitched scale TMA descriptor");
+        };
+
+        for (int i = 0; i < n; ++i) {
+            const int64_t M_i = A_list[i].size(0);
+            const int64_t D_rows_i = D_list[i].size(0);
+            const int64_t N_i = D_list[i].size(1);
+            const int64_t K_i = 2 * A_list[i].size(1);
+            TORCH_CHECK(D_rows_i > 0 && D_rows_i <= M_i);
+            TORCH_CHECK(B_list[i].size(0) == N_i);
+            TORCH_CHECK(2 * B_list[i].size(1) == K_i);
+            TORCH_CHECK(M_i % C::Mb == 0 && N_i % C::Nb == 0 && K_i % C::Kb == 0);
+            g_host.num_row_blocks[i] = (int)(M_i / C::Mb);
+            g_host.num_col_blocks[i] = (int)(N_i / C::Nb);
+            g_host.num_red_blocks[i] = (int)(K_i / C::Kb);
+            g_host.batch_block_offsets[i + 1] =
+                g_host.batch_block_offsets[i]
+                + g_host.num_row_blocks[i] * g_host.num_col_blocks[i];
+
+            create_pitched_fp4_tma(&g_host.A_tma[i], A_list[i], C::Mb / 2);
+            create_pitched_fp4_tma(&g_host.B_tma[i], B_list[i], C::Nb / 2);
+            create_pitched_sc_tma(&g_host.A_sc_tma[i], A_sc_list[i]);
+            create_pitched_sc_tma(&g_host.B_sc_tma[i], B_sc_list[i]);
+            auto d_gl = kittens::py::tensor_to_gl<typename G::D_gl>(D_list[i]);
+            std::memcpy(
+                &g_host.D_tma[i],
+                &d_gl.tma_descs.tma_desc,
+                sizeof(CUtensorMap));
+            g_host.A_sg[i] = A_sg_list[i].data_ptr<float>();
+            g_host.B_sg[i] = B_sg_list[i].data_ptr<float>();
+        }
+        g_host.total_blocks = g_host.batch_block_offsets[n];
+        kittens::py::launch_kernel<C, G, nvfp4_batched_gemm::kernel<C>>(g_host);
+    };
+
+    // These candidates cover the useful pipeline and tile families without
+    // instantiating the much larger generic single-GEMM sweep for this
+    // parameter-heavy batched kernel. PDL stays disabled because the batches
+    // are flattened into one persistent launch.
+    switch (config_id) {
+        case 0:
+            build_and_launch.operator()<
+                nvfp4_gemm::config<256, 5, 8, 4, 2, false, 256, false>>();
+            break;
+        case 1:
+            build_and_launch.operator()<
+                nvfp4_gemm::config<256, 4, 8, 4, 2, false, 256, false>>();
+            break;
+        case 2:
+            build_and_launch.operator()<
+                nvfp4_gemm::config<256, 3, 8, 4, 2, false, 256, false>>();
+            break;
+        case 3:
+            build_and_launch.operator()<
+                nvfp4_gemm::config<256, 5, 8, 1, 2, false, 256, false>>();
+            break;
+        case 4:
+            build_and_launch.operator()<
+                nvfp4_gemm::config<256, 5, 8, 2, 2, false, 256, false>>();
+            break;
+        case 5:
+            build_and_launch.operator()<
+                nvfp4_gemm::config<256, 5, 8, 8, 2, false, 256, false>>();
+            break;
+        case 6:
+            build_and_launch.operator()<
+                nvfp4_gemm::config<256, 5, 8, 12, 2, false, 256, false>>();
+            break;
+        case 7:
+            build_and_launch.operator()<
+                nvfp4_gemm::config<256, 5, 16, 4, 2, false, 256, false>>();
+            break;
+        case 8:
+            build_and_launch.operator()<
+                nvfp4_gemm::config<256, 4, 16, 4, 2, false, 256, false>>();
+            break;
+        case 9:
+            build_and_launch.operator()<
+                nvfp4_gemm::config<128, 5, 8, 4, 2, false, 256, false>>();
+            break;
+        case 10:
+            build_and_launch.operator()<
+                nvfp4_gemm::config<256, 5, 8, 4, 2, true, 256, false>>();
+            break;
+        case 11:
+            build_and_launch.operator()<
+                nvfp4_gemm::config<256, 5, 16, 1, 2, false, 256, false>>();
+            break;
+        case 12:
+            build_and_launch.operator()<
+                nvfp4_gemm::config<256, 4, 8, 8, 2, false, 256, false>>();
+            break;
+        default:
+            TORCH_CHECK(false, "Invalid pitched batched GEMM config_id: ",
+                        config_id, " (valid: 0-12)");
     }
 }
 
@@ -922,9 +1171,7 @@ void nvfp4_batched_gemm_strided_entrypoint(
         G g_host;
         memset(&g_host, 0, sizeof(G));
         g_host.num_batches = n;
-        g_host.num_row_blocks = (int)(M / C::Mb);
-        g_host.num_col_blocks = (int)(N_out / C::Nb);
-        g_host.num_red_blocks = (int)(2 * A_col_widths[0] / C::Kb);
+        static_assert(sizeof(G) <= 32764, "Batched GEMM kernel arguments exceed CUDA's limit");
 
         const uint8_t *a_base = (const uint8_t*)A_full.data_ptr();
         const int64_t a_full_row_stride = K_total_fp4;  // bytes per row (sizeof(fp4x2) = 1)
@@ -932,6 +1179,15 @@ void nvfp4_batched_gemm_strided_entrypoint(
         for (int i = 0; i < n; ++i) {
             const int64_t fp4_cols = A_col_widths[i];     // N_g/2 in fp4x2 elements
             const int64_t fp4_offset = A_col_offsets[i];  // column offset in fp4x2
+            const int64_t N_i = D_list[i].size(1);
+            const int64_t K_i = 2 * fp4_cols;
+            TORCH_CHECK(D_list[i].size(0) == M);
+            TORCH_CHECK(B_list[i].size(0) == N_i);
+            TORCH_CHECK(2 * B_list[i].size(1) == K_i);
+            TORCH_CHECK(M % C::Mb == 0 && N_i % C::Nb == 0 && K_i % C::Kb == 0);
+            g_host.num_row_blocks[i] = (int)(M / C::Mb);
+            g_host.num_col_blocks[i] = (int)(N_i / C::Nb);
+            g_host.num_red_blocks[i] = (int)(K_i / C::Kb);
 
             // --- A FP4 TMA: strided ---
             // Create TMA for (M, fp4_cols) sub-region from (M, K_total_fp4) buffer
@@ -1040,9 +1296,7 @@ void nvfp4_batched_gemm_strided_nopdl_entrypoint(
         G g_host;
         memset(&g_host, 0, sizeof(G));
         g_host.num_batches = n;
-        g_host.num_row_blocks = (int)(M / C::Mb);
-        g_host.num_col_blocks = (int)(N_out / C::Nb);
-        g_host.num_red_blocks = (int)(2 * A_col_widths[0] / C::Kb);
+        static_assert(sizeof(G) <= 32764, "Batched GEMM kernel arguments exceed CUDA's limit");
 
         const uint8_t *a_base = (const uint8_t*)A_full.data_ptr();
         const int64_t a_full_row_stride = K_total_fp4;
@@ -1050,6 +1304,15 @@ void nvfp4_batched_gemm_strided_nopdl_entrypoint(
         for (int i = 0; i < n; ++i) {
             const int64_t fp4_cols = A_col_widths[i];
             const int64_t fp4_offset = A_col_offsets[i];
+            const int64_t N_i = D_list[i].size(1);
+            const int64_t K_i = 2 * fp4_cols;
+            TORCH_CHECK(D_list[i].size(0) == M);
+            TORCH_CHECK(B_list[i].size(0) == N_i);
+            TORCH_CHECK(2 * B_list[i].size(1) == K_i);
+            TORCH_CHECK(M % C::Mb == 0 && N_i % C::Nb == 0 && K_i % C::Kb == 0);
+            g_host.num_row_blocks[i] = (int)(M / C::Mb);
+            g_host.num_col_blocks[i] = (int)(N_i / C::Nb);
+            g_host.num_red_blocks[i] = (int)(K_i / C::Kb);
 
             {
                 constexpr int64_t swizzle_elements = 128;
@@ -1592,6 +1855,12 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           pybind11::arg("A_list"), pybind11::arg("A_sc_list"), pybind11::arg("A_sg_list"),
           pybind11::arg("B_list"), pybind11::arg("B_sc_list"), pybind11::arg("B_sg_list"),
           pybind11::arg("D_list"));
+    m.def("nvfp4_batched_gemm_pitched", &nvfp4_batched_gemm_pitched_entrypoint,
+          "Batched GEMM accepting pitched row-major FP4 views for both operands",
+          pybind11::arg("A_list"), pybind11::arg("A_sc_list"), pybind11::arg("A_sg_list"),
+          pybind11::arg("B_list"), pybind11::arg("B_sc_list"), pybind11::arg("B_sg_list"),
+          pybind11::arg("D_list"), pybind11::arg("flatten_batches") = false,
+          pybind11::arg("config_id") = 0);
     m.def("nvfp4_batched_gemm_strided", &nvfp4_batched_gemm_strided_entrypoint,
           "Strided Batched GEMM: reads A FP4 from full buffer with column offsets, avoiding .contiguous()",
           pybind11::arg("A_full"), pybind11::arg("A_sc_list"), pybind11::arg("A_sg_list"),
