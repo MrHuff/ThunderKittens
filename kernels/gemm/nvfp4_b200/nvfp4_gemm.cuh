@@ -23,7 +23,11 @@ template <
     int _CLUSTER_SIZE = 2,
     int _Kb = 256,
     bool _ROPE_LIVE64 = false,
-    bool _FUSE_RESIDUAL = false
+    bool _FUSE_RESIDUAL = false,
+    int _ROPE_HEAD_DIM = 64,
+    int _ROPE_OFFSET = 0,
+    int _ROPE_DIM = 64,
+    bool _ROPE_AFTER_BF16 = false
 >
 struct config {
     static_assert(_Nb == 128 || _Nb == 256, "Nb must be 128 or 256");
@@ -58,6 +62,10 @@ struct config {
     static constexpr int NUM_D_TILES = _NUM_D_TILES;
     static constexpr bool ROPE_LIVE64 = _ROPE_LIVE64;
     static constexpr bool FUSE_RESIDUAL = _FUSE_RESIDUAL;
+    static constexpr int ROPE_HEAD_DIM = _ROPE_HEAD_DIM;
+    static constexpr int ROPE_OFFSET = _ROPE_OFFSET;
+    static constexpr int ROPE_DIM = _ROPE_DIM;
+    static constexpr bool ROPE_AFTER_BF16 = _ROPE_AFTER_BF16;
 
     // Output cache policy for TMA stores
     static constexpr auto D_CACHE_POLICY = cache_policy::EVICT_FIRST;
@@ -216,7 +224,11 @@ __device__ inline void apply_rope_live64_if_enabled(
         if (g.use_split_D && col_offset_elems >= g.q_dim + g.k_dim) {
             return;
         }
-        nvfp4_rope_epilogue::apply_inplace_live64(
+        nvfp4_rope_epilogue::apply_inplace_live64<
+            C::ROPE_HEAD_DIM,
+            C::ROPE_OFFSET,
+            C::ROPE_DIM
+        >(
             D_reg,
             g.rope_live64,
             (row_block_idx * 2 + cta_id) * (C::Mb / 2),
@@ -617,17 +629,29 @@ __device__ inline void kernel_impl(const globals<C> &g) {
                             apply_silu_inplace(D_reg);
                         }
                     }
-                    apply_rope_live64_if_enabled(D_reg, g, row_block_idx, cta_id, col_offset_elems);
+                    if constexpr (!C::ROPE_AFTER_BF16) {
+                        apply_rope_live64_if_enabled(D_reg, g, row_block_idx, cta_id, col_offset_elems);
+                    }
                     warpgroup::tma::store_async_read_wait<C::NUM_D_TILES-1>();
                     warpgroup::sync(1);
                     if constexpr (C::FUSE_RESIDUAL) {
                         rt_bf<C::Mb / 8, C::Nb/C::EPI_PIPE_DEPTH> D_reg_bf;
                         warp::copy(D_reg_bf, D_reg);
+                        if constexpr (C::ROPE_AFTER_BF16) {
+                            apply_rope_live64_if_enabled(
+                                D_reg_bf, g, row_block_idx, cta_id, col_offset_elems);
+                        }
                         maybe_add_residual_tile<C>(
                             g, output_tiles.D[i%C::NUM_D_TILES], D_reg_bf,
                             residual_load_arrived, residual_load_phase,
                             row_block_idx * 2 + cta_id,
                             C::EPI_PIPE_DEPTH * col_block_idx + i);
+                        warpgroup::store(output_tiles.D[i%C::NUM_D_TILES], D_reg_bf);
+                    } else if constexpr (C::ROPE_AFTER_BF16) {
+                        rt_bf<C::Mb / 8, C::Nb/C::EPI_PIPE_DEPTH> D_reg_bf;
+                        warp::copy(D_reg_bf, D_reg);
+                        apply_rope_live64_if_enabled(
+                            D_reg_bf, g, row_block_idx, cta_id, col_offset_elems);
                         warpgroup::store(output_tiles.D[i%C::NUM_D_TILES], D_reg_bf);
                     } else {
                         warpgroup::store(output_tiles.D[i%C::NUM_D_TILES], D_reg);
@@ -664,8 +688,15 @@ __device__ inline void kernel_impl(const globals<C> &g) {
                             apply_silu_inplace(D_reg_fl);
                         }
                     }
-                    apply_rope_live64_if_enabled(D_reg_fl, g, row_block_idx, cta_id, col_offset_elems);
+                    if constexpr (!C::ROPE_AFTER_BF16) {
+                        apply_rope_live64_if_enabled(
+                            D_reg_fl, g, row_block_idx, cta_id, col_offset_elems);
+                    }
                     warp::copy(D_reg[i], D_reg_fl);
+                    if constexpr (C::ROPE_AFTER_BF16) {
+                        apply_rope_live64_if_enabled(
+                            D_reg[i], g, row_block_idx, cta_id, col_offset_elems);
+                    }
                 }
                 tensor_load_wait();
                 tensor_before_thread_sync();
@@ -978,9 +1009,16 @@ __device__ inline void kernel_chunk_grid(const globals<C> &g) {
                         apply_silu_inplace(D_acc[i]);
                     }
                 }
-                apply_rope_live64_if_enabled(D_acc[i], g, row_block_idx, cta_id, col_offset_elems);
+                if constexpr (!C::ROPE_AFTER_BF16) {
+                    apply_rope_live64_if_enabled(
+                        D_acc[i], g, row_block_idx, cta_id, col_offset_elems);
+                }
                 rt_bf<C::Mb / 8, C::Nb/C::EPI_PIPE_DEPTH> D_reg;
                 warp::copy(D_reg, D_acc[i]);
+                if constexpr (C::ROPE_AFTER_BF16) {
+                    apply_rope_live64_if_enabled(
+                        D_reg, g, row_block_idx, cta_id, col_offset_elems);
+                }
                 warpgroup::tma::store_async_read_wait<C::NUM_D_TILES-1>();
                 warpgroup::sync(1);
                 warpgroup::store(output_tiles.D[i%C::NUM_D_TILES], D_reg);

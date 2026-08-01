@@ -39,14 +39,30 @@ __device__ inline kittens::bf16_2 rotate_pair<kittens::bf16_2>(
     };
 }
 
-template <kittens::ducks::rt::row_layout RT>
+template <int HEAD_DIM, int ROTARY_OFFSET, int ROTARY_DIM, kittens::ducks::rt::row_layout RT>
 __device__ inline void apply_inplace_live64(
     RT& tile,
     const rope_live64_desc& rope,
     int global_row_base,
     int global_col_base
 ) {
+    static_assert(HEAD_DIM > 0, "RoPE head dimension must be positive");
+    static_assert(ROTARY_OFFSET >= 0 && ROTARY_OFFSET % 2 == 0,
+                  "RoPE offset must be non-negative and even");
+    static_assert(ROTARY_DIM > 0 && ROTARY_DIM <= 64 && ROTARY_DIM % 2 == 0,
+                  "RoPE dimension must be positive, even, and at most 64");
+    static_assert(ROTARY_OFFSET + ROTARY_DIM <= HEAD_DIM,
+                  "RoPE range must fit within each head");
     if (!rope.enabled()) {
+        return;
+    }
+
+    // Live64 configurations emit 32-column epilogue tiles. DeepSeek's
+    // [nope=128, rope=64] head layout is therefore tile-aligned, so reject
+    // non-RoPE tiles once instead of doing a runtime modulo for every pair.
+    const int head_col_base = global_col_base % HEAD_DIM;
+    if (head_col_base < ROTARY_OFFSET ||
+        head_col_base >= ROTARY_OFFSET + ROTARY_DIM) {
         return;
     }
 
@@ -72,12 +88,13 @@ __device__ inline void apply_inplace_live64(
                     i * tile_row_dim +
                     (k % 2) * (tile_row_dim / 2) +
                     warp_lane / 4;
-                const int col_even =
-                    global_col_base +
+                const int local_col_even =
                     j * tile_col_dim +
                     (k / 2) * (tile_col_dim / 2) +
                     (warp_lane % 4) * 2;
-                const float2 cs = rope.cs[(row & rope.seq_mask) * 32 + ((col_even & 63) >> 1)];
+                const int rotary_pair =
+                    (head_col_base - ROTARY_OFFSET + local_col_even) >> 1;
+                const float2 cs = rope.cs[(row & rope.seq_mask) * 32 + rotary_pair];
                 tile.tiles[i][j].data[k] = rotate_pair(tile.tiles[i][j].data[k], cs.x, cs.y);
             }
         }

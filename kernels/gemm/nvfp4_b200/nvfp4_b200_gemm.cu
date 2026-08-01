@@ -249,6 +249,96 @@ void nvfp4_gemm_entrypoint(
     }
 }
 
+template <typename C>
+void launch_nvfp4_gemm_rope_live64(
+    const at::Tensor &A,
+    const at::Tensor &A_sc,
+    const at::Tensor &A_sc_global,
+    const at::Tensor &B,
+    const at::Tensor &B_sc,
+    const at::Tensor &B_sc_global,
+    at::Tensor &D,
+    const at::Tensor &rope_cs,
+    int64_t rope_seq_len,
+    int64_t head_dim,
+    int64_t rotary_offset,
+    int64_t rotary_dim
+) {
+    using G = nvfp4_gemm::globals<C>;
+    G g {
+        .A = kittens::py::tensor_to_gl<typename G::A_fp4x2_gl>(A),
+        .A_sc = kittens::py::tensor_to_gl<typename G::A_sc_gl, false>(A_sc, 1, A_sc.dim() == 2 ? A_sc.size(0)/128 : A_sc.size(0), A_sc.dim() == 2 ? A_sc.size(1)/4 : A_sc.size(1), 256),
+        .A_sc_global = kittens::py::tensor_to_gl<typename G::A_sc_global_gl>(A_sc_global),
+        .B = kittens::py::tensor_to_gl<typename G::B_fp4x2_gl>(B),
+        .B_sc = kittens::py::tensor_to_gl<typename G::B_sc_gl, false>(B_sc, 1, B_sc.dim() == 2 ? B_sc.size(0)/128 : B_sc.size(0), B_sc.dim() == 2 ? B_sc.size(1)/4 : B_sc.size(1), 256),
+        .B_sc_global = kittens::py::tensor_to_gl<typename G::B_sc_global_gl>(B_sc_global),
+        .D = kittens::py::tensor_to_gl<typename G::D_gl>(D),
+        .D_K = kittens::py::tensor_to_gl<typename G::D_gl>(D),
+        .D_V = kittens::py::tensor_to_gl<typename G::D_gl>(D),
+        .q_dim = 0,
+        .k_dim = 0,
+        .v_dim = 0,
+        .use_split_D = false,
+        .b_sg_per_tile = nullptr,
+        .silu_dim = 0,
+        .rope_live64 = {
+            .cs = reinterpret_cast<const float2*>(rope_cs.data_ptr<float>()),
+            .seq_len = static_cast<int>(rope_seq_len),
+            .seq_mask = static_cast<int>(rope_seq_len - 1),
+        },
+    };
+    kittens::py::launch_kernel<C, G, nvfp4_gemm::kernel<C>>(g);
+}
+
+void nvfp4_gemm_rope_live64_entrypoint(
+    const at::Tensor &A,
+    const at::Tensor &A_sc,
+    const at::Tensor &A_sc_global,
+    const at::Tensor &B,
+    const at::Tensor &B_sc,
+    const at::Tensor &B_sc_global,
+    at::Tensor &D,
+    const at::Tensor &rope_cs,
+    int64_t rope_seq_len,
+    int64_t head_dim,
+    int64_t rotary_offset,
+    int64_t rotary_dim
+) {
+    TORCH_CHECK(rope_seq_len > 0 && (rope_seq_len & (rope_seq_len - 1)) == 0,
+                "rope_seq_len must be a positive power of two");
+    TORCH_CHECK(D.size(0) % rope_seq_len == 0,
+                "output rows must be divisible by rope_seq_len");
+    TORCH_CHECK(head_dim > 0 && D.size(1) % head_dim == 0,
+                "output columns must contain complete RoPE heads");
+    TORCH_CHECK(rotary_offset >= 0 && rotary_dim > 0 && rotary_dim <= 64,
+                "rotary offset/dimension must describe at most 64 columns");
+    TORCH_CHECK((rotary_offset % 2) == 0 && (rotary_dim % 2) == 0 &&
+                    rotary_offset + rotary_dim <= head_dim,
+                "rotary range must be even-aligned and fit within each head");
+    TORCH_CHECK(head_dim == 192 && rotary_offset == 128 && rotary_dim == 64,
+                "plain NVFP4 GEMM currently specializes DeepSeek's 192/128/64 RoPE layout");
+    TORCH_CHECK(rope_cs.is_cuda() && rope_cs.is_contiguous() &&
+                    rope_cs.scalar_type() == at::kFloat && rope_cs.dim() == 3 &&
+                    rope_cs.size(0) == rope_seq_len && rope_cs.size(1) == 32 &&
+                    rope_cs.size(2) == 2,
+                "rope_cs must be contiguous CUDA float32 [seq_len, 32, 2]");
+
+    const int K = B.size(1) * 2;
+    if (K <= 2048) {
+        using C = nvfp4_gemm::config<
+            256, 5, 8, 4, 2, false, 256, true, 2, 256, true, false, 192, 128, 64, true>;
+        launch_nvfp4_gemm_rope_live64<C>(
+            A, A_sc, A_sc_global, B, B_sc, B_sc_global, D, rope_cs,
+            rope_seq_len, head_dim, rotary_offset, rotary_dim);
+    } else {
+        using C = nvfp4_gemm::config<
+            256, 4, 8, 12, 2, false, 256, true, 2, 256, true, false, 192, 128, 64, true>;
+        launch_nvfp4_gemm_rope_live64<C>(
+            A, A_sc, A_sc_global, B, B_sc, B_sc_global, D, rope_cs,
+            rope_seq_len, head_dim, rotary_offset, rotary_dim);
+    }
+}
+
 // ================================================================
 // Non-PDL standard GEMM: USE_PDL=false, CLUSTER_SIZE=1.
 // Safe for CUDA graph capture and replay.
@@ -954,6 +1044,68 @@ void nvfp4_batched_gemm_pitched_entrypoint(
             TORCH_CHECK(false, "Invalid pitched batched GEMM config_id: ",
                         config_id, " (valid: 0-12)");
     }
+}
+
+// Uniform packed variant of the pitched batched GEMM. Keeping the expert
+// dimension in each tensor avoids converting hundreds of Python tensor views
+// into std::vector<at::Tensor> on every expert-layer invocation.
+void nvfp4_uniform_batched_gemm_pitched_entrypoint(
+    const at::Tensor &A,
+    const at::Tensor &A_sc,
+    const at::Tensor &A_sg,
+    const at::Tensor &B,
+    const at::Tensor &B_sc,
+    const at::Tensor &B_sg,
+    at::Tensor &D,
+    bool flatten_batches,
+    int config_id
+) {
+    TORCH_CHECK(A.is_cuda() && B.is_cuda() && D.is_cuda());
+    TORCH_CHECK(A.dim() == 3 && B.dim() == 3 && D.dim() == 3,
+                "uniform packed FP4 operands and output must be 3D");
+    TORCH_CHECK(A_sc.dim() == 4 && B_sc.dim() == 4,
+                "uniform packed FP4 scales must be 4D");
+
+    const int n = (int)A.size(0);
+    TORCH_CHECK(n > 0 && n <= nvfp4_batched_gemm::MAX_BATCHES,
+                "num_batches must be 1..", nvfp4_batched_gemm::MAX_BATCHES);
+    TORCH_CHECK(B.size(0) == n && D.size(0) == n);
+    TORCH_CHECK(A_sc.size(0) == n && B_sc.size(0) == n);
+
+    std::vector<at::Tensor> A_list;
+    std::vector<at::Tensor> A_sc_list;
+    std::vector<at::Tensor> A_sg_list;
+    std::vector<at::Tensor> B_list;
+    std::vector<at::Tensor> B_sc_list;
+    std::vector<at::Tensor> B_sg_list;
+    std::vector<at::Tensor> D_list;
+    A_list.reserve(n);
+    A_sc_list.reserve(n);
+    A_sg_list.reserve(n);
+    B_list.reserve(n);
+    B_sc_list.reserve(n);
+    B_sg_list.reserve(n);
+    D_list.reserve(n);
+
+    for (int i = 0; i < n; ++i) {
+        A_list.emplace_back(A.select(0, i));
+        A_sc_list.emplace_back(A_sc.select(0, i));
+        A_sg_list.emplace_back(A_sg);
+        B_list.emplace_back(B.select(0, i));
+        B_sc_list.emplace_back(B_sc.select(0, i));
+        B_sg_list.emplace_back(B_sg);
+        D_list.emplace_back(D.select(0, i));
+    }
+    nvfp4_batched_gemm_pitched_entrypoint(
+        A_list,
+        A_sc_list,
+        A_sg_list,
+        B_list,
+        B_sc_list,
+        B_sg_list,
+        D_list,
+        flatten_batches,
+        config_id);
 }
 
 // ================================================================
@@ -1806,6 +1958,13 @@ void nvfp4_persistent_gemm_entrypoint(
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("nvfp4_gemm", &nvfp4_gemm_entrypoint);
+    m.def("nvfp4_gemm_rope_live64", &nvfp4_gemm_rope_live64_entrypoint,
+          "NVFP4 GEMM with an in-epilogue live float32 RoPE table",
+          pybind11::arg("A"), pybind11::arg("A_sc"), pybind11::arg("A_sc_global"),
+          pybind11::arg("B"), pybind11::arg("B_sc"), pybind11::arg("B_sc_global"),
+          pybind11::arg("D"), pybind11::arg("rope_cs"), pybind11::arg("rope_seq_len"),
+          pybind11::arg("head_dim"), pybind11::arg("rotary_offset"),
+          pybind11::arg("rotary_dim"));
     m.def("nvfp4_gemm_nopdl", &nvfp4_gemm_nopdl_entrypoint,
           "Non-PDL GEMM for CUDA graph capture (CLUSTER_SIZE=1, USE_PDL=false)");
     m.def("nvfp4_gemm_config", &nvfp4_gemm_config_entrypoint,
@@ -1860,6 +2019,13 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           pybind11::arg("A_list"), pybind11::arg("A_sc_list"), pybind11::arg("A_sg_list"),
           pybind11::arg("B_list"), pybind11::arg("B_sc_list"), pybind11::arg("B_sg_list"),
           pybind11::arg("D_list"), pybind11::arg("flatten_batches") = false,
+          pybind11::arg("config_id") = 0);
+    m.def("nvfp4_uniform_batched_gemm_pitched",
+          &nvfp4_uniform_batched_gemm_pitched_entrypoint,
+          "Uniform pitched batched GEMM accepting packed expert tensors",
+          pybind11::arg("A"), pybind11::arg("A_sc"), pybind11::arg("A_sg"),
+          pybind11::arg("B"), pybind11::arg("B_sc"), pybind11::arg("B_sg"),
+          pybind11::arg("D"), pybind11::arg("flatten_batches") = false,
           pybind11::arg("config_id") = 0);
     m.def("nvfp4_batched_gemm_strided", &nvfp4_batched_gemm_strided_entrypoint,
           "Strided Batched GEMM: reads A FP4 from full buffer with column offsets, avoiding .contiguous()",
