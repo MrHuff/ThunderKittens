@@ -1522,7 +1522,21 @@ void mxfp4_gemm_config_entrypoint(
     case 9:  run_gemm_with_config<mxfp4_gemm::config<256, 5,  8,  4, 2, true >>(A, A_sc, B, B_sc, D); break;
     case 10: run_gemm_with_config<mxfp4_gemm::config<256, 5,  4, 12, 2, false>>(A, A_sc, B, B_sc, D); break;
 
-    default: TORCH_CHECK(false, "Invalid config_id: ", config_id, " (valid: 0-10)");
+    // EPI=4 neighborhood for the Llama-8B CCE logits shape.
+    case 11: run_gemm_with_config<mxfp4_gemm::config<256, 5,  4,  1, 2, false>>(A, A_sc, B, B_sc, D); break;
+    case 12: run_gemm_with_config<mxfp4_gemm::config<256, 5,  4,  2, 2, false>>(A, A_sc, B, B_sc, D); break;
+    case 13: run_gemm_with_config<mxfp4_gemm::config<256, 5,  4,  4, 2, false>>(A, A_sc, B, B_sc, D); break;
+    case 14: run_gemm_with_config<mxfp4_gemm::config<256, 5,  4,  8, 2, false>>(A, A_sc, B, B_sc, D); break;
+    case 15: run_gemm_with_config<mxfp4_gemm::config<256, 5,  4, 16, 2, false>>(A, A_sc, B, B_sc, D); break;
+    case 16: run_gemm_with_config<mxfp4_gemm::config<256, 5,  4,  4, 2, true >>(A, A_sc, B, B_sc, D); break;
+    case 17: run_gemm_with_config<mxfp4_gemm::config<256, 5,  4,  8, 2, true >>(A, A_sc, B, B_sc, D); break;
+    case 18: run_gemm_with_config<mxfp4_gemm::config<256, 5,  4, 12, 2, true >>(A, A_sc, B, B_sc, D); break;
+    case 19: run_gemm_with_config<mxfp4_gemm::config<256, 5,  4, 16, 2, true >>(A, A_sc, B, B_sc, D); break;
+    case 20: run_gemm_with_config<mxfp4_gemm::config<256, 4,  4,  8, 2, false>>(A, A_sc, B, B_sc, D); break;
+    case 21: run_gemm_with_config<mxfp4_gemm::config<256, 4,  4, 12, 2, false>>(A, A_sc, B, B_sc, D); break;
+    case 22: run_gemm_with_config<mxfp4_gemm::config<256, 4,  4, 16, 2, false>>(A, A_sc, B, B_sc, D); break;
+
+    default: TORCH_CHECK(false, "Invalid config_id: ", config_id, " (valid: 0-22)");
     }
 }
 
