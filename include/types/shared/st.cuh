@@ -324,6 +324,10 @@ using st_fp8e5m2 = st<fp8e5m2, _height, _width, _swizzle, _swizzle_bytes>;
 #if defined(KITTENS_BLACKWELL)
 template<int _height, int _width, bool _swizzle=true, int _swizzle_bytes=0> 
 using st_fp8e8m0 = st<fp8e8m0, _height, _width, _swizzle, _swizzle_bytes>;
+template<int _height, int _width, bool _swizzle=true, int _swizzle_bytes=0>
+using st_fp6e3m2 = st<fp6e3m2, _height, _width, _swizzle, _swizzle_bytes>;
+template<int _height, int _width, bool _swizzle=true, int _swizzle_bytes=0>
+using st_fp6e2m3 = st<fp6e2m3, _height, _width, _swizzle, _swizzle_bytes>;
 template<int _height, int _width, bool _swizzle=true, int _swizzle_bytes=0> 
 using st_fp4e2m1_2 = st<fp4e2m1_2, _height, _width, _swizzle, _swizzle_bytes>;
 #endif

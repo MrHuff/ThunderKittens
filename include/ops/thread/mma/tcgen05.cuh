@@ -121,8 +121,14 @@ __device__ static inline constexpr uint32_t instruction_descriptor() {
 
 template<typename D, typename AB, typename SAB, int M, int N, bool neg=false, int scale_factor_id=0>
 __device__ static inline constexpr uint32_t instruction_descriptor() {
-    // Only supported types are MXFP8 and NVFP4
-    static_assert(std::is_same_v<AB, fp8e4m3> || std::is_same_v<AB, fp4e2m1_2>, "AB must be fp8e4m3 for f4e2m1");
+    // Supported microscaling data types are MXFP8, MXFP6, and MXFP4/NVFP4.
+    static_assert(
+        std::is_same_v<AB, fp8e4m3> ||
+        std::is_same_v<AB, fp6e3m2> ||
+        std::is_same_v<AB, fp6e2m3> ||
+        std::is_same_v<AB, fp4e2m1_2>,
+        "AB must be E4M3, E3M2, E2M3, or packed E2M1"
+    );
     static_assert(std::is_same_v<SAB, fp8e4m3> || std::is_same_v<SAB, fp8e8m0>, "SAB must be either fp8e4m3 or fp8e8m0");
     constexpr int scale_type = std::is_same_v<SAB, fp8e4m3> ? 0 : std::is_same_v<SAB, fp8e8m0> ? 1 : -1;
 
@@ -135,6 +141,12 @@ __device__ static inline constexpr uint32_t instruction_descriptor() {
     if constexpr (std::is_same_v<AB, fp8e4m3>) { // MXFP8
         desc |= (0b000 << 7); // Matrix A is E4M3
         desc |= (0b000 << 10); // Matrix B is E4M3
+    } else if constexpr (std::is_same_v<AB, fp6e2m3>) { // MXFP6 E2M3
+        desc |= (0b011 << 7);
+        desc |= (0b011 << 10);
+    } else if constexpr (std::is_same_v<AB, fp6e3m2>) { // MXFP6 E3M2
+        desc |= (0b100 << 7);
+        desc |= (0b100 << 10);
     } else if constexpr (std::is_same_v<AB, fp4e2m1_2>) { // NVFP4
         desc |= 0b001 << 7; // Matrix A is E2M1
         desc |= 0b01 << 10; // Matrix B is E2M1
@@ -241,9 +253,15 @@ __device__ static inline void st_st(uint32_t d_tt_addr, uint64_t a_desc, uint64_
 
 template<typename AB, typename SAB, int acc, int ncta=1, int block_size=16>
 __device__ static inline void st_st(uint32_t d_tt_addr, uint64_t a_desc, uint64_t b_desc, uint32_t sa_tt_addr, uint32_t sb_tt_addr, uint32_t idesc) {
-    static_assert(std::is_same_v<AB, fp8e4m3> || std::is_same_v<AB, fp4e2m1_2>, "AB must be fp8e4m3 for f4e2m1");
+    static_assert(
+        std::is_same_v<AB, fp8e4m3> ||
+        std::is_same_v<AB, fp6e3m2> ||
+        std::is_same_v<AB, fp6e2m3> ||
+        std::is_same_v<AB, fp4e2m1_2>,
+        "Unsupported microscaling data type"
+    );
     if constexpr (ncta == 1) {
-        if constexpr (std::is_same_v<AB, fp8e4m3>) { // Block size is always 32; alias is 1X
+        if constexpr (std::is_same_v<AB, fp8e4m3> || std::is_same_v<AB, fp6e3m2> || std::is_same_v<AB, fp6e2m3>) { // Block size is always 32; alias is 1X
             asm volatile(
                 "{.reg .pred p;\n\t" \
                 "setp.eq.u32 p, 1, %6;\n\t" \
@@ -272,7 +290,7 @@ __device__ static inline void st_st(uint32_t d_tt_addr, uint64_t a_desc, uint64_
         }
     }
     else {
-        if constexpr (std::is_same_v<AB, fp8e4m3>) { // Block size is always 32; alias is 1X
+        if constexpr (std::is_same_v<AB, fp8e4m3> || std::is_same_v<AB, fp6e3m2> || std::is_same_v<AB, fp6e2m3>) { // Block size is always 32; alias is 1X
             asm volatile(
                 "{.reg .pred p;\n\t" \
                 "setp.eq.u32 p, 1, %6;\n\t" \
@@ -469,22 +487,26 @@ __device__ static inline void mma(D &d, const A &a, const B &b, semaphore &sem) 
 template<int trans_a, int n_trans_b, ducks::tt::all D, ducks::st_descriptor::input A, ducks::st_descriptor::input B, ducks::tt::all SA, ducks::tt::all SB, int acc=1, int ncta=1>
 __device__ static inline void mma(D &d, const A &a, const B &b, const SA &sa, const SB &sb) {
 
-    // Check that A and B are fp8e4m3 or fp4e2m1 and the scales match
+    // Check that A and B use the same supported microscaling format.
     static_assert(std::is_same_v<typename A::T, typename B::T>); // A and B must match type.
     static_assert(
         (std::is_same_v<typename A::T, fp8e4m3> && std::is_same_v<typename B::T, fp8e4m3>) ||
+        (std::is_same_v<typename A::T, fp6e3m2> && std::is_same_v<typename B::T, fp6e3m2>) ||
+        (std::is_same_v<typename A::T, fp6e2m3> && std::is_same_v<typename B::T, fp6e2m3>) ||
         (std::is_same_v<typename A::T, fp4e2m1_2> && std::is_same_v<typename B::T, fp4e2m1_2>),
-        "A and B must be fp8e4m3 or fp4e2m1_2"
+        "A and B must use matching E4M3, E3M2, E2M3, or E2M1"
     );
     static_assert(
-        (std::is_same_v<typename A::T, fp8e4m3> && (
+        ((std::is_same_v<typename A::T, fp8e4m3> ||
+          std::is_same_v<typename A::T, fp6e3m2> ||
+          std::is_same_v<typename A::T, fp6e2m3>) && (
             std::is_same_v<typename SA::T, fp8e8m0> && std::is_same_v<typename SB::T, fp8e8m0>
         )) || 
         (std::is_same_v<typename A::T, fp4e2m1_2> && (
             (std::is_same_v<typename SA::T, fp8e8m0> && std::is_same_v<typename SB::T, fp8e8m0>) ||
             (std::is_same_v<typename SA::T, fp8e4m3> && std::is_same_v<typename SB::T, fp8e4m3>)
         )),
-        "SAB must be fp8e8m0 for fp8e4m3 element type, or fp8e4m3 / fp8e8m0 for fp4e2m1_2 element type");
+        "SAB must be fp8e8m0 for MXFP8/MXFP6, or fp8e4m3 / fp8e8m0 for FP4");
     // Only float32 accumulator is supported for microscaling formats
     static_assert(std::is_same_v<typename D::T, float>, "Only float32 accumulator is supported for microscaling formats");
     using T_AB = A::T;
@@ -498,7 +520,7 @@ __device__ static inline void mma(D &d, const A &a, const B &b, const SA &sa, co
     constexpr int M = (trans_a ? A::cols : A::rows) * ncta;
     constexpr int N = (trans_b ? B::cols : B::rows) * ncta;
     constexpr int K = std::is_same_v<typename A::T, fp4e2m1_2> ? (trans_a ? A::rows : A::cols) * 2 : (trans_a ? A::rows : A::cols);
-    constexpr int red_dim = std::is_same_v<typename A::T, fp8e4m3> ? 32 : 64; // TODO: this can also be 96 for 2 CTAs on sm_103a & fp4e2m1
+    constexpr int red_dim = std::is_same_v<typename A::T, fp4e2m1_2> ? 64 : 32; // TODO: FP4 can also use K=96 for 2 CTAs on sm_103a
     static_assert(K % red_dim == 0, "K dimension must be divisible by red_dim.");
 
     // M is 128 for 1 CTA, 128 or 256 for 2 CTAs
@@ -536,7 +558,7 @@ __device__ static inline void mma(D &d, const A &a, const B &b, const SA &sa, co
     constexpr int N_offset = N / 32; // 8 if N=256
     constexpr int M_offset = M / 32 / ncta; // 4 if M=256
 
-    if constexpr (std::is_same_v<typename A::T, fp8e4m3>) { // FP8E4M3 + FP8E8M0 scale (MXFP8)
+    if constexpr (!std::is_same_v<typename A::T, fp4e2m1_2>) { // MXFP8/MXFP6 + FP8E8M0 scale
         #pragma unroll
         for (int i = 1; i < K / red_dim; i++) {
             detail::tcgen05::template st_st<T_AB, T_SAB, 1, ncta, block_size>(

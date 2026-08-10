@@ -25,6 +25,7 @@ struct alignas(64) CUtensorMap { char __opaque[128]; };
 #endif
 #if defined(KITTENS_BLACKWELL)
 #include <cuda_fp4.h>
+#include <cuda_fp6.h>
 #endif
 
 // Host-only standard library includes

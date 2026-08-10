@@ -30,6 +30,11 @@ __host__ static inline void create_tensor_map(
     static_assert(axis==0 || axis==1 || axis==2, "axis must be 0, 1, or 2");
 #ifdef KITTENS_BLACKWELL
     static_assert(!(std::is_same_v<dtype, fp4e2m1_2> && axis != 2), "Axes 0 and 1 are not yet supported for FP4 type");
+    constexpr bool is_fp6 = std::is_same_v<dtype, fp6e3m2> || std::is_same_v<dtype, fp6e2m3>;
+    static_assert(!(is_fp6 && axis != 2), "Axes 0 and 1 are not yet supported for FP6 types");
+    static_assert(!is_fp6 || ST::swizzle_bytes == 128, "FP6 TMA requires the 128-byte shared-memory swizzle");
+#else
+    constexpr bool is_fp6 = false;
 #endif
 
     constexpr uint32_t  tma_dim = ST::swizzle ? 5 : 4;
@@ -43,6 +48,8 @@ __host__ static inline void create_tensor_map(
         std::is_same_v<dtype, fp8e5m2> ? CU_TENSOR_MAP_DATA_TYPE_UINT8 :
 #ifdef KITTENS_BLACKWELL
         std::is_same_v<dtype, fp8e8m0> ? CU_TENSOR_MAP_DATA_TYPE_UINT8 :
+        std::is_same_v<dtype, fp6e3m2> ? CU_TENSOR_MAP_DATA_TYPE_16U6_ALIGN16B :
+        std::is_same_v<dtype, fp6e2m3> ? CU_TENSOR_MAP_DATA_TYPE_16U6_ALIGN16B :
         std::is_same_v<dtype, fp4e2m1_2> ? CU_TENSOR_MAP_DATA_TYPE_UINT8 :
 #endif
         CUtensorMapDataType(-1)
@@ -67,6 +74,11 @@ __host__ static inline void create_tensor_map(
 
     // TMA expects the global and shared shapes to be in elements.
     constexpr int swizzle_elements = ST::swizzle_bytes / sizeof(dtype);
+    // U6 is compact in global memory (96 bytes per 128 logical values). TMA
+    // expands each 12-byte group into a 16-byte-aligned shared-memory slot.
+    constexpr auto global_bytes = [](uint64_t elements) {
+        return is_fp6 ? (elements * 6) / 8 : elements * sizeof(dtype);
+    };
 
     if constexpr (ST::swizzle) {
         if constexpr (axis == 2) {
@@ -76,10 +88,10 @@ __host__ static inline void create_tensor_map(
             gmem_shape[3] = (uint64_t)depth;
             gmem_shape[4] = (uint64_t)batch;
     
-            gmem_stride[0] = (uint64_t)cols * sizeof(dtype); // 2 FP4 elements per col, but sizeof(fp4) = 0.5, so these cancel out
-            gmem_stride[1] = ST::swizzle_bytes;
-            gmem_stride[2] = (uint64_t)rows * cols * sizeof(dtype); // see above
-            gmem_stride[3] = (uint64_t)depth * rows * cols * sizeof(dtype); // see above
+            gmem_stride[0] = global_bytes((uint64_t)cols);
+            gmem_stride[1] = global_bytes((uint64_t)swizzle_elements);
+            gmem_stride[2] = global_bytes((uint64_t)rows * cols);
+            gmem_stride[3] = global_bytes((uint64_t)depth * rows * cols);
         }
         else if constexpr (axis == 1) {
             gmem_shape[0] = swizzle_elements;
@@ -88,10 +100,10 @@ __host__ static inline void create_tensor_map(
             gmem_shape[3] = (uint64_t)rows;
             gmem_shape[4] = (uint64_t)batch;
     
-            gmem_stride[0] = (uint64_t)rows * cols * sizeof(dtype);
-            gmem_stride[1] = ST::swizzle_bytes;
-            gmem_stride[2] = (uint64_t)cols * sizeof(dtype);
-            gmem_stride[3] = (uint64_t)depth * rows * cols * sizeof(dtype);
+            gmem_stride[0] = global_bytes((uint64_t)rows * cols);
+            gmem_stride[1] = global_bytes((uint64_t)swizzle_elements);
+            gmem_stride[2] = global_bytes((uint64_t)cols);
+            gmem_stride[3] = global_bytes((uint64_t)depth * rows * cols);
     
         }
         else {
@@ -101,10 +113,10 @@ __host__ static inline void create_tensor_map(
             gmem_shape[3] = (uint64_t)rows;
             gmem_shape[4] = (uint64_t)depth;
     
-            gmem_stride[0] = (uint64_t)depth * rows * cols * sizeof(dtype);
-            gmem_stride[1] = ST::swizzle_bytes;
-            gmem_stride[2] = (uint64_t)cols * sizeof(dtype);
-            gmem_stride[3] = (uint64_t)rows * cols * sizeof(dtype);
+            gmem_stride[0] = global_bytes((uint64_t)depth * rows * cols);
+            gmem_stride[1] = global_bytes((uint64_t)swizzle_elements);
+            gmem_stride[2] = global_bytes((uint64_t)cols);
+            gmem_stride[3] = global_bytes((uint64_t)rows * cols);
         }
         smem_shape[0] = swizzle_elements;
         smem_shape[1] = shared_tile_height;
@@ -119,9 +131,9 @@ __host__ static inline void create_tensor_map(
         gmem_shape[2] = (uint64_t)depth;
         gmem_shape[3] = (uint64_t)batch;
 
-        gmem_stride[0] = (uint64_t)cols * sizeof(dtype);
-        gmem_stride[1] = (uint64_t)rows * cols * sizeof(dtype);
-        gmem_stride[2] = (uint64_t)depth * rows * cols * sizeof(dtype);
+        gmem_stride[0] = global_bytes((uint64_t)cols);
+        gmem_stride[1] = global_bytes((uint64_t)rows * cols);
+        gmem_stride[2] = global_bytes((uint64_t)depth * rows * cols);
 
         smem_shape[0] = shared_tile_width;
         smem_shape[1] = shared_tile_height;
@@ -130,12 +142,18 @@ __host__ static inline void create_tensor_map(
     }
 
     // ensure that the global address is always 16-byte aligned 
-    assert((reinterpret_cast<uint64_t>(global_addr) & 0b1111) == 0);
+    assert((reinterpret_cast<uint64_t>(global_addr) & (is_fp6 ? 31 : 15)) == 0);
 
     assert(gmem_stride[0] % 16 == 0); // gmem_stride[0] elements must be a multiple of 16B
     assert(gmem_stride[1] % 16 == 0); // gmem_stride[1] elements must be a multiple of 16B
     assert(gmem_stride[2] % 16 == 0); // gmem_stride[2] elements must be a multiple of 16B
     assert(gmem_stride[3] % 16 == 0); // gmem_stride[2] elements must be a multiple of 16B
+    if constexpr (is_fp6) {
+        assert(gmem_stride[0] % 32 == 0);
+        assert(gmem_stride[1] % 32 == 0);
+        assert(gmem_stride[2] % 32 == 0);
+        assert(gmem_stride[3] % 32 == 0);
+    }
 
     assert(smem_shape[0] <= 256); // smem_shape[0] elements must be <= 256
     assert(smem_shape[1] <= 256); // smem_shape[1] elements must be <= 256
