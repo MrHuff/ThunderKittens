@@ -270,23 +270,37 @@ __device__ static inline void copy(rt<T2, _height, _width, layout> &dst, const r
 
                     int src_offset2 = (laneid % 4 < 2 ) ? src_offset + 1 : (src_offset - 1);
                     src_t val23 = packed_shfl_sync(MASK_ALL, val2, src_offset2);  // Get from odd thread
+
+                    float2 val01_f, val23_f;
+                    if constexpr (std::is_same_v<U2, float>) {
+                        val01_f = val01;
+                        val23_f = val23;
+                    }
+                    else if constexpr (std::is_same_v<U2, kittens::bf16>) {
+                        val01_f = __bfloat1622float2(val01);
+                        val23_f = __bfloat1622float2(val23);
+                    }
+                    else {
+                        val01_f = __half22float2(val01);
+                        val23_f = __half22float2(val23);
+                    }
                     
                     // Convert to fp8e4m3_4
                     float4 f4;
                     using fp8_4_t = std::conditional_t<std::is_same_v<T2, fp8e4m3>, fp8e4m3_4, fp8e5m2_4>;
                     fp8_4_t f4_fp8;
                     if ( laneid % 4 < 2 ) { 
-                        f4.x = val01.x;  // Thread 2N's first value
-                        f4.y = val01.y;  // Thread 2N's second value
-                        f4.z = val23.x;  // Thread 2N+1's first value
-                        f4.w = val23.y;  // Thread 2N+1's second value
+                        f4.x = val01_f.x;  // Thread 2N's first value
+                        f4.y = val01_f.y;  // Thread 2N's second value
+                        f4.z = val23_f.x;  // Thread 2N+1's first value
+                        f4.w = val23_f.y;  // Thread 2N+1's second value
                         f4_fp8 = base_types::convertor<fp8_4_t, float4>::convert(f4);
                         dst.tiles[i][j].data[k] = f4_fp8;
                     } else {
-                        f4.x = val23.x;  // Thread 2N+1's first value
-                        f4.y = val23.y;  // Thread 2N+1's second value
-                        f4.z = val01.x;  // Thread 2N's first value
-                        f4.w = val01.y;  // Thread 2N's second value
+                        f4.x = val23_f.x;  // Thread 2N+1's first value
+                        f4.y = val23_f.y;  // Thread 2N+1's second value
+                        f4.z = val01_f.x;  // Thread 2N's first value
+                        f4.w = val01_f.y;  // Thread 2N's second value
                         f4_fp8 = base_types::convertor<fp8_4_t, float4>::convert(f4);
                         dst.tiles[i][j].data[k] = f4_fp8;
                     }

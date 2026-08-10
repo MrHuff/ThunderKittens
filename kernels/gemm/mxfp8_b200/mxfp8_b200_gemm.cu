@@ -4,7 +4,7 @@ using namespace kittens;
 
 namespace mxfp8_gemm {
 
-template <int _Nb, int _LOAD_PIPE_DEPTH, int _EPI_PIPE_DEPTH, int _SUPERGROUP_SIZE, int _NUM_D_TILES, bool _OVERLAP_EPI>
+template <int _Nb, int _LOAD_PIPE_DEPTH, int _EPI_PIPE_DEPTH, int _SUPERGROUP_SIZE, int _NUM_D_TILES, bool _OVERLAP_EPI, bool _FP8_OUTPUT = false>
 struct config {
     static_assert(_Nb == 128 || _Nb == 256, "Nb must be 128 or 256");
     static_assert(_LOAD_PIPE_DEPTH > 0, "LOAD_PIPE_DEPTH must be greater than 0");
@@ -25,6 +25,7 @@ struct config {
     static constexpr int LOAD_PIPE_DEPTH = _LOAD_PIPE_DEPTH;
     static constexpr int EPI_PIPE_DEPTH = _EPI_PIPE_DEPTH;
     static constexpr bool OVERLAP_EPI = _OVERLAP_EPI;
+    static constexpr bool FP8_OUTPUT = _FP8_OUTPUT;
 
     static constexpr int SUPERGROUP_SIZE = _SUPERGROUP_SIZE;
     static constexpr int Mb = 256;
@@ -41,13 +42,21 @@ struct globals {
     using A_sc_tile  = st_fp8e8m0<32, 16, false>;
     using B_fp8_tile = st_fp8e4m3<C::Nb / 2, C::Kb>;
     using B_sc_tile  = st_fp8e8m0<32, 16, false>;
-    using D_tile     = st_bf<C::Mb / 2, C::Nb / C::EPI_PIPE_DEPTH>;
+    using D_tile     = std::conditional_t<
+        C::FP8_OUTPUT,
+        st_fp8e4m3<C::Mb / 2, C::Nb / C::EPI_PIPE_DEPTH, false>,
+        st_bf<C::Mb / 2, C::Nb / C::EPI_PIPE_DEPTH>
+    >;
 
     using A_gl    = gl<fp8e4m3,  1,  1, -1, -1, A_fp8_tile>;
     using A_sc_gl = gl<fp8e8m0, -1, -1, 32, 16, A_sc_tile>;
     using B_gl    = gl<fp8e4m3,  1,  1, -1, -1, B_fp8_tile>;
     using B_sc_gl = gl<fp8e8m0, -1, -1, 32, 16, B_sc_tile>;
-    using D_gl    = gl<bf16,     1,  1, -1, -1, D_tile>;
+    using D_gl    = std::conditional_t<
+        C::FP8_OUTPUT,
+        gl<fp8e4m3, 1, 1, -1, -1, D_tile>,
+        gl<bf16, 1, 1, -1, -1, D_tile>
+    >;
 
     A_gl A;       // M x K
     A_sc_gl A_sc; // (M // 128) x (K // 128) x 32 x 16
@@ -257,7 +266,14 @@ __device__ inline void kernel(const globals<C> &g) {
                     }
                     warpgroup::tma::store_async_read_wait<C::NUM_D_TILES-1>();
                     warpgroup::sync(1);
-                    warpgroup::store(output_tiles.D[i%C::NUM_D_TILES], D_reg);
+                    if constexpr (C::FP8_OUTPUT) {
+                        rt_fp8e4m3<C::Mb / 8, C::Nb / C::EPI_PIPE_DEPTH> D_fp8;
+                        warp::copy(D_fp8, D_reg);
+                        warpgroup::store(output_tiles.D[i%C::NUM_D_TILES], D_fp8);
+                    }
+                    else {
+                        warpgroup::store(output_tiles.D[i%C::NUM_D_TILES], D_reg);
+                    }
                     warpgroup::sync(1);
                     warpgroup::tma::store_async<dim::ROW, cache_policy::EVICT_FIRST>(g.D, output_tiles.D[i%C::NUM_D_TILES], {row_block_idx * 2 + cta_id, col_block_idx * C::EPI_PIPE_DEPTH + i});
                 }
@@ -274,7 +290,14 @@ __device__ inline void kernel(const globals<C> &g) {
                 for (int i = 0; i < C::EPI_PIPE_DEPTH; i++) {
                     warpgroup::tma::store_async_read_wait<C::NUM_D_TILES-1>();
                     warpgroup::sync(1);
-                    warpgroup::store(output_tiles.D[i%C::NUM_D_TILES], D_reg[i]);
+                    if constexpr (C::FP8_OUTPUT) {
+                        rt_fp8e4m3<C::Mb / 8, C::Nb / C::EPI_PIPE_DEPTH> D_fp8;
+                        warp::copy(D_fp8, D_reg[i]);
+                        warpgroup::store(output_tiles.D[i%C::NUM_D_TILES], D_fp8);
+                    }
+                    else {
+                        warpgroup::store(output_tiles.D[i%C::NUM_D_TILES], D_reg[i]);
+                    }
                     warpgroup::sync(1);
                     warpgroup::tma::store_async<dim::ROW, cache_policy::EVICT_FIRST>(g.D, output_tiles.D[i%C::NUM_D_TILES], {row_block_idx * 2 + cta_id, col_block_idx * C::EPI_PIPE_DEPTH + i});
                 }
@@ -582,14 +605,19 @@ int main() {
 
 #include "pyutils/torchutils.cuh"
 
-void mxfp8_gemm_entrypoint(
+template <bool FP8_OUTPUT>
+void mxfp8_gemm_entrypoint_impl(
     const at::Tensor &A,
     const at::Tensor &A_sc,
     const at::Tensor &B,
     const at::Tensor &B_sc,
     at::Tensor &D
 ) {
-    using C = mxfp8_gemm::config<256, 6, 16, 12, 4, false>;
+    using C = std::conditional_t<
+        FP8_OUTPUT,
+        mxfp8_gemm::config<256, 6, 8, 12, 4, false, true>,
+        mxfp8_gemm::config<256, 6, 16, 12, 4, false, false>
+    >;
     using G = mxfp8_gemm::globals<C>;
 
     G g {
@@ -600,6 +628,26 @@ void mxfp8_gemm_entrypoint(
         .D = kittens::py::tensor_to_gl<typename G::D_gl>(D)
     };
     kittens::py::launch_kernel<C, G, mxfp8_gemm::kernel<C>>(g);
+}
+
+void mxfp8_gemm_entrypoint(
+    const at::Tensor &A,
+    const at::Tensor &A_sc,
+    const at::Tensor &B,
+    const at::Tensor &B_sc,
+    at::Tensor &D
+) {
+    mxfp8_gemm_entrypoint_impl<false>(A, A_sc, B, B_sc, D);
+}
+
+void mxfp8_gemm_fp8_entrypoint(
+    const at::Tensor &A,
+    const at::Tensor &A_sc,
+    const at::Tensor &B,
+    const at::Tensor &B_sc,
+    at::Tensor &D
+) {
+    mxfp8_gemm_entrypoint_impl<true>(A, A_sc, B, B_sc, D);
 }
 
 void mxfp8_quantize_entrypoint(
@@ -618,8 +666,9 @@ void mxfp8_quantize_entrypoint(
     kittens::py::launch_kernel<C, G, mxfp8_quantize::kernel>(g);
 }
 
-PYBIND11_MODULE(_C, m) {
+PYBIND11_MODULE(_C_mxfp8, m) {
     m.def("mxfp8_gemm", &mxfp8_gemm_entrypoint);
+    m.def("mxfp8_gemm_fp8", &mxfp8_gemm_fp8_entrypoint);
     m.def("mxfp8_quantize", &mxfp8_quantize_entrypoint);
 }
 
