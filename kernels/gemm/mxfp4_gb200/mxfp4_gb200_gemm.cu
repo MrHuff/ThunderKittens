@@ -926,8 +926,59 @@ void mxfp4_gemm_scaled_entrypoint(
     TORCH_CHECK(output_scale.is_cuda(), "output_scale must be a CUDA scalar tensor");
     TORCH_CHECK(output_scale.scalar_type() == at::kFloat, "output_scale must be float32");
     TORCH_CHECK(output_scale.numel() == 1, "output_scale must contain one element");
-    launch_mxfp4_gemm_dense<mxfp4_gemm::config<256, 5, 8, 4, 2, false, 256, false, false, true>>(
-        A, A_sc, B, B_sc, D, &output_scale);
+    const int64_t M = A.size(0);
+    const int64_t N = B.size(0);
+    const int64_t K = A.size(1) * 2;
+    if (M == 4096 && N == 4096 && K == 128256) {
+        // Llama-8B CCE dE: overlap the epilogue with an eight-tile
+        // supergroup. This is bit-identical and 2-3% faster on GB200/B200.
+        launch_mxfp4_gemm_dense<mxfp4_gemm::config<
+            256, 5, 8, 8, 2, true, 256, false, false, true>>(
+            A, A_sc, B, B_sc, D, &output_scale);
+    } else if (M == 128256 && N == 4096 && K == 4096) {
+        // Llama-8B CCE dW: the short reduction benefits from a shallow
+        // epilogue while preserving the same eight-tile overlap.
+        launch_mxfp4_gemm_dense<mxfp4_gemm::config<
+            256, 5, 4, 8, 2, true, 256, false, false, true>>(
+            A, A_sc, B, B_sc, D, &output_scale);
+    } else {
+        launch_mxfp4_gemm_dense<mxfp4_gemm::config<
+            256, 5, 8, 4, 2, false, 256, false, false, true>>(
+            A, A_sc, B, B_sc, D, &output_scale);
+    }
+}
+
+void mxfp4_gemm_scaled_config_entrypoint(
+    const at::Tensor &A,
+    const at::Tensor &A_sc,
+    const at::Tensor &B,
+    const at::Tensor &B_sc,
+    at::Tensor &D,
+    const at::Tensor &output_scale,
+    int config_id
+) {
+    TORCH_CHECK(output_scale.is_cuda(), "output_scale must be a CUDA scalar tensor");
+    TORCH_CHECK(output_scale.scalar_type() == at::kFloat, "output_scale must be float32");
+    TORCH_CHECK(output_scale.numel() == 1, "output_scale must contain one element");
+    switch (config_id) {
+    case 0:
+        launch_mxfp4_gemm_dense<mxfp4_gemm::config<
+            256, 5, 8, 4, 2, false, 256, false, false, true>>(
+            A, A_sc, B, B_sc, D, &output_scale);
+        break;
+    case 2:
+        launch_mxfp4_gemm_dense<mxfp4_gemm::config<
+            256, 5, 8, 8, 2, true, 256, false, false, true>>(
+            A, A_sc, B, B_sc, D, &output_scale);
+        break;
+    case 17:
+        launch_mxfp4_gemm_dense<mxfp4_gemm::config<
+            256, 5, 4, 8, 2, true, 256, false, false, true>>(
+            A, A_sc, B, B_sc, D, &output_scale);
+        break;
+    default:
+        TORCH_CHECK(false, "Invalid scaled config_id: ", config_id, " (valid: 0, 2, 17)");
+    }
 }
 
 void mxfp4_gemm_residual_entrypoint(
@@ -2636,6 +2687,12 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           pybind11::arg("A"), pybind11::arg("A_sc"),
           pybind11::arg("B"), pybind11::arg("B_sc"),
           pybind11::arg("D"), pybind11::arg("output_scale"));
+    m.def("mxfp4_gemm_scaled_config", &mxfp4_gemm_scaled_config_entrypoint,
+          "MXFP4 GEMM with a CUDA scalar epilogue multiplier and explicit config",
+          pybind11::arg("A"), pybind11::arg("A_sc"),
+          pybind11::arg("B"), pybind11::arg("B_sc"),
+          pybind11::arg("D"), pybind11::arg("output_scale"),
+          pybind11::arg("config_id"));
     m.def("mxfp4_gemm_residual", &mxfp4_gemm_residual_entrypoint,
           "Dense GEMM with fused bf16 residual add in the epilogue",
           pybind11::arg("A"), pybind11::arg("A_sc"),
