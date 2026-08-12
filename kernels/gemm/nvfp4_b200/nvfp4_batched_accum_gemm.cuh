@@ -41,7 +41,7 @@ struct globals {
 
     CUtensorMap D_tma;
 
-    int       num_red_blocks;
+    int       num_red_blocks[MAX_BATCHES];
     int       num_batches;
     int       num_row_blocks;
     int       num_col_blocks;
@@ -91,7 +91,6 @@ __device__ inline void kernel_impl(const globals<C> &g) {
     const int warpgroup_id = warpgroup::groupid();
     const int cta_id = cluster_ctarank();
     const int cluster_id = clusterIdx().x;
-    const int num_red_blocks = g.num_red_blocks;
     const int num_blocks_per_supergroup = C::SUPERGROUP_SIZE * g.num_col_blocks;
     uint32_t stage = 0;
     uint32_t phasebits = 0xFFFF0000;
@@ -151,6 +150,7 @@ __device__ inline void kernel_impl(const globals<C> &g) {
                     }
                     tma_dev_proxy<typename G::A_fp4x2_gl> proxy_A(&g.A_tma[batch]);
                     tma_dev_proxy<typename G::B_fp4x2_gl> proxy_B(&g.B_tma[batch]);
+                    const int num_red_blocks = g.num_red_blocks[batch];
                     if (batch > 0 && threadIdx.x == 0) {
                         proxy_A.prefetch();
                         proxy_B.prefetch();
@@ -188,6 +188,7 @@ __device__ inline void kernel_impl(const globals<C> &g) {
                     }
                     tma_dev_proxy<typename G::A_sc_gl>    proxy_A_sc(&g.A_sc_tma[batch]);
                     tma_dev_proxy<typename G::B_sc_gl>    proxy_B_sc(&g.B_sc_tma[batch]);
+                    const int num_red_blocks = g.num_red_blocks[batch];
                     if (batch > 0 && threadIdx.x == 0) {
                         proxy_A_sc.prefetch();
                         proxy_B_sc.prefetch();
@@ -223,6 +224,7 @@ __device__ inline void kernel_impl(const globals<C> &g) {
                     }
                     wait(outputs_finished, get_phasebit<1>(phasebits, 0));
                     tensor_after_thread_sync();
+                    const int num_red_blocks = g.num_red_blocks[batch];
                     for (int i = 0; i < num_red_blocks; i++) {
                         tma::expect_bytes(scales_arrived[stage], 2*sizeof(G::input_scales_t));
                         wait(scales_arrived[stage], get_phasebit<0>(phasebits, stage));

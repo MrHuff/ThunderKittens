@@ -67,7 +67,7 @@ struct globals {
     int          A_sg_stride[MAX_BATCHES];
     int          B_sg_stride[MAX_BATCHES];
 
-    int       num_red_blocks;
+    int       num_red_blocks[MAX_BATCHES];
     int       num_batches;
     int       num_row_blocks;
     int       num_col_blocks;
@@ -117,7 +117,7 @@ __device__ inline void kernel(const globals<C> &g) {
     const int warpgroup_id = warpgroup::groupid();
     const int cta_id = cluster_ctarank();
     const int cluster_id = clusterIdx().x;
-    const int num_red_blocks = g.num_red_blocks;
+    const int num_red_blocks = g.num_red_blocks[batch];
     const int num_blocks_per_supergroup = C::SUPERGROUP_SIZE * g.num_col_blocks;
     uint32_t stage = 0;
     uint32_t phasebits = 0xFFFF0000;

@@ -1968,9 +1968,11 @@ void nvfp4_batched_gemm_entrypoint(
         g_host.num_batches = n;
         g_host.num_row_blocks = (int)(M / C::Mb);
         g_host.num_col_blocks = (int)(N_out / C::Nb);
-        g_host.num_red_blocks = (int)(2 * A_list[0].size(1) / C::Kb);
 
         for (int i = 0; i < n; ++i) {
+            TORCH_CHECK(2 * A_list[i].size(1) % C::Kb == 0,
+                        "batched GEMM reduction width must be divisible by ", C::Kb);
+            g_host.num_red_blocks[i] = (int)(2 * A_list[i].size(1) / C::Kb);
             auto a_gl = kittens::py::tensor_to_gl<typename G::A_fp4x2_gl>(A_list[i]);
             auto a_sc_gl = kittens::py::tensor_to_gl<typename G::A_sc_gl, false>(
                 A_sc_list[i], 1,
@@ -2034,7 +2036,6 @@ void nvfp4_accum_gemm_v2_entrypoint(
         g_host.num_batches = n;
         g_host.num_row_blocks = (int)(M / C::Mb);
         g_host.num_col_blocks = (int)(N_out / C::Nb);
-        g_host.num_red_blocks = (int)(2 * A_list[0].size(1) / C::Kb);
 
         // Per-tile completion counters (zeroed by caller)
         int num_tiles = g_host.num_row_blocks * 2 * g_host.num_col_blocks;
@@ -2043,6 +2044,9 @@ void nvfp4_accum_gemm_v2_entrypoint(
         g_host.tile_done = tile_done_buf.data_ptr<int>();
 
         for (int i = 0; i < n; ++i) {
+            TORCH_CHECK(2 * A_list[i].size(1) % C::Kb == 0,
+                        "accumulating GEMM reduction width must be divisible by ", C::Kb);
+            g_host.num_red_blocks[i] = (int)(2 * A_list[i].size(1) / C::Kb);
             auto a_gl = kittens::py::tensor_to_gl<typename G::A_fp4x2_gl>(A_list[i]);
             auto a_sc_gl = kittens::py::tensor_to_gl<typename G::A_sc_gl, false>(
                 A_sc_list[i], 1,
@@ -2221,7 +2225,6 @@ void nvfp4_batched_gemm_strided_entrypoint(
         g_host.num_batches = n;
         g_host.num_row_blocks = (int)(M / C::Mb);
         g_host.num_col_blocks = (int)(N_out / C::Nb);
-        g_host.num_red_blocks = (int)(2 * A_col_widths[0] / C::Kb);
 
         const uint8_t *a_base = (const uint8_t*)A_full.data_ptr();
         const int64_t a_full_row_stride = K_total_fp4;  // bytes per row (sizeof(fp4x2) = 1)
@@ -2229,6 +2232,9 @@ void nvfp4_batched_gemm_strided_entrypoint(
         for (int i = 0; i < n; ++i) {
             const int64_t fp4_cols = A_col_widths[i];     // N_g/2 in fp4x2 elements
             const int64_t fp4_offset = A_col_offsets[i];  // column offset in fp4x2
+            TORCH_CHECK(2 * fp4_cols % C::Kb == 0,
+                        "strided batched GEMM reduction width must be divisible by ", C::Kb);
+            g_host.num_red_blocks[i] = (int)(2 * fp4_cols / C::Kb);
 
             // --- A FP4 TMA: strided ---
             // Create TMA for (M, fp4_cols) sub-region from (M, K_total_fp4) buffer
@@ -2339,7 +2345,6 @@ void nvfp4_batched_gemm_strided_nopdl_entrypoint(
         g_host.num_batches = n;
         g_host.num_row_blocks = (int)(M / C::Mb);
         g_host.num_col_blocks = (int)(N_out / C::Nb);
-        g_host.num_red_blocks = (int)(2 * A_col_widths[0] / C::Kb);
 
         const uint8_t *a_base = (const uint8_t*)A_full.data_ptr();
         const int64_t a_full_row_stride = K_total_fp4;
@@ -2347,6 +2352,9 @@ void nvfp4_batched_gemm_strided_nopdl_entrypoint(
         for (int i = 0; i < n; ++i) {
             const int64_t fp4_cols = A_col_widths[i];
             const int64_t fp4_offset = A_col_offsets[i];
+            TORCH_CHECK(2 * fp4_cols % C::Kb == 0,
+                        "strided batched GEMM reduction width must be divisible by ", C::Kb);
+            g_host.num_red_blocks[i] = (int)(2 * fp4_cols / C::Kb);
 
             {
                 constexpr int64_t swizzle_elements = 128;
@@ -2588,9 +2596,11 @@ void nvfp4_batched_accum_gemm_entrypoint(
         g_host.num_batches = n;
         g_host.num_row_blocks = (int)(M / C::Mb);
         g_host.num_col_blocks = (int)(N_out / C::Nb);
-        g_host.num_red_blocks = (int)(2 * A_list[0].size(1) / C::Kb);
 
         for (int i = 0; i < n; ++i) {
+            TORCH_CHECK(2 * A_list[i].size(1) % C::Kb == 0,
+                        "batched accumulation reduction width must be divisible by ", C::Kb);
+            g_host.num_red_blocks[i] = (int)(2 * A_list[i].size(1) / C::Kb);
             auto a_gl = kittens::py::tensor_to_gl<typename G::A_fp4x2_gl>(A_list[i]);
             auto a_sc_gl = kittens::py::tensor_to_gl<typename G::A_sc_gl, false>(
                 A_sc_list[i], 1,
