@@ -2320,9 +2320,9 @@ void launch_fast_batched_gemm_with_config(
     g_host.num_batches = n;
     g_host.num_row_blocks = static_cast<int>(M / C::Mb);
     g_host.num_col_blocks = static_cast<int>(N_out / C::Nb);
-    g_host.num_red_blocks = static_cast<int>((2 * A_list[0].size(1)) / C::Kb);
 
     for (int i = 0; i < n; ++i) {
+        g_host.num_red_blocks[i] = static_cast<int>((2 * A_list[i].size(1)) / C::Kb);
         auto a_gl = kittens::py::tensor_to_gl<typename G::A_fp4x2_gl>(A_list[i]);
         auto a_sc_gl = kittens::py::tensor_to_gl<typename G::A_sc_gl, false>(
             A_sc_prepared_list[i], 1, A_sc_prepared_list[i].size(0), A_sc_prepared_list[i].size(1), 256);
@@ -2407,7 +2407,6 @@ void launch_fast_batched_accum_gemm_with_config(
     g_host.num_batches = n;
     g_host.num_row_blocks = static_cast<int>(M / C::Mb);
     g_host.num_col_blocks = static_cast<int>(N_out / C::Nb);
-    g_host.num_red_blocks = static_cast<int>((2 * A_list[0].size(1)) / C::Kb);
     const int num_tiles = g_host.num_row_blocks * 2 * g_host.num_col_blocks;
 
     static thread_local std::vector<at::Tensor> tile_done_cache;
@@ -2424,6 +2423,7 @@ void launch_fast_batched_accum_gemm_with_config(
     g_host.tile_done = tile_done_buf.data_ptr<int>();
 
     for (int i = 0; i < n; ++i) {
+        g_host.num_red_blocks[i] = static_cast<int>((2 * A_list[i].size(1)) / C::Kb);
         auto a_gl = kittens::py::tensor_to_gl<typename G::A_fp4x2_gl>(A_list[i]);
         auto a_sc_gl = kittens::py::tensor_to_gl<typename G::A_sc_gl, false>(
             A_sc_prepared_list[i], 1,
@@ -2485,16 +2485,12 @@ void launch_fast_batched_accum_gemm_strided_with_config(
     const int64_t M = D_out.size(0);
     const int64_t N_out = D_out.size(1);
     const int64_t K_total_fp4 = A_full.size(1);
-    const int64_t max_fp4_cols =
-        *std::max_element(A_col_widths.begin(), A_col_widths.end());
     auto one = get_unit_scale_tensor(A_full);
     const float* one_ptr = one.data_ptr<float>();
 
     g_host.num_batches = n;
     g_host.num_row_blocks = static_cast<int>(M / C::Mb);
     g_host.num_col_blocks = static_cast<int>(N_out / C::Nb);
-    g_host.num_red_blocks = static_cast<int>((2 * max_fp4_cols) / C::Kb);
-
     const int num_tiles = g_host.num_row_blocks * 2 * g_host.num_col_blocks;
     static thread_local std::vector<at::Tensor> tile_done_cache;
     const int device_index = A_full.get_device();
@@ -2515,6 +2511,7 @@ void launch_fast_batched_accum_gemm_strided_with_config(
     for (int i = 0; i < n; ++i) {
         constexpr int64_t swizzle_elements = 128;
         const int64_t fp4_cols = A_col_widths[i];
+        g_host.num_red_blocks[i] = static_cast<int>((2 * fp4_cols) / C::Kb);
         const int64_t fp4_offset = A_col_offsets[i];
         const void* data_ptr = a_base + fp4_offset;
 
@@ -2609,22 +2606,19 @@ void launch_fast_batched_accum_gemm_strided_v3_with_config(
     const int64_t M = D_out.size(0);
     const int64_t N_out = D_out.size(1);
     const int64_t K_total_fp4 = A_full.size(1);
-    const int64_t max_fp4_cols =
-        *std::max_element(A_col_widths.begin(), A_col_widths.end());
     auto one = get_unit_scale_tensor(A_full);
     const float* one_ptr = one.data_ptr<float>();
 
     g_host.num_batches = n;
     g_host.num_row_blocks = static_cast<int>(M / C::Mb);
     g_host.num_col_blocks = static_cast<int>(N_out / C::Nb);
-    g_host.num_red_blocks = static_cast<int>((2 * max_fp4_cols) / C::Kb);
-
     const uint8_t* a_base = reinterpret_cast<const uint8_t*>(A_full.data_ptr());
     const int64_t a_full_row_stride = K_total_fp4;
 
     for (int i = 0; i < n; ++i) {
         constexpr int64_t swizzle_elements = 128;
         const int64_t fp4_cols = A_col_widths[i];
+        g_host.num_red_blocks[i] = static_cast<int>((2 * fp4_cols) / C::Kb);
         const int64_t fp4_offset = A_col_offsets[i];
         const void* data_ptr = a_base + fp4_offset;
 
@@ -2732,14 +2726,13 @@ void launch_fast_batched_gemm_strided_with_config(
     g_host.num_batches = n;
     g_host.num_row_blocks = static_cast<int>(M / C::Mb);
     g_host.num_col_blocks = static_cast<int>(N_out / C::Nb);
-    g_host.num_red_blocks = static_cast<int>((2 * A_col_widths[0]) / C::Kb);
-
     const uint8_t* a_base = reinterpret_cast<const uint8_t*>(A_full.data_ptr());
     const int64_t a_full_row_stride = K_total_fp4;
 
     for (int i = 0; i < n; ++i) {
         constexpr int64_t swizzle_elements = 128;
         const int64_t fp4_cols = A_col_widths[i];
+        g_host.num_red_blocks[i] = static_cast<int>((2 * fp4_cols) / C::Kb);
         const int64_t fp4_offset = A_col_offsets[i];
         const void* data_ptr = a_base + fp4_offset;
 
