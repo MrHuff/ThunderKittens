@@ -171,6 +171,10 @@ concept static_dynamic_shared_memory = requires { Config::DYNAMIC_SHARED_MEMORY;
 template <typename Config>
 concept has_pdl_config = requires { { Config::USE_PDL } -> std::convertible_to<bool>; };
 template <typename Config>
+concept has_cluster_scheduling_policy = requires {
+    { Config::CLUSTER_SCHEDULING_POLICY } -> std::convertible_to<int>;
+};
+template <typename Config>
 inline constexpr bool use_pdl = false;
 template <typename Config> requires has_pdl_config<Config>
 inline constexpr bool use_pdl<Config> = Config::USE_PDL;
@@ -208,6 +212,19 @@ __host__ static inline void launch_kernel(const Globals &G) {
         });
     }
 #endif
+    if constexpr (has_cluster_scheduling_policy<Config>) {
+        if constexpr (
+            Config::CLUSTER_SCHEDULING_POLICY != cudaClusterSchedulingPolicyDefault
+        ) {
+            static std::once_flag cluster_policy_once;
+            std::call_once(cluster_policy_once, []() {
+                CUDACHECK(cudaFuncSetAttribute(
+                    global_kernel<Config, Globals, Kernel>,
+                    cudaFuncAttributeClusterSchedulingPolicyPreference,
+                    static_cast<int>(Config::CLUSTER_SCHEDULING_POLICY)));
+            });
+        }
+    }
     static std::atomic<int> max_dynamic_shared_memory_set{-1};
     if (dynamic_shared_memory > max_dynamic_shared_memory_set.load(std::memory_order_acquire)) {
         static std::mutex attr_mutex;

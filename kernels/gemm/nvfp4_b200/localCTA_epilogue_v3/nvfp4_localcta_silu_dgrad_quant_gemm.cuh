@@ -11,11 +11,17 @@ template <
     int _SUPERGROUP_SIZE,
     bool _USE_PDL = true,
     int _GRID_WAVES = 1,
-    int _CONSUMER_WARPGROUPS = 1>
+    int _CONSUMER_WARPGROUPS = 1,
+    int _RESERVE_CLUSTERS = 0,
+    cudaClusterSchedulingPolicy _CLUSTER_SCHEDULING_POLICY =
+        cudaClusterSchedulingPolicyDefault>
 struct config {
     static constexpr int CLUSTER_SIZE = 2;
     static constexpr bool USE_PDL = _USE_PDL;
     static constexpr int GRID_WAVES = _GRID_WAVES;
+    static constexpr int RESERVE_CLUSTERS = _RESERVE_CLUSTERS;
+    static constexpr cudaClusterSchedulingPolicy CLUSTER_SCHEDULING_POLICY =
+        _CLUSTER_SCHEDULING_POLICY;
 
     static constexpr int CONSUMER_WARPGROUPS = _CONSUMER_WARPGROUPS;
     static constexpr int PRODUCER_WARPGROUPS = 1;
@@ -107,9 +113,12 @@ struct globals {
     __host__ inline dim3 grid() const {
         const int num_row_blocks = M / C::Mb;
         const int num_col_blocks = H / C::Nb;
+        const int resident_limit = max(
+            C::CLUSTER_SIZE,
+            C::GRID_WAVES * num_sms() - C::RESERVE_CLUSTERS * C::CLUSTER_SIZE);
         int grid_size = min(
             num_row_blocks * num_col_blocks * C::CLUSTER_SIZE,
-            C::GRID_WAVES * num_sms());
+            resident_limit);
         grid_size = (grid_size / C::CLUSTER_SIZE) * C::CLUSTER_SIZE;
         return dim3(max(grid_size, C::CLUSTER_SIZE));
     }
