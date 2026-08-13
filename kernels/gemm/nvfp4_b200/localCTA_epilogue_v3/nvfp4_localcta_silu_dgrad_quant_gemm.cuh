@@ -795,7 +795,13 @@ __device__ inline void kernel(const globals<C>& g) {
             }
             update_phasebit<0>(output_phasebits, 0);
         }
-        warpgroup::sync(4 + warpgroup_id);
+        if constexpr (C::CONSUMER_WARPGROUPS == 1) {
+            warpgroup::sync(4 + warpgroup_id);
+        } else {
+            // Every role-parallel consumer must finish its final tensor-memory
+            // load and epilogue before warpgroup 0 releases the allocation.
+            group<WARPGROUP_WARPS * C::CONSUMER_WARPGROUPS>::sync(8);
+        }
         if (warpgroup_id == 0) {
             if constexpr (C::USE_PDL) warpgroup::pdl::arrive();
             if (warpgroup::warpid() == 0) tm_allocator.deprovision();
