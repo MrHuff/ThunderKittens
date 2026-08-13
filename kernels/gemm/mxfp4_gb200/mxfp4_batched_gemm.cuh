@@ -310,7 +310,7 @@ __device__ inline void kernel(const globals<C> &g) {
         int warp_id = group<WARPGROUP_WARPS*C::PRODUCER_WARPGROUPS>::warpid();
         if (warp_id == 3) {
             // ── Producer: load input tiles ──
-            pdl::wait();
+            if constexpr (C::USE_PDL) pdl::wait();
             everyone::tma::cluster::wait();
 
             for (int flat_block_idx = cluster_id; flat_block_idx < num_blocks; flat_block_idx += cluster_stride) {
@@ -348,7 +348,7 @@ __device__ inline void kernel(const globals<C> &g) {
             }
         } else if (warp_id == 2) {
             // ── Producer: load input scales ──
-            pdl::wait();
+            if constexpr (C::USE_PDL) pdl::wait();
             everyone::tma::cluster::wait();
 
             for (int flat_block_idx = cluster_id; flat_block_idx < num_blocks; flat_block_idx += cluster_stride) {
@@ -501,6 +501,7 @@ __device__ inline void kernel(const globals<C> &g) {
     } else if (warpgroup_id < C::CONSUMER_WARPGROUPS) {
         // ── Consumer: direct store (no global scale for MXFP4) ──
         everyone::tma::cluster::wait_aligned();
+        if constexpr (C::USE_PDL) warpgroup::pdl::wait();
         if (warpgroup::warpid() == 0) {
             tm_allocator.provision(tmem_addr);
             warp::arrive(tmem_provisioned);
@@ -580,8 +581,10 @@ __device__ inline void kernel(const globals<C> &g) {
             update_phasebit<0>(phasebits, 0);
         }
         warpgroup::sync(1);
-        warpgroup::pdl::arrive();
+        warpgroup::tma::store_async_read_wait<0>();
         if (warpgroup::warpid() == 0) tm_allocator.deprovision();
+        warpgroup::sync(1);
+        if constexpr (C::USE_PDL) warpgroup::pdl::arrive();
     }
 }
 

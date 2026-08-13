@@ -315,6 +315,7 @@ __device__ inline void kernel(const globals<C> &g) {
         }
     } else if (warpgroup_id < C::CONSUMER_WARPGROUPS) {
         everyone::tma::cluster::wait_aligned();
+        if constexpr (C::USE_PDL) warpgroup::pdl::wait();
         if (warpgroup::warpid() == 0) {
             tm_allocator.provision(tmem_addr);
             warp::arrive(tmem_provisioned);
@@ -367,8 +368,9 @@ __device__ inline void kernel(const globals<C> &g) {
         }
         warpgroup::sync(1);
         warpgroup::tma::store_async_read_wait<0>();
-        if constexpr (C::USE_PDL) warpgroup::pdl::arrive();
         if (warpgroup::warpid() == 0) tm_allocator.deprovision();
+        warpgroup::sync(1);
+        if constexpr (C::USE_PDL) warpgroup::pdl::arrive();
     }
 }
 

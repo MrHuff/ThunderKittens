@@ -1,6 +1,7 @@
 #pragma once
 
 #include "kittens.cuh"
+#include "mxfp4_launch_config.cuh"
 
 using namespace kittens;
 
@@ -9,7 +10,7 @@ namespace mxfp4_silu_dgrad_quant_gemm {
 template <int _LOAD_PIPE_DEPTH, int _SUPERGROUP_SIZE, int _QUANT_MODE = 1, bool _USE_SAVED_SIGMOID = false>
 struct config {
     static constexpr int CLUSTER_SIZE = 2;
-    static constexpr bool USE_PDL = true;
+    static constexpr bool USE_PDL = mxfp4_launch::default_use_pdl;
 
     static constexpr int CONSUMER_WARPGROUPS = 1;
     static constexpr int PRODUCER_WARPGROUPS = 1;
@@ -456,7 +457,7 @@ __device__ inline void kernel(const globals<C>& g) {
     if (warpgroup_id >= C::CONSUMER_WARPGROUPS && warp::elect_leader()) {
         int warp_id = group<WARPGROUP_WARPS*C::PRODUCER_WARPGROUPS>::warpid();
         if (warp_id == 3) {
-            pdl::wait();
+            if constexpr (C::USE_PDL) pdl::wait();
             everyone::tma::cluster::wait();
             for (int block_idx = cluster_id; block_idx < num_blocks; block_idx += gridDim.x / C::CLUSTER_SIZE) {
                 int supergroup_idx = block_idx / num_blocks_per_supergroup;
@@ -474,7 +475,7 @@ __device__ inline void kernel(const globals<C>& g) {
                 }
             }
         } else if (warp_id == 2) {
-            pdl::wait();
+            if constexpr (C::USE_PDL) pdl::wait();
             everyone::tma::cluster::wait();
             for (int block_idx = cluster_id; block_idx < num_blocks; block_idx += gridDim.x / C::CLUSTER_SIZE) {
                 int supergroup_idx = block_idx / num_blocks_per_supergroup;
@@ -554,6 +555,7 @@ __device__ inline void kernel(const globals<C>& g) {
         }
     } else if (warpgroup_id < C::CONSUMER_WARPGROUPS) {
         everyone::tma::cluster::wait_aligned();
+        if constexpr (C::USE_PDL) warpgroup::pdl::wait();
         if (warpgroup::warpid() == 0) {
             tm_allocator.provision(tmem_addr);
             warp::arrive(tmem_provisioned);
@@ -614,8 +616,9 @@ __device__ inline void kernel(const globals<C>& g) {
             update_phasebit<0>(output_phasebits, 0);
         }
         warpgroup::sync(1);
-        warpgroup::pdl::arrive();
         if (warpgroup::warpid() == 0) tm_allocator.deprovision();
+        warpgroup::sync(1);
+        if constexpr (C::USE_PDL) warpgroup::pdl::arrive();
     }
 }
 

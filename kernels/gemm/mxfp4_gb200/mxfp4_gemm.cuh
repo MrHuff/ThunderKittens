@@ -7,6 +7,7 @@
 
 #include "kittens.cuh"
 #include "mxfp4_rope_epilogue.cuh"
+#include "mxfp4_launch_config.cuh"
 #include "../common/h_mxfp4_tile_carrier.cuh"
 
 using namespace kittens;
@@ -26,7 +27,7 @@ template <
     bool _OUTPUT_SCALE = false,
     bool _FUSE_H_MX_CARRIER = false,
     bool _FUSE_C1_RMS_CTA = false,
-    bool _USE_PDL = true
+    bool _USE_PDL = mxfp4_launch::default_use_pdl
 >
 struct config {
     static_assert(_Nb == 128 || _Nb == 256, "Nb must be 128 or 256");
@@ -523,6 +524,9 @@ __device__ inline void kernel(const globals<C> &g) {
     } else if (warpgroup_id < C::CONSUMER_WARPGROUPS) {
         // Consumer group — no global scale needed for MXFP4
         everyone::tma::cluster::wait_aligned();
+        // The preceding clustered GEMM releases tensor memory before its PDL
+        // arrival. Do not provision the dependent cluster until then.
+        if constexpr (C::USE_PDL) warpgroup::pdl::wait();
         if (warpgroup::warpid() == 0) {
             tm_allocator.provision(tmem_addr);
             warp::arrive(tmem_provisioned);
@@ -802,8 +806,9 @@ __device__ inline void kernel(const globals<C> &g) {
         // Ensure all TMA stores have committed before signaling the next
         // kernel can start (matches NVFP4 pattern).
         warpgroup::tma::store_async_read_wait<0>();
-        if constexpr (C::USE_PDL) warpgroup::pdl::arrive();
         if (warpgroup::warpid() == 0) tm_allocator.deprovision();
+        warpgroup::sync(1);
+        if constexpr (C::USE_PDL) warpgroup::pdl::arrive();
     }
 }
 
