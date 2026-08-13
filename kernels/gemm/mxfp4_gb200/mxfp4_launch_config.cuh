@@ -1,9 +1,11 @@
 #pragma once
 
-// Early dependent launch does not improve the production MXFP4 shapes and can
-// strand a clustered CTA while its predecessor still owns tensor memory.
+// The clustered kernels retire TMA stores and tensor memory before publishing
+// the dependency arrival, and consumers wait before provisioning tensor
+// memory. Keep that corrected overlap enabled for production; the compile-time
+// override remains available as a diagnostic fallback.
 #ifndef MXFP4_GEMM_DEFAULT_USE_PDL
-#define MXFP4_GEMM_DEFAULT_USE_PDL 0
+#define MXFP4_GEMM_DEFAULT_USE_PDL 1
 #endif
 
 namespace mxfp4_launch {
