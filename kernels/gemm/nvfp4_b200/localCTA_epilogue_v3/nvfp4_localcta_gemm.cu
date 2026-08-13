@@ -5910,6 +5910,12 @@ void nvfp4_localcta_w2_dgrad_silu_quant_gemm_entrypoint(
             A, A_sc, A_sg, B, B_sc, B_sg, h3, h1_raw,
             row_fp4_cat, row_sc_prepared_cat, row_sg_cat,
             col_fp4_cat, col_sc_prepared_cat, col_sg_cat);
+    } else if (config_id == 7) {
+        launch_localcta_silu_dgrad_quant_gemm_with_config<
+            nvfp4_localcta_silu_dgrad_quant_gemm::config<3, 12, false, 1, 4>>(
+            A, A_sc, A_sg, B, B_sc, B_sg, h3, h1_raw,
+            row_fp4_cat, row_sc_prepared_cat, row_sg_cat,
+            col_fp4_cat, col_sc_prepared_cat, col_sg_cat);
     } else {
         launch_localcta_silu_dgrad_quant_gemm_with_config<
             nvfp4_localcta_silu_dgrad_quant_gemm::config<3, 12>>(

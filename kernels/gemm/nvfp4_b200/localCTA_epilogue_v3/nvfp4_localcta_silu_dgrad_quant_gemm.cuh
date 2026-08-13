@@ -6,16 +6,24 @@ using namespace kittens;
 
 namespace nvfp4_localcta_silu_dgrad_quant_gemm {
 
-template <int _LOAD_PIPE_DEPTH, int _SUPERGROUP_SIZE, bool _USE_PDL = true>
+template <
+    int _LOAD_PIPE_DEPTH,
+    int _SUPERGROUP_SIZE,
+    bool _USE_PDL = true,
+    int _GRID_WAVES = 1,
+    int _CONSUMER_WARPGROUPS = 1>
 struct config {
     static constexpr int CLUSTER_SIZE = 2;
     static constexpr bool USE_PDL = _USE_PDL;
+    static constexpr int GRID_WAVES = _GRID_WAVES;
 
-    static constexpr int CONSUMER_WARPGROUPS = 1;
+    static constexpr int CONSUMER_WARPGROUPS = _CONSUMER_WARPGROUPS;
     static constexpr int PRODUCER_WARPGROUPS = 1;
     static constexpr int NUM_WARPGROUPS = CONSUMER_WARPGROUPS + PRODUCER_WARPGROUPS;
     static constexpr int NUM_WARPS = NUM_WARPGROUPS * WARPGROUP_WARPS;
     static constexpr int NUM_THREADS = NUM_WARPS * WARP_THREADS;
+    static_assert(CONSUMER_WARPGROUPS == 1 || CONSUMER_WARPGROUPS == 4,
+                  "fused localCTA producer supports one serial or four role-parallel consumer warpgroups");
 
     static constexpr int LOAD_PIPE_DEPTH = _LOAD_PIPE_DEPTH;
     static constexpr int EPI_PIPE_DEPTH = 8;
@@ -99,7 +107,9 @@ struct globals {
     __host__ inline dim3 grid() const {
         const int num_row_blocks = M / C::Mb;
         const int num_col_blocks = H / C::Nb;
-        int grid_size = min(num_row_blocks * num_col_blocks * C::CLUSTER_SIZE, num_sms());
+        int grid_size = min(
+            num_row_blocks * num_col_blocks * C::CLUSTER_SIZE,
+            C::GRID_WAVES * num_sms());
         grid_size = (grid_size / C::CLUSTER_SIZE) * C::CLUSTER_SIZE;
         return dim3(max(grid_size, C::CLUSTER_SIZE));
     }
@@ -116,24 +126,76 @@ static constexpr float LOCALCTA_GLOBAL_SCALE_NUM = 1493.0f;
 static constexpr float LOCALCTA_MIN_NONZERO_SCALE = 0.001953125f;
 static constexpr float FP8_E4M3_MAX = 448.0f;
 
-__device__ __forceinline__ uint8_t float_to_fp4(float val) {
-    float aval = fabsf(val);
-    uint8_t sign = ((__float_as_uint(val) >> 31) << 3);
-    uint8_t enc =
-        static_cast<uint8_t>(aval >= 0.25f) +
-        static_cast<uint8_t>(aval >= 0.75f) +
-        static_cast<uint8_t>(aval >= 1.25f) +
-        static_cast<uint8_t>(aval >= 1.75f) +
-        static_cast<uint8_t>(aval >= 2.5f) +
-        static_cast<uint8_t>(aval >= 3.5f) +
-        static_cast<uint8_t>(aval >= 5.0f);
-    return sign | enc;
+__device__ __forceinline__ uint8_t quantize_fp4_pair(float v0, float v1, float coeff) {
+    const float s0 = v0 * coeff;
+    const float s1 = v1 * coeff;
+    uint32_t packed;
+    asm volatile(
+        "{\n\t"
+        ".reg .b8 fp4_pair;\n\t"
+        "cvt.rn.satfinite.e2m1x2.f32 fp4_pair, %2, %1;\n\t"
+        "mov.b32 %0, {fp4_pair, fp4_pair, fp4_pair, fp4_pair};\n\t"
+        "}\n\t"
+        : "=r"(packed)
+        : "f"(s0), "f"(s1));
+    return static_cast<uint8_t>(packed);
 }
 
-__device__ __forceinline__ uint8_t quantize_fp4_pair(float v0, float v1, float coeff) {
-    uint8_t q0 = float_to_fp4(v0 * coeff);
-    uint8_t q1 = float_to_fp4(v1 * coeff);
-    return q0 | (q1 << 4);
+__device__ __forceinline__ uint32_t quantize_fp4_8(
+    bf16_2 v01,
+    bf16_2 v23,
+    bf16_2 v45,
+    bf16_2 v67,
+    float coeff)
+{
+    const uint32_t raw01 = reinterpret_cast<const uint32_t&>(v01);
+    const uint32_t raw23 = reinterpret_cast<const uint32_t&>(v23);
+    const uint32_t raw45 = reinterpret_cast<const uint32_t&>(v45);
+    const uint32_t raw67 = reinterpret_cast<const uint32_t&>(v67);
+    const uint64_t in03 = static_cast<uint64_t>(raw01) |
+                          (static_cast<uint64_t>(raw23) << 32);
+    const uint64_t in47 = static_cast<uint64_t>(raw45) |
+                          (static_cast<uint64_t>(raw67) << 32);
+    uint32_t packed;
+    asm volatile(
+        "{\n\t"
+        ".reg .b64 coeff2;\n\t"
+        "mov.b64 coeff2, {%3, %3};\n\t"
+        ".reg .b16 b0, b1, b2, b3, b4, b5, b6, b7;\n\t"
+        "mov.b64 {b0, b1, b2, b3}, %1;\n\t"
+        "mov.b64 {b4, b5, b6, b7}, %2;\n\t"
+        ".reg .b32 v0, v1, v2, v3, v4, v5, v6, v7;\n\t"
+        "cvt.f32.bf16 v0, b0;\n\t"
+        "cvt.f32.bf16 v1, b1;\n\t"
+        "cvt.f32.bf16 v2, b2;\n\t"
+        "cvt.f32.bf16 v3, b3;\n\t"
+        "cvt.f32.bf16 v4, b4;\n\t"
+        "cvt.f32.bf16 v5, b5;\n\t"
+        "cvt.f32.bf16 v6, b6;\n\t"
+        "cvt.f32.bf16 v7, b7;\n\t"
+        ".reg .b64 v01, v23, v45, v67;\n\t"
+        "mov.b64 v01, {v0, v1};\n\t"
+        "mov.b64 v23, {v2, v3};\n\t"
+        "mov.b64 v45, {v4, v5};\n\t"
+        "mov.b64 v67, {v6, v7};\n\t"
+        "mul.f32x2 v01, v01, coeff2;\n\t"
+        "mul.f32x2 v23, v23, coeff2;\n\t"
+        "mul.f32x2 v45, v45, coeff2;\n\t"
+        "mul.f32x2 v67, v67, coeff2;\n\t"
+        "mov.b64 {v1, v0}, v01;\n\t"
+        "mov.b64 {v3, v2}, v23;\n\t"
+        "mov.b64 {v5, v4}, v45;\n\t"
+        "mov.b64 {v7, v6}, v67;\n\t"
+        ".reg .b8 f0, f1, f2, f3;\n\t"
+        "cvt.rn.satfinite.e2m1x2.f32 f0, v0, v1;\n\t"
+        "cvt.rn.satfinite.e2m1x2.f32 f1, v2, v3;\n\t"
+        "cvt.rn.satfinite.e2m1x2.f32 f2, v4, v5;\n\t"
+        "cvt.rn.satfinite.e2m1x2.f32 f3, v6, v7;\n\t"
+        "mov.b32 %0, {f0, f1, f2, f3};\n\t"
+        "}\n\t"
+        : "=r"(packed)
+        : "l"(in03), "l"(in47), "f"(coeff));
+    return packed;
 }
 
 __device__ __forceinline__ uint8_t fp8e4m3_byte(float value) {
@@ -330,13 +392,10 @@ __device__ __noinline__ void quantize_rows_from_stage(
         uint8_t stored_scale;
         localcta_block_quant_params(block_amax, chunk_s_enc, chunk_sg, coeff, stored_scale);
 
-        uint64_t packed = 0;
-        #pragma unroll
-        for (int pair = 0; pair < 8; ++pair) {
-            const bf16_2 v = cached[pair];
-            packed |= static_cast<uint64_t>(quantize_fp4_pair(
-                __bfloat162float(v.x), __bfloat162float(v.y), coeff)) << (pair * 8);
-        }
+        const uint64_t packed = static_cast<uint64_t>(quantize_fp4_8(
+                                    cached[0], cached[1], cached[2], cached[3], coeff)) |
+                                (static_cast<uint64_t>(quantize_fp4_8(
+                                    cached[4], cached[5], cached[6], cached[7], coeff)) << 32);
 
         const int logical_col = logical_col_start + group * 16;
         *reinterpret_cast<uint64_t*>(
@@ -389,13 +448,10 @@ __device__ __noinline__ void quantize_cols_from_stage(
         uint8_t stored_scale;
         localcta_block_quant_params(block_amax, chunk_s_enc, chunk_sg, coeff, stored_scale);
 
-        uint64_t packed = 0;
-        #pragma unroll
-        for (int pair = 0; pair < 8; ++pair) {
-            const bf16_2 v = cached[pair];
-            packed |= static_cast<uint64_t>(quantize_fp4_pair(
-                __bfloat162float(v.x), __bfloat162float(v.y), coeff)) << (pair * 8);
-        }
+        const uint64_t packed = static_cast<uint64_t>(quantize_fp4_8(
+                                    cached[0], cached[1], cached[2], cached[3], coeff)) |
+                                (static_cast<uint64_t>(quantize_fp4_8(
+                                    cached[4], cached[5], cached[6], cached[7], coeff)) << 32);
 
         const int global_row_pair = warp_row_base / 2 + row_group * 8;
         *reinterpret_cast<uint64_t*>(
@@ -555,7 +611,7 @@ __device__ inline void kernel(const globals<C>& g) {
         }
     } else if (warpgroup_id < C::CONSUMER_WARPGROUPS) {
         everyone::tma::cluster::wait_aligned();
-        if (warpgroup::warpid() == 0) {
+        if (warpgroup_id == 0 && warpgroup::warpid() == 0) {
             tm_allocator.provision(tmem_addr);
             warp::arrive(tmem_provisioned);
         }
@@ -568,8 +624,8 @@ __device__ inline void kernel(const globals<C>& g) {
         static_assert(SUBTILE_COLS == 32, "localCTA SiLU dgrad producer assumes 32-column epilogue slices");
         __shared__ bf16_2 staged0[WARPGROUP_WARPS][4][16][33];
         __shared__ bf16_2 staged1[WARPGROUP_WARPS][4][16][33];
-        __shared__ float warp_amax0[2][WARPGROUP_WARPS];
-        __shared__ float warp_amax1[2][WARPGROUP_WARPS];
+        __shared__ float warp_amax0[2][C::CONSUMER_WARPGROUPS][WARPGROUP_WARPS];
+        __shared__ float warp_amax1[2][C::CONSUMER_WARPGROUPS][WARPGROUP_WARPS];
         __shared__ float chunk_s_enc0[2];
         __shared__ float chunk_s_enc1[2];
         __shared__ float chunk_sg0[2];
@@ -585,99 +641,165 @@ __device__ inline void kernel(const globals<C>& g) {
             int col_block_idx = idx_within_supergroup / rows_in_supergroup;
             const int wg_warp = warpgroup::warpid();
             const int lane_id = warp::laneid();
+            const int consumer_barrier_id = 4 + warpgroup_id;
             const int warp_row_base = (row_block_idx * 2 + cta_id) * (C::Mb / 2) + wg_warp * 32;
-
-            subtile_rt D_acc[C::EPI_PIPE_DEPTH];
-            wait(outputs_arrived, get_phasebit<0>(output_phasebits, 0));
-            #pragma unroll
-            for (int epi = 0; epi < C::EPI_PIPE_DEPTH; epi++) {
-                warpgroup::load_async(
-                    D_acc[epi],
-                    out_tm.template subtile<full_tt_fl<SUBTILE_COLS>>(0, SUBTILE_COLS * epi));
-            }
-            tensor_load_wait();
-            tensor_before_thread_sync();
-            warpgroup::sync(1);
-            warpgroup::tma::cluster::arrive(outputs_finished, 0, 1);
 
             const float gs = g.A_sg[row_block_idx * g.A_sg_stride] *
                              g.B_sg[col_block_idx * g.B_sg_stride];
-            #pragma unroll
-            for (int epi = 0; epi < C::EPI_PIPE_DEPTH; ++epi) {
-                warp::mul(D_acc[epi], D_acc[epi], gs);
-            }
-            warpgroup::sync(1);
-            tensor_after_thread_sync();
-            update_phasebit<0>(output_phasebits, 0);
+
+            wait(outputs_arrived, get_phasebit<0>(output_phasebits, 0));
 
             #pragma unroll
             for (int half = 0; half < 2; ++half) {
-                float local_amax0 = 0.0f;
-                float local_amax1 = 0.0f;
                 bf16_2 (*pairs0)[16][33] = staged0[wg_warp];
                 bf16_2 (*pairs1)[16][33] = staged1[wg_warp];
-                #pragma unroll
-                for (int e = 0; e < 4; ++e) {
-                    const int epi = half * 4 + e;
-                    const int col_start = col_block_idx * C::Nb + epi * SUBTILE_COLS;
-                    stage_silu_deriv_pairs<C>(
-                        g, D_acc[epi], pairs0, pairs1, e, lane_id, warp_row_base,
-                        col_start, local_amax0, local_amax1);
-                }
-                local_amax0 = warp_reduce_max(local_amax0);
-                local_amax1 = warp_reduce_max(local_amax1);
-                if (lane_id == 0) {
-                    warp_amax0[half][wg_warp] = local_amax0;
-                    warp_amax1[half][wg_warp] = local_amax1;
-                }
-                warpgroup::sync(1);
-                if (wg_warp == 0 && lane_id == 0) {
-                    float amax0 = 0.0f;
-                    float amax1 = 0.0f;
+                if constexpr (C::CONSUMER_WARPGROUPS == 1) {
+                    float local_amax0 = 0.0f;
+                    float local_amax1 = 0.0f;
                     #pragma unroll
-                    for (int w = 0; w < WARPGROUP_WARPS; ++w) {
-                        amax0 = fmaxf(amax0, warp_amax0[half][w]);
-                        amax1 = fmaxf(amax1, warp_amax1[half][w]);
+                    for (int e = 0; e < 4; ++e) {
+                        const int epi = half * 4 + e;
+                        const int col_start = col_block_idx * C::Nb + epi * SUBTILE_COLS;
+                        subtile_rt D_acc;
+                        warpgroup::load_async(
+                            D_acc,
+                            out_tm.template subtile<full_tt_fl<SUBTILE_COLS>>(
+                                0, SUBTILE_COLS * epi));
+                        tensor_load_wait();
+                        tensor_before_thread_sync();
+                        warpgroup::sync(consumer_barrier_id);
+                        if (epi == C::EPI_PIPE_DEPTH - 1) {
+                            warpgroup::tma::cluster::arrive(outputs_finished, 0, 1);
+                        }
+                        warp::mul(D_acc, D_acc, gs);
+                        stage_silu_deriv_pairs<C>(
+                            g, D_acc, pairs0, pairs1, e, lane_id, warp_row_base,
+                            col_start, local_amax0, local_amax1);
+                        warpgroup::sync(consumer_barrier_id);
+                        tensor_after_thread_sync();
                     }
-                    chunk_s_enc0[half] = localcta_encode_scale(amax0);
-                    chunk_s_enc1[half] = localcta_encode_scale(amax1);
-                    chunk_sg0[half] = amax0 / LOCALCTA_GLOBAL_SCALE_NUM;
-                    chunk_sg1[half] = amax1 / LOCALCTA_GLOBAL_SCALE_NUM;
-
-                    const int row_chunk = row_block_idx * 2 + cta_id;
-                    const int col_chunk = col_block_idx * 2 + half;
-                    const int row_sg_cols = (2 * g.H) / 128;
-                    const int split_chunk_offset = g.H / 128;
-                    const int col_sg_cols = g.M / 128;
-                    g.row_sg[row_chunk * row_sg_cols + col_chunk] = chunk_sg0[half];
-                    g.row_sg[row_chunk * row_sg_cols + split_chunk_offset + col_chunk] = chunk_sg1[half];
-                    g.col_sg[col_chunk * col_sg_cols + row_chunk] = chunk_sg0[half];
-                    g.col_sg[(split_chunk_offset + col_chunk) * col_sg_cols + row_chunk] = chunk_sg1[half];
+                    local_amax0 = warp_reduce_max(local_amax0);
+                    local_amax1 = warp_reduce_max(local_amax1);
+                    if (lane_id == 0) {
+                        warp_amax0[half][0][wg_warp] = local_amax0;
+                        warp_amax1[half][0][wg_warp] = local_amax1;
+                    }
+                    warpgroup::sync(consumer_barrier_id);
+                } else {
+                    const int e = warpgroup_id;
+                    const int epi = half * 4 + e;
+                    const int col_start = col_block_idx * C::Nb + epi * SUBTILE_COLS;
+                    float local_amax0 = 0.0f;
+                    float local_amax1 = 0.0f;
+                    subtile_rt D_acc;
+                    warpgroup::load_async(
+                        D_acc,
+                        out_tm.template subtile<full_tt_fl<SUBTILE_COLS>>(
+                            0, SUBTILE_COLS * epi));
+                    tensor_load_wait();
+                    tensor_before_thread_sync();
+                    warpgroup::sync(consumer_barrier_id);
+                    if (epi == C::EPI_PIPE_DEPTH - 1) {
+                        warpgroup::tma::cluster::arrive(outputs_finished, 0, 1);
+                    }
+                    warp::mul(D_acc, D_acc, gs);
+                    stage_silu_deriv_pairs<C>(
+                        g, D_acc, pairs0, pairs1, e, lane_id, warp_row_base,
+                        col_start, local_amax0, local_amax1);
+                    warpgroup::sync(consumer_barrier_id);
+                    tensor_after_thread_sync();
+                    local_amax0 = warp_reduce_max(local_amax0);
+                    local_amax1 = warp_reduce_max(local_amax1);
+                    if (lane_id == 0) {
+                        warp_amax0[half][warpgroup_id][wg_warp] = local_amax0;
+                        warp_amax1[half][warpgroup_id][wg_warp] = local_amax1;
+                    }
+                    warpgroup::sync(consumer_barrier_id);
+                    group<WARPGROUP_WARPS * C::CONSUMER_WARPGROUPS>::sync(8);
                 }
-                warpgroup::sync(1);
+
+                if (warpgroup_id == 0) {
+                    if (wg_warp == 0 && lane_id == 0) {
+                        float amax0 = 0.0f;
+                        float amax1 = 0.0f;
+                        #pragma unroll
+                        for (int role = 0; role < C::CONSUMER_WARPGROUPS; ++role) {
+                            #pragma unroll
+                            for (int w = 0; w < WARPGROUP_WARPS; ++w) {
+                                amax0 = fmaxf(amax0, warp_amax0[half][role][w]);
+                                amax1 = fmaxf(amax1, warp_amax1[half][role][w]);
+                            }
+                        }
+                        chunk_s_enc0[half] = localcta_encode_scale(amax0);
+                        chunk_s_enc1[half] = localcta_encode_scale(amax1);
+                        chunk_sg0[half] = amax0 / LOCALCTA_GLOBAL_SCALE_NUM;
+                        chunk_sg1[half] = amax1 / LOCALCTA_GLOBAL_SCALE_NUM;
+
+                        const int row_chunk = row_block_idx * 2 + cta_id;
+                        const int col_chunk = col_block_idx * 2 + half;
+                        const int row_sg_cols = (2 * g.H) / 128;
+                        const int split_chunk_offset = g.H / 128;
+                        const int col_sg_cols = g.M / 128;
+                        g.row_sg[row_chunk * row_sg_cols + col_chunk] = chunk_sg0[half];
+                        g.row_sg[row_chunk * row_sg_cols + split_chunk_offset + col_chunk] = chunk_sg1[half];
+                        g.col_sg[col_chunk * col_sg_cols + row_chunk] = chunk_sg0[half];
+                        g.col_sg[(split_chunk_offset + col_chunk) * col_sg_cols + row_chunk] = chunk_sg1[half];
+                    }
+                }
+                if constexpr (C::CONSUMER_WARPGROUPS == 1) {
+                    warpgroup::sync(consumer_barrier_id);
+                } else {
+                    group<WARPGROUP_WARPS * C::CONSUMER_WARPGROUPS>::sync(8);
+                }
+
                 #pragma unroll
                 for (int e = 0; e < 4; ++e) {
                     const int epi = half * 4 + e;
                     const int col_start = col_block_idx * C::Nb + epi * SUBTILE_COLS;
-                    quantize_rows_from_stage<C>(
-                        g, pairs0, e, lane_id, warp_row_base, col_start,
-                        chunk_s_enc0[half], chunk_sg0[half]);
-                    quantize_cols_from_stage<C>(
-                        g, pairs0, e, lane_id, warp_row_base, col_start,
-                        chunk_s_enc0[half], chunk_sg0[half]);
-                    quantize_rows_from_stage<C>(
-                        g, pairs1, e, lane_id, warp_row_base, g.H + col_start,
-                        chunk_s_enc1[half], chunk_sg1[half]);
-                    quantize_cols_from_stage<C>(
-                        g, pairs1, e, lane_id, warp_row_base, g.H + col_start,
-                        chunk_s_enc1[half], chunk_sg1[half]);
+                    if constexpr (C::CONSUMER_WARPGROUPS == 1) {
+                        quantize_rows_from_stage<C>(
+                            g, pairs0, e, lane_id, warp_row_base, col_start,
+                            chunk_s_enc0[half], chunk_sg0[half]);
+                        quantize_cols_from_stage<C>(
+                            g, pairs0, e, lane_id, warp_row_base, col_start,
+                            chunk_s_enc0[half], chunk_sg0[half]);
+                        quantize_rows_from_stage<C>(
+                            g, pairs1, e, lane_id, warp_row_base, g.H + col_start,
+                            chunk_s_enc1[half], chunk_sg1[half]);
+                        quantize_cols_from_stage<C>(
+                            g, pairs1, e, lane_id, warp_row_base, g.H + col_start,
+                            chunk_s_enc1[half], chunk_sg1[half]);
+                    } else if (warpgroup_id == 0) {
+                        quantize_rows_from_stage<C>(
+                            g, pairs0, e, lane_id, warp_row_base, col_start,
+                            chunk_s_enc0[half], chunk_sg0[half]);
+                    } else if (warpgroup_id == 1) {
+                        quantize_cols_from_stage<C>(
+                            g, pairs0, e, lane_id, warp_row_base, col_start,
+                            chunk_s_enc0[half], chunk_sg0[half]);
+                    } else if (warpgroup_id == 2) {
+                        quantize_rows_from_stage<C>(
+                            g, pairs1, e, lane_id, warp_row_base, g.H + col_start,
+                            chunk_s_enc1[half], chunk_sg1[half]);
+                    } else {
+                        quantize_cols_from_stage<C>(
+                            g, pairs1, e, lane_id, warp_row_base, g.H + col_start,
+                            chunk_s_enc1[half], chunk_sg1[half]);
+                    }
                 }
-                warpgroup::sync(1);
+                if constexpr (C::CONSUMER_WARPGROUPS == 1) {
+                    warpgroup::sync(consumer_barrier_id);
+                } else {
+                    group<WARPGROUP_WARPS * C::CONSUMER_WARPGROUPS>::sync(8);
+                }
             }
+            update_phasebit<0>(output_phasebits, 0);
         }
-        warpgroup::sync(1);
-        if constexpr (C::USE_PDL) warpgroup::pdl::arrive();
-        if (warpgroup::warpid() == 0) tm_allocator.deprovision();
+        warpgroup::sync(4 + warpgroup_id);
+        if (warpgroup_id == 0) {
+            if constexpr (C::USE_PDL) warpgroup::pdl::arrive();
+            if (warpgroup::warpid() == 0) tm_allocator.deprovision();
+        }
     }
 }
 
