@@ -708,9 +708,6 @@ __device__ inline void kernel(const globals<C>& g) {
                     tensor_load_wait();
                     tensor_before_thread_sync();
                     warpgroup::sync(consumer_barrier_id);
-                    if (epi == C::EPI_PIPE_DEPTH - 1) {
-                        warpgroup::tma::cluster::arrive(outputs_finished, 0, 1);
-                    }
                     warp::mul(D_acc, D_acc, gs);
                     stage_silu_deriv_pairs<C>(
                         g, D_acc, pairs0, pairs1, e, lane_id, warp_row_base,
@@ -725,6 +722,11 @@ __device__ inline void kernel(const globals<C>& g) {
                     }
                     warpgroup::sync(consumer_barrier_id);
                     group<WARPGROUP_WARPS * C::CONSUMER_WARPGROUPS>::sync(8);
+                    if (half == 1 && warpgroup_id == 0) {
+                        // Releasing tensor memory from role 3 alone races the
+                        // other consumer warpgroups' asynchronous loads.
+                        warpgroup::tma::cluster::arrive(outputs_finished, 0, 1);
+                    }
                 }
 
                 if (warpgroup_id == 0) {
