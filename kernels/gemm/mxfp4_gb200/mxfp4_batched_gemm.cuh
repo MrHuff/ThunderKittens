@@ -17,7 +17,11 @@
 // ================================================================
 namespace mxfp4_batched_gemm {
 
-static constexpr int MAX_BATCHES = 32;
+// Five 128-byte TMA descriptors plus RoPE metadata and block counts are
+// carried in the kernel argument block per batch. 40 entries remain below
+// CUDA's 32 KiB kernel-parameter limit and cover the 36 local experts in
+// 27A4B EP2.
+static constexpr int MAX_BATCHES = 40;
 
 // ---- tma_dev_proxy: gl-like wrapper that returns a device-global CUtensorMap* ----
 template <typename _GL>
@@ -122,6 +126,7 @@ __device__ inline void resolve_problem_tile(
     const globals<C> &g,
     int flat_block_idx,
     int legacy_batch,
+    int &batch_hint,
     int &batch,
     int &block_idx,
     int &num_row_blocks,
@@ -129,18 +134,15 @@ __device__ inline void resolve_problem_tile(
     int &num_red_blocks
 ) {
     if (g.total_spatial_tiles > 0) {
-        int selected = 0;
-        #pragma unroll
-        for (int i = 0; i < MAX_BATCHES; ++i) {
-            if (i < g.num_batches && flat_block_idx >= g.tile_offsets[i]) {
-                selected = i;
-            }
+        #pragma unroll 1
+        while (flat_block_idx >= g.tile_offsets[batch_hint + 1]) {
+            ++batch_hint;
         }
-        batch = selected;
-        block_idx = flat_block_idx - g.tile_offsets[selected];
-        num_row_blocks = g.num_row_blocks_by_batch[selected];
-        num_col_blocks = g.num_col_blocks_by_batch[selected];
-        num_red_blocks = g.num_red_blocks_by_batch[selected];
+        batch = batch_hint;
+        block_idx = flat_block_idx - g.tile_offsets[batch];
+        num_row_blocks = g.num_row_blocks_by_batch[batch];
+        num_col_blocks = g.num_col_blocks_by_batch[batch];
+        num_red_blocks = g.num_red_blocks_by_batch[batch];
     } else {
         batch = legacy_batch;
         block_idx = flat_block_idx;
@@ -167,7 +169,7 @@ __device__ inline void resolve_block_coords(
     col_block_idx = idx_within_supergroup / rows_in_supergroup;
 }
 
-template <typename C>
+template <typename C, bool APPLY_ROPE = true>
 __device__ inline void kernel(const globals<C> &g) {
     using G = globals<C>;
 
@@ -241,10 +243,11 @@ __device__ inline void kernel(const globals<C> &g) {
             pdl::wait();
             everyone::tma::cluster::wait();
 
+            int batch_hint = 0;
             for (int flat_block_idx = cluster_id; flat_block_idx < num_blocks; flat_block_idx += cluster_stride) {
                 int batch, block_idx, num_row_blocks, num_col_blocks, num_red_blocks;
                 int row_block_idx, col_block_idx;
-                resolve_problem_tile<C>(g, flat_block_idx, legacy_batch, batch, block_idx, num_row_blocks, num_col_blocks, num_red_blocks);
+                resolve_problem_tile<C>(g, flat_block_idx, legacy_batch, batch_hint, batch, block_idx, num_row_blocks, num_col_blocks, num_red_blocks);
                 resolve_block_coords<C>(block_idx, num_row_blocks, num_col_blocks, row_block_idx, col_block_idx);
                 const int tma_batch = g.uniform_strided ? 0 : batch;
                 const int a_row_block_base = g.uniform_strided ? batch * g.a_row_block_stride : 0;
@@ -267,10 +270,11 @@ __device__ inline void kernel(const globals<C> &g) {
             pdl::wait();
             everyone::tma::cluster::wait();
 
+            int batch_hint = 0;
             for (int flat_block_idx = cluster_id; flat_block_idx < num_blocks; flat_block_idx += cluster_stride) {
                 int batch, block_idx, num_row_blocks, num_col_blocks, num_red_blocks;
                 int row_block_idx, col_block_idx;
-                resolve_problem_tile<C>(g, flat_block_idx, legacy_batch, batch, block_idx, num_row_blocks, num_col_blocks, num_red_blocks);
+                resolve_problem_tile<C>(g, flat_block_idx, legacy_batch, batch_hint, batch, block_idx, num_row_blocks, num_col_blocks, num_red_blocks);
                 resolve_block_coords<C>(block_idx, num_row_blocks, num_col_blocks, row_block_idx, col_block_idx);
                 const int tma_batch = g.uniform_strided ? 0 : batch;
                 const int a_row_block_base = g.uniform_strided ? batch * g.a_row_block_stride : 0;
@@ -331,9 +335,10 @@ __device__ inline void kernel(const globals<C> &g) {
             auto A_sc_tm = tm_allocator.template allocate<full_tt_fp8e8m0<16*C::MMA_PER_TILE*C::LOAD_PIPE_DEPTH>>(256);
             auto B_sc_tm = tm_allocator.template allocate<full_tt_fp8e8m0<32*C::MMA_PER_TILE*C::LOAD_PIPE_DEPTH>>(256 + 4 * C::MMA_PER_TILE * C::LOAD_PIPE_DEPTH);
 
+            int batch_hint = 0;
             for (int flat_block_idx = cluster_id; flat_block_idx < num_blocks; flat_block_idx += cluster_stride) {
                 int batch, block_idx, num_row_blocks, num_col_blocks, num_red_blocks;
-                resolve_problem_tile<C>(g, flat_block_idx, legacy_batch, batch, block_idx, num_row_blocks, num_col_blocks, num_red_blocks);
+                resolve_problem_tile<C>(g, flat_block_idx, legacy_batch, batch_hint, batch, block_idx, num_row_blocks, num_col_blocks, num_red_blocks);
                 wait(outputs_finished, get_phasebit<1>(phasebits, 0));
                 tensor_after_thread_sync();
                 for (int i = 0; i < num_red_blocks; i++) {
@@ -378,10 +383,11 @@ __device__ inline void kernel(const globals<C> &g) {
         tm_allocator.set_addr(tmem_addr);
         auto out_tm = tm_allocator.template allocate<full_tt_fl<C::Nb>>(0);
 
+        int batch_hint = 0;
         for (int flat_block_idx = cluster_id; flat_block_idx < num_blocks; flat_block_idx += cluster_stride) {
             int batch, block_idx, num_row_blocks, num_col_blocks, num_red_blocks;
             int row_block_idx, col_block_idx;
-            resolve_problem_tile<C>(g, flat_block_idx, legacy_batch, batch, block_idx, num_row_blocks, num_col_blocks, num_red_blocks);
+            resolve_problem_tile<C>(g, flat_block_idx, legacy_batch, batch_hint, batch, block_idx, num_row_blocks, num_col_blocks, num_red_blocks);
             resolve_block_coords<C>(block_idx, num_row_blocks, num_col_blocks, row_block_idx, col_block_idx);
             const int tma_batch = g.uniform_strided ? 0 : batch;
             const int d_row_block_base = g.uniform_strided ? batch * g.d_row_block_stride : 0;
@@ -404,29 +410,31 @@ __device__ inline void kernel(const globals<C> &g) {
             #pragma unroll
             for (int i = 0; i < C::EPI_PIPE_DEPTH; i++) {
                 warp::mul(D_reg_fl[i], D_reg_fl[i], MXFP4_ALPHA);
-                if (g.rope_live64[rope_batch].enabled()) {
-                    if constexpr (C::ROPE_LIVE64_RHT32) {
-                        mxfp4_rope_epilogue::apply_inplace_live64_rht32(
-                            D_reg_fl[i],
-                            g.rope_live64[rope_batch],
-                            (row_block_idx * 2 + cta_id) * (C::Mb / 2),
-                            (col_block_idx * C::EPI_PIPE_DEPTH + i) * (C::Nb / C::EPI_PIPE_DEPTH)
-                        );
+                if constexpr (APPLY_ROPE) {
+                    if (g.rope_live64[rope_batch].enabled()) {
+                        if constexpr (C::ROPE_LIVE64_RHT32) {
+                            mxfp4_rope_epilogue::apply_inplace_live64_rht32(
+                                D_reg_fl[i],
+                                g.rope_live64[rope_batch],
+                                (row_block_idx * 2 + cta_id) * (C::Mb / 2),
+                                (col_block_idx * C::EPI_PIPE_DEPTH + i) * (C::Nb / C::EPI_PIPE_DEPTH)
+                            );
+                        } else {
+                            mxfp4_rope_epilogue::apply_inplace_live64(
+                                D_reg_fl[i],
+                                g.rope_live64[rope_batch],
+                                (row_block_idx * 2 + cta_id) * (C::Mb / 2),
+                                (col_block_idx * C::EPI_PIPE_DEPTH + i) * (C::Nb / C::EPI_PIPE_DEPTH)
+                            );
+                        }
                     } else {
-                        mxfp4_rope_epilogue::apply_inplace_live64(
+                        mxfp4_rope_epilogue::apply_inplace(
                             D_reg_fl[i],
-                            g.rope_live64[rope_batch],
+                            g.rope[rope_batch],
                             (row_block_idx * 2 + cta_id) * (C::Mb / 2),
                             (col_block_idx * C::EPI_PIPE_DEPTH + i) * (C::Nb / C::EPI_PIPE_DEPTH)
                         );
                     }
-                } else {
-                    mxfp4_rope_epilogue::apply_inplace(
-                        D_reg_fl[i],
-                        g.rope[rope_batch],
-                        (row_block_idx * 2 + cta_id) * (C::Mb / 2),
-                        (col_block_idx * C::EPI_PIPE_DEPTH + i) * (C::Nb / C::EPI_PIPE_DEPTH)
-                    );
                 }
             }
             rt_bf<C::Mb / 8, C::Nb/C::EPI_PIPE_DEPTH> D_reg[C::EPI_PIPE_DEPTH];

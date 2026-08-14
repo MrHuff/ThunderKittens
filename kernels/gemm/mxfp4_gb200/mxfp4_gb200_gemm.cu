@@ -1412,7 +1412,7 @@ void mxfp4_batched_gemm_entrypoint(
             auto d_gl = kittens::py::tensor_to_gl<typename G::D_gl>(D_out_list[i]);
             memcpy(&g_host.D_tma[i], &d_gl.tma_descs.tma_desc, sizeof(CUtensorMap));
         }
-        kittens::py::launch_kernel<C, G, mxfp4_batched_gemm::kernel<C>>(g_host);
+        kittens::py::launch_kernel<C, G, mxfp4_batched_gemm::kernel<C, false>>(g_host);
     };
 
     // For batched GEMM, use MMA_PER_TILE-friendly configs to avoid resource overflow.
@@ -1506,7 +1506,7 @@ void mxfp4_grouped_gemm_strided_entrypoint(
         memcpy(&g_host.B_tma[0], &b_gl.tma_descs.tma_desc, sizeof(CUtensorMap));
         memcpy(&g_host.B_sc_tma[0], &b_sc_gl.tma_descs.tma_desc, sizeof(CUtensorMap));
         memcpy(&g_host.D_tma[0], &d_gl.tma_descs.tma_desc, sizeof(CUtensorMap));
-        kittens::py::launch_kernel<C, G, mxfp4_batched_gemm::kernel<C>>(g_host);
+        kittens::py::launch_kernel<C, G, mxfp4_batched_gemm::kernel<C, false>>(g_host);
     };
 
     auto build_nb128_kb128 = [&](int cfg) {
@@ -1669,13 +1669,17 @@ void mxfp4_batched_gemm_slices_entrypoint(
             memcpy(&g_host.B_sc_tma[i], &b_sc_gl.tma_descs.tma_desc, sizeof(CUtensorMap));
             memcpy(&g_host.D_tma[i], &d_gl.tma_descs.tma_desc, sizeof(CUtensorMap));
         }
-        kittens::py::launch_kernel<C, G, mxfp4_batched_gemm::kernel<C>>(g_host);
+        kittens::py::launch_kernel<C, G, mxfp4_batched_gemm::kernel<C, false>>(g_host);
     };
 
     const int64_t N_out = N_list[0];
     const int64_t K0 = K_list[0];
     auto run_auto = [&]() {
-        if (N_out % 256 != 0 && N_out % 128 == 0) {
+        if (N_out == 3072 && K0 == 2560) {
+            // DeepSeek 27A4B gate/up: the deeper epilogue pipeline is faster
+            // for this wide expert projection.
+            build_and_launch.template operator()<mxfp4_gemm::config<256, 5, 16, 4, 2, true, 256>>();
+        } else if (N_out % 256 != 0 && N_out % 128 == 0) {
             if (K0 % 256 == 0) {
                 build_and_launch.template operator()<mxfp4_gemm::config<128, 5, 8, 4, 2, false, 256>>();
             } else {
@@ -1774,7 +1778,7 @@ void mxfp4_batched_gemm_config_entrypoint(
             auto d_gl = kittens::py::tensor_to_gl<typename G::D_gl>(D_out_list[i]);
             memcpy(&g_host.D_tma[i], &d_gl.tma_descs.tma_desc, sizeof(CUtensorMap));
         }
-        kittens::py::launch_kernel<C, G, mxfp4_batched_gemm::kernel<C>>(g_host);
+        kittens::py::launch_kernel<C, G, mxfp4_batched_gemm::kernel<C, false>>(g_host);
     };
 
     switch (config_id) {
