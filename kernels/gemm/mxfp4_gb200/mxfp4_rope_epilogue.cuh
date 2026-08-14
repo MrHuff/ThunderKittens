@@ -22,6 +22,8 @@ struct rope_live64_desc {
     const float2* cs = nullptr;
     int seq_len = 0;
     int seq_mask = 0;
+    int pair_stride = 32;
+    int head_mask = 63;
 
     __host__ __device__ inline bool enabled() const {
         return cs != nullptr && seq_len > 0;
@@ -106,7 +108,10 @@ __device__ inline void load_rope_stride1_live64(
     int col_even
 ) {
     constexpr float inv_sqrt2 = 0.70710678118654752440f;
-    const float2 cs = rope.cs[(row & rope.seq_mask) * 32 + ((col_even & 63) >> 1)];
+    const float2 cs = rope.cs[
+        (row & rope.seq_mask) * rope.pair_stride +
+        ((col_even & rope.head_mask) >> 1)
+    ];
     const float2 v = unpack_pair(packed);
     const float r0 = v.x * cs.x - v.y * cs.y;
     const float r1 = v.y * cs.x + v.x * cs.y;
@@ -292,7 +297,10 @@ __device__ inline void apply_inplace_live64(
                     j * tile_col_dim +
                     (k / 2) * (tile_col_dim / 2) +
                     (warp_lane % 4) * 2;
-                const float2 cs = rope.cs[(row & rope.seq_mask) * 32 + ((col_even & 63) >> 1)];
+                const float2 cs = rope.cs[
+                    (row & rope.seq_mask) * rope.pair_stride +
+                    ((col_even & rope.head_mask) >> 1)
+                ];
                 tile.tiles[i][j].data[k] = rotate_pair(tile.tiles[i][j].data[k], cs.x, cs.y);
             }
         }

@@ -292,7 +292,7 @@ void check_rope_epilogue_args(
     kittens::py::device_check(D, rope_cos, rope_sin);
 }
 
-void check_rope_live64_tensor(
+int64_t check_rope_live_tensor(
     const at::Tensor& t,
     const char* name,
     int64_t seq_len
@@ -302,11 +302,16 @@ void check_rope_live64_tensor(
     TORCH_CHECK(t.dim() == 3, name, " must be 3D");
     TORCH_CHECK(t.scalar_type() == at::kFloat, name, " must be float32");
     TORCH_CHECK(t.size(0) == seq_len, name, " seq_len mismatch");
-    TORCH_CHECK(t.size(1) == 32, name, " second dim must equal 32");
+    const int64_t pair_dim = t.size(1);
+    TORCH_CHECK(
+        pair_dim >= 16 && pair_dim <= 128 && is_power_of_two(pair_dim),
+        name, " second dim must be a power of two in [16, 128]"
+    );
     TORCH_CHECK(t.size(2) == 2, name, " third dim must equal 2");
+    return pair_dim;
 }
 
-void check_rope_live64_args(
+int64_t check_rope_live_args(
     const at::Tensor& D,
     const at::Tensor& rope_cs,
     int64_t rope_seq_len
@@ -314,9 +319,13 @@ void check_rope_live64_args(
     TORCH_CHECK(rope_seq_len > 0, "rope_seq_len must be positive");
     TORCH_CHECK(is_power_of_two(rope_seq_len), "rope_seq_len must be a power of two");
     TORCH_CHECK(D.size(0) % rope_seq_len == 0, "output rows must be divisible by rope_seq_len");
-    TORCH_CHECK(D.size(1) % 64 == 0, "output cols must be divisible by 64");
-    check_rope_live64_tensor(rope_cs, "rope_cs", rope_seq_len);
+    const int64_t pair_dim = check_rope_live_tensor(rope_cs, "rope_cs", rope_seq_len);
+    TORCH_CHECK(
+        D.size(1) % (2 * pair_dim) == 0,
+        "output cols must be divisible by the RoPE head dimension"
+    );
     kittens::py::device_check(D, rope_cs);
+    return pair_dim;
 }
 
 static bool use_rope_live64_rht32() {
@@ -1517,6 +1526,7 @@ static void run_gemm_with_config_rope_live64_impl(
     int64_t rope_seq_len
 ) {
     using G = mxfp4_gemm::globals<C>;
+    const int pair_stride = static_cast<int>(rope_cs.size(1));
     G g {
         .A = kittens::py::tensor_to_gl<typename G::A_fp4x2_gl>(A),
         .A_sc = kittens::py::tensor_to_gl<typename G::A_sc_gl>(A_sc),
@@ -1527,6 +1537,8 @@ static void run_gemm_with_config_rope_live64_impl(
             .cs = reinterpret_cast<const float2*>(rope_cs.data_ptr<float>()),
             .seq_len = static_cast<int>(rope_seq_len),
             .seq_mask = static_cast<int>(rope_seq_len - 1),
+            .pair_stride = pair_stride,
+            .head_mask = 2 * pair_stride - 1,
         },
     };
     kittens::py::launch_kernel<C, G, mxfp4_gemm::kernel<C>>(g);
@@ -1769,7 +1781,7 @@ void mxfp4_gemm_rope_live64_entrypoint(
     const at::Tensor &rope_cs,
     int64_t rope_seq_len
 ) {
-    check_rope_live64_args(D, rope_cs, rope_seq_len);
+    check_rope_live_args(D, rope_cs, rope_seq_len);
     run_gemm_with_config_rope_live64<mxfp4_gemm::config<256, 5, 8, 4, 2, false>>(
         A, A_sc, B, B_sc, D, rope_cs, rope_seq_len);
 }
@@ -1782,7 +1794,7 @@ void mxfp4_gemm_rope_live64_config_entrypoint(
     int64_t rope_seq_len,
     int config_id
 ) {
-    check_rope_live64_args(D, rope_cs, rope_seq_len);
+    check_rope_live_args(D, rope_cs, rope_seq_len);
     switch (config_id) {
     case 0:  run_gemm_with_config_rope_live64<mxfp4_gemm::config<256, 5,  8,  4, 2, false>>(A, A_sc, B, B_sc, D, rope_cs, rope_seq_len); break;
     case 1:  run_gemm_with_config_rope_live64<mxfp4_gemm::config<256, 4, 16,  4, 2, false>>(A, A_sc, B, B_sc, D, rope_cs, rope_seq_len); break;
@@ -2443,10 +2455,14 @@ void mxfp4_batched_gemm_rope_live64_entrypoint(
             memcpy(&g_host.D_tma[i], &d_gl.tma_descs.tma_desc, sizeof(CUtensorMap));
 
             if (!rope_tensor_disabled(rope_cs_list[i])) {
-                check_rope_live64_args(D_out_list[i], rope_cs_list[i], rope_seq_len_list[i]);
+                const int pair_stride = static_cast<int>(
+                    check_rope_live_args(D_out_list[i], rope_cs_list[i], rope_seq_len_list[i])
+                );
                 g_host.rope_live64[i].cs = reinterpret_cast<const float2*>(rope_cs_list[i].data_ptr<float>());
                 g_host.rope_live64[i].seq_len = static_cast<int>(rope_seq_len_list[i]);
                 g_host.rope_live64[i].seq_mask = static_cast<int>(rope_seq_len_list[i] - 1);
+                g_host.rope_live64[i].pair_stride = pair_stride;
+                g_host.rope_live64[i].head_mask = 2 * pair_stride - 1;
             }
         }
         kittens::py::launch_kernel<C, G, mxfp4_batched_gemm::kernel<C>>(g_host);
@@ -2514,10 +2530,14 @@ void mxfp4_batched_gemm_rope_live64_config_entrypoint(
             memcpy(&g_host.D_tma[i], &d_gl.tma_descs.tma_desc, sizeof(CUtensorMap));
 
             if (!rope_tensor_disabled(rope_cs_list[i])) {
-                check_rope_live64_args(D_out_list[i], rope_cs_list[i], rope_seq_len_list[i]);
+                const int pair_stride = static_cast<int>(
+                    check_rope_live_args(D_out_list[i], rope_cs_list[i], rope_seq_len_list[i])
+                );
                 g_host.rope_live64[i].cs = reinterpret_cast<const float2*>(rope_cs_list[i].data_ptr<float>());
                 g_host.rope_live64[i].seq_len = static_cast<int>(rope_seq_len_list[i]);
                 g_host.rope_live64[i].seq_mask = static_cast<int>(rope_seq_len_list[i] - 1);
+                g_host.rope_live64[i].pair_stride = pair_stride;
+                g_host.rope_live64[i].head_mask = 2 * pair_stride - 1;
             }
         }
         kittens::py::launch_kernel<C, G, mxfp4_batched_gemm::kernel<C>>(g_host);
@@ -2801,6 +2821,21 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           pybind11::arg("rope_cs"),
           pybind11::arg("rope_seq_len"),
           pybind11::arg("config_id"));
+    m.def("mxfp4_gemm_rope_live", &mxfp4_gemm_rope_live64_entrypoint,
+          "GEMM with a packed power-of-two RoPE epilogue",
+          pybind11::arg("A"), pybind11::arg("A_sc"),
+          pybind11::arg("B"), pybind11::arg("B_sc"),
+          pybind11::arg("D"),
+          pybind11::arg("rope_cs"),
+          pybind11::arg("rope_seq_len"));
+    m.def("mxfp4_gemm_rope_live_config", &mxfp4_gemm_rope_live64_config_entrypoint,
+          "GEMM with selectable tile config and a packed power-of-two RoPE epilogue",
+          pybind11::arg("A"), pybind11::arg("A_sc"),
+          pybind11::arg("B"), pybind11::arg("B_sc"),
+          pybind11::arg("D"),
+          pybind11::arg("rope_cs"),
+          pybind11::arg("rope_seq_len"),
+          pybind11::arg("config_id"));
     m.def("mxfp4_gemm_rope_config", &mxfp4_gemm_rope_config_entrypoint,
           "GEMM with selectable tile config and a RoPE epilogue",
           pybind11::arg("A"), pybind11::arg("A_sc"),
@@ -2929,6 +2964,21 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           pybind11::arg("rope_seq_len_list"));
     m.def("mxfp4_batched_gemm_rope_live64_config", &mxfp4_batched_gemm_rope_live64_config_entrypoint,
           "True Batched GEMM with selectable tile config and an exact-shape live64 per-batch RoPE epilogue",
+          pybind11::arg("A_list"), pybind11::arg("A_sc_list"),
+          pybind11::arg("B_list"), pybind11::arg("B_sc_list"),
+          pybind11::arg("D_out_list"),
+          pybind11::arg("rope_cs_list"),
+          pybind11::arg("rope_seq_len_list"),
+          pybind11::arg("config_id"));
+    m.def("mxfp4_batched_gemm_rope_live", &mxfp4_batched_gemm_rope_live64_entrypoint,
+          "True Batched GEMM with a packed power-of-two per-batch RoPE epilogue",
+          pybind11::arg("A_list"), pybind11::arg("A_sc_list"),
+          pybind11::arg("B_list"), pybind11::arg("B_sc_list"),
+          pybind11::arg("D_out_list"),
+          pybind11::arg("rope_cs_list"),
+          pybind11::arg("rope_seq_len_list"));
+    m.def("mxfp4_batched_gemm_rope_live_config", &mxfp4_batched_gemm_rope_live64_config_entrypoint,
+          "True Batched GEMM with selectable tile config and a packed power-of-two per-batch RoPE epilogue",
           pybind11::arg("A_list"), pybind11::arg("A_sc_list"),
           pybind11::arg("B_list"), pybind11::arg("B_sc_list"),
           pybind11::arg("D_out_list"),
