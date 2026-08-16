@@ -502,7 +502,26 @@ struct LaunchConfig {
 
     __host__ inline LaunchConfig(dim3 grid, dim3 block, size_t dynamic_shared_memory, 
                                  cudaStream_t stream, dim3 cluster) noexcept requires(CLUSTER)
-        : LaunchConfig(grid, block, dynamic_shared_memory, stream, cluster, cluster) { }
+    {
+        // This overload is an exact cluster contract. Keep the preferred/minimum
+        // pair exclusive to the dynamic-cluster overload above.
+        attributes[0].id = cudaLaunchAttributeClusterDimension;
+        attributes[0].val.clusterDim.x = cluster.x;
+        attributes[0].val.clusterDim.y = cluster.y;
+        attributes[0].val.clusterDim.z = cluster.z;
+        attributes[1].id = cudaLaunchAttributeClusterSchedulingPolicyPreference;
+        attributes[1].val.clusterSchedulingPolicyPreference = cudaClusterSchedulingPolicyLoadBalancing;
+        if constexpr (PDL) {
+            attributes[2].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+            attributes[2].val.programmaticStreamSerializationAllowed = 1;
+        }
+        config.attrs = attributes;
+        config.numAttrs = num_attributes;
+        config.gridDim = grid;
+        config.blockDim = block;
+        config.dynamicSmemBytes = dynamic_shared_memory;
+        config.stream = stream;
+    }
 
     __host__ inline LaunchConfig(const LaunchConfig& other) noexcept : config(other.config) {
         std::copy_n(other.attributes, num_attributes, attributes);
