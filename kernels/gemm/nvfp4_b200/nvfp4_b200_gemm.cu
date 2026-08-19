@@ -10,6 +10,7 @@
 #include "nvfp4_persistent_gemm.cuh"
 #include <cstdint>
 #include <cstring>
+#include <memory>
 #include <optional>
 
 #ifndef TORCH_COMPILE
@@ -738,6 +739,112 @@ void nvfp4_grouped_gemm_config_nopdl_entrypoint(
 // Batched GEMM entrypoint (z-dim parallel): D_i = A_i × B_i^T
 // Each batch writes to a separate output buffer.
 // ================================================================
+using nvfp4_batched_default_config =
+    nvfp4_gemm::config<256, 5, 8, 4, 2, false>;
+
+class NVFP4BatchedGemmPlan {
+public:
+    using C = nvfp4_batched_default_config;
+    using G = nvfp4_batched_gemm::globals<C>;
+
+    NVFP4BatchedGemmPlan(
+        const std::vector<at::Tensor> &A_list,
+        const std::vector<at::Tensor> &A_sc_list,
+        const std::vector<at::Tensor> &A_sg_list,
+        const std::vector<at::Tensor> &B_list,
+        const std::vector<at::Tensor> &B_sc_list,
+        const std::vector<at::Tensor> &B_sg_list,
+        const std::vector<at::Tensor> &D_list
+    ) : A_list_(A_list), A_sc_list_(A_sc_list), A_sg_list_(A_sg_list),
+        B_list_(B_list), B_sc_list_(B_sc_list), B_sg_list_(B_sg_list),
+        D_list_(D_list) {
+        const int n = static_cast<int>(A_list_.size());
+        TORCH_CHECK(n > 0 && n <= nvfp4_batched_gemm::MAX_BATCHES,
+                    "num_batches must be 1..", nvfp4_batched_gemm::MAX_BATCHES);
+        TORCH_CHECK(n == static_cast<int>(A_sc_list_.size()));
+        TORCH_CHECK(n == static_cast<int>(A_sg_list_.size()));
+        TORCH_CHECK(n == static_cast<int>(B_list_.size()));
+        TORCH_CHECK(n == static_cast<int>(B_sc_list_.size()));
+        TORCH_CHECK(n == static_cast<int>(B_sg_list_.size()));
+        TORCH_CHECK(n == static_cast<int>(D_list_.size()));
+        static_assert(sizeof(G) <= 32764,
+                      "Batched GEMM kernel arguments exceed CUDA's limit");
+
+        std::memset(&g_host_, 0, sizeof(G));
+        g_host_.num_batches = n;
+        for (int i = 0; i < n; ++i) {
+            const int64_t M_i = D_list_[i].size(0);
+            const int64_t N_i = D_list_[i].size(1);
+            const int64_t K_i = 2 * A_list_[i].size(1);
+            TORCH_CHECK(A_list_[i].size(0) == M_i);
+            TORCH_CHECK(B_list_[i].size(0) == N_i);
+            TORCH_CHECK(2 * B_list_[i].size(1) == K_i);
+            TORCH_CHECK(
+                M_i % C::Mb == 0 && N_i % C::Nb == 0 && K_i % C::Kb == 0);
+            g_host_.num_row_blocks[i] = static_cast<int>(M_i / C::Mb);
+            g_host_.num_col_blocks[i] = static_cast<int>(N_i / C::Nb);
+            g_host_.num_red_blocks[i] = static_cast<int>(K_i / C::Kb);
+
+            auto a_gl = kittens::py::tensor_to_gl<typename G::A_fp4x2_gl>(
+                A_list_[i]);
+            auto a_sc_gl = kittens::py::tensor_to_gl<typename G::A_sc_gl, false>(
+                A_sc_list_[i], 1,
+                A_sc_list_[i].dim() == 2
+                    ? A_sc_list_[i].size(0) / 128
+                    : A_sc_list_[i].size(0),
+                A_sc_list_[i].dim() == 2
+                    ? A_sc_list_[i].size(1) / 4
+                    : A_sc_list_[i].size(1),
+                256);
+            auto b_gl = kittens::py::tensor_to_gl<typename G::B_fp4x2_gl>(
+                B_list_[i]);
+            auto b_sc_gl = kittens::py::tensor_to_gl<typename G::B_sc_gl, false>(
+                B_sc_list_[i], 1,
+                B_sc_list_[i].dim() == 2
+                    ? B_sc_list_[i].size(0) / 128
+                    : B_sc_list_[i].size(0),
+                B_sc_list_[i].dim() == 2
+                    ? B_sc_list_[i].size(1) / 4
+                    : B_sc_list_[i].size(1),
+                256);
+            std::memcpy(
+                &g_host_.A_tma[i], &a_gl.tma_descs.tma_desc,
+                sizeof(CUtensorMap));
+            std::memcpy(
+                &g_host_.A_sc_tma[i], &a_sc_gl.tma_descs.tma_desc,
+                sizeof(CUtensorMap));
+            std::memcpy(
+                &g_host_.B_tma[i], &b_gl.tma_descs.tma_desc,
+                sizeof(CUtensorMap));
+            std::memcpy(
+                &g_host_.B_sc_tma[i], &b_sc_gl.tma_descs.tma_desc,
+                sizeof(CUtensorMap));
+
+            auto d_gl = kittens::py::tensor_to_gl<typename G::D_gl>(D_list_[i]);
+            std::memcpy(
+                &g_host_.D_tma[i], &d_gl.tma_descs.tma_desc,
+                sizeof(CUtensorMap));
+            g_host_.A_sg[i] = A_sg_list_[i].data_ptr<float>();
+            g_host_.B_sg[i] = B_sg_list_[i].data_ptr<float>();
+        }
+    }
+
+    void run() const {
+        kittens::py::launch_kernel<C, G, nvfp4_batched_gemm::kernel<C>>(
+            g_host_);
+    }
+
+private:
+    G g_host_{};
+    std::vector<at::Tensor> A_list_;
+    std::vector<at::Tensor> A_sc_list_;
+    std::vector<at::Tensor> A_sg_list_;
+    std::vector<at::Tensor> B_list_;
+    std::vector<at::Tensor> B_sc_list_;
+    std::vector<at::Tensor> B_sg_list_;
+    std::vector<at::Tensor> D_list_;
+};
+
 void nvfp4_batched_gemm_entrypoint(
     const std::vector<at::Tensor> &A_list,
     const std::vector<at::Tensor> &A_sc_list,
@@ -747,65 +854,9 @@ void nvfp4_batched_gemm_entrypoint(
     const std::vector<at::Tensor> &B_sg_list,
     std::vector<at::Tensor> &D_list
 ) {
-    const int n = (int)A_list.size();
-    TORCH_CHECK(n > 0 && n <= nvfp4_batched_gemm::MAX_BATCHES,
-                "num_batches must be 1..", nvfp4_batched_gemm::MAX_BATCHES);
-    TORCH_CHECK(n == (int)D_list.size());
-
-    const int64_t M = D_list[0].size(0);
-    const int64_t N_out = D_list[0].size(1);
-    const int K_first = (int)(A_list[0].size(1) * 2);
-
-    auto build_and_launch = [&]<typename C>() {
-        using G = nvfp4_batched_gemm::globals<C>;
-        G g_host;
-        memset(&g_host, 0, sizeof(G));
-        g_host.num_batches = n;
-        static_assert(sizeof(G) <= 32764, "Batched GEMM kernel arguments exceed CUDA's limit");
-
-        for (int i = 0; i < n; ++i) {
-            const int64_t M_i = D_list[i].size(0);
-            const int64_t N_i = D_list[i].size(1);
-            const int64_t K_i = 2 * A_list[i].size(1);
-            TORCH_CHECK(A_list[i].size(0) == M_i);
-            TORCH_CHECK(B_list[i].size(0) == N_i);
-            TORCH_CHECK(2 * B_list[i].size(1) == K_i);
-            TORCH_CHECK(M_i % C::Mb == 0 && N_i % C::Nb == 0 && K_i % C::Kb == 0);
-            g_host.num_row_blocks[i] = (int)(M_i / C::Mb);
-            g_host.num_col_blocks[i] = (int)(N_i / C::Nb);
-            g_host.num_red_blocks[i] = (int)(K_i / C::Kb);
-
-            auto a_gl = kittens::py::tensor_to_gl<typename G::A_fp4x2_gl>(A_list[i]);
-            auto a_sc_gl = kittens::py::tensor_to_gl<typename G::A_sc_gl, false>(
-                A_sc_list[i], 1,
-                A_sc_list[i].dim() == 2 ? A_sc_list[i].size(0)/128 : A_sc_list[i].size(0),
-                A_sc_list[i].dim() == 2 ? A_sc_list[i].size(1)/4 : A_sc_list[i].size(1), 256);
-            auto b_gl = kittens::py::tensor_to_gl<typename G::B_fp4x2_gl>(B_list[i]);
-            auto b_sc_gl = kittens::py::tensor_to_gl<typename G::B_sc_gl, false>(
-                B_sc_list[i], 1,
-                B_sc_list[i].dim() == 2 ? B_sc_list[i].size(0)/128 : B_sc_list[i].size(0),
-                B_sc_list[i].dim() == 2 ? B_sc_list[i].size(1)/4 : B_sc_list[i].size(1), 256);
-            memcpy(&g_host.A_tma[i], &a_gl.tma_descs.tma_desc, sizeof(CUtensorMap));
-            memcpy(&g_host.A_sc_tma[i], &a_sc_gl.tma_descs.tma_desc, sizeof(CUtensorMap));
-            memcpy(&g_host.B_tma[i], &b_gl.tma_descs.tma_desc, sizeof(CUtensorMap));
-            memcpy(&g_host.B_sc_tma[i], &b_sc_gl.tma_descs.tma_desc, sizeof(CUtensorMap));
-
-            auto d_gl = kittens::py::tensor_to_gl<typename G::D_gl>(D_list[i]);
-            memcpy(&g_host.D_tma[i], &d_gl.tma_descs.tma_desc, sizeof(CUtensorMap));
-
-            g_host.A_sg[i] = A_sg_list[i].data_ptr<float>();
-            g_host.B_sg[i] = B_sg_list[i].data_ptr<float>();
-        }
-        kittens::py::launch_kernel<C, G, nvfp4_batched_gemm::kernel<C>>(g_host);
-    };
-
-    if (K_first <= 2048 && N_out <= 4096) {
-        build_and_launch.operator()<nvfp4_gemm::config<256, 5, 8, 4, 2, false>>();
-    } else if (K_first <= 2048) {
-        build_and_launch.operator()<nvfp4_gemm::config<256, 5, 8, 4, 2, false>>();
-    } else {
-        build_and_launch.operator()<nvfp4_gemm::config<256, 5, 8, 4, 2, false>>();
-    }
+    NVFP4BatchedGemmPlan(
+        A_list, A_sc_list, A_sg_list,
+        B_list, B_sc_list, B_sg_list, D_list).run();
 }
 
 // Batched GEMM for row-major FP4 views with a larger parent row stride.
@@ -1957,6 +2008,19 @@ void nvfp4_persistent_gemm_entrypoint(
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    pybind11::class_<NVFP4BatchedGemmPlan,
+                     std::shared_ptr<NVFP4BatchedGemmPlan>>(
+        m, "NVFP4BatchedGemmPlan")
+        .def(
+            pybind11::init<
+                const std::vector<at::Tensor>&,
+                const std::vector<at::Tensor>&,
+                const std::vector<at::Tensor>&,
+                const std::vector<at::Tensor>&,
+                const std::vector<at::Tensor>&,
+                const std::vector<at::Tensor>&,
+                const std::vector<at::Tensor>&>())
+        .def("run", &NVFP4BatchedGemmPlan::run);
     m.def("nvfp4_gemm", &nvfp4_gemm_entrypoint);
     m.def("nvfp4_gemm_rope_live64", &nvfp4_gemm_rope_live64_entrypoint,
           "NVFP4 GEMM with an in-epilogue live float32 RoPE table",

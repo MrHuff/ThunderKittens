@@ -980,6 +980,47 @@ static void launch_mxfp4_gemm_dense(
     kittens::py::launch_kernel<C, G, mxfp4_gemm::kernel<C>>(g);
 }
 
+using mxfp4_dense_default_config =
+    mxfp4_gemm::config<256, 5, 8, 4, 2, false, 256>;
+
+class MXFP4GemmPlan {
+public:
+    using C = mxfp4_dense_default_config;
+    using G = mxfp4_gemm::globals<C>;
+
+    MXFP4GemmPlan(
+        const at::Tensor &A,
+        const at::Tensor &A_sc,
+        const at::Tensor &B,
+        const at::Tensor &B_sc,
+        const at::Tensor &D
+    ) : A_(A), A_sc_(A_sc), B_(B), B_sc_(B_sc), D_(D),
+        g_host_{
+            .A = kittens::py::tensor_to_gl<typename G::A_fp4x2_gl>(A_),
+            .A_sc = kittens::py::tensor_to_gl<typename G::A_sc_gl>(A_sc_),
+            .B = kittens::py::tensor_to_gl<typename G::B_fp4x2_gl>(B_),
+            .B_sc = kittens::py::tensor_to_gl<typename G::B_sc_gl>(B_sc_),
+            .D = kittens::py::tensor_to_gl<typename G::D_gl>(D_),
+            .output_scale = nullptr,
+            .tilemask_ptr = nullptr,
+            .tilemask_rows = 0,
+            .tilemask_cols = 0,
+            .tilemask_transposed = false
+        } {}
+
+    void run() const {
+        kittens::py::launch_kernel<C, G, mxfp4_gemm::kernel<C>>(g_host_);
+    }
+
+private:
+    at::Tensor A_;
+    at::Tensor A_sc_;
+    at::Tensor B_;
+    at::Tensor B_sc_;
+    at::Tensor D_;
+    G g_host_;
+};
+
 template <typename C>
 static void launch_mxfp4_gemm_dense_residual(
     const at::Tensor &A,
@@ -2167,6 +2208,14 @@ void mxfp4_split3_dgrad_strided_onepass_gemm_entrypoint(
 
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    pybind11::class_<MXFP4GemmPlan>(m, "MXFP4GemmPlan")
+        .def(pybind11::init<
+             const at::Tensor &,
+             const at::Tensor &,
+             const at::Tensor &,
+             const at::Tensor &,
+             const at::Tensor &>())
+        .def("run", &MXFP4GemmPlan::run);
     m.def("mxfp4_gemm", &mxfp4_gemm_entrypoint);
     m.def("mxfp4_gemm_scaled", &mxfp4_gemm_scaled_entrypoint,
           "MXFP4 GEMM with an extra CUDA scalar epilogue multiplier",
