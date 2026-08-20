@@ -101,14 +101,53 @@ struct globals {
 };
 
 template <typename C>
+struct scaled_globals {
+    globals<C> gemm;
+    const float* output_scale;
+
+    __host__ inline dim3 grid() const { return gemm.grid(); }
+    __host__ inline dim3 block() const { return gemm.block(); }
+    __host__ inline int dynamic_shared_memory() const {
+        return gemm.dynamic_shared_memory();
+    }
+};
+
+template <typename Tile>
+__device__ inline void scale_bf16_register_tile(Tile& tile, float scale) {
+    static_assert(std::is_same_v<typename Tile::dtype, bf16_2>);
+    // Match BF16 TensorIterator in-place multiplication by a CUDA FP32 scalar:
+    // the scalar is first cast to the destination dtype, then both BF16 inputs
+    // are widened for the arithmetic.  Keeping this conversion explicit is
+    // required for bitwise parity at non-power-of-two scales.
+    const float bf16_scale = __bfloat162float(__float2bfloat16_rn(scale));
+    #pragma unroll
+    for (int i = 0; i < Tile::height; ++i) {
+        #pragma unroll
+        for (int j = 0; j < Tile::width; ++j) {
+            #pragma unroll
+            for (int k = 0; k < Tile::packed_per_tile; ++k) {
+                float2 value = __bfloat1622float2(tile.tiles[i][j].data[k]);
+                value.x *= bf16_scale;
+                value.y *= bf16_scale;
+                tile.tiles[i][j].data[k] = __float22bfloat162_rn(value);
+            }
+        }
+    }
+}
+
+template <typename C, bool OUTPUT_SCALE>
 __device__ inline void stage_output_tile(
     const globals<C>& g,
     typename globals<C>::D_tile& output_tile,
-    const rt_bf<C::Mb / 8, C::Nb / C::EPI_PIPE_DEPTH>& D_reg,
+    rt_bf<C::Mb / 8, C::Nb / C::EPI_PIPE_DEPTH>& D_reg,
     int row_block_idx,
     int col_block_idx,
     int epi,
-    int cta_id) {
+    int cta_id,
+    float output_scale) {
+    static_assert(
+        !OUTPUT_SCALE || !(C::FP8_OUTPUT || C::CENTERED_FP8_OUTPUT),
+        "scaled MXFP8 GEMM supports BF16 output only");
     if constexpr (C::CENTERED_FP8_OUTPUT) {
         using D_bf_t = rt_bf<C::Mb / 8, C::Nb / C::EPI_PIPE_DEPTH>;
         D_bf_t residual;
@@ -149,12 +188,21 @@ __device__ inline void stage_output_tile(
         warp::copy(D_fp8, D_reg);
         warpgroup::store(output_tile, D_fp8);
     } else {
+        if constexpr (OUTPUT_SCALE) {
+            // Preserve the existing numerical boundary exactly: tensor-memory
+            // accumulators have already been rounded into BF16 D_reg.  Widen
+            // each packed BF16 pair to float2, apply the runtime FP32 scalar,
+            // and round once more to BF16 before the existing shared/HBM store.
+            scale_bf16_register_tile(D_reg, output_scale);
+        }
         warpgroup::store(output_tile, D_reg);
     }
 }
 
-template <typename C>
-__device__ inline void kernel(const globals<C> &g) {
+template <typename C, bool OUTPUT_SCALE>
+__device__ inline void kernel_impl(
+    const globals<C> &g,
+    const float* output_scale_ptr) {
     using G = globals<C>;
 
     if (threadIdx.x == 0) {
@@ -302,6 +350,10 @@ __device__ inline void kernel(const globals<C> &g) {
         }
     } else if (warpgroup_id < C::CONSUMER_WARPGROUPS) {
         // Consumer group
+        float output_scale = 1.0f;
+        if constexpr (OUTPUT_SCALE) {
+            output_scale = *output_scale_ptr;
+        }
         everyone::tma::cluster::wait_aligned();
         if (warpgroup::warpid() == 0) {
             tm_allocator.provision(tmem_addr);
@@ -335,9 +387,10 @@ __device__ inline void kernel(const globals<C> &g) {
                     }
                     warpgroup::tma::store_async_read_wait<C::NUM_D_TILES-1>();
                     warpgroup::sync(1);
-                    stage_output_tile<C>(
+                    stage_output_tile<C, OUTPUT_SCALE>(
                         g, output_tiles.D[i%C::NUM_D_TILES], D_reg,
-                        row_block_idx, col_block_idx, i, cta_id);
+                        row_block_idx, col_block_idx, i, cta_id,
+                        output_scale);
                     warpgroup::sync(1);
                     warpgroup::tma::store_async<dim::ROW, cache_policy::EVICT_FIRST>(g.D, output_tiles.D[i%C::NUM_D_TILES], {row_block_idx * 2 + cta_id, col_block_idx * C::EPI_PIPE_DEPTH + i});
                 }
@@ -354,9 +407,10 @@ __device__ inline void kernel(const globals<C> &g) {
                 for (int i = 0; i < C::EPI_PIPE_DEPTH; i++) {
                     warpgroup::tma::store_async_read_wait<C::NUM_D_TILES-1>();
                     warpgroup::sync(1);
-                    stage_output_tile<C>(
+                    stage_output_tile<C, OUTPUT_SCALE>(
                         g, output_tiles.D[i%C::NUM_D_TILES], D_reg[i],
-                        row_block_idx, col_block_idx, i, cta_id);
+                        row_block_idx, col_block_idx, i, cta_id,
+                        output_scale);
                     warpgroup::sync(1);
                     warpgroup::tma::store_async<dim::ROW, cache_policy::EVICT_FIRST>(g.D, output_tiles.D[i%C::NUM_D_TILES], {row_block_idx * 2 + cta_id, col_block_idx * C::EPI_PIPE_DEPTH + i});
                 }
@@ -371,6 +425,19 @@ __device__ inline void kernel(const globals<C> &g) {
             tm_allocator.deprovision();
         }
     }
+}
+
+template <typename C>
+__device__ inline void kernel(const globals<C> &g) {
+    kernel_impl<C, false>(g, nullptr);
+}
+
+template <typename C>
+__device__ inline void scaled_kernel(const scaled_globals<C> &g) {
+    static_assert(
+        !(C::FP8_OUTPUT || C::CENTERED_FP8_OUTPUT),
+        "scaled MXFP8 GEMM supports BF16 output only");
+    kernel_impl<C, true>(g.gemm, g.output_scale);
 }
 
 } // namespace mxfp8_gemm
@@ -704,6 +771,71 @@ void mxfp8_gemm_entrypoint(
     mxfp8_gemm_entrypoint_config<C>(A, A_sc, B, B_sc, D);
 }
 
+template <typename C>
+void mxfp8_gemm_scaled_entrypoint_config(
+    const at::Tensor &A,
+    const at::Tensor &A_sc,
+    const at::Tensor &B,
+    const at::Tensor &B_sc,
+    at::Tensor &D,
+    const at::Tensor &output_scale
+) {
+    using BaseG = mxfp8_gemm::globals<C>;
+    using G = mxfp8_gemm::scaled_globals<C>;
+
+    BaseG gemm {
+        .A = kittens::py::tensor_to_gl<typename BaseG::A_gl>(A),
+        .A_sc = kittens::py::tensor_to_gl<typename BaseG::A_sc_gl>(A_sc),
+        .B = kittens::py::tensor_to_gl<typename BaseG::B_gl>(B),
+        .B_sc = kittens::py::tensor_to_gl<typename BaseG::B_sc_gl>(B_sc),
+        .D = kittens::py::tensor_to_gl<typename BaseG::D_gl>(D),
+        .D_center = nullptr,
+        .D_center_stride = 0
+    };
+    G g {
+        .gemm = gemm,
+        .output_scale = output_scale.data_ptr<float>()
+    };
+    kittens::py::launch_kernel<C, G, mxfp8_gemm::scaled_kernel<C>>(g);
+}
+
+void check_mxfp8_output_scale(
+    const at::Tensor &A,
+    const at::Tensor &A_sc,
+    const at::Tensor &B,
+    const at::Tensor &B_sc,
+    const at::Tensor &D,
+    const at::Tensor &output_scale
+) {
+    TORCH_CHECK(
+        output_scale.is_cuda(),
+        "output_scale must be a CUDA scalar tensor");
+    TORCH_CHECK(
+        output_scale.scalar_type() == at::kFloat,
+        "output_scale must be float32");
+    TORCH_CHECK(
+        output_scale.numel() == 1,
+        "output_scale must contain one element");
+    TORCH_CHECK(
+        output_scale.is_contiguous(),
+        "output_scale must be contiguous");
+    kittens::py::device_check(A, A_sc, B, B_sc, D, output_scale);
+}
+
+void mxfp8_gemm_scaled_entrypoint(
+    const at::Tensor &A,
+    const at::Tensor &A_sc,
+    const at::Tensor &B,
+    const at::Tensor &B_sc,
+    at::Tensor &D,
+    const at::Tensor &output_scale
+) {
+    check_mxfp8_output_scale(A, A_sc, B, B_sc, D, output_scale);
+    using C = mxfp8_gemm::config<256, 6, 16, 12, 4, false, false>;
+    mxfp8_gemm_scaled_entrypoint_config<C>(
+        A, A_sc, B, B_sc, D, output_scale);
+}
+
 void mxfp8_gemm_config_entrypoint(
     const at::Tensor &A,
     const at::Tensor &A_sc,
@@ -739,6 +871,49 @@ void mxfp8_gemm_config_entrypoint(
     case 23: mxfp8_gemm_entrypoint_config<mxfp8_gemm::config<128, 5,  8, 12, 4, true >>(A, A_sc, B, B_sc, D); break;
     default:
         TORCH_CHECK(false, "invalid MXFP8 GEMM config_id: ", config_id, " (valid: 0-23)");
+    }
+}
+
+void mxfp8_gemm_scaled_config_entrypoint(
+    const at::Tensor &A,
+    const at::Tensor &A_sc,
+    const at::Tensor &B,
+    const at::Tensor &B_sc,
+    at::Tensor &D,
+    const at::Tensor &output_scale,
+    int64_t config_id
+) {
+    check_mxfp8_output_scale(A, A_sc, B, B_sc, D, output_scale);
+    switch (config_id) {
+    case 0:  mxfp8_gemm_scaled_entrypoint_config<mxfp8_gemm::config<256, 6, 16, 12, 4, false>>(A, A_sc, B, B_sc, D, output_scale); break;
+    case 1:  mxfp8_gemm_scaled_entrypoint_config<mxfp8_gemm::config<256, 5,  4,  1, 2, false>>(A, A_sc, B, B_sc, D, output_scale); break;
+    case 2:  mxfp8_gemm_scaled_entrypoint_config<mxfp8_gemm::config<256, 5,  4,  2, 2, false>>(A, A_sc, B, B_sc, D, output_scale); break;
+    case 3:  mxfp8_gemm_scaled_entrypoint_config<mxfp8_gemm::config<256, 5,  4,  4, 2, false>>(A, A_sc, B, B_sc, D, output_scale); break;
+    case 4:  mxfp8_gemm_scaled_entrypoint_config<mxfp8_gemm::config<256, 5,  4,  8, 2, false>>(A, A_sc, B, B_sc, D, output_scale); break;
+    case 5:  mxfp8_gemm_scaled_entrypoint_config<mxfp8_gemm::config<256, 5,  4, 16, 2, false>>(A, A_sc, B, B_sc, D, output_scale); break;
+    case 6:  mxfp8_gemm_scaled_entrypoint_config<mxfp8_gemm::config<256, 5,  4,  4, 2, true >>(A, A_sc, B, B_sc, D, output_scale); break;
+    case 7:  mxfp8_gemm_scaled_entrypoint_config<mxfp8_gemm::config<256, 5,  4,  8, 2, true >>(A, A_sc, B, B_sc, D, output_scale); break;
+    case 8:  mxfp8_gemm_scaled_entrypoint_config<mxfp8_gemm::config<256, 5,  4, 12, 2, true >>(A, A_sc, B, B_sc, D, output_scale); break;
+    case 9:  mxfp8_gemm_scaled_entrypoint_config<mxfp8_gemm::config<256, 5,  4, 16, 2, true >>(A, A_sc, B, B_sc, D, output_scale); break;
+    case 10: mxfp8_gemm_scaled_entrypoint_config<mxfp8_gemm::config<256, 4,  4,  8, 2, false>>(A, A_sc, B, B_sc, D, output_scale); break;
+    case 11: mxfp8_gemm_scaled_entrypoint_config<mxfp8_gemm::config<256, 4,  4, 12, 2, false>>(A, A_sc, B, B_sc, D, output_scale); break;
+    case 12: mxfp8_gemm_scaled_entrypoint_config<mxfp8_gemm::config<256, 4,  4, 16, 2, false>>(A, A_sc, B, B_sc, D, output_scale); break;
+    case 13: mxfp8_gemm_scaled_entrypoint_config<mxfp8_gemm::config<256, 6, 16,  4, 4, false>>(A, A_sc, B, B_sc, D, output_scale); break;
+    case 14: mxfp8_gemm_scaled_entrypoint_config<mxfp8_gemm::config<256, 6, 16,  8, 4, false>>(A, A_sc, B, B_sc, D, output_scale); break;
+    case 15: mxfp8_gemm_scaled_entrypoint_config<mxfp8_gemm::config<256, 6, 16, 16, 4, false>>(A, A_sc, B, B_sc, D, output_scale); break;
+    case 16: mxfp8_gemm_scaled_entrypoint_config<mxfp8_gemm::config<256, 5, 16,  4, 4, false>>(A, A_sc, B, B_sc, D, output_scale); break;
+    case 17: mxfp8_gemm_scaled_entrypoint_config<mxfp8_gemm::config<256, 5, 16,  8, 4, false>>(A, A_sc, B, B_sc, D, output_scale); break;
+    case 18: mxfp8_gemm_scaled_entrypoint_config<mxfp8_gemm::config<256, 5, 16, 12, 4, false>>(A, A_sc, B, B_sc, D, output_scale); break;
+    case 19: mxfp8_gemm_scaled_entrypoint_config<mxfp8_gemm::config<256, 5, 16, 16, 4, false>>(A, A_sc, B, B_sc, D, output_scale); break;
+    case 20: mxfp8_gemm_scaled_entrypoint_config<mxfp8_gemm::config<256, 6, 16, 12, 4, true >>(A, A_sc, B, B_sc, D, output_scale); break;
+    case 21: mxfp8_gemm_scaled_entrypoint_config<mxfp8_gemm::config<128, 6,  8,  8, 4, false>>(A, A_sc, B, B_sc, D, output_scale); break;
+    case 22: mxfp8_gemm_scaled_entrypoint_config<mxfp8_gemm::config<128, 6,  8, 12, 4, false>>(A, A_sc, B, B_sc, D, output_scale); break;
+    case 23: mxfp8_gemm_scaled_entrypoint_config<mxfp8_gemm::config<128, 5,  8, 12, 4, true >>(A, A_sc, B, B_sc, D, output_scale); break;
+    default:
+        TORCH_CHECK(
+            false,
+            "invalid scaled MXFP8 GEMM config_id: ", config_id,
+            " (valid: 0-23)");
     }
 }
 
@@ -940,6 +1115,21 @@ void mxfp6_e2m3_gemm_config_entrypoint(
 PYBIND11_MODULE(_C_mxfp8, m) {
     m.def("mxfp8_gemm", &mxfp8_gemm_entrypoint);
     m.def("mxfp8_gemm_config", &mxfp8_gemm_config_entrypoint);
+    m.def(
+        "mxfp8_gemm_scaled",
+        &mxfp8_gemm_scaled_entrypoint,
+        "MXFP8 GEMM with a CUDA FP32 scalar applied after BF16 rounding",
+        pybind11::arg("A"), pybind11::arg("A_sc"),
+        pybind11::arg("B"), pybind11::arg("B_sc"),
+        pybind11::arg("D"), pybind11::arg("output_scale"));
+    m.def(
+        "mxfp8_gemm_scaled_config",
+        &mxfp8_gemm_scaled_config_entrypoint,
+        "Configured MXFP8 GEMM with post-BF16 CUDA FP32 scaling",
+        pybind11::arg("A"), pybind11::arg("A_sc"),
+        pybind11::arg("B"), pybind11::arg("B_sc"),
+        pybind11::arg("D"), pybind11::arg("output_scale"),
+        pybind11::arg("config_id"));
     m.def("mxfp8_gemm_fp8", &mxfp8_gemm_fp8_entrypoint);
     m.def(
         "mxfp8_gemm_centered_fp8",
