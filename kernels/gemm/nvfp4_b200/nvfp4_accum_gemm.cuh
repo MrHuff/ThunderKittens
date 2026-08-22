@@ -144,6 +144,7 @@ __device__ inline void kernel(const globals<C> &g) {
         init_semaphore(accum_load_arrived, 0, 1);
     }
     everyone::tma::cluster::arrive_aligned();
+    everyone::tma::cluster::wait_aligned();
 
     // Create proxies for this batch's TMA descriptors
     tma_dev_proxy<typename G::A_fp4x2_gl> proxy_A(&g.A_tma[batch]);
@@ -158,7 +159,6 @@ __device__ inline void kernel(const globals<C> &g) {
         if (warp_id == 3) {
             // ── Producer: load input tiles ── (identical to batched GEMM)
             if constexpr (C::USE_PDL) pdl::wait();
-            everyone::tma::cluster::wait();
 
             for (int block_idx = cluster_id; block_idx < num_blocks; block_idx += gridDim.x / C::CLUSTER_SIZE) {
                 int supergroup_idx = block_idx / num_blocks_per_supergroup;
@@ -179,7 +179,6 @@ __device__ inline void kernel(const globals<C> &g) {
         } else if (warp_id == 2) {
             // ── Producer: load input scales ── (identical to batched GEMM)
             if constexpr (C::USE_PDL) pdl::wait();
-            everyone::tma::cluster::wait();
 
             for (int block_idx = cluster_id; block_idx < num_blocks; block_idx += gridDim.x / C::CLUSTER_SIZE) {
                 int supergroup_idx = block_idx / num_blocks_per_supergroup;
@@ -200,7 +199,6 @@ __device__ inline void kernel(const globals<C> &g) {
             }
         } else if (cta_id == 0 && warp_id == 0) {
             // ── MMA warp ── (identical to batched GEMM)
-            everyone::tma::cluster::wait();
             wait(tmem_provisioned, 0);
             tm_allocator.set_addr(tmem_addr);
             auto out_tm  = tm_allocator.template allocate<full_tt_fl<C::Nb>>(0);
@@ -246,7 +244,6 @@ __device__ inline void kernel(const globals<C> &g) {
         }
     } else if (warpgroup_id < C::CONSUMER_WARPGROUPS) {
         // ── Consumer: scale and ACCUMULATE into shared D output ──
-        everyone::tma::cluster::wait_aligned();
         if (warpgroup::warpid() == 0) {
             tm_allocator.provision(tmem_addr);
             warp::arrive(tmem_provisioned);
@@ -360,6 +357,9 @@ __device__ inline void kernel(const globals<C> &g) {
         if constexpr (C::USE_PDL) warpgroup::pdl::arrive();
         if (warpgroup::warpid() == 0) tm_allocator.deprovision();
     }
+
+    asm volatile("barrier.cluster.arrive.relaxed.aligned;\n");
+    asm volatile("barrier.cluster.wait.aligned;\n");
 }
 
 } // namespace nvfp4_accum_gemm

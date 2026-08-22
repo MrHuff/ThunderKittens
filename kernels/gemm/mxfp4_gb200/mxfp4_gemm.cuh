@@ -371,6 +371,7 @@ __device__ inline void kernel(const globals<C> &g) {
         }
     }
     everyone::tma::cluster::arrive_aligned();
+    everyone::tma::cluster::wait_aligned();
 
     // Main divergence
     if (warpgroup_id >= C::CONSUMER_WARPGROUPS && warp::elect_leader()) {
@@ -379,7 +380,6 @@ __device__ inline void kernel(const globals<C> &g) {
         if (warp_id == 3) {
             // Load input FP4 tiles to shared memory
             if constexpr (C::USE_PDL) pdl::wait();
-            everyone::tma::cluster::wait();
             for (int block_idx = cluster_id; block_idx < num_blocks; block_idx += gridDim.x / C::CLUSTER_SIZE) {
                 int supergroup_idx = block_idx / num_blocks_per_supergroup;
                 int idx_within_supergroup = block_idx % num_blocks_per_supergroup;
@@ -408,7 +408,6 @@ __device__ inline void kernel(const globals<C> &g) {
             // Load input scales to shared memory
             // Each iteration loads MMA_PER_TILE (=2) scale tiles per A and B
             if constexpr (C::USE_PDL) pdl::wait();
-            everyone::tma::cluster::wait();
             for (int block_idx = cluster_id; block_idx < num_blocks; block_idx += gridDim.x / C::CLUSTER_SIZE) {
                 int supergroup_idx = block_idx / num_blocks_per_supergroup;
                 int idx_within_supergroup = block_idx % num_blocks_per_supergroup;
@@ -459,7 +458,6 @@ __device__ inline void kernel(const globals<C> &g) {
             }
         } else if (cta_id == 0 && warp_id == 0) {
             // Launch tensor core matrix multiply
-            everyone::tma::cluster::wait();
             wait(tmem_provisioned, 0);
             tm_allocator.set_addr(tmem_addr);
             auto out_tm  = tm_allocator.template allocate<full_tt_fl<C::Nb>>(0);
@@ -523,7 +521,6 @@ __device__ inline void kernel(const globals<C> &g) {
         }
     } else if (warpgroup_id < C::CONSUMER_WARPGROUPS) {
         // Consumer group — no global scale needed for MXFP4
-        everyone::tma::cluster::wait_aligned();
         // The preceding clustered GEMM releases tensor memory before its PDL
         // arrival. Do not provision the dependent cluster until then.
         if constexpr (C::USE_PDL) warpgroup::pdl::wait();
@@ -810,6 +807,11 @@ __device__ inline void kernel(const globals<C> &g) {
         warpgroup::sync(1);
         if constexpr (C::USE_PDL) warpgroup::pdl::arrive();
     }
+
+    // Both CTAs use peer DSM/TMEM traffic. Keep either CTA alive until its
+    // peer has retired all tail operations targeting the cluster.
+    asm volatile("barrier.cluster.arrive.relaxed.aligned;\n");
+    asm volatile("barrier.cluster.wait.aligned;\n");
 }
 
 } // namespace mxfp4_gemm

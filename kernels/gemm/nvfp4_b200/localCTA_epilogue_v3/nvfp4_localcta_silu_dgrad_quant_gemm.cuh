@@ -458,12 +458,12 @@ __device__ inline void kernel(const globals<C>& g) {
         init_semaphore(outputs_finished, 0, C::CLUSTER_SIZE);
     }
     everyone::tma::cluster::arrive_aligned();
+    everyone::tma::cluster::wait_aligned();
 
     if (warpgroup_id >= C::CONSUMER_WARPGROUPS && warp::elect_leader()) {
         int warp_id = group<WARPGROUP_WARPS*C::PRODUCER_WARPGROUPS>::warpid();
         if (warp_id == 3) {
             if constexpr (C::USE_PDL) pdl::wait();
-            everyone::tma::cluster::wait();
             for (int block_idx = cluster_id; block_idx < num_blocks; block_idx += gridDim.x / C::CLUSTER_SIZE) {
                 int supergroup_idx = block_idx / num_blocks_per_supergroup;
                 int idx_within_supergroup = block_idx % num_blocks_per_supergroup;
@@ -481,7 +481,6 @@ __device__ inline void kernel(const globals<C>& g) {
             }
         } else if (warp_id == 2) {
             if constexpr (C::USE_PDL) pdl::wait();
-            everyone::tma::cluster::wait();
             for (int block_idx = cluster_id; block_idx < num_blocks; block_idx += gridDim.x / C::CLUSTER_SIZE) {
                 int supergroup_idx = block_idx / num_blocks_per_supergroup;
                 int idx_within_supergroup = block_idx % num_blocks_per_supergroup;
@@ -499,7 +498,6 @@ __device__ inline void kernel(const globals<C>& g) {
                 }
             }
         } else if (cta_id == 0 && warp_id == 0) {
-            everyone::tma::cluster::wait();
             wait(tmem_provisioned, 0);
             tm_allocator.set_addr(tmem_addr);
             auto out_tm  = tm_allocator.template allocate<full_tt_fl<C::Nb>>(0);
@@ -554,7 +552,6 @@ __device__ inline void kernel(const globals<C>& g) {
             }
         }
     } else if (warpgroup_id < C::CONSUMER_WARPGROUPS) {
-        everyone::tma::cluster::wait_aligned();
         if (warpgroup::warpid() == 0) {
             tm_allocator.provision(tmem_addr);
             warp::arrive(tmem_provisioned);
@@ -679,6 +676,9 @@ __device__ inline void kernel(const globals<C>& g) {
         if constexpr (C::USE_PDL) warpgroup::pdl::arrive();
         if (warpgroup::warpid() == 0) tm_allocator.deprovision();
     }
+
+    asm volatile("barrier.cluster.arrive.relaxed.aligned;\n");
+    asm volatile("barrier.cluster.wait.aligned;\n");
 }
 
 } // namespace nvfp4_localcta_silu_dgrad_quant_gemm
